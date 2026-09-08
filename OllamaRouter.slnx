@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/Solution/">
+    <File Path="LICENSE" />
+    <File Path="README.md" />
+  </Folder>
+  <Project Path="OllamaRouter.E2ETests/OllamaRouter.E2ETests.csproj" />
+  <Project Path="OllamaRouter.Tests/OllamaRouter.Tests.csproj" />
+  <Project Path="OllamaRouter/OllamaRouter.csproj" />
+</Solution>

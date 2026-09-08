@@ -1,0 +1,152 @@
+using Microsoft.Extensions.Logging.Abstractions;
+using Moq;
+using OllamaRouter.Options;
+using OllamaRouter.Services;
+
+namespace OllamaRouter.Tests.Services;
+
+public class RoutingDecisionServiceTests
+{
+    private const string ModelName = "llama3";
+
+    private static RoutingDecisionService CreateSut(
+        Mock<IOllamaModelCatalogClient> catalogClient,
+        Mock<IGpuVramProvider> gpuVramProvider,
+        int maxLocalTokens = 40_000,
+        int minRequiredVramMB = 13_500,
+        string modelName = ModelName)
+    {
+        var options = Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions
+        {
+            Models = new Dictionary<string, ModelThresholds>
+            {
+                [modelName] = new ModelThresholds
+                {
+                    MaxLocalTokens = maxLocalTokens,
+                    MinRequiredVramMB = minRequiredVramMB
+                }
+            },
+            LocalUrl = "http://127.0.0.1:11435",
+            RemoteUrl = "http://aiserver.local:11434"
+        });
+
+        return new RoutingDecisionService(options, catalogClient.Object, gpuVramProvider.Object, NullLogger<RoutingDecisionService>.Instance);
+    }
+
+    [Fact]
+    public async Task DecideAsync_ModelNotConfigured_ReturnsRemote_WithoutQueryingCatalogOrGpu()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        // The SUT only has "llama3" configured, so any other model name must be routed remote.
+        var sut = CreateSut(catalogClient, gpuVramProvider);
+
+        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: "unknown-model");
+
+        Assert.Equal(RoutingTarget.Remote, target);
+        catalogClient.Verify(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        gpuVramProvider.Verify(g => g.GetFreeVramMB(), Times.Never);
+    }
+
+    [Fact]
+    public async Task DecideAsync_TokenCountExceedsMax_ReturnsRemote_WithoutQueryingCatalogOrGpu()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        var sut = CreateSut(catalogClient, gpuVramProvider);
+
+        var target = await sut.DecideAsync(tokenCount: 50_000, modelName: ModelName);
+
+        Assert.Equal(RoutingTarget.Remote, target);
+        catalogClient.Verify(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        gpuVramProvider.Verify(g => g.GetFreeVramMB(), Times.Never);
+    }
+
+    [Fact]
+    public async Task DecideAsync_ModelAlreadyLoadedLocally_ReturnsLocal_WithoutQueryingGpu()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        catalogClient.Setup(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), ModelName, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        var sut = CreateSut(catalogClient, gpuVramProvider);
+
+        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
+
+        Assert.Equal(RoutingTarget.Local, target);
+        gpuVramProvider.Verify(g => g.GetFreeVramMB(), Times.Never);
+    }
+
+    [Fact]
+    public async Task DecideAsync_ModelNotLoaded_EnoughVram_ReturnsLocal()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        catalogClient.Setup(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(15_000);
+        var sut = CreateSut(catalogClient, gpuVramProvider);
+
+        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
+
+        Assert.Equal(RoutingTarget.Local, target);
+    }
+
+    [Fact]
+    public async Task DecideAsync_ModelNotLoaded_NotEnoughVram_ReturnsRemote()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        catalogClient.Setup(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(5_000);
+        var sut = CreateSut(catalogClient, gpuVramProvider);
+
+        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
+
+        Assert.Equal(RoutingTarget.Remote, target);
+    }
+
+    [Fact]
+    public async Task DecideAsync_TokenCountEqualsMax_IsWithinLocalLimit()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        catalogClient.Setup(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
+        var sut = CreateSut(catalogClient, gpuVramProvider);
+
+        var target = await sut.DecideAsync(tokenCount: 40_000, modelName: ModelName);
+
+        Assert.Equal(RoutingTarget.Local, target);
+    }
+
+    [Fact]
+    public async Task DecideAsync_ModelNameWithLatestTag_ResolvesConfiguredModel()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        catalogClient.Setup(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
+        var sut = CreateSut(catalogClient, gpuVramProvider);
+
+        // Clients frequently send the implicit ":latest" tag; the configured key has no tag.
+        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName + ":latest");
+
+        Assert.Equal(RoutingTarget.Local, target);
+    }
+
+    [Theory]
+    [InlineData("llama3", "llama3")]
+    [InlineData("llama3:latest", "llama3")]
+    [InlineData("qwen3.8-27B:latest", "qwen3.8-27B")]
+    [InlineData("qwen3.8-27B:myquant", "qwen3.8-27B")]
+    [InlineData("no-tag", "no-tag")]
+    [InlineData("", "")]
+    public void NormalizeModelName_StripsTagPrefix(string input, string expected)
+    {
+        Assert.Equal(expected, RoutingDecisionService.NormalizeModelName(input));
+    }
+}
