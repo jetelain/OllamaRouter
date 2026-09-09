@@ -55,12 +55,18 @@ public static class OllamaRequestParser
             {
                 foreach (var message in messages.EnumerateArray())
                 {
-                    if (message.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.String)
+                    if (message.TryGetProperty("content", out var content))
                     {
-                        var text = content.GetString();
-                        if (!string.IsNullOrEmpty(text))
+                        AppendContent(content, parts);
+                    }
+
+                    // Assistant messages requesting tool/function calls: include the call payload
+                    // (name + arguments), since it is also part of the model's context.
+                    if (message.TryGetProperty("tool_calls", out var toolCalls) && toolCalls.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var toolCall in toolCalls.EnumerateArray())
                         {
-                            parts.Add(text);
+                            parts.Add(toolCall.GetRawText());
                         }
                     }
                 }
@@ -96,6 +102,16 @@ public static class OllamaRequestParser
                 }
             }
 
+            // Optional tool/function definitions (chat and OpenAI-compatible formats): their JSON
+            // schema is injected into the model's context and can be sizeable.
+            if (root.TryGetProperty("tools", out var tools) && tools.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var tool in tools.EnumerateArray())
+                {
+                    parts.Add(tool.GetRawText());
+                }
+            }
+
             return string.Join("\n", parts);
         }
         catch
@@ -104,6 +120,69 @@ public static class OllamaRequestParser
         }
 
         return "";
+    }
+
+    /// <summary>
+    /// Extracts the size (in tokens) of a previous conversation context carried over via the
+    /// raw <c>context</c> field of the /api/generate endpoint (an array of token ids returned by
+    /// a prior call). Ignoring this field leads to a large underestimation of the real context
+    /// size for follow-up requests, since it is not plain text and cannot be tokenized again.
+    /// </summary>
+    public static int ExtractPriorContextTokenCount(string jsonBody)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(jsonBody);
+            if (doc.RootElement.TryGetProperty("context", out var context) && context.ValueKind == JsonValueKind.Array)
+            {
+                return context.GetArrayLength();
+            }
+        }
+        catch
+        {
+            // Invalid or non-JSON request body: no usable context.
+        }
+
+        return 0;
+    }
+
+    /// <summary>
+    /// Appends the textual content of a message's "content" property, which may be either a
+    /// plain string or an array of content parts (OpenAI-compatible multimodal format, e.g.
+    /// [{ "type": "text", "text": "..." }, { "type": "image_url", ... }]).
+    /// </summary>
+    private static void AppendContent(JsonElement content, List<string> parts)
+    {
+        if (content.ValueKind == JsonValueKind.String)
+        {
+            var text = content.GetString();
+            if (!string.IsNullOrEmpty(text))
+            {
+                parts.Add(text);
+            }
+        }
+        else if (content.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var part in content.EnumerateArray())
+            {
+                if (part.ValueKind == JsonValueKind.String)
+                {
+                    var text = part.GetString();
+                    if (!string.IsNullOrEmpty(text))
+                    {
+                        parts.Add(text);
+                    }
+                }
+                else if (part.ValueKind == JsonValueKind.Object && part.TryGetProperty("text", out var textElement) && textElement.ValueKind == JsonValueKind.String)
+                {
+                    var text = textElement.GetString();
+                    if (!string.IsNullOrEmpty(text))
+                    {
+                        parts.Add(text);
+                    }
+                }
+            }
+        }
     }
 
     public static string ExtractModelName(string jsonBody)

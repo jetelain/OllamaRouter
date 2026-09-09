@@ -86,6 +86,8 @@ Invoke-RestMethod -Uri 'http://localhost:11435/api/create' -Method Post -Content
 }'
 ```
 
+> With `num_ctx` set to `49152`, the corresponding `Models:Qwen3.8-27B:MaxLocalTokens` setting should be around `36864` (75% of `num_ctx`, see [Configuration](#configuration)).
+
 ### Remote Ollama
 
 See [this guide](https://github.com/jetelain/wiki/blob/main/ai/server.md) for a more comprehensive walkthrough of setting up a remote Ollama instance.
@@ -111,6 +113,8 @@ curl http://localhost:11434/api/create -d '{
 }'
 ```
 
+> The remote instance's larger `num_ctx` (`196608`) is only reached once the request no longer fits locally, so it does not need to follow the same 75% rule: the remote instance has no comparable `MaxLocalTokens` cap.
+
 ## Configuration
 
 Configuration is provided through the `OllamaRouter` section of `appsettings.json` (or any other standard .NET configuration source, such as environment variables):
@@ -120,11 +124,11 @@ Configuration is provided through the `OllamaRouter` section of `appsettings.jso
   "OllamaRouter": {
 	"Models": {
 	  "Qwen3.8-27B": {
-		"MaxLocalTokens": 24500,
+		"MaxLocalTokens": 36864,
 		"MinRequiredVramMB": 13500
 	  },
 	  "llama3": {
-		"MaxLocalTokens": 30000,
+		"MaxLocalTokens": 24576,
 		"MinRequiredVramMB": 4096
 	  }
 	},
@@ -139,7 +143,7 @@ Configuration is provided through the `OllamaRouter` section of `appsettings.jso
 | Setting            | Description                                                                                     |
 |--------------------|---------------------------------------------------------------------------------------------------|
 | `Models`           | Dictionary of model names (base name, no tag) to their routing thresholds. **Any model not listed here is always routed to the remote instance.**                          |
-| `Models:*:MaxLocalTokens`   | Maximum estimated token count that the local instance is allowed to handle for this model. Keep margin to leave room for model output, half the size of model context should be used.                        |
+| `Models:*:MaxLocalTokens`   | Maximum estimated token count that the local instance is allowed to handle for this model. Keep margin to leave room for model output, 75% of the local model's configured `num_ctx` should be fine. |
 | `Models:*:MinRequiredVramMB`| Minimum amount of free VRAM (in MB) required on the local GPU to route a request for this model there. It should match VRAM usage of the model with a little margin.           |
 | `LocalUrl`         | Base URL of the local Ollama instance.                                                            |
 | `RemoteUrl`        | Base URL of the remote Ollama instance.                                                           |

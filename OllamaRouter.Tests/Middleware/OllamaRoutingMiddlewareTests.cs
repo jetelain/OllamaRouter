@@ -115,6 +115,27 @@ public class OllamaRoutingMiddlewareTests
     }
 
     [Fact]
+    public async Task InvokeAsync_GenerateRequestWithPriorContext_AddsPriorContextTokenCount()
+    {
+        var context = BuildContext("/api/generate", """{ "model": "llama3", "prompt": "Continue", "context": [1, 2, 3, 4, 5] }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<string>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(105, "llama3", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Remote);
+
+        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService);
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("Remote", context.Request.Headers["X-Ollama-Target"]);
+        routingDecisionService.Verify(r => r.DecideAsync(105, "llama3", It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
     public async Task InvokeAsync_ShowRequest_ModelExistsRemotely_SetsHeaderToRemote()
     {
         var context = BuildContext("/api/show", """{ "model": "llama3" }""");

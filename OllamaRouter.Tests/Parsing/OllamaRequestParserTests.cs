@@ -123,6 +123,128 @@ public class OllamaRequestParserTests
     }
 
     [Fact]
+    public void ExtractContextText_MultiPartContent_ExtractsTextParts()
+    {
+        var body = """
+        {
+            "model": "llama3",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": "Que vois-tu ?" },
+                        { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } }
+                    ]
+                }
+            ]
+        }
+        """;
+
+        var context = OllamaRequestParser.ExtractContextText(body);
+
+        Assert.Equal("Que vois-tu ?", context);
+    }
+
+    [Fact]
+    public void ExtractContextText_MultiPartContent_WithStringParts_ExtractsAllParts()
+    {
+        var body = """
+        {
+            "model": "llama3",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [ "Bonjour", "le monde" ]
+                }
+            ]
+        }
+        """;
+
+        var context = OllamaRequestParser.ExtractContextText(body);
+
+        Assert.Equal("Bonjour\nle monde", context);
+    }
+
+    [Fact]
+    public void ExtractContextText_ToolCalls_IncludesToolCallPayload()
+    {
+        var body = """
+        {
+            "model": "llama3",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        { "function": { "name": "get_weather", "arguments": "{\"city\":\"Paris\"}" } }
+                    ]
+                }
+            ]
+        }
+        """;
+
+        var context = OllamaRequestParser.ExtractContextText(body);
+
+        Assert.Contains("get_weather", context);
+        Assert.Contains("Paris", context);
+    }
+
+    [Fact]
+    public void ExtractContextText_Tools_IncludesToolDefinitions()
+    {
+        var body = """
+        {
+            "model": "llama3",
+            "messages": [
+                { "role": "user", "content": "Quelle heure est-il ?" }
+            ],
+            "tools": [
+                { "type": "function", "function": { "name": "get_time", "description": "Retourne l'heure courante." } }
+            ]
+        }
+        """;
+
+        var context = OllamaRequestParser.ExtractContextText(body);
+
+        Assert.Contains("Quelle heure est-il ?", context);
+        Assert.Contains("get_time", context);
+        Assert.Contains("Retourne l'heure courante.", context);
+    }
+
+    [Fact]
+    public void ExtractPriorContextTokenCount_GenerateFormat_ReturnsArrayLength()
+    {
+        var body = """
+        {
+            "model": "llama3",
+            "prompt": "Continue",
+            "context": [1, 2, 3, 4, 5]
+        }
+        """;
+
+        var tokenCount = OllamaRequestParser.ExtractPriorContextTokenCount(body);
+
+        Assert.Equal(5, tokenCount);
+    }
+
+    [Fact]
+    public void ExtractPriorContextTokenCount_MissingContext_ReturnsZero()
+    {
+        var body = """{ "model": "llama3", "prompt": "Bonjour" }""";
+
+        var tokenCount = OllamaRequestParser.ExtractPriorContextTokenCount(body);
+
+        Assert.Equal(0, tokenCount);
+    }
+
+    [Fact]
+    public void ExtractPriorContextTokenCount_InvalidJson_ReturnsZero()
+    {
+        var tokenCount = OllamaRequestParser.ExtractPriorContextTokenCount("not-json");
+
+        Assert.Equal(0, tokenCount);
+    }
+
+    [Fact]
     public void ExtractModelName_ReturnsModel()
     {
         var body = """{ "model": "llama3", "prompt": "Bonjour" }""";

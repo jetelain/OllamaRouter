@@ -61,7 +61,8 @@ public sealed class OllamaRoutingMiddleware(
         {
             var contextText = OllamaRequestParser.ExtractContextText(body);
             var modelName = OllamaRequestParser.ExtractModelName(body);
-            int tokenCount = tokenEstimator.EstimateTokens(contextText);
+            int tokenCount = tokenEstimator.EstimateTokens(contextText)
+                + OllamaRequestParser.ExtractPriorContextTokenCount(body);
 
             var target = await routingDecisionService.DecideAsync(tokenCount, modelName, context.RequestAborted);
 
