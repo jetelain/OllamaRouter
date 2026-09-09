@@ -15,7 +15,7 @@ public sealed class OllamaModelCatalogClient(IHttpClientFactory httpClientFactor
         var remoteTask = GetTagsAsync(remoteUrl, cancellationToken);
         await Task.WhenAll(localTask, remoteTask);
 
-        return MergeByKey(remoteTask.Result, localTask.Result, "name");
+        return MergeByKey(localTask.Result, remoteTask.Result, "name");
     }
 
     public async Task<JsonArray> GetTagsAsync(string? baseUrl, CancellationToken cancellationToken = default)
@@ -32,7 +32,7 @@ public sealed class OllamaModelCatalogClient(IHttpClientFactory httpClientFactor
         var remoteTask = FetchArraySafeAsync(client, BuildUrl(remoteUrl, "/v1/models"), "data", cancellationToken);
         await Task.WhenAll(localTask, remoteTask);
 
-        return MergeByKey(remoteTask.Result, localTask.Result, "id");
+        return MergeByKey(localTask.Result, remoteTask.Result, "id");
     }
 
     public async Task<JsonArray> GetMergedRunningModelsAsync(string? localUrl, string? remoteUrl, CancellationToken cancellationToken = default)
@@ -43,7 +43,7 @@ public sealed class OllamaModelCatalogClient(IHttpClientFactory httpClientFactor
         var remoteTask = FetchArraySafeAsync(client, BuildUrl(remoteUrl, "/api/ps"), "models", cancellationToken);
         await Task.WhenAll(localTask, remoteTask);
 
-        return MergeByKey(remoteTask.Result, localTask.Result, "name");
+        return MergeByKey(localTask.Result, remoteTask.Result, "name");
     }
 
     public async Task<bool> IsModelLoadedLocallyAsync(string localUrl, string modelName, CancellationToken cancellationToken = default)

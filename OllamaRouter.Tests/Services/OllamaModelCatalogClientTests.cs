@@ -84,18 +84,18 @@ public class OllamaModelCatalogClientTests
     }
 
     [Fact]
-    public async Task GetMergedTagsAsync_UsesGetTagsAsync_ForBothInstances_LocalTakesPriority()
+    public async Task GetMergedTagsAsync_UsesGetTagsAsync_ForBothInstances_RemoteTakesPriority()
     {
         var httpClientFactory = new Mock<IHttpClientFactory>();
-        var localHandler = new FakeHttpMessageHandler(req => req.RequestUri!.ToString().Contains("local")
+        var handler = new FakeHttpMessageHandler(req => req.RequestUri!.ToString().Contains("local")
             ? JsonResponse("""{ "models": [ { "name": "shared", "source": "local" } ] }""")
-            : JsonResponse("""{ "models": [] }"""));
-        httpClientFactory.Setup(f => f.CreateClient(It.IsAny<string>())).Returns(new HttpClient(localHandler));
+            : JsonResponse("""{ "models": [ { "name": "shared", "source": "remote" } ] }"""));
+        httpClientFactory.Setup(f => f.CreateClient(It.IsAny<string>())).Returns(() => new HttpClient(handler));
         var sut = new OllamaModelCatalogClient(httpClientFactory.Object);
 
         var merged = await sut.GetMergedTagsAsync("http://local", "http://remote");
 
         Assert.Single(merged);
-        Assert.Equal("local", merged[0]!["source"]!.ToString());
+        Assert.Equal("remote", merged[0]!["source"]!.ToString());
     }
 }

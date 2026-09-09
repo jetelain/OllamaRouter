@@ -86,15 +86,15 @@ public sealed class OllamaRoutingMiddleware(
         {
             var modelName = OllamaRequestParser.ExtractModelName(body);
 
-            // Prefer the local instance when the model is known to be available there, otherwise
-            // fall back to the remote instance, which is what actually hosts most "remote-only" models.
-            var existsLocally = await modelCatalogCache.ModelExistsAsync(options.Value.LocalUrl, modelName, context.RequestAborted);
+            // Prefer the remote instance when the model is known to be available there, since it
+            // typically advertises a larger context window; otherwise fall back to the local instance.
+            var existsRemotely = await modelCatalogCache.ModelExistsAsync(options.Value.RemoteUrl, modelName, context.RequestAborted);
 
-            logger.LogInformation("{ModelName} - /api/show => {Target}", modelName, existsLocally ? "Local" : "Remote");
+            logger.LogInformation("{ModelName} - /api/show => {Target}", modelName, existsRemotely ? "Remote" : "Local");
 
-            context.Request.Headers[OllamaReverseProxyConfig.TargetHeader] = existsLocally
-                ? OllamaReverseProxyConfig.LocalTarget
-                : OllamaReverseProxyConfig.RemoteTarget;
+            context.Request.Headers[OllamaReverseProxyConfig.TargetHeader] = existsRemotely
+                ? OllamaReverseProxyConfig.RemoteTarget
+                : OllamaReverseProxyConfig.LocalTarget;
         }
         catch (Exception ex)
         {
