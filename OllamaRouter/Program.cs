@@ -17,11 +17,13 @@ builder.Services.AddReverseProxy()
     .LoadFromMemory(routes, clusters);
 
 builder.Services.AddHttpClient();
+builder.Services.AddMemoryCache();
 
 builder.Services.AddSingleton<ITokenEstimator, TiktokenTokenEstimator>();
 builder.Services.AddSingleton<IGpuVramProvider, NvidiaSmiVramProvider>();
 builder.Services.AddTransient<IOllamaModelCatalogClient, OllamaModelCatalogClient>();
 builder.Services.AddTransient<IRoutingDecisionService, RoutingDecisionService>();
+builder.Services.AddSingleton<IModelCatalogCacheService, ModelCatalogCacheService>();
 
 var app = builder.Build();
 

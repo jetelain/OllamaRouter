@@ -30,4 +30,10 @@ public interface IOllamaModelCatalogClient
     /// Indicates whether the given model already appears loaded (/api/ps) on the local instance.
     /// </summary>
     Task<bool> IsModelLoadedLocallyAsync(string localUrl, string modelName, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Fetches the raw list of models exposed via /api/tags by a single instance (no merging).
+    /// Returns an empty array if the instance is unreachable or not configured.
+    /// </summary>
+    Task<JsonArray> GetTagsAsync(string? baseUrl, CancellationToken cancellationToken = default);
 }

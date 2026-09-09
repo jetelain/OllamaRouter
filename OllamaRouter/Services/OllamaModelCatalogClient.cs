@@ -11,13 +11,17 @@ public sealed class OllamaModelCatalogClient(IHttpClientFactory httpClientFactor
 {
     public async Task<JsonArray> GetMergedTagsAsync(string? localUrl, string? remoteUrl, CancellationToken cancellationToken = default)
     {
-        using var client = httpClientFactory.CreateClient();
-
-        var localTask = FetchArraySafeAsync(client, BuildUrl(localUrl, "/api/tags"), "models", cancellationToken);
-        var remoteTask = FetchArraySafeAsync(client, BuildUrl(remoteUrl, "/api/tags"), "models", cancellationToken);
+        var localTask = GetTagsAsync(localUrl, cancellationToken);
+        var remoteTask = GetTagsAsync(remoteUrl, cancellationToken);
         await Task.WhenAll(localTask, remoteTask);
 
         return MergeByKey(remoteTask.Result, localTask.Result, "name");
+    }
+
+    public async Task<JsonArray> GetTagsAsync(string? baseUrl, CancellationToken cancellationToken = default)
+    {
+        using var client = httpClientFactory.CreateClient();
+        return await FetchArraySafeAsync(client, BuildUrl(baseUrl, "/api/tags"), "models", cancellationToken);
     }
 
     public async Task<JsonArray> GetMergedOpenAIModelsAsync(string? localUrl, string? remoteUrl, CancellationToken cancellationToken = default)

@@ -115,6 +115,12 @@ public static class OllamaRequestParser
             {
                 return modelElement.GetString() ?? "";
             }
+
+            // Legacy alias used by some /api/show clients.
+            if (doc.RootElement.TryGetProperty("name", out var nameElement))
+            {
+                return nameElement.GetString() ?? "";
+            }
         }
         catch
         {

@@ -3,7 +3,9 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using OllamaRouter.Middleware;
+using OllamaRouter.Options;
 using OllamaRouter.Services;
+using MsOptions = Microsoft.Extensions.Options.Options;
 
 namespace OllamaRouter.Tests.Middleware;
 
@@ -21,12 +23,15 @@ public class OllamaRoutingMiddlewareTests
     private static OllamaRoutingMiddleware CreateSut(
         RequestDelegate next,
         Mock<ITokenEstimator> tokenEstimator,
-        Mock<IRoutingDecisionService> routingDecisionService)
+        Mock<IRoutingDecisionService> routingDecisionService,
+        Mock<IModelCatalogCacheService>? modelCatalogCache = null)
     {
         return new OllamaRoutingMiddleware(
             next,
             tokenEstimator.Object,
             routingDecisionService.Object,
+            (modelCatalogCache ?? new Mock<IModelCatalogCacheService>()).Object,
+            MsOptions.Create(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
             NullLogger<OllamaRoutingMiddleware>.Instance);
     }
 
@@ -103,6 +108,46 @@ public class OllamaRoutingMiddlewareTests
         var routingDecisionService = new Mock<IRoutingDecisionService>();
 
         var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService);
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("Remote", context.Request.Headers["X-Ollama-Target"]);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_ShowRequest_ModelExistsLocally_SetsHeaderToLocal()
+    {
+        var context = BuildContext("/api/show", """{ "model": "llama3" }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+
+        var modelCatalogCache = new Mock<IModelCatalogCacheService>();
+        modelCatalogCache
+            .Setup(c => c.ModelExistsAsync("http://localhost:11435", "llama3", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+
+        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService, modelCatalogCache);
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("Local", context.Request.Headers["X-Ollama-Target"]);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_ShowRequest_ModelNotFoundLocally_SetsHeaderToRemote()
+    {
+        var context = BuildContext("/api/show", """{ "model": "remote-only" }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+
+        var modelCatalogCache = new Mock<IModelCatalogCacheService>();
+        modelCatalogCache
+            .Setup(c => c.ModelExistsAsync("http://localhost:11435", "remote-only", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+
+        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService, modelCatalogCache);
 
         await sut.InvokeAsync(context);
 
