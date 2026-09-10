@@ -24,8 +24,12 @@ builder.Services.AddSingleton<IGpuVramProvider, NvidiaSmiVramProvider>();
 builder.Services.AddTransient<IOllamaModelCatalogClient, OllamaModelCatalogClient>();
 builder.Services.AddTransient<IRoutingDecisionService, RoutingDecisionService>();
 builder.Services.AddSingleton<IModelCatalogCacheService, ModelCatalogCacheService>();
+builder.Services.AddSingleton<IOllamaProcessLauncher, OllamaProcessLauncher>();
 
 var app = builder.Build();
+
+// Ensure local Ollama is running (Windows only).
+app.Services.GetRequiredService<IOllamaProcessLauncher>().EnsureRunning();
 
 // 1. INSPECTION MIDDLEWARE (dynamic routing)
 // Must run before UseRouting: UseRouting is what selects the YARP endpoint based on the
