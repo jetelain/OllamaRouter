@@ -25,6 +25,7 @@ builder.Services.AddTransient<IOllamaModelCatalogClient, OllamaModelCatalogClien
 builder.Services.AddTransient<IRoutingDecisionService, RoutingDecisionService>();
 builder.Services.AddSingleton<IModelCatalogCacheService, ModelCatalogCacheService>();
 builder.Services.AddSingleton<IOllamaProcessLauncher, OllamaProcessLauncher>();
+builder.Services.AddSingleton<IActivityMonitorService, ActivityMonitorService>();
 
 var app = builder.Build();
 
@@ -43,11 +44,21 @@ app.UseRouting();
 // 2. HYBRID ENDPOINTS /api/tags, /api/ps and /v1/models (short-circuit YARP)
 app.MapOllamaRouterEndpoints();
 
+// Lightweight activity monitoring UI (no VRAM impact, in-memory state only).
+app.MapOllamaMonitorEndpoints();
+
 // 3. YARP CATCH-ALL
 app.MapReverseProxy();
 
-// Listen on the standard Ollama port
-app.Run("http://localhost:11434");
+// Print a clickable link to the monitoring UI once the server has started.
+app.Lifetime.ApplicationStarted.Register(() =>
+{
+    var monitorUrl = ollamaOptions.BindAddress.TrimEnd('/').Replace("+", "localhost") + "/monitor";
+    Console.WriteLine($"Activity monitor available at: {monitorUrl}");
+});
+
+// Listen on the configured address (defaults to the standard Ollama port).
+app.Run(ollamaOptions.BindAddress);
 
 // Entry point exposed for integration tests (WebApplicationFactory).
 public partial class Program;

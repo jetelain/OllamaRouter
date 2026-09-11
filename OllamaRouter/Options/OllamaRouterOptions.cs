@@ -22,6 +22,21 @@ public sealed class OllamaRouterOptions
     /// Base address of the remote Ollama instance (e.g. http://aiserver.local:11434).
     /// </summary>
     public string RemoteUrl { get; set; } = "";
+
+    /// <summary>
+    /// Address the router itself listens on (e.g. http://localhost:11434, or http://0.0.0.0:11434
+    /// to accept connections from other machines). Defaults to the standard Ollama port on
+    /// localhost only.
+    /// </summary>
+    public string BindAddress { get; set; } = "http://localhost:11434";
+
+    /// <summary>
+    /// Multiplicative correction factor applied to the estimated token count to compensate for
+    /// the systematic underestimation of the generic tokenizer compared to the actual tokenizer
+    /// used by the targeted models (different vocabulary, chat template overhead, etc.).
+    /// A value of 1.1 adds a 10% margin on top of the raw estimate. Defaults to 1.0 (no correction).
+    /// </summary>
+    public double TokenEstimationOverheadFactor { get; set; } = 1.0;
 }
 
 /// <summary>

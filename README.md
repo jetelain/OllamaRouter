@@ -147,6 +147,8 @@ Configuration is provided through the `OllamaRouter` section of `appsettings.jso
 | `Models:*:MinRequiredVramMB`| Minimum amount of free VRAM (in MB) required on the local GPU to route a request for this model there. It should match VRAM usage of the model with a little margin.           |
 | `LocalUrl`         | Base URL of the local Ollama instance.                                                            |
 | `RemoteUrl`        | Base URL of the remote Ollama instance.                                                           |
+| `BindAddress`      | Address the router itself listens on. Defaults to `http://localhost:11434`. Set it to e.g. `http://0.0.0.0:11434` to accept connections from other machines. |
+| `TokenEstimationOverheadFactor` | Multiplicative correction applied to the estimated token count, to compensate for the systematic underestimation of the generic tokenizer versus the actual tokenizer/chat template of the targeted models. Defaults to `1.0` (no correction); based on observed data a value around `1.1` (10% margin) is a reasonable starting point. |
 
 ## Running
 
@@ -154,7 +156,21 @@ Configuration is provided through the `OllamaRouter` section of `appsettings.jso
 dotnet run --project OllamaRouter\OllamaRouter.csproj
 ```
 
-By default, the router listens on `http://localhost:11434`, the standard Ollama port, so it can be used as a drop-in replacement for a direct Ollama endpoint in your existing tools and clients.
+By default, the router listens on `http://localhost:11434`, the standard Ollama port, so it can be used as a drop-in replacement for a direct Ollama endpoint in your existing tools and clients. On startup, a link to the [monitoring UI](#monitoring) is printed to the console.
+
+## Monitoring
+
+OllamaRouter exposes a very lightweight, dependency-free monitoring page at `/monitor` (e.g. `http://localhost:11434/monitor`), backed by a JSON endpoint at `/monitor/api`. 
+
+The page shows:
+
+- Whether each instance (**Local**/**Remote**) is currently **busy** processing a chat/generate request.
+- The requests currently **in progress**, with target instance, model, estimated input tokens and running time.
+- A history of the most recent completed requests (last 50), with model, estimated vs. actual input tokens, actual output tokens, elapsed time and HTTP status. Failed requests are highlighted.
+
+The page auto-refreshes every 2 seconds by polling `/monitor/api`. A clickable link to this page is printed to the console when the router starts (see [Running](#running)).
+
+![Monitor screenshot](docs/monitor.png)
 
 ## Requirements
 
@@ -170,6 +186,8 @@ By default, the router listens on `http://localhost:11434`, the standard Ollama 
 - `Parsing/OllamaRequestParser.cs` – extracts the prompt and model name from request bodies.
 - `ReverseProxy/OllamaReverseProxyConfig.cs` – builds the YARP routes/clusters in code.
 - `Endpoints/OllamaEndpointsExtensions.cs` – hybrid endpoints (`/api/tags`, `/api/ps`, `/v1/models`) that short-circuit YARP to return merged results.
+- `Endpoints/MonitorEndpointsExtensions.cs` – lightweight monitoring UI (`/monitor`, `/monitor/api`).
+- `Services/ActivityMonitorService.cs` – in-memory bookkeeping of busy state, in-progress requests and recent request history used by the monitoring UI.
 
 ## Tests
 

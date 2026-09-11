@@ -24,13 +24,15 @@ public class OllamaRoutingMiddlewareTests
         RequestDelegate next,
         Mock<ITokenEstimator> tokenEstimator,
         Mock<IRoutingDecisionService> routingDecisionService,
-        Mock<IModelCatalogCacheService>? modelCatalogCache = null)
+        Mock<IModelCatalogCacheService>? modelCatalogCache = null,
+        Mock<IActivityMonitorService>? activityMonitor = null)
     {
         return new OllamaRoutingMiddleware(
             next,
             tokenEstimator.Object,
             routingDecisionService.Object,
             (modelCatalogCache ?? new Mock<IModelCatalogCacheService>()).Object,
+            (activityMonitor ?? new Mock<IActivityMonitorService>()).Object,
             MsOptions.Create(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
             NullLogger<OllamaRoutingMiddleware>.Instance);
     }
