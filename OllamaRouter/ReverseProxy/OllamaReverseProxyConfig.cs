@@ -1,5 +1,6 @@
 using OllamaRouter.Options;
 using Yarp.ReverseProxy.Configuration;
+using Yarp.ReverseProxy.Forwarder;
 
 namespace OllamaRouter.ReverseProxy;
 
@@ -53,9 +54,18 @@ public static class OllamaReverseProxyConfig
         }
     };
 
+    // Ollama can take a long time to respond (model cold start, long generations),
+    // so the default 100s YARP activity timeout is extended to avoid the proxy
+    // cancelling the request while the response body is still being streamed.
+    private static readonly TimeSpan ActivityTimeout = TimeSpan.FromMinutes(15);
+
     private static ClusterConfig BuildCluster(string clusterId, string destinationId, string address) => new()
     {
         ClusterId = clusterId,
+        HttpRequest = new ForwarderRequestConfig
+        {
+            ActivityTimeout = ActivityTimeout
+        },
         Destinations = new Dictionary<string, DestinationConfig>
         {
             [destinationId] = new() { Address = address }
