@@ -56,4 +56,10 @@ public interface IActivityMonitorService
     /// Returns the current busy state, in-progress requests and recent request history.
     /// </summary>
     ActivityMonitorSnapshot GetSnapshot();
+
+    /// <summary>
+    /// Returns whether the given target currently has at least one request in progress. Cheaper
+    /// than <see cref="GetSnapshot"/> when only the busy state of a single target is needed.
+    /// </summary>
+    bool IsBusy(RoutingTarget target);
 }

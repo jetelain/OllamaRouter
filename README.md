@@ -5,7 +5,7 @@ OllamaRouter is a lightweight reverse proxy that sits in front of two [Ollama](h
 - A **local** Ollama instance, running on a machine with a powerful GPU but **limited VRAM** (assumed to be a nVidia card).
 - A **remote** Ollama instance (e.g. a server), with a lot of **unified RAM or VRAM** but a **less powerful GPU**.
 
-The goal is to get the best of both worlds: use the fast local GPU whenever the request can fit in its available VRAM, and fall back to the remote server for everything else (larger contexts, models that don't fit locally, etc.).
+The goal is to get the best of both worlds: use the fast local GPU whenever the request can fit in its available VRAM, and fall back to the remote server for everything else (larger contexts, models that don't fit locally, etc.). Optionally, when **both** instances are busy, requests can further **overflow to [ollama.com cloud](https://ollama.com)** models, so a slow/unavailable Local or Remote instance never fully blocks incoming requests.
 
 ## How it works
 
@@ -18,18 +18,22 @@ flowchart TD
 
     router -->|"POST /api/chat, /v1/chat/completions"| decision{"Routing decision"}
 
-    decision -->|"Model not configured, too many tokens or not enough free VRAM"| remote
-    decision -->|"Model known, context fits and enough free VRAM (already loaded locally = direct win)"| local
+    decision -->|"Too many tokens or not enough free VRAM"| remote
+    decision -->|"Context fits and enough free VRAM"| local
+    decision -->|"(Optional) Local and Remote busy/unable to process"| cloud
 
     local["Local Ollama (fast GPU, limited VRAM)"]
     remote["Remote Ollama (large RAM/VRAM, slower GPU)"]
+    cloud["(Optional) Overflow to ollama.com cloud"]
 
     style decision fill:#fff3cd
+    style remoteOrCloud fill:#fff3cd
     style local fill:#d4edda
-    style remote fill:#cfe8ff
+    style remote fill:#d4edda
+    style cloud fill:#cfe8ff
 ```
 
-For every incoming request, OllamaRouter decides between `Local` and `Remote` and forwards the request accordingly using [YARP](https://github.com/microsoft/reverse-proxy).
+For every incoming request, OllamaRouter decides between `Local`, `Remote` and `Cloud` and forwards the request accordingly using [YARP](https://github.com/microsoft/reverse-proxy) (`Cloud` is physically routed to the **Local** instance, see [Cloud overflow](#cloud-overflow) below).
 
 ### Endpoints that are inspected and routed dynamically
 
@@ -42,13 +46,26 @@ Requests to the following endpoints are inspected to extract the prompt and the 
 
 For these requests, the routing decision is made as follows:
 
+0. If **both** Local and Remote are currently busy processing another request, and the model has a `CloudModel` configured, the request immediately overflows to **Cloud** (see [Cloud overflow](#cloud-overflow)).
 1. Only models explicitly configured under `OllamaRouter:Models` are eligible for local routing. Any other model name is routed to **Remote** immediately.
 2. The prompt is tokenized and the token count is estimated.
-3. If the estimated token count exceeds the per-model `MaxLocalTokens`, the request is routed to **Remote** (the context wouldn't fit reliably on the local GPU).
+3. If the estimated token count exceeds the per-model `MaxLocalTokens`, the request would be routed to **Remote** (the context wouldn't fit reliably on the local GPU) — or to **Cloud** instead if Remote is currently busy and a `CloudModel` is configured.
 4. Otherwise, if the requested model is already loaded on the **local** instance (checked via `/api/ps`), the request is routed to **Local** (no need to check VRAM, it's already loaded).
-5. Otherwise, the free VRAM on the local GPU is checked (via `nvidia-smi`). If it is greater than or equal to the per-model `MinRequiredVramMB`, the request is routed to **Local**; otherwise it is routed to **Remote**.
+5. Otherwise, the free VRAM on the local GPU is checked (via `nvidia-smi`). If it is greater than or equal to the per-model `MinRequiredVramMB`, the request is routed to **Local**; otherwise it would be routed to **Remote**, or to **Cloud** if Remote is currently busy and a `CloudModel` is configured.
 
 If the request body cannot be parsed for any reason, the request is routed to **Remote** as a safe fallback.
+
+### Cloud overflow
+
+When a model's configuration includes a `CloudModel` entry (e.g. `deepseek-v3.1:671b-cloud` or `glm-4.6:cloud`), OllamaRouter can overflow to [ollama.com cloud](https://ollama.com) whenever using **Remote** would mean waiting behind an already-busy request:
+
+- The request is still physically forwarded to the **Local** instance (same YARP cluster), because it is expected to be **signed in to ollama.com** (`ollama signin`) and therefore able to relay chat/generate requests to the cloud on its own.
+- Before forwarding, the `model` field of the request body is rewritten to the configured `CloudModel` name, so the local Ollama process knows which cloud-hosted model to relay to.
+- "Busy" is a simple, already-in-use signal: an instance is considered busy as soon as it currently has at least one chat/generate request in flight (see `IActivityMonitorService.IsBusy`).
+- This is meant as a last resort for a model that has no directly usable ollama.com cloud equivalent (e.g. Qwen3.8 isn't offered as an ollama.com cloud model): configure a comparable/cheaper cloud model instead of leaving requests queued behind a busy Remote instance.
+- Cloud overflow is entirely opt-in per model: leave `CloudModel` unset (the default) to keep the original Local/Remote-only behavior.
+
+> **Note.** Unlike Local/Remote, OllamaRouter does not talk directly to ollama.com: it relies on the Local Ollama instance's own cloud relay and credentials. No API key or cloud URL needs to be configured in OllamaRouter itself.
 
 ### Other endpoints
 
@@ -124,9 +141,10 @@ Configuration is provided through the `OllamaRouter` section of `appsettings.jso
   "OllamaRouter": {
 	"Models": {
 	  "Qwen3.8-27B": {
-		"MaxLocalTokens": 36864,
-		"MinRequiredVramMB": 13500
-	  },
+		  "MaxLocalTokens": 36864,
+		  "MinRequiredVramMB": 13500,
+		  "CloudModel": "deepseek-v3.1:671b-cloud"
+		},
 	  "llama3": {
 		"MaxLocalTokens": 24576,
 		"MinRequiredVramMB": 4096
@@ -145,12 +163,27 @@ Configuration is provided through the `OllamaRouter` section of `appsettings.jso
 | `Models`           | Dictionary of model names (base name, no tag) to their routing thresholds. **Any model not listed here is always routed to the remote instance.**                          |
 | `Models:*:MaxLocalTokens`   | Maximum estimated token count that the local instance is allowed to handle for this model. Keep margin to leave room for model output, 75% of the local model's configured `num_ctx` should be fine. |
 | `Models:*:MinRequiredVramMB`| Minimum amount of free VRAM (in MB) required on the local GPU to route a request for this model there. It should match VRAM usage of the model with a little margin.           |
+| `Models:*:CloudModel`| Optional name of the equivalent model hosted on [ollama.com cloud](https://ollama.com) (e.g. `glm-5.3-flash:cloud`). When set, enables overflow to **Cloud** for this model whenever Remote is busy (see [Cloud overflow](#cloud-overflow)). Leave unset to disable cloud overflow for this model. |
 | `LocalUrl`         | Base URL of the local Ollama instance.                                                            |
 | `RemoteUrl`        | Base URL of the remote Ollama instance.                                                           |
 | `BindAddress`      | Address the router itself listens on. Defaults to `http://localhost:11434`. Set it to e.g. `http://0.0.0.0:11434` to accept connections from other machines. |
 | `TokenEstimationOverheadFactor` | Multiplicative correction applied to the estimated token count, to compensate for the systematic underestimation of the generic tokenizer versus the actual tokenizer/chat template of the targeted models. Defaults to `1.0` (no correction); based on observed data a value around `1.1` (10% margin) is a reasonable starting point. |
 
+## Installation
+
+### Manual (Windows)
+
+Download the latest [`OllamaRouter-win-x64.zip`](../../releases) from the [releases page](../../releases), extract it into a folder of your choice and run `OllamaRouter.exe`. The executable is self-contained: no .NET installation is required.
+
+### From source
+
+```powershell
+dotnet run --project OllamaRouter\OllamaRouter.csproj
+```
+
 ## Running
+
+After installation, start the router by launching `OllamaRouter.exe`, or from source:
 
 ```powershell
 dotnet run --project OllamaRouter\OllamaRouter.csproj
@@ -164,7 +197,7 @@ OllamaRouter exposes a very lightweight, dependency-free monitoring page at `/mo
 
 The page shows:
 
-- Whether each instance (**Local**/**Remote**) is currently **busy** processing a chat/generate request.
+- Whether each instance (**Local**/**Remote**, and **Cloud** when at least one model has a `CloudModel` configured, see [Cloud overflow](#cloud-overflow)) is currently **busy** processing a chat/generate request.
 - The requests currently **in progress**, with target instance, model, estimated input tokens and running time.
 - A history of the most recent completed requests (last 50), with model, estimated vs. actual input tokens, actual output tokens, elapsed time and HTTP status. Failed requests are highlighted.
 

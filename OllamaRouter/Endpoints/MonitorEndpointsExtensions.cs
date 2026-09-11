@@ -1,3 +1,5 @@
+using Microsoft.Extensions.Options;
+using OllamaRouter.Options;
 using OllamaRouter.Services;
 
 namespace OllamaRouter.Endpoints;
@@ -12,17 +14,20 @@ public static class MonitorEndpointsExtensions
 {
     public static WebApplication MapOllamaMonitorEndpoints(this WebApplication app)
     {
-        app.MapGet("/monitor/api", (IActivityMonitorService activityMonitor) =>
+        app.MapGet("/monitor/api", (IActivityMonitorService activityMonitor, IOptions<OllamaRouterOptions> options) =>
         {
             var snapshot = activityMonitor.GetSnapshot();
             var now = DateTimeOffset.UtcNow;
+            var cloudEnabled = options.Value.Models.Values.Any(m => !string.IsNullOrEmpty(m.CloudModel));
 
             return Results.Json(new
             {
+                cloudEnabled,
                 busy = new
                 {
                     local = snapshot.Busy.GetValueOrDefault(RoutingTarget.Local),
-                    remote = snapshot.Busy.GetValueOrDefault(RoutingTarget.Remote)
+                    remote = snapshot.Busy.GetValueOrDefault(RoutingTarget.Remote),
+                    cloud = snapshot.Busy.GetValueOrDefault(RoutingTarget.Cloud)
                 },
                 inProgress = snapshot.InProgressRequests.Select(r => new
                 {
@@ -75,6 +80,7 @@ public static class MonitorEndpointsExtensions
   tr.pending { color: #ffd479; }
   .target-Local { color: #6bc4ff; }
   .target-Remote { color: #c48bff; }
+  .target-Cloud { color: #5ce8b5; }
   .empty { color: #777; font-style: italic; padding: 0.5rem 0.75rem; }
 </style>
 </head>
@@ -137,7 +143,10 @@ async function refresh() {
 
     const instances = document.getElementById('instances');
     clear(instances);
-    for (const name of ['local', 'remote']) {
+    for (const name of ['local', 'remote', 'cloud']) {
+      if (name === 'cloud' && !data.cloudEnabled) {
+        continue;
+      }
       const busy = data.busy[name];
       const div = document.createElement('div');
       div.className = 'card ' + (busy ? 'busy' : 'idle');

@@ -53,4 +53,13 @@ public sealed class ModelThresholds
     /// Minimum amount of free VRAM (in MB) required to route a request for this model to the local Ollama instance.
     /// </summary>
     public int MinRequiredVramMB { get; set; } = 13500;
+
+    /// <summary>
+    /// Name of the equivalent model hosted on ollama.com cloud (e.g. "deepseek-v3.1:671b-cloud",
+    /// "glm-4.6:cloud"), used as an overflow target when both Local and Remote are busy. The
+    /// request is still forwarded to the Local instance, which is expected to be signed in to
+    /// ollama.com and able to relay it to the cloud, but the "model" field of the request body is
+    /// rewritten to this value. Leave null/empty to disable cloud overflow for this model.
+    /// </summary>
+    public string? CloudModel { get; set; }
 }

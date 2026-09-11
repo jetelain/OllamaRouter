@@ -15,7 +15,9 @@ public class RoutingDecisionServiceTests
         int maxLocalTokens = 40_000,
         int minRequiredVramMB = 13_500,
         string modelName = ModelName,
-        Mock<IModelCatalogCacheService>? modelCatalogCacheService = null)
+        string? cloudModel = null,
+        Mock<IModelCatalogCacheService>? modelCatalogCacheService = null,
+        Mock<IActivityMonitorService>? activityMonitor = null)
     {
         var options = Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions
         {
@@ -24,7 +26,8 @@ public class RoutingDecisionServiceTests
                 [modelName] = new ModelThresholds
                 {
                     MaxLocalTokens = maxLocalTokens,
-                    MinRequiredVramMB = minRequiredVramMB
+                    MinRequiredVramMB = minRequiredVramMB,
+                    CloudModel = cloudModel
                 }
             },
             LocalUrl = "http://127.0.0.1:11435",
@@ -32,8 +35,31 @@ public class RoutingDecisionServiceTests
         });
 
         modelCatalogCacheService ??= CreateModelCatalogCacheServiceAvailableOnBoth();
+        activityMonitor ??= CreateActivityMonitorNotBusy();
 
-        return new RoutingDecisionService(options, catalogClient.Object, modelCatalogCacheService.Object, gpuVramProvider.Object, NullLogger<RoutingDecisionService>.Instance);
+        return new RoutingDecisionService(options, catalogClient.Object, modelCatalogCacheService.Object, gpuVramProvider.Object, activityMonitor.Object, NullLogger<RoutingDecisionService>.Instance);
+    }
+
+    private static Mock<IActivityMonitorService> CreateActivityMonitorNotBusy()
+    {
+        var activityMonitor = new Mock<IActivityMonitorService>();
+        activityMonitor.Setup(a => a.IsBusy(It.IsAny<RoutingTarget>())).Returns(false);
+        return activityMonitor;
+    }
+
+    private static Mock<IActivityMonitorService> CreateActivityMonitorRemoteBusy()
+    {
+        var activityMonitor = new Mock<IActivityMonitorService>();
+        activityMonitor.Setup(a => a.IsBusy(RoutingTarget.Remote)).Returns(true);
+        return activityMonitor;
+    }
+
+    private static Mock<IActivityMonitorService> CreateActivityMonitorBothBusy()
+    {
+        var activityMonitor = new Mock<IActivityMonitorService>();
+        activityMonitor.Setup(a => a.IsBusy(RoutingTarget.Local)).Returns(true);
+        activityMonitor.Setup(a => a.IsBusy(RoutingTarget.Remote)).Returns(true);
+        return activityMonitor;
     }
 
     private static Mock<IModelCatalogCacheService> CreateModelCatalogCacheServiceAvailableOnBoth()
@@ -72,6 +98,50 @@ public class RoutingDecisionServiceTests
         Assert.Equal(RoutingTarget.Remote, target);
         catalogClient.Verify(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
         gpuVramProvider.Verify(g => g.GetFreeVramMB(), Times.Never);
+    }
+
+    [Fact]
+    public async Task DecideAsync_TokenCountExceedsMax_RemoteBusy_CloudModelConfigured_ReturnsCloud()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        var activityMonitor = CreateActivityMonitorRemoteBusy();
+        var sut = CreateSut(catalogClient, gpuVramProvider, cloudModel: "deepseek-v3.1:671b-cloud", activityMonitor: activityMonitor);
+
+        var target = await sut.DecideAsync(tokenCount: 50_000, modelName: ModelName);
+
+        Assert.Equal(RoutingTarget.Cloud, target);
+    }
+
+    [Fact]
+    public async Task DecideAsync_ModelNotLoaded_NotEnoughVram_RemoteBusy_CloudModelConfigured_ReturnsCloud()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        catalogClient.Setup(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(5_000);
+        var activityMonitor = CreateActivityMonitorRemoteBusy();
+        var sut = CreateSut(catalogClient, gpuVramProvider, cloudModel: "deepseek-v3.1:671b-cloud", activityMonitor: activityMonitor);
+
+        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
+
+        Assert.Equal(RoutingTarget.Cloud, target);
+    }
+
+    [Fact]
+    public async Task DecideAsync_ModelNotLoaded_NotEnoughVram_RemoteNotBusy_ReturnsRemote()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        catalogClient.Setup(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(5_000);
+        var sut = CreateSut(catalogClient, gpuVramProvider, cloudModel: "deepseek-v3.1:671b-cloud");
+
+        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
+
+        Assert.Equal(RoutingTarget.Remote, target);
     }
 
     [Fact]
@@ -250,6 +320,35 @@ public class RoutingDecisionServiceTests
         Assert.Equal(RoutingTarget.Remote, target);
         catalogClient.Verify(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
         gpuVramProvider.Verify(g => g.GetFreeVramMB(), Times.Never);
+    }
+
+    [Fact]
+    public async Task DecideAsync_LocalAndRemoteBothBusy_CloudModelConfigured_ReturnsCloud()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        var activityMonitor = CreateActivityMonitorBothBusy();
+        var sut = CreateSut(catalogClient, gpuVramProvider, cloudModel: "deepseek-v3.1:671b-cloud", activityMonitor: activityMonitor);
+
+        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
+
+        Assert.Equal(RoutingTarget.Cloud, target);
+        catalogClient.Verify(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        gpuVramProvider.Verify(g => g.GetFreeVramMB(), Times.Never);
+    }
+
+    [Fact]
+    public async Task DecideAsync_LocalAndRemoteBothBusy_NoCloudModelConfigured_DoesNotOverflow()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
+        var activityMonitor = CreateActivityMonitorBothBusy();
+        var sut = CreateSut(catalogClient, gpuVramProvider, activityMonitor: activityMonitor);
+
+        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
+
+        Assert.NotEqual(RoutingTarget.Cloud, target);
     }
 
     [Theory]

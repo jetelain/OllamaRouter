@@ -38,11 +38,17 @@ public sealed class ActivityMonitorService : IActivityMonitorService
         var busy = new Dictionary<RoutingTarget, bool>
         {
             [RoutingTarget.Local] = inProgress.Any(r => r.Target == RoutingTarget.Local),
-            [RoutingTarget.Remote] = inProgress.Any(r => r.Target == RoutingTarget.Remote)
+            [RoutingTarget.Remote] = inProgress.Any(r => r.Target == RoutingTarget.Remote),
+            [RoutingTarget.Cloud] = inProgress.Any(r => r.Target == RoutingTarget.Cloud)
         };
 
         var recent = _history.ToArray().OrderByDescending(e => e.Timestamp).ToList();
 
         return new ActivityMonitorSnapshot(busy, inProgress, recent);
+    }
+
+    public bool IsBusy(RoutingTarget target)
+    {
+        return _inProgress.Values.Any(r => r.Target == target);
     }
 }

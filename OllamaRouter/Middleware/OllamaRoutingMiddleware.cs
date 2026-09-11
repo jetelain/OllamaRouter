@@ -81,9 +81,25 @@ public sealed class OllamaRoutingMiddleware(
             logger.LogError(ex, "Error while inspecting the request. Falling back to Remote routing.");
         }
 
-        context.Request.Headers[OllamaReverseProxyConfig.TargetHeader] = target == RoutingTarget.Local
-            ? OllamaReverseProxyConfig.LocalTarget
-            : OllamaReverseProxyConfig.RemoteTarget;
+        context.Request.Headers[OllamaReverseProxyConfig.TargetHeader] = target switch
+        {
+            RoutingTarget.Local => OllamaReverseProxyConfig.LocalTarget,
+            RoutingTarget.Cloud => OllamaReverseProxyConfig.LocalTarget,
+            _ => OllamaReverseProxyConfig.RemoteTarget
+        };
+
+        if (target == RoutingTarget.Cloud)
+        {
+            var normalizedName = RoutingDecisionService.NormalizeModelName(modelName);
+            if (options.Value.Models.TryGetValue(normalizedName, out var cloudThresholds) &&
+                !string.IsNullOrEmpty(cloudThresholds.CloudModel))
+            {
+                var rewrittenBody = OllamaRequestParser.ReplaceModelName(body, cloudThresholds.CloudModel);
+                var bodyBytes = System.Text.Encoding.UTF8.GetBytes(rewrittenBody);
+                context.Request.Body = new MemoryStream(bodyBytes);
+                context.Request.ContentLength = bodyBytes.Length;
+            }
+        }
 
         var originalBody = context.Response.Body;
         var capturingStream = new ResponseCapturingStream(originalBody);

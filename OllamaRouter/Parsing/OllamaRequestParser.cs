@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace OllamaRouter.Parsing;
 
@@ -207,5 +208,42 @@ public static class OllamaRequestParser
         }
 
         return "";
+    }
+
+    /// <summary>
+    /// Returns a copy of the request body with the "model" property (or the legacy "name" alias)
+    /// rewritten to <paramref name="newModelName"/>. Used to substitute a cloud-hosted model name
+    /// when overflowing to ollama.com cloud. Returns the original body unchanged if it cannot be
+    /// parsed or does not contain a model field.
+    /// </summary>
+    public static string ReplaceModelName(string jsonBody, string newModelName)
+    {
+        try
+        {
+            var node = JsonNode.Parse(jsonBody);
+            if (node is JsonObject obj)
+            {
+                if (obj.ContainsKey("model"))
+                {
+                    obj["model"] = newModelName;
+                }
+                else if (obj.ContainsKey("name"))
+                {
+                    obj["name"] = newModelName;
+                }
+                else
+                {
+                    return jsonBody;
+                }
+
+                return obj.ToJsonString();
+            }
+        }
+        catch
+        {
+            // Ignore parsing errors and fall back to the original body.
+        }
+
+        return jsonBody;
     }
 }
