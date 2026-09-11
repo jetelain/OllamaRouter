@@ -7,6 +7,7 @@ namespace OllamaRouter.Services;
 public sealed class RoutingDecisionService(
     IOptions<OllamaRouterOptions> options,
     IOllamaModelCatalogClient modelCatalogClient,
+    IModelCatalogCacheService modelCatalogCacheService,
     IGpuVramProvider gpuVramProvider,
     ILogger<RoutingDecisionService> logger) : IRoutingDecisionService
 {
@@ -18,14 +19,41 @@ public sealed class RoutingDecisionService(
         // Only models explicitly configured in the options dict are allowed to run locally.
         if (settings.Models.TryGetValue(normalizedName, out var thresholds))
         {
+            var localUrl = settings.LocalUrl.TrimEnd('/');
+            var remoteUrl = settings.RemoteUrl.TrimEnd('/');
+
+            // Since the configuration key is tag-agnostic, the requested tag may not actually be
+            // available on either (or both) targets. Check availability before deciding.
+            var existsLocallyTask = modelCatalogCacheService.ModelExistsAsync(localUrl, modelName, cancellationToken);
+            var existsRemotelyTask = modelCatalogCacheService.ModelExistsAsync(remoteUrl, modelName, cancellationToken);
+            await Task.WhenAll(existsLocallyTask, existsRemotelyTask);
+            var existsLocally = await existsLocallyTask;
+            var existsRemotely = await existsRemotelyTask;
+
+            if (existsLocally && !existsRemotely)
+            {
+                logger.LogDebug("{Model} is only available locally, routing to Local.", modelName);
+                return RoutingTarget.Local;
+            }
+
+            if (!existsLocally && existsRemotely)
+            {
+                logger.LogDebug("{Model} is only available remotely, routing to Remote.", modelName);
+                return RoutingTarget.Remote;
+            }
+
+            if (!existsLocally && !existsRemotely)
+            {
+                logger.LogDebug("{Model} is not available on either target, routing to Remote.", modelName);
+                return RoutingTarget.Remote;
+            }
+
             // Beyond the per-model token limit, there is no need to query anything else.
             if (tokenCount > thresholds.MaxLocalTokens)
             {
                 logger.LogDebug("{Model}: tokenCount {TokenCount} exceeds max {Max}, routing to Remote.", normalizedName, tokenCount, thresholds.MaxLocalTokens);
                 return RoutingTarget.Remote;
             }
-
-            var localUrl = settings.LocalUrl.TrimEnd('/');
 
             // If the model is already loaded locally, no need to check the available VRAM.
             if (await modelCatalogClient.IsModelLoadedLocallyAsync(localUrl, modelName, cancellationToken))

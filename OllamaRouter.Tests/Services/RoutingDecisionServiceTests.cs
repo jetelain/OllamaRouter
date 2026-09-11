@@ -14,7 +14,8 @@ public class RoutingDecisionServiceTests
         Mock<IGpuVramProvider> gpuVramProvider,
         int maxLocalTokens = 40_000,
         int minRequiredVramMB = 13_500,
-        string modelName = ModelName)
+        string modelName = ModelName,
+        Mock<IModelCatalogCacheService>? modelCatalogCacheService = null)
     {
         var options = Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions
         {
@@ -30,7 +31,18 @@ public class RoutingDecisionServiceTests
             RemoteUrl = "http://aiserver.local:11434"
         });
 
-        return new RoutingDecisionService(options, catalogClient.Object, gpuVramProvider.Object, NullLogger<RoutingDecisionService>.Instance);
+        modelCatalogCacheService ??= CreateModelCatalogCacheServiceAvailableOnBoth();
+
+        return new RoutingDecisionService(options, catalogClient.Object, modelCatalogCacheService.Object, gpuVramProvider.Object, NullLogger<RoutingDecisionService>.Instance);
+    }
+
+    private static Mock<IModelCatalogCacheService> CreateModelCatalogCacheServiceAvailableOnBoth()
+    {
+        var modelCatalogCacheService = new Mock<IModelCatalogCacheService>();
+        modelCatalogCacheService
+            .Setup(c => c.ModelExistsAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+        return modelCatalogCacheService;
     }
 
     [Fact]
@@ -136,6 +148,108 @@ public class RoutingDecisionServiceTests
         var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName + ":latest");
 
         Assert.Equal(RoutingTarget.Local, target);
+    }
+
+    [Fact]
+    public async Task DecideAsync_ModelOnlyAvailableLocally_ReturnsLocal_WithoutQueryingGpu()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        var modelCatalogCacheService = new Mock<IModelCatalogCacheService>();
+        modelCatalogCacheService.Setup(c => c.ModelExistsAsync("http://127.0.0.1:11435", ModelName, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+        modelCatalogCacheService.Setup(c => c.ModelExistsAsync("http://aiserver.local:11434", ModelName, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+        var sut = CreateSut(catalogClient, gpuVramProvider, modelCatalogCacheService: modelCatalogCacheService);
+
+        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
+
+        Assert.Equal(RoutingTarget.Local, target);
+        gpuVramProvider.Verify(g => g.GetFreeVramMB(), Times.Never);
+    }
+
+    [Fact]
+    public async Task DecideAsync_ModelOnlyAvailableRemotely_ReturnsRemote_WithoutQueryingGpu()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        var modelCatalogCacheService = new Mock<IModelCatalogCacheService>();
+        modelCatalogCacheService.Setup(c => c.ModelExistsAsync("http://127.0.0.1:11435", ModelName, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+        modelCatalogCacheService.Setup(c => c.ModelExistsAsync("http://aiserver.local:11434", ModelName, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+        var sut = CreateSut(catalogClient, gpuVramProvider, modelCatalogCacheService: modelCatalogCacheService);
+
+        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
+
+        Assert.Equal(RoutingTarget.Remote, target);
+        gpuVramProvider.Verify(g => g.GetFreeVramMB(), Times.Never);
+    }
+
+    [Fact]
+    public async Task DecideAsync_ModelNotAvailableOnEitherTarget_ReturnsRemote_WithoutQueryingGpu()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        var modelCatalogCacheService = new Mock<IModelCatalogCacheService>();
+        modelCatalogCacheService
+            .Setup(c => c.ModelExistsAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+        var sut = CreateSut(catalogClient, gpuVramProvider, modelCatalogCacheService: modelCatalogCacheService);
+
+        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
+
+        Assert.Equal(RoutingTarget.Remote, target);
+        gpuVramProvider.Verify(g => g.GetFreeVramMB(), Times.Never);
+    }
+
+    [Fact]
+    public async Task DecideAsync_ChecksAvailability_WithFullModelNameAndCorrectUrls()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        catalogClient.Setup(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
+        var modelCatalogCacheService = CreateModelCatalogCacheServiceAvailableOnBoth();
+        var sut = CreateSut(catalogClient, gpuVramProvider, modelCatalogCacheService: modelCatalogCacheService);
+
+        await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName + ":latest");
+
+        modelCatalogCacheService.Verify(c => c.ModelExistsAsync("http://127.0.0.1:11435", ModelName + ":latest", It.IsAny<CancellationToken>()), Times.Once);
+        modelCatalogCacheService.Verify(c => c.ModelExistsAsync("http://aiserver.local:11434", ModelName + ":latest", It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task DecideAsync_ModelNotAvailableOnEitherTarget_TokenCountExceedsMax_ReturnsRemote_WithoutQueryingCatalogOrGpu()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        var modelCatalogCacheService = new Mock<IModelCatalogCacheService>();
+        modelCatalogCacheService
+            .Setup(c => c.ModelExistsAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+        var sut = CreateSut(catalogClient, gpuVramProvider, modelCatalogCacheService: modelCatalogCacheService);
+
+        var target = await sut.DecideAsync(tokenCount: 50_000, modelName: ModelName);
+
+        Assert.Equal(RoutingTarget.Remote, target);
+        catalogClient.Verify(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        gpuVramProvider.Verify(g => g.GetFreeVramMB(), Times.Never);
+    }
+
+    [Fact]
+    public async Task DecideAsync_ModelAvailableOnBoth_ButExceedsTokenLimit_ReturnsRemote()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        var sut = CreateSut(catalogClient, gpuVramProvider);
+
+        var target = await sut.DecideAsync(tokenCount: 50_000, modelName: ModelName);
+
+        Assert.Equal(RoutingTarget.Remote, target);
+        catalogClient.Verify(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        gpuVramProvider.Verify(g => g.GetFreeVramMB(), Times.Never);
     }
 
     [Theory]
