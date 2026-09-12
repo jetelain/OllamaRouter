@@ -14,15 +14,22 @@ public static class MonitorEndpointsExtensions
 {
     public static WebApplication MapOllamaMonitorEndpoints(this WebApplication app)
     {
-        app.MapGet("/monitor/api", (IActivityMonitorService activityMonitor, IOptions<OllamaRouterOptions> options) =>
+        app.MapGet("/monitor/api", (IActivityMonitorService activityMonitor, IOptions<OllamaRouterOptions> options, ITargetAvailabilityService targetAvailability) =>
         {
             var snapshot = activityMonitor.GetSnapshot();
             var now = DateTimeOffset.UtcNow;
             var cloudEnabled = options.Value.Models.Values.Any(m => !string.IsNullOrEmpty(m.CloudModel));
+            var targets = targetAvailability.GetSnapshot();
 
             return Results.Json(new
             {
                 cloudEnabled,
+                targets = new
+                {
+                    local = targets.Local,
+                    remote = targets.Remote,
+                    cloud = targets.Cloud
+                },
                 busy = new
                 {
                     local = snapshot.Busy.GetValueOrDefault(RoutingTarget.Local),
@@ -51,10 +58,21 @@ public static class MonitorEndpointsExtensions
             });
         });
 
+        app.MapPost("/targets", (TargetsUpdateRequest request, ITargetAvailabilityService targetAvailability) =>
+        {
+            targetAvailability.Update(request.Local, request.Remote, request.Cloud);
+            return Results.Ok(new { request.Local, request.Remote, request.Cloud });
+        });
+
         app.MapGet("/monitor", () => Results.Content(MonitorPageHtml, "text/html"));
 
         return app;
     }
+
+    /// <summary>
+    /// Request payload for <c>POST /targets</c>.
+    /// </summary>
+    public sealed record TargetsUpdateRequest(bool Local, bool Remote, bool Cloud);
 
     private const string MonitorPageHtml = """
 <!DOCTYPE html>
@@ -70,9 +88,13 @@ public static class MonitorEndpointsExtensions
   .card { padding: 0.75rem 1.25rem; border-radius: 8px; min-width: 140px; background: #2b2b2b; }
   .card.busy { background: #5a3d00; border: 1px solid #ffb300; }
   .card.idle { background: #1f3d24; border: 1px solid #3ba55c; }
+  .card.disabled { background: #3a1f1f; border: 1px solid #b33333; }
+  .card .toggle { display: flex; align-items: center; margin-top: 0.4rem; font-size: 0.8rem; color: #bbb; }
+  .card .toggle input { margin-right: 6px; }
   .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
   .busy .dot { background: #ffb300; }
   .idle .dot { background: #3ba55c; }
+  .disabled .dot { background: #b33333; }
   table { border-collapse: collapse; width: 100%; }
   th, td { text-align: left; padding: 0.35rem 0.75rem; border-bottom: 1px solid #333; font-size: 0.9rem; }
   th { color: #999; font-weight: 600; }
@@ -148,12 +170,25 @@ async function refresh() {
         continue;
       }
       const busy = data.busy[name];
+      const enabled = data.targets[name];
       const div = document.createElement('div');
-      div.className = 'card ' + (busy ? 'busy' : 'idle');
+      div.className = 'card ' + (!enabled ? 'disabled' : (busy ? 'busy' : 'idle'));
       const dot = document.createElement('span');
       dot.className = 'dot';
       div.appendChild(dot);
-      div.appendChild(document.createTextNode(name.charAt(0).toUpperCase() + name.slice(1) + ': ' + (busy ? 'Busy' : 'Idle')));
+      const label = name.charAt(0).toUpperCase() + name.slice(1) + ': ' + (!enabled ? 'Disabled' : (busy ? 'Busy' : 'Idle'));
+      div.appendChild(document.createTextNode(label));
+
+      const toggle = document.createElement('label');
+      toggle.className = 'toggle';
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.checked = enabled;
+      checkbox.addEventListener('change', () => toggleTarget(name, checkbox.checked, data.targets));
+      toggle.appendChild(checkbox);
+      toggle.appendChild(document.createTextNode('Enabled'));
+      div.appendChild(toggle);
+
       instances.appendChild(div);
     }
 
@@ -192,6 +227,22 @@ async function refresh() {
     }
   } catch (e) {
     console.error(e);
+  }
+}
+
+async function toggleTarget(name, checked, currentTargets) {
+  const updated = { local: currentTargets.local, remote: currentTargets.remote, cloud: currentTargets.cloud };
+  updated[name] = checked;
+  try {
+    await fetch('/targets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updated)
+    });
+  } catch (e) {
+    console.error(e);
+  } finally {
+    refresh();
   }
 }
 

@@ -10,6 +10,7 @@ public sealed class RoutingDecisionService(
     IModelCatalogCacheService modelCatalogCacheService,
     IGpuVramProvider gpuVramProvider,
     IActivityMonitorService activityMonitor,
+    ITargetAvailabilityService targetAvailability,
     ILogger<RoutingDecisionService> logger) : IRoutingDecisionService
 {
     public async Task<RoutingTarget> DecideAsync(int tokenCount, string modelName, CancellationToken cancellationToken = default)
@@ -20,11 +21,14 @@ public sealed class RoutingDecisionService(
         // Only models explicitly configured in the options dict are allowed to run locally.
         if (settings.Models.TryGetValue(normalizedName, out var thresholds))
         {
-            if (!string.IsNullOrEmpty(thresholds.CloudModel) &&
-                activityMonitor.IsBusy(RoutingTarget.Local) &&
-                activityMonitor.IsBusy(RoutingTarget.Remote))
+            // A disabled Cloud target simply turns off overflow, as if no CloudModel was configured.
+            var cloudModel = targetAvailability.IsEnabled(RoutingTarget.Cloud) ? thresholds.CloudModel : null;
+
+            if (!string.IsNullOrEmpty(cloudModel) &&
+                IsBusyOrDisabled(RoutingTarget.Local) &&
+                IsBusyOrDisabled(RoutingTarget.Remote))
             {
-                logger.LogDebug("{Model}: Local and Remote are both busy, overflowing to Cloud ({CloudModel}).", normalizedName, thresholds.CloudModel);
+                logger.LogDebug("{Model}: Local and Remote are both busy or disabled, overflowing to Cloud ({CloudModel}).", normalizedName, cloudModel);
                 return RoutingTarget.Cloud;
             }
 
@@ -48,20 +52,20 @@ public sealed class RoutingDecisionService(
             if (!existsLocally && existsRemotely)
             {
                 logger.LogDebug("{Model} is only available remotely, routing to Remote.", modelName);
-                return RemoteOrCloudOverflow(normalizedName, thresholds.CloudModel, "the model is not available locally");
+                return RemoteOrCloudOverflow(normalizedName, cloudModel, "the model is not available locally");
             }
 
             if (!existsLocally && !existsRemotely)
             {
                 logger.LogDebug("{Model} is not available on either target, routing to Remote.", modelName);
-                return RemoteOrCloudOverflow(normalizedName, thresholds.CloudModel, "the model is not available on either target");
+                return RemoteOrCloudOverflow(normalizedName, cloudModel, "the model is not available on either target");
             }
 
             // Beyond the per-model token limit, there is no need to query anything else.
             if (tokenCount > thresholds.MaxLocalTokens)
             {
                 logger.LogDebug("{Model}: tokenCount {TokenCount} exceeds max {Max}, routing to Remote.", normalizedName, tokenCount, thresholds.MaxLocalTokens);
-                return RemoteOrCloudOverflow(normalizedName, thresholds.CloudModel, $"tokenCount {tokenCount} exceeds max {thresholds.MaxLocalTokens}");
+                return RemoteOrCloudOverflow(normalizedName, cloudModel, $"tokenCount {tokenCount} exceeds max {thresholds.MaxLocalTokens}");
             }
 
             // If the model is already loaded locally, no need to check the available VRAM.
@@ -79,7 +83,7 @@ public sealed class RoutingDecisionService(
             }
 
             logger.LogDebug("{Model}: freeVram {Free}MB, minRequired {Min}MB, routing to Remote.", normalizedName, freeVramMB, thresholds.MinRequiredVramMB);
-            return RemoteOrCloudOverflow(normalizedName, thresholds.CloudModel, $"freeVram {freeVramMB}MB is below required {thresholds.MinRequiredVramMB}MB");
+            return RemoteOrCloudOverflow(normalizedName, cloudModel, $"freeVram {freeVramMB}MB is below required {thresholds.MinRequiredVramMB}MB");
         }
 
         logger.LogDebug("{Model} is not configured for local routing, routing to Remote.", normalizedName);
@@ -88,18 +92,28 @@ public sealed class RoutingDecisionService(
 
     /// <summary>
     /// The Local instance cannot (or should not) handle the request. Routes to Remote, unless
-    /// Remote is currently busy and a cloud equivalent is configured for the model, in which case
-    /// overflows to Cloud instead of queueing behind the busy Remote instance.
+    /// Remote is currently busy or disabled and a cloud equivalent is configured for the model, in
+    /// which case overflows to Cloud instead of queueing behind the busy/disabled Remote instance.
     /// </summary>
     private RoutingTarget RemoteOrCloudOverflow(string normalizedName, string? cloudModel, string reason)
     {
-        if (!string.IsNullOrEmpty(cloudModel) && activityMonitor.IsBusy(RoutingTarget.Remote))
+        if (!string.IsNullOrEmpty(cloudModel) && IsBusyOrDisabled(RoutingTarget.Remote))
         {
-            logger.LogDebug("{Model}: Local cannot handle the request ({Reason}) and Remote is busy, overflowing to Cloud ({CloudModel}).", normalizedName, reason, cloudModel);
+            logger.LogDebug("{Model}: Local cannot handle the request ({Reason}) and Remote is busy or disabled, overflowing to Cloud ({CloudModel}).", normalizedName, reason, cloudModel);
             return RoutingTarget.Cloud;
         }
 
         return RoutingTarget.Remote;
+    }
+
+    /// <summary>
+    /// A target is treated as busy if it is either actually in use, or has been manually disabled
+    /// from the monitoring page. A disabled Local/Remote target thus behaves exactly like a busy
+    /// one for routing/overflow purposes.
+    /// </summary>
+    private bool IsBusyOrDisabled(RoutingTarget target)
+    {
+        return !targetAvailability.IsEnabled(target) || activityMonitor.IsBusy(target);
     }
 
     /// <summary>

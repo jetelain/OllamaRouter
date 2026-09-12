@@ -26,6 +26,13 @@ builder.Services.AddTransient<IRoutingDecisionService, RoutingDecisionService>()
 builder.Services.AddSingleton<IModelCatalogCacheService, ModelCatalogCacheService>();
 builder.Services.AddSingleton<IOllamaProcessLauncher, OllamaProcessLauncher>();
 builder.Services.AddSingleton<IActivityMonitorService, ActivityMonitorService>();
+builder.Services.AddSingleton<ITargetAvailabilityService>(sp =>
+    new TargetAvailabilityService(
+        Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "OllamaRouter",
+            "targets.json"),
+        sp.GetRequiredService<ILogger<TargetAvailabilityService>>()));
 
 var app = builder.Build();
 

@@ -55,6 +55,8 @@ For these requests, the routing decision is made as follows:
 
 If the request body cannot be parsed for any reason, the request is routed to **Remote** as a safe fallback.
 
+> **Note.** Each target (**Local**, **Remote**, **Cloud**) can also be disabled individually, at any time, from the [monitoring page](#monitoring). A disabled **Local** or **Remote** instance behaves exactly like a **busy** one, while disabling **Cloud** is exactly like not having any `CloudModel` configured. This lets you switch the router between operating modes (Local + Cloud, Remote + Cloud, a single destination, …) without restarting it.
+
 ### Cloud overflow
 
 When a model's configuration includes a `CloudModel` entry (e.g. `deepseek-v3.1:671b-cloud` or `glm-4.6:cloud`), OllamaRouter can overflow to [ollama.com cloud](https://ollama.com) whenever using **Remote** would mean waiting behind an already-busy request:
@@ -152,7 +154,7 @@ Configuration is provided through the `OllamaRouter` section of `appsettings.jso
 	},
 	"LocalUrl": "http://127.0.0.1:11435",
 	"RemoteUrl": "http://aiserver.local:11434"
-  }
+	}
 }
 ```
 
@@ -198,6 +200,7 @@ OllamaRouter exposes a very lightweight, dependency-free monitoring page at `/mo
 The page shows:
 
 - Whether each instance (**Local**/**Remote**, and **Cloud** when at least one model has a `CloudModel` configured, see [Cloud overflow](#cloud-overflow)) is currently **busy** processing a chat/generate request.
+- An **Enabled** checkbox per instance, to enable/disable each target at runtime. Toggling it immediately changes the routing behavior (a disabled **Local**/**Remote** acts like a busy instance, disabling **Cloud** acts like no `CloudModel` being configured) and the new state is persisted to a dedicated JSON file (`%LOCALAPPDATA%\OllamaRouter\targets.json` on Windows), so it is restored on the next startup. The state file is written on a best-effort ("failsafe") basis: if it cannot be written, the change still takes effect in memory and a warning is logged — `appsettings.json` is never modified at runtime.
 - The requests currently **in progress**, with target instance, model, estimated input tokens and running time.
 - A history of the most recent completed requests (last 50), with model, estimated vs. actual input tokens, actual output tokens, elapsed time and HTTP status. Failed requests are highlighted.
 
@@ -219,8 +222,9 @@ The page auto-refreshes every 2 seconds by polling `/monitor/api`. A clickable l
 - `Parsing/OllamaRequestParser.cs` – extracts the prompt and model name from request bodies.
 - `ReverseProxy/OllamaReverseProxyConfig.cs` – builds the YARP routes/clusters in code.
 - `Endpoints/OllamaEndpointsExtensions.cs` – hybrid endpoints (`/api/tags`, `/api/ps`, `/v1/models`) that short-circuit YARP to return merged results.
-- `Endpoints/MonitorEndpointsExtensions.cs` – lightweight monitoring UI (`/monitor`, `/monitor/api`).
+- `Endpoints/MonitorEndpointsExtensions.cs` – lightweight monitoring UI (`/monitor`, `/monitor/api`) and target toggles (`POST /targets`).
 - `Services/ActivityMonitorService.cs` – in-memory bookkeeping of busy state, in-progress requests and recent request history used by the monitoring UI.
+- `Services/TargetAvailabilityService.cs` – in-memory state of the Local/Remote/Cloud enable/disable flags, loaded at startup from and persisted on a best-effort basis to a dedicated JSON state file in the application data folder (`%LOCALAPPDATA%\OllamaRouter\targets.json` on Windows), toggled via `POST /targets`.
 
 ## Tests
 
