@@ -176,4 +176,95 @@ public class OllamaRoutingMiddlewareTests
 
         Assert.Equal("Local", context.Request.Headers["X-Ollama-Target"]);
     }
+
+    [Fact]
+    public async Task InvokeAsync_OpenAIStyleSseResponse_ExtractsUsageFromLastDataBlock()
+    {
+        var context = BuildContext("/v1/chat/completions", """{ "model": "qwen", "stream": true }""");
+        var responseBody = new MemoryStream();
+        context.Response.Body = responseBody;
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<string>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Remote);
+
+        var requestId = Guid.NewGuid();
+        var activityMonitor = new Mock<IActivityMonitorService>();
+        activityMonitor.Setup(m => m.StartRequest(It.IsAny<RoutingTarget>(), "qwen", It.IsAny<int>())).Returns(requestId);
+
+        const string sseResponse = """
+            data: {"id":"chatcmpl-570","object":"chat.completion.chunk","created":1789194489,"model":"Qwen3.8-27B:latest","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":" me"},"finish_reason":null}]}
+
+            data: {"id":"chatcmpl-570","object":"chat.completion.chunk","created":1789194489,"model":"Qwen3.8-27B:latest","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"content":"."},"finish_reason":null}]}
+
+            data: {"id":"chatcmpl-570","object":"chat.completion.chunk","created":1789194489,"model":"Qwen3.8-27B:latest","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+            data: {"id":"chatcmpl-570","object":"chat.completion.chunk","created":1789194489,"model":"Qwen3.8-27B:latest","system_fingerprint":"fp_ollama","choices":[],"usage":{"prompt_tokens":13889,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens":33,"total_tokens":13922}}
+
+            data: [DONE]
+
+            """;
+
+        RequestDelegate next = c =>
+        {
+            c.Response.WriteAsync(sseResponse);  // write through the captured stream
+            return Task.CompletedTask;
+        };
+
+        var sut = CreateSut(next, tokenEstimator, routingDecisionService, activityMonitor: activityMonitor);
+
+        await sut.InvokeAsync(context);
+
+        activityMonitor.Verify(
+            m => m.CompleteRequest(
+                requestId,
+                It.Is<ActivityLogEntry>(e => e.ActualPromptTokens == 13889 && e.ActualResponseTokens == 33)),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_OllamaStyleNdjsonResponse_ExtractsTokenCountsFromLastLine()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "qwen", "stream": true }""");
+        var responseBody = new MemoryStream();
+        context.Response.Body = responseBody;
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<string>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Remote);
+
+        var requestId = Guid.NewGuid();
+        var activityMonitor = new Mock<IActivityMonitorService>();
+        activityMonitor.Setup(m => m.StartRequest(It.IsAny<RoutingTarget>(), "qwen", It.IsAny<int>())).Returns(requestId);
+
+        const string ndjsonResponse =
+            """{"model":"Qwen3.8-27B:latest","created_at":"2026-09-12T06:36:27.246174Z","message":{"role":"assistant","content":" action"},"done":false}""" + "\n" +
+            """{"model":"Qwen3.8-27B:latest","created_at":"2026-09-12T06:36:27.271626Z","message":{"role":"assistant","content":" taken"},"done":false}""" + "\n" +
+            """{"model":"Qwen3.8-27B:latest","created_at":"2026-09-12T06:36:27.2977767Z","message":{"role":"assistant","content":"."},"done":false}""" + "\n" +
+            """{"model":"Qwen3.8-27B:latest","created_at":"2026-09-12T06:36:27.3250228Z","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","total_duration":13237340800,"load_duration":1505300,"prompt_eval_count":19553,"prompt_eval_cached_count":0,"prompt_eval_duration":11831027000,"eval_count":26,"eval_duration":667544000}""" + "\n";
+
+        RequestDelegate next = c =>
+        {
+            c.Response.WriteAsync(ndjsonResponse);  // write through the captured stream
+            return Task.CompletedTask;
+        };
+
+        var sut = CreateSut(next, tokenEstimator, routingDecisionService, activityMonitor: activityMonitor);
+
+        await sut.InvokeAsync(context);
+
+        activityMonitor.Verify(
+            m => m.CompleteRequest(
+                requestId,
+                It.Is<ActivityLogEntry>(e => e.ActualPromptTokens == 19553 && e.ActualResponseTokens == 26)),
+            Times.Once);
+    }
 }

@@ -142,18 +142,25 @@ public sealed class OllamaRoutingMiddleware(
         }
 
         // The last NDJSON line of /api/chat and /api/generate responses carries "prompt_eval_count"
-        // and "eval_count". OpenAI-compatible endpoints instead carry a "usage" object with
-        // "prompt_tokens" and "completion_tokens".
+        // and "eval_count". OpenAI-compatible (SSE) responses instead carry a "usage" object with
+        // "prompt_tokens" and "completion_tokens" in the final "data:" block before "data: [DONE]".
         foreach (var line in capturedTail.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Reverse())
         {
-            if (line.Length == 0 || line[0] != '{')
+            var json = line;
+            if (json.StartsWith("data:", StringComparison.Ordinal))
+            {
+                // OpenAI-compatible SSE responses prefix each payload with "data:".
+                json = json["data:".Length..].TrimStart();
+            }
+
+            if (json.Length == 0 || json[0] != '{')
             {
                 continue;
             }
 
             try
             {
-                using var document = JsonDocument.Parse(line);
+                using var document = JsonDocument.Parse(json);
                 var root = document.RootElement;
 
                 int? promptTokens = null;
