@@ -1,7 +1,6 @@
 using System.Text.Json;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging.Abstractions;
-using Moq;
 using OllamaRouter.Services;
 
 namespace OllamaRouter.Tests.Services;
@@ -10,7 +9,7 @@ public class ActivityStatisticsServiceTests : IDisposable
 {
     private readonly string tempDirectory;
     private readonly string statsFilePath;
-    private readonly Mock<IHostApplicationLifetime> lifetime = new();
+    private readonly FakeHostApplicationLifetime lifetime = new();
 
     public ActivityStatisticsServiceTests()
     {
@@ -20,12 +19,15 @@ public class ActivityStatisticsServiceTests : IDisposable
 
     public void Dispose()
     {
+        // Saves scheduled by Task.Run (rollover, throttling) are fire-and-forget; let them
+        // finish before deleting the file they write.
+        WaitForPendingSaves();
         Directory.Delete(tempDirectory, recursive: true);
     }
 
     private ActivityStatisticsService CreateSut()
     {
-        return new ActivityStatisticsService(statsFilePath, lifetime.Object, NullLogger<ActivityStatisticsService>.Instance);
+        return new ActivityStatisticsService(statsFilePath, lifetime, NullLogger<ActivityStatisticsService>.Instance);
     }
 
     private static ActivityLogEntry Entry(RoutingTarget target, int? promptTokens, int? responseTokens, bool success = true)
@@ -161,6 +163,7 @@ public class ActivityStatisticsServiceTests : IDisposable
 
         sut.Add(Entry(RoutingTarget.Local, 100, 20));
         sut.Save();
+        WaitForPendingSaves();
 
         var persisted = File.ReadAllText(statsFilePath);
         Assert.Contains("\"TotalInputTokens\": 100", persisted);
@@ -174,9 +177,11 @@ public class ActivityStatisticsServiceTests : IDisposable
         var first = CreateSut();
         first.Add(Entry(RoutingTarget.Remote, 123, 45));
         first.Save();
+        WaitForPendingSaves();
 
         var second = CreateSut();
         second.Add(Entry(RoutingTarget.Remote, 7, 2));
+        WaitForPendingSaves();
 
         var snapshot = second.GetSnapshot();
 
@@ -188,18 +193,33 @@ public class ActivityStatisticsServiceTests : IDisposable
     [Fact]
     public void Shutdown_SavesPendingStatistics()
     {
-        var shutdownActions = new List<Action>();
-        lifetime
-            .Setup(l => l.ApplicationStopped.Register(It.IsAny<Action>()))
-            .Callback((Action action) => shutdownActions.Add(action));
-
         var sut = CreateSut();
         sut.Add(Entry(RoutingTarget.Cloud, 11, 4));
 
-        shutdownActions.ForEach(action => action());
+        // Let the fire-and-forget saves triggered by Add finish writing before shutdown fires.
+        WaitForPendingSaves();
 
-        var second = CreateSut();
+        lifetime.StopApplication();
+
+        // A fresh lifetime: the shared one is already stopped, which would immediately fire
+        // this instance's registered Save with its still-empty state and wipe the file.
+        var second = new ActivityStatisticsService(statsFilePath, new FakeHostApplicationLifetime(), NullLogger<ActivityStatisticsService>.Instance);
 
         Assert.Equal(1, second.GetSnapshot().Today[RoutingTarget.Cloud].Requests);
+    }
+
+    // Gives fire-and-forget saves (Task.Run) time to finish so the stats file is stable to read.
+    private static void WaitForPendingSaves() => Thread.Sleep(250);
+
+    private sealed class FakeHostApplicationLifetime : IHostApplicationLifetime
+    {
+        private readonly CancellationTokenSource stopped = new();
+
+        public CancellationToken ApplicationStarted { get; } = CancellationToken.None;
+        public CancellationToken ApplicationStarting { get; } = CancellationToken.None;
+        public CancellationToken ApplicationStopping { get; } = CancellationToken.None;
+        public CancellationToken ApplicationStopped => stopped.Token;
+
+        public void StopApplication() => stopped.Cancel();
     }
 }
