@@ -5,32 +5,38 @@ OllamaRouter is a lightweight reverse proxy that sits in front of two [Ollama](h
 - A **local** Ollama instance, running on a machine with a powerful GPU but **limited VRAM** (assumed to be a nVidia card).
 - A **remote** Ollama instance (e.g. a server), with a lot of **unified RAM or VRAM** but a **less powerful GPU**.
 
-The goal is to get the best of both worlds: use the fast local GPU whenever the request can fit in its available VRAM, and fall back to the remote server for everything else (larger contexts, models that don't fit locally, etc.). Optionally, when **both** instances are busy, requests can further **overflow to [ollama.com cloud](https://ollama.com)** models, so a slow/unavailable Local or Remote instance never fully blocks incoming requests.
+The goal is to get the best of both worlds: use the fast local GPU whenever the request can fit in its available VRAM, and fall back to the remote server for everything else (larger contexts, models that don't fit locally, etc.).
+
+OllamaRouter is more than a simple two-tier proxy, it also provides:
+
+- **Cloud overflow** (optional, per model). When both instances are busy, requests can **overflow to [ollama.com cloud](https://ollama.com)** models, so a slow/unavailable Local or Remote instance never fully blocks incoming requests. See [Cloud overflow](#cloud-overflow).
+- **A built-in monitoring page**. A lightweight, dependency-free page at `/monitor` shows which targets are busy, which requests are in progress and what has been processed recently, and lets you enable/disable the **Local**, **Remote** and **Cloud** targets at runtime — switching the router between operating modes without restarting it. See [Monitoring](#monitoring).
 
 ## How it works
 
-From the user's point of view, there is a single endpoint: the router listens on the standard Ollama port (`http://localhost:11434`) and transparently forwards each request to either the local or the remote instance, depending on the model requested and the size of the prompt.
+From the user's point of view, there is a single endpoint: the router listens on the standard Ollama port (`http://localhost:11434`) and transparently forwards each request to the local or the remote instance — or, optionally, to an [ollama.com cloud](https://ollama.com) model — depending on the model requested and the size of the prompt (a monitoring page is also available under `/monitor`, see [Monitoring](#monitoring)).
 
 ```mermaid
 flowchart TD
     client["Client (any Ollama or OpenAI client)"]
-    client -->|HTTP :11434| router{"🔀 OllamaRouter"}
+    client -->|"http :11434"| router{"🔀 OllamaRouter<br/>“best machine for this request?”"}
 
-    router -->|"POST /api/chat, /v1/chat/completions"| decision{"Routing decision"}
+    router -->|"⚡ context fits in the GPU — fastest answers"| local
+    router -->|"🧠 big context, or model not available locally"| remote
+    router -->|"☁️ both instances busy — cloud fallback (optional)"| cloud
+    router -.-> monitor
 
-    decision -->|"Too many tokens or not enough free VRAM"| remote
-    decision -->|"Context fits and enough free VRAM"| local
-    decision -->|"(Optional) Local and Remote busy/unable to process"| cloud
+    local["🖥️ Local Ollama (fast answers: powerful GPU, limited VRAM)"]
+    remote["📡 Remote Ollama (heavy models: big RAM/VRAM, slower GPU)"]
+    cloud["☁️ ollama.com cloud model (requests are never fully blocked)"]
+    monitor["📊 /monitor — see what's going on, pause any target"]
 
-    local["🖥️ Local Ollama (fast GPU, limited VRAM)"]
-    remote["📡 Remote Ollama (large RAM/VRAM, slower GPU)"]
-    cloud["☁️ (Optional) Overflow to ollama.com cloud"]
-
-    style decision fill:#fff3cd
-    style remoteOrCloud fill:#fff3cd
-    style local fill:#d4edda
-    style remote fill:#d4edda
-    style cloud fill:#cfe8ff
+    style local fill:#d3edff
+    style remote fill:#cef8e9
+    style cloud fill:#eddcff
+    style client fill:#fff
+    style router fill:#fff
+    style monitor fill:#fff3cd
 ```
 
 For every incoming request, OllamaRouter decides between `Local`, `Remote` and `Cloud` and forwards the request accordingly using [YARP](https://github.com/microsoft/reverse-proxy) (`Cloud` is physically routed to the **Local** instance, see [Cloud overflow](#cloud-overflow) below).
