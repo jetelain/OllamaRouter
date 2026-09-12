@@ -19,6 +19,7 @@ public sealed class OllamaRoutingMiddleware(
     IRoutingDecisionService routingDecisionService,
     IModelCatalogCacheService modelCatalogCache,
     IActivityMonitorService activityMonitor,
+    IActivityStatisticsService activityStatistics,
     IOptions<OllamaRouterOptions> options,
     ILogger<OllamaRoutingMiddleware> logger)
 {
@@ -121,7 +122,7 @@ public sealed class OllamaRoutingMiddleware(
 
             var (actualPromptTokens, actualResponseTokens) = TryExtractActualTokens(capturingStream.CapturedTail);
 
-            activityMonitor.CompleteRequest(requestId, new ActivityLogEntry(
+            var entry = new ActivityLogEntry(
                 DateTimeOffset.UtcNow,
                 target,
                 modelName,
@@ -130,7 +131,10 @@ public sealed class OllamaRoutingMiddleware(
                 actualResponseTokens,
                 stopwatch.ElapsedMilliseconds,
                 context.Response.StatusCode,
-                success));
+                success);
+
+            activityMonitor.CompleteRequest(requestId, entry);
+            activityStatistics.Add(entry);
         }
     }
 

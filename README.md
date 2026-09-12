@@ -14,7 +14,7 @@ From the user's point of view, there is a single endpoint: the router listens on
 ```mermaid
 flowchart TD
     client["Client (any Ollama or OpenAI client)"]
-    client -->|HTTP :11434| router{"OllamaRouter"}
+    client -->|HTTP :11434| router{"🔀 OllamaRouter"}
 
     router -->|"POST /api/chat, /v1/chat/completions"| decision{"Routing decision"}
 
@@ -22,9 +22,9 @@ flowchart TD
     decision -->|"Context fits and enough free VRAM"| local
     decision -->|"(Optional) Local and Remote busy/unable to process"| cloud
 
-    local["Local Ollama (fast GPU, limited VRAM)"]
-    remote["Remote Ollama (large RAM/VRAM, slower GPU)"]
-    cloud["(Optional) Overflow to ollama.com cloud"]
+    local["🖥️ Local Ollama (fast GPU, limited VRAM)"]
+    remote["📡 Remote Ollama (large RAM/VRAM, slower GPU)"]
+    cloud["☁️ (Optional) Overflow to ollama.com cloud"]
 
     style decision fill:#fff3cd
     style remoteOrCloud fill:#fff3cd
@@ -203,6 +203,7 @@ The page shows:
 - An **Enabled** checkbox per instance, to enable/disable each target at runtime. Toggling it immediately changes the routing behavior (a disabled **Local**/**Remote** acts like a busy instance, disabling **Cloud** acts like no `CloudModel` being configured) and the new state is persisted to a dedicated JSON file (`%LOCALAPPDATA%\OllamaRouter\targets.json` on Windows), so it is restored on the next startup. The state file is written on a best-effort ("failsafe") basis: if it cannot be written, the change still takes effect in memory and a warning is logged — `appsettings.json` is never modified at runtime.
 - The requests currently **in progress**, with target instance, model, estimated input tokens and running time.
 - A history of the most recent completed requests (last 50), with model, estimated vs. actual input tokens, actual output tokens, elapsed time and HTTP status. Failed requests are highlighted.
+- Aggregated **token statistics** per target (and overall total): number of requests, actual input tokens and actual output tokens, both for the **current day** and for the **last 7 days**. Only successful requests with actual token counts are counted. These statistics are persisted to a dedicated JSON file (`%LOCALAPPDATA%\OllamaRouter\activity-statistics.json` on Windows) so they survive restarts, and are written on a best-effort basis (throttled to at most one write per 30 seconds, on day rollover, and on application shutdown).
 
 The page auto-refreshes every 2 seconds by polling `/monitor/api`. A clickable link to this page is printed to the console when the router starts (see [Running](#running)).
 
@@ -224,6 +225,7 @@ The page auto-refreshes every 2 seconds by polling `/monitor/api`. A clickable l
 - `Endpoints/OllamaEndpointsExtensions.cs` – hybrid endpoints (`/api/tags`, `/api/ps`, `/v1/models`) that short-circuit YARP to return merged results.
 - `Endpoints/MonitorEndpointsExtensions.cs` – lightweight monitoring UI (`/monitor`, `/monitor/api`) and target toggles (`POST /targets`).
 - `Services/ActivityMonitorService.cs` – in-memory bookkeeping of busy state, in-progress requests and recent request history used by the monitoring UI.
+- `Services/ActivityStatisticsService.cs` – per-target counters (requests, actual input/output tokens) with current-day and last-7-days aggregation, persisted on a best-effort basis to a dedicated JSON file in the application data folder (`%LOCALAPPDATA%\OllamaRouter\activity-statistics.json` on Windows) and exposed via `/monitor/api`.
 - `Services/TargetAvailabilityService.cs` – in-memory state of the Local/Remote/Cloud enable/disable flags, loaded at startup from and persisted on a best-effort basis to a dedicated JSON state file in the application data folder (`%LOCALAPPDATA%\OllamaRouter\targets.json` on Windows), toggled via `POST /targets`.
 
 ## Tests

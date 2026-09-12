@@ -25,7 +25,8 @@ public class OllamaRoutingMiddlewareTests
         Mock<ITokenEstimator> tokenEstimator,
         Mock<IRoutingDecisionService> routingDecisionService,
         Mock<IModelCatalogCacheService>? modelCatalogCache = null,
-        Mock<IActivityMonitorService>? activityMonitor = null)
+        Mock<IActivityMonitorService>? activityMonitor = null,
+        Mock<IActivityStatisticsService>? activityStatistics = null)
     {
         return new OllamaRoutingMiddleware(
             next,
@@ -33,6 +34,7 @@ public class OllamaRoutingMiddlewareTests
             routingDecisionService.Object,
             (modelCatalogCache ?? new Mock<IModelCatalogCacheService>()).Object,
             (activityMonitor ?? new Mock<IActivityMonitorService>()).Object,
+            (activityStatistics ?? new Mock<IActivityStatisticsService>()).Object,
             MsOptions.Create(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
             NullLogger<OllamaRoutingMiddleware>.Instance);
     }
@@ -223,6 +225,34 @@ public class OllamaRoutingMiddlewareTests
             m => m.CompleteRequest(
                 requestId,
                 It.Is<ActivityLogEntry>(e => e.ActualPromptTokens == 13889 && e.ActualResponseTokens == 33)),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_CompletionRequest_ReportsEntryToStatistics()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Bonjour" }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<string>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(100, "llama3", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var requestId = Guid.NewGuid();
+        var activityMonitor = new Mock<IActivityMonitorService>();
+        activityMonitor.Setup(m => m.StartRequest(RoutingTarget.Local, "llama3", 100)).Returns(requestId);
+
+        var activityStatistics = new Mock<IActivityStatisticsService>();
+
+        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService, activityMonitor: activityMonitor, activityStatistics: activityStatistics);
+
+        await sut.InvokeAsync(context);
+
+        activityStatistics.Verify(
+            s => s.Add(It.Is<ActivityLogEntry>(e => e.Target == RoutingTarget.Local && e.EstimatedPromptTokens == 100)),
             Times.Once);
     }
 

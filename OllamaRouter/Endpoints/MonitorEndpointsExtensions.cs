@@ -1,4 +1,4 @@
-using Microsoft.Extensions.Options;
+﻿using Microsoft.Extensions.Options;
 using OllamaRouter.Options;
 using OllamaRouter.Services;
 
@@ -7,16 +7,18 @@ namespace OllamaRouter.Endpoints;
 /// <summary>
 /// Lightweight, dependency-free monitoring UI: shows which instance (Local/Remote) is currently
 /// busy, requests currently in progress, and the recent request history with model, estimated
-/// and actual tokens, and elapsed time. It only reads in-memory state from
-/// <see cref="IActivityMonitorService"/>, so it has no impact on VRAM.
+/// and actual tokens, and elapsed time. It reads in-memory state from
+/// <see cref="IActivityMonitorService"/> and aggregated token statistics (persisted, current day
+/// and last 7 days) from <see cref="IActivityStatisticsService"/>, so it has no impact on VRAM.
 /// </summary>
 public static class MonitorEndpointsExtensions
 {
     public static WebApplication MapOllamaMonitorEndpoints(this WebApplication app)
     {
-        app.MapGet("/monitor/api", (IActivityMonitorService activityMonitor, IOptions<OllamaRouterOptions> options, ITargetAvailabilityService targetAvailability) =>
+        app.MapGet("/monitor/api", (IActivityMonitorService activityMonitor, IActivityStatisticsService activityStatistics, IOptions<OllamaRouterOptions> options, ITargetAvailabilityService targetAvailability) =>
         {
             var snapshot = activityMonitor.GetSnapshot();
+            var statistics = activityStatistics.GetSnapshot();
             var now = DateTimeOffset.UtcNow;
             var cloudEnabled = options.Value.Models.Values.Any(m => !string.IsNullOrEmpty(m.CloudModel));
             var targets = targetAvailability.GetSnapshot();
@@ -35,6 +37,23 @@ public static class MonitorEndpointsExtensions
                     local = snapshot.Busy.GetValueOrDefault(RoutingTarget.Local),
                     remote = snapshot.Busy.GetValueOrDefault(RoutingTarget.Remote),
                     cloud = snapshot.Busy.GetValueOrDefault(RoutingTarget.Cloud)
+                },
+                statistics = new
+                {
+                    today = new
+                    {
+                        local = statistics.Today[RoutingTarget.Local],
+                        remote = statistics.Today[RoutingTarget.Remote],
+                        cloud = statistics.Today[RoutingTarget.Cloud],
+                        total = statistics.TodayTotal
+                    },
+                    last7Days = new
+                    {
+                        local = statistics.Last7Days[RoutingTarget.Local],
+                        remote = statistics.Last7Days[RoutingTarget.Remote],
+                        cloud = statistics.Last7Days[RoutingTarget.Cloud],
+                        total = statistics.Last7DaysTotal
+                    }
                 },
                 inProgress = snapshot.InProgressRequests.Select(r => new
                 {
@@ -100,9 +119,14 @@ public static class MonitorEndpointsExtensions
   th { color: #999; font-weight: 600; }
   tr.fail { color: #ff6b6b; }
   tr.pending { color: #ffd479; }
+  tr.total td { color: #fff; font-weight: 600; border-top: 1px solid #555; }
+  td.num { text-align: right; }
+  .stats th { text-align: center; }
+  .stats th:first-child, .stats td:first-child { text-align: left; }
+  .stats .today { background: #262626; }
   .target-Local { color: #6bc4ff; }
-  .target-Remote { color: #c48bff; }
-  .target-Cloud { color: #5ce8b5; }
+  .target-Remote { color: #5ce8b5; }
+  .target-Cloud { color: #c48bff; }
   .empty { color: #777; font-style: italic; padding: 0.5rem 0.75rem; }
 </style>
 </head>
@@ -110,10 +134,19 @@ public static class MonitorEndpointsExtensions
 <h1>OllamaRouter - Activity Monitor</h1>
 <div class="instances" id="instances"></div>
 
+<h2>Statistics</h2>
+<table class="stats">
+  <thead>
+    <tr><th rowspan="2">Target</th><th colspan="3" class="today">Today</th><th colspan="3">Last 7 days</th></tr>
+    <tr><th class="today">Req</th><th class="today">In</th><th class="today">Out</th><th>Req</th><th>In</th><th>Out</th></tr>
+  </thead>
+  <tbody id="statsRows"></tbody>
+</table>
+
 <h2>In progress</h2>
 <table>
   <thead>
-    <tr><th>Target</th><th>Model</th><th>Estimated input tokens</th><th>Running for</th></tr>
+    <tr><th>Target</th><th>Model</th><th>In (est.)</th><th>Running for</th></tr>
   </thead>
   <tbody id="inProgressRows"></tbody>
 </table>
@@ -121,13 +154,18 @@ public static class MonitorEndpointsExtensions
 <h2>Recent requests</h2>
 <table>
   <thead>
-    <tr><th>Time</th><th>Target</th><th>Model</th><th>Input tokens (est. / actual)</th><th>Output tokens</th><th>Elapsed</th><th>Status</th></tr>
+    <tr><th>Time</th><th>Target</th><th>Model</th><th>In (est. / act.)</th><th>Out</th><th>Elapsed</th><th>Status</th></tr>
   </thead>
   <tbody id="rows"></tbody>
 </table>
 <script>
-function td(text) {
+const targetIcons = { Local: '🖥️', Remote: '📡', Cloud: '☁️' };
+
+function td(text, className) {
   const cell = document.createElement('td');
+  if (className) {
+    cell.className = className;
+  }
   cell.textContent = text;
   return cell;
 }
@@ -135,9 +173,9 @@ function td(text) {
 function targetCell(target) {
   const cell = document.createElement('td');
   const span = document.createElement('span');
-  span.className = 'target-' + target;
-  span.textContent = target;
-  cell.appendChild(span);
+    span.className = 'target-' + target;
+    span.textContent = (targetIcons[target] ? targetIcons[target] + ' ' : '') + target;
+    cell.appendChild(span);
   return cell;
 }
 
@@ -158,6 +196,52 @@ function clear(element) {
   }
 }
 
+function num(value) {
+  if (value == null) {
+    return '-';
+  }
+  return value >= 1000 ? value.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ' ') : String(value);
+}
+
+function tokens(value) {
+  if (value == null) {
+    return '-';
+  }
+  if (value >= 1000000) {
+    return (value / 1000000).toFixed(1) + 'M';
+  }
+  return value >= 1000 ? (value / 1000).toFixed(1) + 'k' : String(value);
+}
+
+function renderStatistics(tbodyId, today, last7Days, cloudEnabled) {
+  const tbody = document.getElementById(tbodyId);
+  clear(tbody);
+  const names = ['local', 'remote'];
+  if (cloudEnabled) {
+    names.push('cloud');
+  }
+  for (const name of names) {
+    addRow(tbody, [
+      targetCell(name.charAt(0).toUpperCase() + name.slice(1)),
+      td(num(today[name].requests), 'num today'),
+      td(tokens(today[name].inputTokens), 'num today'),
+      td(tokens(today[name].outputTokens), 'num today'),
+      td(num(last7Days[name].requests), 'num'),
+      td(tokens(last7Days[name].inputTokens), 'num'),
+      td(tokens(last7Days[name].outputTokens), 'num')
+    ]);
+  }
+  addRow(tbody, [
+    td('Total'),
+    td(num(today.total.requests), 'num today'),
+    td(tokens(today.total.inputTokens), 'num today'),
+    td(tokens(today.total.outputTokens), 'num today'),
+    td(num(last7Days.total.requests), 'num'),
+    td(tokens(last7Days.total.inputTokens), 'num'),
+    td(tokens(last7Days.total.outputTokens), 'num')
+  ], 'total');
+}
+
 async function refresh() {
   try {
     const res = await fetch('/monitor/api');
@@ -176,7 +260,8 @@ async function refresh() {
       const dot = document.createElement('span');
       dot.className = 'dot';
       div.appendChild(dot);
-      const label = name.charAt(0).toUpperCase() + name.slice(1) + ': ' + (!enabled ? 'Disabled' : (busy ? 'Busy' : 'Idle'));
+      const targetName = name.charAt(0).toUpperCase() + name.slice(1);
+            const label = (targetIcons[targetName] + ' ') + targetName + ': ' + (!enabled ? 'Disabled' : (busy ? 'Busy' : 'Idle'));
       div.appendChild(document.createTextNode(label));
 
       const toggle = document.createElement('label');
@@ -192,6 +277,8 @@ async function refresh() {
       instances.appendChild(div);
     }
 
+    renderStatistics('statsRows', data.statistics.today, data.statistics.last7Days, data.cloudEnabled);
+
     const inProgressRows = document.getElementById('inProgressRows');
     clear(inProgressRows);
     if (data.inProgress.length === 0) {
@@ -204,8 +291,8 @@ async function refresh() {
         addRow(inProgressRows, [
           targetCell(r.target),
           td(r.model),
-          td(r.estimatedPromptTokens),
-          td((r.elapsedMs / 1000).toFixed(1) + 's')
+          td(tokens(r.estimatedPromptTokens), 'num'),
+          td((r.elapsedMs / 1000).toFixed(1) + 's', 'num')
         ], 'pending');
       }
     }
@@ -214,15 +301,14 @@ async function refresh() {
     clear(rows);
     for (const r of data.requests) {
       const time = new Date(r.timestamp).toLocaleTimeString();
-      const inputTokens = r.estimatedPromptTokens + ' / ' + (r.actualPromptTokens ?? '-');
       addRow(rows, [
-        td(time),
+        td(time, 'num'),
         targetCell(r.target),
         td(r.model),
-        td(inputTokens),
-        td(r.actualResponseTokens ?? '-'),
-        td((r.elapsedMs / 1000).toFixed(1) + 's'),
-        td(r.statusCode)
+        td(tokens(r.estimatedPromptTokens) + ' / ' + tokens(r.actualPromptTokens), 'num'),
+        td(tokens(r.actualResponseTokens), 'num'),
+        td((r.elapsedMs / 1000).toFixed(1) + 's', 'num'),
+        td(r.statusCode, 'num')
       ], r.success ? null : 'fail');
     }
   } catch (e) {
