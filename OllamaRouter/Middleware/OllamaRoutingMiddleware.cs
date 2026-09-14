@@ -20,6 +20,7 @@ public sealed class OllamaRoutingMiddleware(
     IModelCatalogCacheService modelCatalogCache,
     IActivityMonitorService activityMonitor,
     IActivityStatisticsService activityStatistics,
+    ITargetAvailabilityService targetAvailability,
     IOptions<OllamaRouterOptions> options,
     ILogger<OllamaRoutingMiddleware> logger)
 {
@@ -36,8 +37,10 @@ public sealed class OllamaRoutingMiddleware(
         }
         else
         {
-            // Default (pull, push, delete...): target the local instance.
-            context.Request.Headers[OllamaReverseProxyConfig.TargetHeader] = OllamaReverseProxyConfig.LocalTarget;
+            // Default (pull, push, delete...): target the local instance if enabled, otherwise remote.
+            context.Request.Headers[OllamaReverseProxyConfig.TargetHeader] = targetAvailability.IsEnabled(RoutingTarget.Local)
+                ? OllamaReverseProxyConfig.LocalTarget
+                : OllamaReverseProxyConfig.RemoteTarget;
             await next(context);
         }
     }
@@ -63,7 +66,7 @@ public sealed class OllamaRoutingMiddleware(
 
         var modelName = "unknown";
         var tokenCount = 0;
-        var target = RoutingTarget.Remote;
+        RoutingTarget target;
 
         try
         {
@@ -77,9 +80,33 @@ public sealed class OllamaRoutingMiddleware(
 
             logger.LogInformation("{ModelName} - Tokens: {TokenCount} => {Target}", modelName, tokenCount, target);
         }
+        catch (NoAvailableTargetException ex)
+        {
+            logger.LogWarning(ex, "No target could handle the request: {Message}", ex.Message);
+            context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+            context.Response.ContentType = "application/json";
+            await context.Response.WriteAsync(JsonSerializer.Serialize(new { error = ex.Message }));
+            return;
+        }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Error while inspecting the request. Falling back to Remote routing.");
+            logger.LogError(ex, "Error while inspecting the request. Falling back to default routing.");
+            var fallback = targetAvailability.IsEnabled(RoutingTarget.Remote)
+                ? RoutingTarget.Remote
+                : targetAvailability.IsEnabled(RoutingTarget.Local)
+                    ? RoutingTarget.Local
+                    : (RoutingTarget?)null;
+
+            if (fallback is null)
+            {
+                logger.LogWarning("No enabled routing target available for fallback.");
+                context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+                context.Response.ContentType = "application/json";
+                await context.Response.WriteAsync(JsonSerializer.Serialize(new { error = "No enabled routing target is available." }));
+                return;
+            }
+
+            target = fallback.Value;
         }
 
         context.Request.Headers[OllamaReverseProxyConfig.TargetHeader] = target switch
@@ -215,20 +242,27 @@ public sealed class OllamaRoutingMiddleware(
         {
             var modelName = OllamaRequestParser.ExtractModelName(body);
 
-            // Prefer the remote instance when the model is known to be available there, since it
-            // typically advertises a larger context window; otherwise fall back to the local instance.
-            var existsRemotely = await modelCatalogCache.ModelExistsAsync(options.Value.RemoteUrl, modelName, context.RequestAborted);
+            var remoteEnabled = targetAvailability.IsEnabled(RoutingTarget.Remote);
+            var localEnabled = targetAvailability.IsEnabled(RoutingTarget.Local);
 
-            logger.LogInformation("{ModelName} - /api/show => {Target}", modelName, existsRemotely ? "Remote" : "Local");
+            // Prefer the remote instance when enabled and the model is known to be available there;
+            // otherwise fall back to local if enabled, or remote if it is the only enabled target.
+            var existsRemotely = remoteEnabled && await modelCatalogCache.ModelExistsAsync(options.Value.RemoteUrl, modelName, context.RequestAborted);
 
-            context.Request.Headers[OllamaReverseProxyConfig.TargetHeader] = existsRemotely
+            var target = (existsRemotely || (remoteEnabled && !localEnabled))
                 ? OllamaReverseProxyConfig.RemoteTarget
                 : OllamaReverseProxyConfig.LocalTarget;
+
+            logger.LogInformation("{ModelName} - /api/show => {Target}", modelName, target);
+
+            context.Request.Headers[OllamaReverseProxyConfig.TargetHeader] = target;
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Error while inspecting the /api/show request. Falling back to Remote routing.");
-            context.Request.Headers[OllamaReverseProxyConfig.TargetHeader] = OllamaReverseProxyConfig.RemoteTarget;
+            logger.LogError(ex, "Error while inspecting the /api/show request. Falling back to default routing.");
+            context.Request.Headers[OllamaReverseProxyConfig.TargetHeader] = targetAvailability.IsEnabled(RoutingTarget.Remote)
+                ? OllamaReverseProxyConfig.RemoteTarget
+                : OllamaReverseProxyConfig.LocalTarget;
         }
     }
 

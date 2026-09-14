@@ -1,8 +1,12 @@
+using System.Text;
 using OllamaRouter.Endpoints;
 using OllamaRouter.Middleware;
 using OllamaRouter.Options;
 using OllamaRouter.ReverseProxy;
 using OllamaRouter.Services;
+
+Console.OutputEncoding = Encoding.UTF8;
+Console.Title = "Ollama Router";
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -22,6 +26,9 @@ builder.Services.AddMemoryCache();
 builder.Services.AddSingleton<ITokenEstimator, TiktokenTokenEstimator>();
 builder.Services.AddSingleton<IGpuVramProvider, NvidiaSmiVramProvider>();
 builder.Services.AddTransient<IOllamaModelCatalogClient, OllamaModelCatalogClient>();
+builder.Services.AddTransient<IRoutingTargetHandler, LocalRoutingTargetHandler>();
+builder.Services.AddTransient<IRoutingTargetHandler, RemoteRoutingTargetHandler>();
+builder.Services.AddTransient<IRoutingTargetHandler, CloudRoutingTargetHandler>();
 builder.Services.AddTransient<IRoutingDecisionService, RoutingDecisionService>();
 builder.Services.AddSingleton<IModelCatalogCacheService, ModelCatalogCacheService>();
 builder.Services.AddSingleton<IOllamaProcessLauncher, OllamaProcessLauncher>();
@@ -69,7 +76,9 @@ app.MapReverseProxy();
 app.Lifetime.ApplicationStarted.Register(() =>
 {
     var monitorUrl = ollamaOptions.BindAddress.TrimEnd('/').Replace("+", "localhost") + "/monitor";
-    Console.WriteLine($"Activity monitor available at: {monitorUrl}");
+    Console.WriteLine("✅ Ollama Router is running");
+    Console.WriteLine();
+    Console.WriteLine($"📊 Activity monitor available at: {monitorUrl}");
 });
 
 // Listen on the configured address (defaults to the standard Ollama port).

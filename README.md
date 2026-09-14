@@ -50,18 +50,20 @@ Requests to the following endpoints are inspected to extract the prompt and the 
 - `POST /v1/chat/completions`
 - `POST /v1/completions`
 
-For these requests, the routing decision is made as follows:
+For these requests, the routing decision is orchestrated by `RoutingDecisionService` using a priority-ordered chain of target handlers (`IRoutingTargetHandler`: **Local** → **Remote** → **Cloud**):
 
-0. If **both** Local and Remote are currently busy processing another request, and the model has a `CloudModel` configured, the request immediately overflows to **Cloud** (see [Cloud overflow](#cloud-overflow)).
-1. Only models explicitly configured under `OllamaRouter:Models` are eligible for local routing. Any other model name is routed to **Remote** immediately.
-2. The prompt is tokenized and the token count is estimated.
-3. If the estimated token count exceeds the per-model `MaxLocalTokens`, the request would be routed to **Remote** (the context wouldn't fit reliably on the local GPU) — or to **Cloud** instead if Remote is currently busy and a `CloudModel` is configured.
-4. Otherwise, if the requested model is already loaded on the **local** instance (checked via `/api/ps`), the request is routed to **Local** (no need to check VRAM, it's already loaded).
-5. Otherwise, the free VRAM on the local GPU is checked (via `nvidia-smi`). If it is greater than or equal to the per-model `MinRequiredVramMB`, the request is routed to **Local**; otherwise it would be routed to **Remote**, or to **Cloud** if Remote is currently busy and a `CloudModel` is configured.
+1. **Available target dispatch:** The router evaluates targets in order and dispatches the request to the first target that is **available** (enabled and not busy) and **capable** of handling it (`CanProcessAsync`):
+   - **Local (`LocalRoutingTargetHandler`)**: Eligible if the model is configured under `OllamaRouter:Models`, exists in the local catalog, the estimated token count fits within `MaxLocalTokens`, and the model is either already loaded in memory (checked via `/api/ps`) or sufficient free GPU VRAM is available (checked via `nvidia-smi` against `MinRequiredVramMB`). If a model is only available locally, Local handles it exclusively.
+   - **Remote (`RemoteRoutingTargetHandler`)**: Accepts requests for models that are available remotely (unconfigured models, models exceeding local token limits, or models that don't fit local VRAM naturally fall through to Remote).
+   - **Cloud (`CloudRoutingTargetHandler`, overflow)**: Acts as an overflow target. If Local and Remote are unavailable or cannot handle the request, Cloud accepts it if enabled and a `CloudModel` is configured for the requested model (see [Cloud overflow](#cloud-overflow)).
+2. **Busy fallback:** If all eligible targets are currently busy:
+   - The router falls back to the first capable **enabled non-overflow target** (Local or Remote), allowing requests to queue behind a busy primary instance.
+   - If no primary target can handle the request, it checks enabled overflow targets (Cloud).
+   - If no enabled target is capable of handling the request, OllamaRouter rejects the request with HTTP `503 Service Unavailable`.
 
-If the request body cannot be parsed for any reason, the request is routed to **Remote** as a safe fallback.
+If the request body cannot be parsed for any reason, the request falls back to the default enabled instance (Remote if enabled, otherwise Local).
 
-> **Note.** Each target (**Local**, **Remote**, **Cloud**) can also be disabled individually, at any time, from the [monitoring page](#monitoring). A disabled **Local** or **Remote** instance behaves exactly like a **busy** one, while disabling **Cloud** is exactly like not having any `CloudModel` configured. This lets you switch the router between operating modes (Local + Cloud, Remote + Cloud, a single destination, …) without restarting it.
+> **Note.** Each target (**Local**, **Remote**, **Cloud**) can also be disabled individually, at any time, from the [monitoring page](#monitoring). If a target is disabled, it will **never** handle any request. A **busy** target can still accept queued requests as a fallback when all eligible instances are in use, but a **disabled** target is completely excluded from routing. Disabling **Cloud** disables cloud overflow for all models. This lets you switch the router between operating modes (Local only, Remote only, Local + Cloud, Remote + Cloud, …) without restarting it.
 
 ### Cloud overflow
 
@@ -206,7 +208,7 @@ OllamaRouter exposes a very lightweight, dependency-free monitoring page at `/mo
 The page shows:
 
 - Whether each instance (**Local**/**Remote**, and **Cloud** when at least one model has a `CloudModel` configured, see [Cloud overflow](#cloud-overflow)) is currently **busy** processing a chat/generate request.
-- An **Enabled** checkbox per instance, to enable/disable each target at runtime. Toggling it immediately changes the routing behavior (a disabled **Local**/**Remote** acts like a busy instance, disabling **Cloud** acts like no `CloudModel` being configured) and the new state is persisted to a dedicated JSON file (`%LOCALAPPDATA%\OllamaRouter\targets.json` on Windows), so it is restored on the next startup. The state file is written on a best-effort ("failsafe") basis: if it cannot be written, the change still takes effect in memory and a warning is logged — `appsettings.json` is never modified at runtime.
+- An **Enabled** checkbox per instance, to enable/disable each target at runtime. Toggling it immediately changes the routing behavior: a disabled target is completely excluded from routing and will never receive requests (unlike a busy target, which can still queue requests if all eligible targets are busy). The new state is persisted to a dedicated JSON file (`%LOCALAPPDATA%\OllamaRouter\targets.json` on Windows), so it is restored on the next startup. The state file is written on a best-effort ("failsafe") basis: if it cannot be written, the change still takes effect in memory and a warning is logged — `appsettings.json` is never modified at runtime.
 - The requests currently **in progress**, with target instance, model, estimated input tokens and running time.
 - A history of the most recent completed requests (last 50), with model, estimated vs. actual input tokens, actual output tokens, elapsed time and HTTP status. Failed requests are highlighted.
 - Aggregated **token statistics** per target (and overall total): number of requests, actual input tokens and actual output tokens, both for the **current day** and for the **last 7 days**. Only successful requests with actual token counts are counted. These statistics are persisted to a dedicated JSON file (`%LOCALAPPDATA%\OllamaRouter\activity-statistics.json` on Windows) so they survive restarts, and are written on a best-effort basis (throttled to at most one write per 30 seconds, on day rollover, and on application shutdown).
@@ -224,7 +226,12 @@ The page auto-refreshes every 2 seconds by polling `/monitor/api`. A clickable l
 ## Project structure
 
 - `Middleware/OllamaRoutingMiddleware.cs` – inspects intercepted requests and sets the `X-Ollama-Target` header used by YARP for routing.
-- `Services/RoutingDecisionService.cs` – encapsulates the routing policy (token limit, model already loaded, free VRAM).
+- `Services/RoutingDecisionService.cs` – orchestrates the chain of target handlers to make the routing decision (first available capable target, with queued fallback when busy).
+- `Services/IRoutingTargetHandler.cs` – abstraction for routing destinations (`Local`, `Remote`, `Cloud`) defining availability, overflow status, and request capability.
+- `Services/LocalRoutingTargetHandler.cs` – target handler for the local Ollama instance (model configuration, token limits, loaded models, GPU VRAM).
+- `Services/RemoteRoutingTargetHandler.cs` – target handler for the remote server.
+- `Services/CloudRoutingTargetHandler.cs` – overflow target handler relaying to ollama.com cloud models when primary instances are busy.
+- `Services/RoutingContext.cs` – encapsulates request parameters, token estimates, thresholds, and shared catalog checks for a routing decision.
 - `Services/OllamaModelCatalogClient.cs` – fetches and merges model catalogs (`/api/tags`, `/v1/models`, `/api/ps`) from both instances.
 - `Parsing/OllamaRequestParser.cs` – extracts the prompt and model name from request bodies.
 - `ReverseProxy/OllamaReverseProxyConfig.cs` – builds the YARP routes/clusters in code.

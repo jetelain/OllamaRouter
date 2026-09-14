@@ -26,8 +26,15 @@ public class OllamaRoutingMiddlewareTests
         Mock<IRoutingDecisionService> routingDecisionService,
         Mock<IModelCatalogCacheService>? modelCatalogCache = null,
         Mock<IActivityMonitorService>? activityMonitor = null,
-        Mock<IActivityStatisticsService>? activityStatistics = null)
+        Mock<IActivityStatisticsService>? activityStatistics = null,
+        Mock<ITargetAvailabilityService>? targetAvailability = null)
     {
+        var effectiveTargetAvailability = targetAvailability ?? new Mock<ITargetAvailabilityService>();
+        if (targetAvailability is null)
+        {
+            effectiveTargetAvailability.Setup(t => t.IsEnabled(It.IsAny<RoutingTarget>())).Returns(true);
+        }
+
         return new OllamaRoutingMiddleware(
             next,
             tokenEstimator.Object,
@@ -35,6 +42,7 @@ public class OllamaRoutingMiddlewareTests
             (modelCatalogCache ?? new Mock<IModelCatalogCacheService>()).Object,
             (activityMonitor ?? new Mock<IActivityMonitorService>()).Object,
             (activityStatistics ?? new Mock<IActivityStatisticsService>()).Object,
+            effectiveTargetAvailability.Object,
             MsOptions.Create(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
             NullLogger<OllamaRoutingMiddleware>.Instance);
     }
@@ -116,6 +124,70 @@ public class OllamaRoutingMiddlewareTests
         await sut.InvokeAsync(context);
 
         Assert.Equal("Remote", context.Request.Headers["X-Ollama-Target"]);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_RoutingDecisionThrowsNoAvailableTargetException_Returns503()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Bonjour" }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<string>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new NoAvailableTargetException("No enabled routing target is available."));
+
+        var nextCalled = false;
+        var sut = CreateSut(_ => { nextCalled = true; return Task.CompletedTask; }, tokenEstimator, routingDecisionService);
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal(StatusCodes.Status503ServiceUnavailable, context.Response.StatusCode);
+        Assert.False(nextCalled);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_ExceptionDuringInspection_RemoteDisabled_FallsBackToLocal()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Bonjour" }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<string>())).Throws(new InvalidOperationException("boom"));
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        var targetAvailability = new Mock<ITargetAvailabilityService>();
+        targetAvailability.Setup(t => t.IsEnabled(RoutingTarget.Local)).Returns(true);
+        targetAvailability.Setup(t => t.IsEnabled(RoutingTarget.Remote)).Returns(false);
+        targetAvailability.Setup(t => t.IsEnabled(RoutingTarget.Cloud)).Returns(false);
+
+        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService, targetAvailability: targetAvailability);
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("Local", context.Request.Headers["X-Ollama-Target"]);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_ExceptionDuringInspection_AllDisabled_Returns503()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Bonjour" }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<string>())).Throws(new InvalidOperationException("boom"));
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        var targetAvailability = new Mock<ITargetAvailabilityService>();
+        targetAvailability.Setup(t => t.IsEnabled(It.IsAny<RoutingTarget>())).Returns(false);
+
+        var nextCalled = false;
+        var sut = CreateSut(_ => { nextCalled = true; return Task.CompletedTask; }, tokenEstimator, routingDecisionService, targetAvailability: targetAvailability);
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal(StatusCodes.Status503ServiceUnavailable, context.Response.StatusCode);
+        Assert.False(nextCalled);
     }
 
     [Fact]

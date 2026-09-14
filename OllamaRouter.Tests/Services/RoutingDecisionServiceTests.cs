@@ -1,3 +1,4 @@
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Moq;
@@ -44,8 +45,14 @@ public class RoutingDecisionServiceTests
 
         modelCatalogCacheService ??= CreateModelCatalogCacheServiceAvailableOnBoth();
         activityMonitor ??= CreateActivityMonitorNotBusy();
+        var handlers = new IRoutingTargetHandler[]
+        {
+            new LocalRoutingTargetHandler(options, catalogClient.Object, gpuVramProvider.Object, activityMonitor.Object, targetAvailability.Object),
+            new RemoteRoutingTargetHandler(activityMonitor.Object, targetAvailability.Object),
+            new CloudRoutingTargetHandler(activityMonitor.Object, targetAvailability.Object)
+        };
 
-        return new RoutingDecisionService(options, catalogClient.Object, modelCatalogCacheService.Object, gpuVramProvider.Object, activityMonitor.Object, targetAvailability.Object, NullLogger<RoutingDecisionService>.Instance);
+        return new RoutingDecisionService(handlers, options, modelCatalogCacheService.Object, NullLogger<RoutingDecisionService>.Instance);
     }
 
     private static Mock<IActivityMonitorService> CreateActivityMonitorNotBusy()
@@ -419,7 +426,7 @@ public class RoutingDecisionServiceTests
     }
 
     [Fact]
-    public async Task DecideAsync_RemoteDisabled_CloudDisabled_TokenCountExceedsMax_ReturnsRemote()
+    public async Task DecideAsync_RemoteDisabled_CloudDisabled_TokenCountExceedsMax_ThrowsNoAvailableTargetException()
     {
         var catalogClient = new Mock<IOllamaModelCatalogClient>();
         var gpuVramProvider = new Mock<IGpuVramProvider>();
@@ -427,8 +434,274 @@ public class RoutingDecisionServiceTests
             cloudModel: "deepseek-v3.1:671b-cloud",
             targets: new TargetAvailabilitySnapshot(true, false, false));
 
-        var target = await sut.DecideAsync(tokenCount: 50_000, modelName: ModelName);
+        await Assert.ThrowsAsync<NoAvailableTargetException>(() => sut.DecideAsync(tokenCount: 50_000, modelName: ModelName));
+    }
 
-        Assert.Equal(RoutingTarget.Remote, target);
+    [Fact]
+    public async Task DecideAsync_RemoteDisabled_CloudDisabled_WithinLocalLimits_ReturnsLocal()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
+        var sut = CreateSut(catalogClient, gpuVramProvider,
+            cloudModel: "deepseek-v3.1:671b-cloud",
+            targets: new TargetAvailabilitySnapshot(true, false, false));
+
+        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
+
+        Assert.Equal(RoutingTarget.Local, target);
+    }
+
+    [Fact]
+    public async Task DecideAsync_RemoteDisabled_LocalBusy_WithinLocalLimits_FallsBackToLocal()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
+        var activityMonitor = new Mock<IActivityMonitorService>();
+        activityMonitor.Setup(a => a.IsBusy(RoutingTarget.Local)).Returns(true);
+        activityMonitor.Setup(a => a.IsBusy(RoutingTarget.Remote)).Returns(false);
+        var sut = CreateSut(catalogClient, gpuVramProvider,
+            activityMonitor: activityMonitor,
+            targets: new TargetAvailabilitySnapshot(true, false, false));
+
+        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
+
+        Assert.Equal(RoutingTarget.Local, target);
+    }
+
+    [Fact]
+    public async Task DecideAsync_AllTargetsDisabled_ThrowsNoAvailableTargetException()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
+        var sut = CreateSut(catalogClient, gpuVramProvider,
+            targets: new TargetAvailabilitySnapshot(false, false, false));
+
+        await Assert.ThrowsAsync<NoAvailableTargetException>(() => sut.DecideAsync(tokenCount: 1_000, modelName: ModelName));
+    }
+
+    [Fact]
+    public async Task DecideAsync_MultiTarget_DispatchesToFirstAvailableTarget()
+    {
+        var target1 = new Mock<IRoutingTargetHandler>();
+        target1.Setup(t => t.Target).Returns(RoutingTarget.Local);
+        target1.Setup(t => t.IsEnabled).Returns(true);
+        target1.Setup(t => t.IsAvailable()).Returns(false); // busy
+        target1.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
+
+        var target2 = new Mock<IRoutingTargetHandler>();
+        target2.Setup(t => t.Target).Returns(RoutingTarget.Remote);
+        target2.Setup(t => t.IsEnabled).Returns(true);
+        target2.Setup(t => t.IsAvailable()).Returns(true);
+        target2.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
+
+        var target3Overflow = new Mock<IRoutingTargetHandler>();
+        target3Overflow.Setup(t => t.Target).Returns(RoutingTarget.Cloud);
+        target3Overflow.Setup(t => t.IsOverflow).Returns(true);
+        target3Overflow.Setup(t => t.IsEnabled).Returns(true);
+        target3Overflow.Setup(t => t.IsAvailable()).Returns(true);
+        target3Overflow.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
+
+        var options = Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions());
+        var catalogCache = new Mock<IModelCatalogCacheService>();
+        var sut = new RoutingDecisionService(
+            [target1.Object, target2.Object, target3Overflow.Object],
+            options,
+            catalogCache.Object,
+            NullLogger<RoutingDecisionService>.Instance);
+
+        var decision = await sut.DecideAsync(100, "test-model");
+
+        Assert.Equal(RoutingTarget.Remote, decision);
+        target3Overflow.Verify(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task DecideAsync_MultiTarget_AllPrimaryBusy_DispatchesToLastOverflowTarget()
+    {
+        var target1 = new Mock<IRoutingTargetHandler>();
+        target1.Setup(t => t.Target).Returns(RoutingTarget.Local);
+        target1.Setup(t => t.IsEnabled).Returns(true);
+        target1.Setup(t => t.IsAvailable()).Returns(false); // busy
+
+        var target2 = new Mock<IRoutingTargetHandler>();
+        target2.Setup(t => t.Target).Returns(RoutingTarget.Remote);
+        target2.Setup(t => t.IsEnabled).Returns(true);
+        target2.Setup(t => t.IsAvailable()).Returns(false); // busy
+
+        var target3Overflow = new Mock<IRoutingTargetHandler>();
+        target3Overflow.Setup(t => t.Target).Returns(RoutingTarget.Cloud);
+        target3Overflow.Setup(t => t.IsOverflow).Returns(true);
+        target3Overflow.Setup(t => t.IsEnabled).Returns(true);
+        target3Overflow.Setup(t => t.IsAvailable()).Returns(true);
+        target3Overflow.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
+
+        var options = Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions());
+        var catalogCache = new Mock<IModelCatalogCacheService>();
+        var sut = new RoutingDecisionService(
+            [target1.Object, target2.Object, target3Overflow.Object],
+            options,
+            catalogCache.Object,
+            NullLogger<RoutingDecisionService>.Instance);
+
+        var decision = await sut.DecideAsync(100, "test-model");
+
+        Assert.Equal(RoutingTarget.Cloud, decision);
+    }
+
+    [Fact]
+    public async Task DecideAsync_MultiTarget_NoTargetAvailable_FallsBackToFirstCapableTarget()
+    {
+        var target1 = new Mock<IRoutingTargetHandler>();
+        target1.Setup(t => t.Target).Returns(RoutingTarget.Local);
+        target1.Setup(t => t.IsEnabled).Returns(true);
+        target1.Setup(t => t.IsAvailable()).Returns(false); // busy
+        target1.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
+
+        var target2 = new Mock<IRoutingTargetHandler>();
+        target2.Setup(t => t.Target).Returns(RoutingTarget.Remote);
+        target2.Setup(t => t.IsEnabled).Returns(true);
+        target2.Setup(t => t.IsAvailable()).Returns(false); // busy
+        target2.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
+
+        var target3Overflow = new Mock<IRoutingTargetHandler>();
+        target3Overflow.Setup(t => t.Target).Returns(RoutingTarget.Cloud);
+        target3Overflow.Setup(t => t.IsOverflow).Returns(true);
+        target3Overflow.Setup(t => t.IsEnabled).Returns(true);
+        target3Overflow.Setup(t => t.IsAvailable()).Returns(false); // busy
+        target3Overflow.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
+
+        var options = Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions());
+        var catalogCache = new Mock<IModelCatalogCacheService>();
+        var sut = new RoutingDecisionService(
+            [target1.Object, target2.Object, target3Overflow.Object],
+            options,
+            catalogCache.Object,
+            NullLogger<RoutingDecisionService>.Instance);
+
+        var decision = await sut.DecideAsync(100, "test-model");
+
+        // Falls back to target1 (Local) as the first capable target
+        Assert.Equal(RoutingTarget.Local, decision);
+    }
+
+    [Fact]
+    public async Task DecideAsync_MultiTarget_NoTargetAvailable_FirstUnable_FallsBackToSecondCapableTarget()
+    {
+        var target1 = new Mock<IRoutingTargetHandler>();
+        target1.Setup(t => t.Target).Returns(RoutingTarget.Local);
+        target1.Setup(t => t.IsEnabled).Returns(true);
+        target1.Setup(t => t.IsAvailable()).Returns(false); // busy
+        target1.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(false); // cannot handle
+
+        var target2 = new Mock<IRoutingTargetHandler>();
+        target2.Setup(t => t.Target).Returns(RoutingTarget.Remote);
+        target2.Setup(t => t.IsEnabled).Returns(true);
+        target2.Setup(t => t.IsAvailable()).Returns(false); // busy
+        target2.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(true); // can handle
+
+        var target3Overflow = new Mock<IRoutingTargetHandler>();
+        target3Overflow.Setup(t => t.Target).Returns(RoutingTarget.Cloud);
+        target3Overflow.Setup(t => t.IsOverflow).Returns(true);
+        target3Overflow.Setup(t => t.IsEnabled).Returns(true);
+        target3Overflow.Setup(t => t.IsAvailable()).Returns(false); // busy
+
+        var options = Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions());
+        var catalogCache = new Mock<IModelCatalogCacheService>();
+        var sut = new RoutingDecisionService(
+            [target1.Object, target2.Object, target3Overflow.Object],
+            options,
+            catalogCache.Object,
+            NullLogger<RoutingDecisionService>.Instance);
+
+        var decision = await sut.DecideAsync(100, "test-model");
+
+        // Falls back to target2 (Remote) as target1 cannot handle the request
+        Assert.Equal(RoutingTarget.Remote, decision);
+    }
+
+    [Fact]
+    public async Task DecideAsync_MultiTarget_DisabledTarget_NeverHandlesRequest()
+    {
+        var target1 = new Mock<IRoutingTargetHandler>();
+        target1.Setup(t => t.Target).Returns(RoutingTarget.Local);
+        target1.Setup(t => t.IsEnabled).Returns(false); // disabled!
+        target1.Setup(t => t.IsAvailable()).Returns(false);
+        target1.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(false);
+
+        var target2 = new Mock<IRoutingTargetHandler>();
+        target2.Setup(t => t.Target).Returns(RoutingTarget.Remote);
+        target2.Setup(t => t.IsEnabled).Returns(true); // enabled but busy
+        target2.Setup(t => t.IsAvailable()).Returns(false);
+        target2.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
+
+        var options = Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions());
+        var catalogCache = new Mock<IModelCatalogCacheService>();
+        var sut = new RoutingDecisionService(
+            [target1.Object, target2.Object],
+            options,
+            catalogCache.Object,
+            NullLogger<RoutingDecisionService>.Instance);
+
+        var decision = await sut.DecideAsync(100, "test-model");
+
+        // Disabled target1 must never be selected; falls back to busy enabled target2
+        Assert.Equal(RoutingTarget.Remote, decision);
+    }
+
+    [Fact]
+    public async Task DecideAsync_MultiTarget_NoTargetCapable_ThrowsInvalidOperationException()
+    {
+        var target1 = new Mock<IRoutingTargetHandler>();
+        target1.Setup(t => t.Target).Returns(RoutingTarget.Local);
+        target1.Setup(t => t.IsEnabled).Returns(true);
+        target1.Setup(t => t.IsAvailable()).Returns(false);
+        target1.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(false);
+
+        var target2 = new Mock<IRoutingTargetHandler>();
+        target2.Setup(t => t.Target).Returns(RoutingTarget.Remote);
+        target2.Setup(t => t.IsEnabled).Returns(true);
+        target2.Setup(t => t.IsAvailable()).Returns(false);
+        target2.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(false);
+
+        var options = Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions());
+        var catalogCache = new Mock<IModelCatalogCacheService>();
+        var sut = new RoutingDecisionService(
+            [target1.Object, target2.Object],
+            options,
+            catalogCache.Object,
+            NullLogger<RoutingDecisionService>.Instance);
+
+        await Assert.ThrowsAsync<NoAvailableTargetException>(() => sut.DecideAsync(100, "test-model"));
+    }
+
+    [Fact]
+    public void ServiceCollection_CanResolveRoutingDecisionService_WithoutAmbiguousConstructors()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddOptions();
+        services.Configure<OllamaRouterOptions>(_ => { });
+        services.AddSingleton(new Mock<IOllamaModelCatalogClient>().Object);
+        services.AddSingleton(new Mock<IModelCatalogCacheService>().Object);
+        services.AddSingleton(new Mock<IGpuVramProvider>().Object);
+        services.AddSingleton(new Mock<IActivityMonitorService>().Object);
+        services.AddSingleton(new Mock<ITargetAvailabilityService>().Object);
+
+        services.AddTransient<IRoutingTargetHandler, LocalRoutingTargetHandler>();
+        services.AddTransient<IRoutingTargetHandler, RemoteRoutingTargetHandler>();
+        services.AddTransient<IRoutingTargetHandler, CloudRoutingTargetHandler>();
+        services.AddTransient<IRoutingDecisionService, RoutingDecisionService>();
+
+        var serviceProvider = services.BuildServiceProvider(new ServiceProviderOptions
+        {
+            ValidateOnBuild = true,
+            ValidateScopes = true
+        });
+
+        var instance = serviceProvider.GetRequiredService<IRoutingDecisionService>();
+        Assert.NotNull(instance);
     }
 }

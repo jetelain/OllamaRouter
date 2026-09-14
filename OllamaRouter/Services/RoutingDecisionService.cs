@@ -1,119 +1,77 @@
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using OllamaRouter.Options;
 
 namespace OllamaRouter.Services;
 
-public sealed class RoutingDecisionService(
-    IOptions<OllamaRouterOptions> options,
-    IOllamaModelCatalogClient modelCatalogClient,
-    IModelCatalogCacheService modelCatalogCacheService,
-    IGpuVramProvider gpuVramProvider,
-    IActivityMonitorService activityMonitor,
-    ITargetAvailabilityService targetAvailability,
-    ILogger<RoutingDecisionService> logger) : IRoutingDecisionService
+public sealed class RoutingDecisionService : IRoutingDecisionService
 {
+    private readonly IReadOnlyList<IRoutingTargetHandler> _targets;
+    private readonly IOptions<OllamaRouterOptions> _options;
+    private readonly IModelCatalogCacheService _modelCatalogCacheService;
+    private readonly ILogger<RoutingDecisionService> _logger;
+
+    public RoutingDecisionService(
+        IEnumerable<IRoutingTargetHandler> targets,
+        IOptions<OllamaRouterOptions> options,
+        IModelCatalogCacheService modelCatalogCacheService,
+        ILogger<RoutingDecisionService> logger)
+    {
+        _targets = targets.ToList();
+        _options = options;
+        _modelCatalogCacheService = modelCatalogCacheService;
+        _logger = logger;
+    }
+
     public async Task<RoutingTarget> DecideAsync(int tokenCount, string modelName, CancellationToken cancellationToken = default)
     {
-        var settings = options.Value;
+        var settings = _options.Value;
         var normalizedName = NormalizeModelName(modelName);
+        settings.Models.TryGetValue(normalizedName, out var thresholds);
 
-        // Only models explicitly configured in the options dict are allowed to run locally.
-        if (settings.Models.TryGetValue(normalizedName, out var thresholds))
+        var context = new RoutingContext(
+            tokenCount,
+            modelName,
+            normalizedName,
+            thresholds,
+            _modelCatalogCacheService,
+            settings.LocalUrl.TrimEnd('/'),
+            settings.RemoteUrl.TrimEnd('/'),
+            cancellationToken);
+
+        // 1. Dispatch to the first target that is available and able to process the request.
+        foreach (var target in _targets)
         {
-            // A disabled Cloud target simply turns off overflow, as if no CloudModel was configured.
-            var cloudModel = targetAvailability.IsEnabled(RoutingTarget.Cloud) ? thresholds.CloudModel : null;
-
-            if (!string.IsNullOrEmpty(cloudModel) &&
-                IsBusyOrDisabled(RoutingTarget.Local) &&
-                IsBusyOrDisabled(RoutingTarget.Remote))
+            if (target.IsAvailable() && await target.CanProcessAsync(context, cancellationToken))
             {
-                logger.LogDebug("{Model}: Local and Remote are both busy or disabled, overflowing to Cloud ({CloudModel}).", normalizedName, cloudModel);
-                return RoutingTarget.Cloud;
+                _logger.LogDebug("{Model}: Routing to available target {Target}.", normalizedName, target.Target);
+                return target.Target;
             }
-
-            var localUrl = settings.LocalUrl.TrimEnd('/');
-            var remoteUrl = settings.RemoteUrl.TrimEnd('/');
-
-            // Since the configuration key is tag-agnostic, the requested tag may not actually be
-            // available on either (or both) targets. Check availability before deciding.
-            var existsLocallyTask = modelCatalogCacheService.ModelExistsAsync(localUrl, modelName, cancellationToken);
-            var existsRemotelyTask = modelCatalogCacheService.ModelExistsAsync(remoteUrl, modelName, cancellationToken);
-            await Task.WhenAll(existsLocallyTask, existsRemotelyTask);
-            var existsLocally = await existsLocallyTask;
-            var existsRemotely = await existsRemotelyTask;
-
-            if (existsLocally && !existsRemotely)
-            {
-                logger.LogDebug("{Model} is only available locally, routing to Local.", modelName);
-                return RoutingTarget.Local;
-            }
-
-            if (!existsLocally && existsRemotely)
-            {
-                logger.LogDebug("{Model} is only available remotely, routing to Remote.", modelName);
-                return RemoteOrCloudOverflow(normalizedName, cloudModel, "the model is not available locally");
-            }
-
-            if (!existsLocally && !existsRemotely)
-            {
-                logger.LogDebug("{Model} is not available on either target, routing to Remote.", modelName);
-                return RemoteOrCloudOverflow(normalizedName, cloudModel, "the model is not available on either target");
-            }
-
-            // Beyond the per-model token limit, there is no need to query anything else.
-            if (tokenCount > thresholds.MaxLocalTokens)
-            {
-                logger.LogDebug("{Model}: tokenCount {TokenCount} exceeds max {Max}, routing to Remote.", normalizedName, tokenCount, thresholds.MaxLocalTokens);
-                return RemoteOrCloudOverflow(normalizedName, cloudModel, $"tokenCount {tokenCount} exceeds max {thresholds.MaxLocalTokens}");
-            }
-
-            // If the model is already loaded locally, no need to check the available VRAM.
-            if (await modelCatalogClient.IsModelLoadedLocallyAsync(localUrl, modelName, cancellationToken))
-            {
-                logger.LogDebug("{Model} already loaded locally.", normalizedName);
-                return RoutingTarget.Local;
-            }
-
-            var freeVramMB = gpuVramProvider.GetFreeVramMB();
-            if (freeVramMB >= thresholds.MinRequiredVramMB)
-            {
-                logger.LogDebug("{Model}: freeVram {Free}MB, minRequired {Min}MB, routing to Local.", normalizedName, freeVramMB, thresholds.MinRequiredVramMB);
-                return RoutingTarget.Local;
-            }
-
-            logger.LogDebug("{Model}: freeVram {Free}MB, minRequired {Min}MB, routing to Remote.", normalizedName, freeVramMB, thresholds.MinRequiredVramMB);
-            return RemoteOrCloudOverflow(normalizedName, cloudModel, $"freeVram {freeVramMB}MB is below required {thresholds.MinRequiredVramMB}MB");
         }
 
-        logger.LogDebug("{Model} is not configured for local routing, routing to Remote.", normalizedName);
-        return RoutingTarget.Remote;
-    }
-
-    /// <summary>
-    /// The Local instance cannot (or should not) handle the request. Routes to Remote, unless
-    /// Remote is currently busy or disabled and a cloud equivalent is configured for the model, in
-    /// which case overflows to Cloud instead of queueing behind the busy/disabled Remote instance.
-    /// </summary>
-    private RoutingTarget RemoteOrCloudOverflow(string normalizedName, string? cloudModel, string reason)
-    {
-        if (!string.IsNullOrEmpty(cloudModel) && IsBusyOrDisabled(RoutingTarget.Remote))
+        // 2. If no target is available, fallback to the first enabled target that is able to handle the request.
+        // Non-overflow targets are evaluated first so that busy primary instances take precedence over overflow.
+        foreach (var target in _targets.Where(t => t.IsEnabled && !t.IsOverflow))
         {
-            logger.LogDebug("{Model}: Local cannot handle the request ({Reason}) and Remote is busy or disabled, overflowing to Cloud ({CloudModel}).", normalizedName, reason, cloudModel);
-            return RoutingTarget.Cloud;
+            if (await target.CanProcessAsync(context, cancellationToken))
+            {
+                _logger.LogDebug("{Model}: No target available, falling back to {Target}.", normalizedName, target.Target);
+                return target.Target;
+            }
         }
 
-        return RoutingTarget.Remote;
-    }
+        foreach (var target in _targets.Where(t => t.IsEnabled && t.IsOverflow))
+        {
+            if (await target.CanProcessAsync(context, cancellationToken))
+            {
+                _logger.LogDebug("{Model}: No non-overflow target available, falling back to overflow target {Target}.", normalizedName, target.Target);
+                return target.Target;
+            }
+        }
 
-    /// <summary>
-    /// A target is treated as busy if it is either actually in use, or has been manually disabled
-    /// from the monitoring page. A disabled Local/Remote target thus behaves exactly like a busy
-    /// one for routing/overflow purposes.
-    /// </summary>
-    private bool IsBusyOrDisabled(RoutingTarget target)
-    {
-        return !targetAvailability.IsEnabled(target) || activityMonitor.IsBusy(target);
+        _logger.LogWarning("{Model}: No enabled target can handle the request.", normalizedName);
+        throw new NoAvailableTargetException($"No enabled routing target is available to handle the request for model '{modelName}'.");
     }
 
     /// <summary>
