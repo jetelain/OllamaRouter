@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json.Nodes;
 
 namespace OllamaRouter.Services;
@@ -53,35 +54,79 @@ public sealed class OllamaModelCatalogClient(IHttpClientFactory httpClientFactor
             return false;
         }
 
+        var runningModels = await GetRunningModelNamesAsync(localUrl, cancellationToken);
+        return runningModels.Any(m => string.Equals(m, modelName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    public async Task<IReadOnlyList<string>> GetRunningModelNamesAsync(string? baseUrl, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(baseUrl))
+        {
+            return [];
+        }
+
+        using var client = httpClientFactory.CreateClient();
+        var models = await FetchArraySafeAsync(client, BuildUrl(baseUrl, "/api/ps"), "models", cancellationToken);
+        var names = new List<string>();
+        foreach (var model in models)
+        {
+            var name = model?["name"]?.ToString() ?? model?["model"]?.ToString();
+            if (!string.IsNullOrWhiteSpace(name))
+            {
+                names.Add(name);
+            }
+        }
+
+        return names.Distinct().ToList();
+    }
+
+    public async Task<bool> UnloadModelAsync(string? baseUrl, string modelName, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(baseUrl) || string.IsNullOrWhiteSpace(modelName))
+        {
+            return false;
+        }
+
         try
         {
             using var client = httpClientFactory.CreateClient();
-            var response = await client.GetStringAsync($"{localUrl}/api/ps", cancellationToken);
-            var json = JsonNode.Parse(response);
-            var models = json?["models"]?.AsArray();
-
-            if (models is null)
+            var payload = new JsonObject
             {
-                return false;
-            }
-
-            foreach (var model in models)
-            {
-                if (model?["name"]?.ToString() == modelName)
-                {
-                    return true;
-                }
-            }
+                ["model"] = modelName,
+                ["keep_alive"] = 0,
+                ["stream"] = false
+            };
+            using var content = new StringContent(payload.ToJsonString(), Encoding.UTF8, "application/json");
+            var response = await client.PostAsync(BuildUrl(baseUrl, "/api/generate"), content, cancellationToken);
+            return response.IsSuccessStatusCode;
         }
         catch
         {
-            // If the local API does not respond, assume the model is not loaded.
+            return false;
         }
-
-        return false;
     }
 
-    private static string BuildUrl(string? baseUrl, string path) => $"{baseUrl}{path}";
+    public async Task<IReadOnlyList<string>> StopRunningModelsAsync(string? baseUrl, CancellationToken cancellationToken = default)
+    {
+        var runningModels = await GetRunningModelNamesAsync(baseUrl, cancellationToken);
+        if (runningModels.Count == 0)
+        {
+            return [];
+        }
+
+        var unloaded = new List<string>();
+        foreach (var model in runningModels)
+        {
+            if (await UnloadModelAsync(baseUrl, model, cancellationToken))
+            {
+                unloaded.Add(model);
+            }
+        }
+
+        return unloaded;
+    }
+
+    private static string BuildUrl(string? baseUrl, string path) => $"{baseUrl?.TrimEnd('/')}{path}";
 
     private static async Task<JsonArray> FetchArraySafeAsync(HttpClient client, string url, string arrayPropertyName, CancellationToken cancellationToken)
     {

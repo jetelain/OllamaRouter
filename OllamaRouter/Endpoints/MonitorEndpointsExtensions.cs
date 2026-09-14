@@ -1,4 +1,4 @@
-﻿using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Options;
 using OllamaRouter.Options;
 using OllamaRouter.Services;
 
@@ -83,6 +83,34 @@ public static class MonitorEndpointsExtensions
             return Results.Ok(new { request.Local, request.Remote, request.Cloud });
         });
 
+        app.MapPost("/monitor/reclaim-vram", async (IOllamaModelCatalogClient catalogClient, ITargetAvailabilityService targetAvailability, IOptions<OllamaRouterOptions> options, CancellationToken cancellationToken) =>
+        {
+            var targets = targetAvailability.GetSnapshot();
+            targetAvailability.Update(local: false, targets.Remote, targets.Cloud);
+
+            var localUrl = options.Value.LocalUrl?.TrimEnd('/');
+            if (string.IsNullOrWhiteSpace(localUrl))
+            {
+                return Results.Ok(new
+                {
+                    success = false,
+                    message = "Local URL is not configured.",
+                    count = 0,
+                    unloadedModels = Array.Empty<string>(),
+                    localDisabled = true
+                });
+            }
+
+            var unloaded = await catalogClient.StopRunningModelsAsync(localUrl, cancellationToken);
+            return Results.Ok(new
+            {
+                success = true,
+                count = unloaded.Count,
+                unloadedModels = unloaded,
+                localDisabled = true
+            });
+        });
+
         app.MapGet("/monitor", () => Results.Content(MonitorPageHtml, "text/html"));
 
         return app;
@@ -103,7 +131,8 @@ public static class MonitorEndpointsExtensions
   body { font-family: Segoe UI, Arial, sans-serif; margin: 1.5rem; background: #1e1e1e; color: #ddd; }
   h1 { font-size: 1.3rem; }
   h2 { font-size: 1.05rem; color: #bbb; margin-top: 1.75rem; }
-  .instances { display: flex; gap: 1rem; margin-bottom: 1.5rem; }
+  .instances { display: flex; gap: 1rem; margin-bottom: 1.5rem; align-items: flex-start; }
+  .instance-col { display: flex; flex-direction: column; gap: 0.4rem; }
   .card { padding: 0.75rem 1.25rem; border-radius: 8px; min-width: 140px; background: #2b2b2b; }
   .card.busy { background: #5a3d00; border: 1px solid #ffb300; }
   .card.idle { background: #1f3d24; border: 1px solid #3ba55c; }
@@ -114,6 +143,10 @@ public static class MonitorEndpointsExtensions
   .busy .dot { background: #ffb300; }
   .idle .dot { background: #3ba55c; }
   .disabled .dot { background: #b33333; }
+  .btn-reclaim { display: block; padding: 0.4rem 0.6rem; font-size: 0.78rem; font-weight: 500; color: #eee; background: #333; border: 1px solid #555; border-radius: 6px; cursor: pointer; width: 100%; box-sizing: border-box; text-align: center; }
+  .btn-reclaim:hover:not(:disabled) { background: #444; border-color: #888; color: #fff; }
+  .btn-reclaim:disabled { opacity: 0.6; cursor: not-allowed; }
+  .reclaim-status { font-size: 0.75rem; color: #9cdcfe; line-height: 1.2; word-break: break-word; text-align: center; }
   table { border-collapse: collapse; width: 100%; }
   th, td { text-align: left; padding: 0.35rem 0.75rem; border-bottom: 1px solid #333; font-size: 0.9rem; }
   th { color: #999; font-weight: 600; }
@@ -242,6 +275,55 @@ function renderStatistics(tbodyId, today, last7Days, cloudEnabled) {
   ], 'total');
 }
 
+let isReclaiming = false;
+let reclaimStatusText = '';
+let statusResetTimer = null;
+
+function renderReclaimButtonState() {
+  const btn = document.getElementById('reclaimBtn');
+  if (btn) {
+    btn.disabled = isReclaiming;
+    btn.textContent = isReclaiming ? '⏳ Reclaiming...' : '🎮 Reclaim local VRAM';
+  }
+  const statusDiv = document.getElementById('reclaimStatus');
+  if (statusDiv) {
+    statusDiv.textContent = reclaimStatusText;
+  }
+}
+
+async function reclaimLocalVram() {
+  if (isReclaiming) {
+    return;
+  }
+  isReclaiming = true;
+  reclaimStatusText = 'Unloading models & disabling local...';
+  renderReclaimButtonState();
+
+  try {
+    const res = await fetch('/monitor/reclaim-vram', { method: 'POST' });
+    const data = await res.json();
+    if (data.unloadedModels && data.unloadedModels.length > 0) {
+      reclaimStatusText = '✅ Local disabled & unloaded: ' + data.unloadedModels.join(', ');
+    } else {
+      reclaimStatusText = '✅ Local disabled (no models were loaded)';
+    }
+  } catch (e) {
+    console.error(e);
+    reclaimStatusText = '❌ Failed to reclaim VRAM';
+  } finally {
+    isReclaiming = false;
+    renderReclaimButtonState();
+    if (statusResetTimer) {
+      clearTimeout(statusResetTimer);
+    }
+    statusResetTimer = setTimeout(() => {
+      reclaimStatusText = '';
+      renderReclaimButtonState();
+    }, 5000);
+    await refresh();
+  }
+}
+
 async function refresh() {
   try {
     const res = await fetch('/monitor/api');
@@ -274,7 +356,30 @@ async function refresh() {
       toggle.appendChild(document.createTextNode('Enabled'));
       div.appendChild(toggle);
 
-      instances.appendChild(div);
+      if (name === 'local') {
+        const col = document.createElement('div');
+        col.className = 'instance-col';
+        col.appendChild(div);
+
+        const btn = document.createElement('button');
+        btn.id = 'reclaimBtn';
+        btn.className = 'btn-reclaim';
+        btn.title = 'Unload all running models in local Ollama instance and disable local target (e.g. to play video games)';
+        btn.disabled = isReclaiming;
+        btn.textContent = isReclaiming ? '⏳ Reclaiming...' : '🎮 Reclaim local VRAM';
+        btn.addEventListener('click', reclaimLocalVram);
+        col.appendChild(btn);
+
+        const statusDiv = document.createElement('div');
+        statusDiv.id = 'reclaimStatus';
+        statusDiv.className = 'reclaim-status';
+        statusDiv.textContent = reclaimStatusText;
+        col.appendChild(statusDiv);
+
+        instances.appendChild(col);
+      } else {
+        instances.appendChild(div);
+      }
     }
 
     renderStatistics('statsRows', data.statistics.today, data.statistics.last7Days, data.cloudEnabled);

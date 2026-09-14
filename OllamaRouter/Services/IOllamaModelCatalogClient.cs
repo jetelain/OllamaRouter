@@ -36,4 +36,20 @@ public interface IOllamaModelCatalogClient
     /// Returns an empty array if the instance is unreachable or not configured.
     /// </summary>
     Task<JsonArray> GetTagsAsync(string? baseUrl, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Fetches the list of currently running model names on the specified instance via /api/ps.
+    /// </summary>
+    Task<IReadOnlyList<string>> GetRunningModelNamesAsync(string? baseUrl, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Requests the specified instance to unload a model immediately by setting keep_alive to 0 via /api/generate.
+    /// </summary>
+    Task<bool> UnloadModelAsync(string? baseUrl, string modelName, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Unloads all currently loaded models on the specified instance to free VRAM.
+    /// Returns the list of model names that were unloaded.
+    /// </summary>
+    Task<IReadOnlyList<string>> StopRunningModelsAsync(string? baseUrl, CancellationToken cancellationToken = default);
 }
