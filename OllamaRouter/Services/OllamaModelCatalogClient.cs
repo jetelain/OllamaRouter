@@ -8,7 +8,7 @@ namespace OllamaRouter.Services;
 /// caught and treated as empty catalogs / model not loaded, so as not to block routing when
 /// one of the instances is unavailable.
 /// </summary>
-public sealed class OllamaModelCatalogClient(IHttpClientFactory httpClientFactory) : IOllamaModelCatalogClient
+public sealed class OllamaModelCatalogClient(HttpClient httpClient) : IOllamaModelCatalogClient
 {
     public async Task<JsonArray> GetMergedTagsAsync(string? localUrl, string? remoteUrl, CancellationToken cancellationToken = default)
     {
@@ -21,16 +21,13 @@ public sealed class OllamaModelCatalogClient(IHttpClientFactory httpClientFactor
 
     public async Task<JsonArray> GetTagsAsync(string? baseUrl, CancellationToken cancellationToken = default)
     {
-        using var client = httpClientFactory.CreateClient();
-        return await FetchArraySafeAsync(client, BuildUrl(baseUrl, "/api/tags"), "models", cancellationToken);
+        return await FetchArraySafeAsync(BuildUrl(baseUrl, "/api/tags"), "models", cancellationToken);
     }
 
     public async Task<JsonArray> GetMergedOpenAIModelsAsync(string? localUrl, string? remoteUrl, CancellationToken cancellationToken = default)
     {
-        using var client = httpClientFactory.CreateClient();
-
-        var localTask = FetchArraySafeAsync(client, BuildUrl(localUrl, "/v1/models"), "data", cancellationToken);
-        var remoteTask = FetchArraySafeAsync(client, BuildUrl(remoteUrl, "/v1/models"), "data", cancellationToken);
+        var localTask = FetchArraySafeAsync(BuildUrl(localUrl, "/v1/models"), "data", cancellationToken);
+        var remoteTask = FetchArraySafeAsync(BuildUrl(remoteUrl, "/v1/models"), "data", cancellationToken);
         await Task.WhenAll(localTask, remoteTask);
 
         return MergeByKey(localTask.Result, remoteTask.Result, "id");
@@ -38,10 +35,8 @@ public sealed class OllamaModelCatalogClient(IHttpClientFactory httpClientFactor
 
     public async Task<JsonArray> GetMergedRunningModelsAsync(string? localUrl, string? remoteUrl, CancellationToken cancellationToken = default)
     {
-        using var client = httpClientFactory.CreateClient();
-
-        var localTask = FetchArraySafeAsync(client, BuildUrl(localUrl, "/api/ps"), "models", cancellationToken);
-        var remoteTask = FetchArraySafeAsync(client, BuildUrl(remoteUrl, "/api/ps"), "models", cancellationToken);
+        var localTask = FetchArraySafeAsync(BuildUrl(localUrl, "/api/ps"), "models", cancellationToken);
+        var remoteTask = FetchArraySafeAsync(BuildUrl(remoteUrl, "/api/ps"), "models", cancellationToken);
         await Task.WhenAll(localTask, remoteTask);
 
         return MergeByKey(localTask.Result, remoteTask.Result, "name");
@@ -65,8 +60,7 @@ public sealed class OllamaModelCatalogClient(IHttpClientFactory httpClientFactor
             return [];
         }
 
-        using var client = httpClientFactory.CreateClient();
-        var models = await FetchArraySafeAsync(client, BuildUrl(baseUrl, "/api/ps"), "models", cancellationToken);
+        var models = await FetchArraySafeAsync(BuildUrl(baseUrl, "/api/ps"), "models", cancellationToken);
         var names = new List<string>();
         foreach (var model in models)
         {
@@ -89,7 +83,6 @@ public sealed class OllamaModelCatalogClient(IHttpClientFactory httpClientFactor
 
         try
         {
-            using var client = httpClientFactory.CreateClient();
             var payload = new JsonObject
             {
                 ["model"] = modelName,
@@ -97,7 +90,7 @@ public sealed class OllamaModelCatalogClient(IHttpClientFactory httpClientFactor
                 ["stream"] = false
             };
             using var content = new StringContent(payload.ToJsonString(), Encoding.UTF8, "application/json");
-            var response = await client.PostAsync(BuildUrl(baseUrl, "/api/generate"), content, cancellationToken);
+            var response = await httpClient.PostAsync(BuildUrl(baseUrl, "/api/generate"), content, cancellationToken);
             return response.IsSuccessStatusCode;
         }
         catch
@@ -128,11 +121,11 @@ public sealed class OllamaModelCatalogClient(IHttpClientFactory httpClientFactor
 
     private static string BuildUrl(string? baseUrl, string path) => $"{baseUrl?.TrimEnd('/')}{path}";
 
-    private static async Task<JsonArray> FetchArraySafeAsync(HttpClient client, string url, string arrayPropertyName, CancellationToken cancellationToken)
+    private async Task<JsonArray> FetchArraySafeAsync(string url, string arrayPropertyName, CancellationToken cancellationToken)
     {
         try
         {
-            var response = await client.GetStringAsync(url, cancellationToken);
+            var response = await httpClient.GetStringAsync(url, cancellationToken);
             var json = JsonNode.Parse(response);
             return json?[arrayPropertyName]?.AsArray() ?? [];
         }

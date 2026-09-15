@@ -26,10 +26,7 @@ public class OllamaModelCatalogClientTests
     private static (OllamaModelCatalogClient Sut, FakeHttpMessageHandler Handler) CreateSut(Func<HttpRequestMessage, HttpResponseMessage> respond)
     {
         var handler = new FakeHttpMessageHandler(respond);
-        var httpClientFactory = new Mock<IHttpClientFactory>();
-        httpClientFactory.Setup(f => f.CreateClient(It.IsAny<string>())).Returns(new HttpClient(handler));
-
-        return (new OllamaModelCatalogClient(httpClientFactory.Object), handler);
+        return (new OllamaModelCatalogClient(new HttpClient(handler)), handler);
     }
 
     private static HttpResponseMessage JsonResponse(string json) => new(HttpStatusCode.OK)
@@ -91,12 +88,10 @@ public class OllamaModelCatalogClientTests
     [Fact]
     public async Task GetMergedTagsAsync_UsesGetTagsAsync_ForBothInstances_RemoteTakesPriority()
     {
-        var httpClientFactory = new Mock<IHttpClientFactory>();
         var handler = new FakeHttpMessageHandler(req => req.RequestUri!.ToString().Contains("local")
             ? JsonResponse("""{ "models": [ { "name": "shared", "source": "local" } ] }""")
             : JsonResponse("""{ "models": [ { "name": "shared", "source": "remote" } ] }"""));
-        httpClientFactory.Setup(f => f.CreateClient(It.IsAny<string>())).Returns(() => new HttpClient(handler));
-        var sut = new OllamaModelCatalogClient(httpClientFactory.Object);
+        var sut = new OllamaModelCatalogClient(new HttpClient(handler));
 
         var merged = await sut.GetMergedTagsAsync("http://local", "http://remote");
 
@@ -186,7 +181,6 @@ public class OllamaModelCatalogClientTests
     public async Task StopRunningModelsAsync_MultipleModelsLoaded_UnloadsAllAndReturnsNames()
     {
         var requests = new List<HttpRequestMessage>();
-        var httpClientFactory = new Mock<IHttpClientFactory>();
         var handler = new FakeHttpMessageHandler(req =>
         {
             requests.Add(req);
@@ -196,8 +190,7 @@ public class OllamaModelCatalogClientTests
             }
             return new HttpResponseMessage(HttpStatusCode.OK);
         });
-        httpClientFactory.Setup(f => f.CreateClient(It.IsAny<string>())).Returns(() => new HttpClient(handler));
-        var sut = new OllamaModelCatalogClient(httpClientFactory.Object);
+        var sut = new OllamaModelCatalogClient(new HttpClient(handler));
 
         var unloaded = await sut.StopRunningModelsAsync("http://127.0.0.1:11435");
 
@@ -216,5 +209,15 @@ public class OllamaModelCatalogClientTests
         var unloaded = await sut.StopRunningModelsAsync("http://127.0.0.1:11435");
 
         Assert.Empty(unloaded);
+    }
+
+    [Fact]
+    public async Task GetTagsAsync_TimeoutOrCancellation_ReturnsEmptyArray()
+    {
+        var (sut, _) = CreateSut(_ => throw new TaskCanceledException("HttpClient timeout"));
+
+        var tags = await sut.GetTagsAsync("http://127.0.0.1:11435");
+
+        Assert.Empty(tags);
     }
 }

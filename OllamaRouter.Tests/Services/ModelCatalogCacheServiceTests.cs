@@ -121,4 +121,60 @@ public class ModelCatalogCacheServiceTests
 
         Assert.False(result);
     }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    public async Task HasAnyModelsAsync_MissingBaseUrl_ReturnsFalse_WithoutQueryingCatalog(string? baseUrl)
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var sut = CreateSut(catalogClient);
+
+        var result = await sut.HasAnyModelsAsync(baseUrl);
+
+        Assert.False(result);
+        catalogClient.Verify(c => c.GetTagsAsync(It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task HasAnyModelsAsync_WhenModelsPresent_ReturnsTrue()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        catalogClient.Setup(c => c.GetTagsAsync(BaseUrl, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Tags("llama3"));
+        var sut = CreateSut(catalogClient);
+
+        var result = await sut.HasAnyModelsAsync(BaseUrl);
+
+        Assert.True(result);
+    }
+
+    [Fact]
+    public async Task HasAnyModelsAsync_WhenNoModels_ReturnsFalse()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        catalogClient.Setup(c => c.GetTagsAsync(BaseUrl, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new JsonArray());
+        var sut = CreateSut(catalogClient);
+
+        var result = await sut.HasAnyModelsAsync(BaseUrl);
+
+        Assert.False(result);
+    }
+
+    [Fact]
+    public async Task HasAnyModelsAsync_SharesCacheWith_ModelExistsAsync()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        catalogClient.Setup(c => c.GetTagsAsync(BaseUrl, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Tags("llama3"));
+        var sut = CreateSut(catalogClient);
+
+        var hasAny = await sut.HasAnyModelsAsync(BaseUrl);
+        var exists = await sut.ModelExistsAsync(BaseUrl, "llama3");
+
+        Assert.True(hasAny);
+        Assert.True(exists);
+        catalogClient.Verify(c => c.GetTagsAsync(BaseUrl, It.IsAny<CancellationToken>()), Times.Once);
+    }
 }

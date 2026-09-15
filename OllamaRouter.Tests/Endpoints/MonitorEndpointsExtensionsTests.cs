@@ -24,7 +24,8 @@ public class MonitorEndpointsExtensionsTests
             new Mock<IActivityMonitorService>(),
             new Mock<IActivityStatisticsService>(),
             new Mock<ITargetAvailabilityService>(),
-            new Mock<IOllamaModelCatalogClient>());
+            new Mock<IOllamaModelCatalogClient>(),
+            new Mock<IModelCatalogCacheService>());
 
         mocks.ActivityMonitor.Setup(m => m.GetSnapshot())
             .Returns(new ActivityMonitorSnapshot(new Dictionary<RoutingTarget, bool>(), [], []));
@@ -53,6 +54,7 @@ public class MonitorEndpointsExtensionsTests
         builder.Services.AddSingleton(mocks.ActivityStatistics.Object);
         builder.Services.AddSingleton(mocks.TargetAvailability.Object);
         builder.Services.AddSingleton(mocks.CatalogClient.Object);
+        builder.Services.AddSingleton(mocks.ModelCatalogCache.Object);
         builder.Services.AddSingleton(Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions
         {
             LocalUrl = localUrl
@@ -70,7 +72,8 @@ public class MonitorEndpointsExtensionsTests
         Mock<IActivityMonitorService> ActivityMonitor,
         Mock<IActivityStatisticsService> ActivityStatistics,
         Mock<ITargetAvailabilityService> TargetAvailability,
-        Mock<IOllamaModelCatalogClient> CatalogClient);
+        Mock<IOllamaModelCatalogClient> CatalogClient,
+        Mock<IModelCatalogCacheService> ModelCatalogCache);
 
     [Fact]
     public async Task GetMonitor_ReturnsHtmlWithReclaimVramButton()
@@ -172,6 +175,54 @@ public class MonitorEndpointsExtensionsTests
             // Still disabled local
             mocks.TargetAvailability.Verify(t => t.Update(false, true, false), Times.Once);
             mocks.CatalogClient.Verify(c => c.StopRunningModelsAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task GetMonitor_ReturnsHtmlWithOfflineStylesAndScript()
+    {
+        var (app, client, _) = await CreateTestAppAsync();
+        try
+        {
+            var response = await client.GetAsync("/monitor");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var html = await response.Content.ReadAsStringAsync();
+            Assert.Contains(".card.offline", html);
+            Assert.Contains(".offline .dot", html);
+            Assert.Contains("statusText = 'Offline'", html);
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task GetMonitorApi_ReturnsOnlineStatus_ReflectingModelCatalogCache()
+    {
+        var (app, client, mocks) = await CreateTestAppAsync("http://127.0.0.1:11435");
+        try
+        {
+            mocks.ModelCatalogCache.Setup(c => c.HasAnyModelsAsync("http://127.0.0.1:11435", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(true);
+
+            var response = await client.GetAsync("/monitor/api");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var json = await response.Content.ReadFromJsonAsync<JsonObject>();
+
+            Assert.NotNull(json);
+            var online = json["online"];
+            Assert.NotNull(online);
+            Assert.True(online["local"]?.GetValue<bool>());
+            Assert.False(online["remote"]?.GetValue<bool>()); // remoteUrl not configured, so false
         }
         finally
         {

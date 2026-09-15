@@ -15,13 +15,24 @@ public static class MonitorEndpointsExtensions
 {
     public static WebApplication MapOllamaMonitorEndpoints(this WebApplication app)
     {
-        app.MapGet("/monitor/api", (IActivityMonitorService activityMonitor, IActivityStatisticsService activityStatistics, IOptions<OllamaRouterOptions> options, ITargetAvailabilityService targetAvailability) =>
+        app.MapGet("/monitor/api", async (
+            IActivityMonitorService activityMonitor,
+            IActivityStatisticsService activityStatistics,
+            IOptions<OllamaRouterOptions> options,
+            ITargetAvailabilityService targetAvailability,
+            IModelCatalogCacheService modelCatalogCache,
+            CancellationToken cancellationToken) =>
         {
             var snapshot = activityMonitor.GetSnapshot();
             var statistics = activityStatistics.GetSnapshot();
             var now = DateTimeOffset.UtcNow;
             var cloudEnabled = options.Value.Models.Values.Any(m => !string.IsNullOrEmpty(m.CloudModel));
             var targets = targetAvailability.GetSnapshot();
+
+            var localOnline = !string.IsNullOrWhiteSpace(options.Value.LocalUrl) &&
+                              await modelCatalogCache.HasAnyModelsAsync(options.Value.LocalUrl, cancellationToken);
+            var remoteOnline = !string.IsNullOrWhiteSpace(options.Value.RemoteUrl) &&
+                               await modelCatalogCache.HasAnyModelsAsync(options.Value.RemoteUrl, cancellationToken);
 
             return Results.Json(new
             {
@@ -31,6 +42,12 @@ public static class MonitorEndpointsExtensions
                     local = targets.Local,
                     remote = targets.Remote,
                     cloud = targets.Cloud
+                },
+                online = new
+                {
+                    local = localOnline,
+                    remote = remoteOnline,
+                    cloud = cloudEnabled
                 },
                 busy = new
                 {
@@ -137,12 +154,14 @@ public static class MonitorEndpointsExtensions
   .card.busy { background: #5a3d00; border: 1px solid #ffb300; }
   .card.idle { background: #1f3d24; border: 1px solid #3ba55c; }
   .card.disabled { background: #3a1f1f; border: 1px solid #b33333; }
+  .card.offline { background: #4a2800; border: 1px solid #e67e22; }
   .card .toggle { display: flex; align-items: center; margin-top: 0.4rem; font-size: 0.8rem; color: #bbb; }
   .card .toggle input { margin-right: 6px; }
   .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
   .busy .dot { background: #ffb300; }
   .idle .dot { background: #3ba55c; }
   .disabled .dot { background: #b33333; }
+  .offline .dot { background: #e67e22; }
   .btn-reclaim { display: block; padding: 0.4rem 0.6rem; font-size: 0.78rem; font-weight: 500; color: #eee; background: #333; border: 1px solid #555; border-radius: 6px; cursor: pointer; width: 100%; box-sizing: border-box; text-align: center; }
   .btn-reclaim:hover:not(:disabled) { background: #444; border-color: #888; color: #fff; }
   .btn-reclaim:disabled { opacity: 0.6; cursor: not-allowed; }
@@ -337,13 +356,28 @@ async function refresh() {
       }
       const busy = data.busy[name];
       const enabled = data.targets[name];
+      const online = data.online ? data.online[name] : true;
+
+      let statusClass = 'idle';
+      let statusText = 'Idle';
+      if (!enabled) {
+        statusClass = 'disabled';
+        statusText = 'Disabled';
+      } else if (!online) {
+        statusClass = 'offline';
+        statusText = 'Offline';
+      } else if (busy) {
+        statusClass = 'busy';
+        statusText = 'Busy';
+      }
+
       const div = document.createElement('div');
-      div.className = 'card ' + (!enabled ? 'disabled' : (busy ? 'busy' : 'idle'));
+      div.className = 'card ' + statusClass;
       const dot = document.createElement('span');
       dot.className = 'dot';
       div.appendChild(dot);
       const targetName = name.charAt(0).toUpperCase() + name.slice(1);
-            const label = (targetIcons[targetName] + ' ') + targetName + ': ' + (!enabled ? 'Disabled' : (busy ? 'Busy' : 'Idle'));
+      const label = (targetIcons[targetName] + ' ') + targetName + ': ' + statusText;
       div.appendChild(document.createTextNode(label));
 
       const toggle = document.createElement('label');

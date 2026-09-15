@@ -12,4 +12,12 @@ public interface IModelCatalogCacheService
     /// located at <paramref name="baseUrl"/>. Results are cached for a short duration.
     /// </summary>
     Task<bool> ModelExistsAsync(string? baseUrl, string modelName, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Indicates whether any models are present in the /api/tags catalog of the instance
+    /// located at <paramref name="baseUrl"/>. If false, the instance is considered unreachable or empty.
+    /// Results are cached for a short duration.
+    /// </summary>
+    Task<bool> HasAnyModelsAsync(string? baseUrl, CancellationToken cancellationToken = default);
 }
+

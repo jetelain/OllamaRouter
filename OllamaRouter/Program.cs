@@ -20,12 +20,14 @@ var (routes, clusters) = OllamaReverseProxyConfig.Build(ollamaOptions);
 builder.Services.AddReverseProxy()
     .LoadFromMemory(routes, clusters);
 
-builder.Services.AddHttpClient();
+builder.Services.AddHttpClient<IOllamaModelCatalogClient, OllamaModelCatalogClient>(client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(4);
+});
 builder.Services.AddMemoryCache();
 
 builder.Services.AddSingleton<ITokenEstimator, TiktokenTokenEstimator>();
 builder.Services.AddSingleton<IGpuVramProvider, NvidiaSmiVramProvider>();
-builder.Services.AddTransient<IOllamaModelCatalogClient, OllamaModelCatalogClient>();
 builder.Services.AddTransient<IRoutingTargetHandler, LocalRoutingTargetHandler>();
 builder.Services.AddTransient<IRoutingTargetHandler, RemoteRoutingTargetHandler>();
 builder.Services.AddTransient<IRoutingTargetHandler, CloudRoutingTargetHandler>();

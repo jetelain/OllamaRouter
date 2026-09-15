@@ -12,6 +12,7 @@ public sealed class ModelCatalogCacheService(
     IMemoryCache memoryCache) : IModelCatalogCacheService
 {
     private static readonly TimeSpan CacheDuration = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan OfflineCacheDuration = TimeSpan.FromSeconds(10);
 
     public async Task<bool> ModelExistsAsync(string? baseUrl, string modelName, CancellationToken cancellationToken = default)
     {
@@ -25,14 +26,24 @@ public sealed class ModelCatalogCacheService(
         return names.Contains(modelName);
     }
 
+    public async Task<bool> HasAnyModelsAsync(string? baseUrl, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(baseUrl))
+        {
+            return false;
+        }
+
+        var names = await GetModelNamesAsync(baseUrl, cancellationToken);
+
+        return names.Count > 0;
+    }
+
     private Task<HashSet<string>> GetModelNamesAsync(string baseUrl, CancellationToken cancellationToken)
     {
         var cacheKey = $"ModelCatalogCacheService:{baseUrl}";
 
         return memoryCache.GetOrCreateAsync(cacheKey, async entry =>
         {
-            entry.AbsoluteExpirationRelativeToNow = CacheDuration;
-
             var tags = await catalogClient.GetTagsAsync(baseUrl, cancellationToken);
 
             var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -43,6 +54,8 @@ public sealed class ModelCatalogCacheService(
                     names.Add(name);
                 }
             }
+
+            entry.AbsoluteExpirationRelativeToNow = names.Count > 0 ? CacheDuration : OfflineCacheDuration;
 
             return names;
         })!;
