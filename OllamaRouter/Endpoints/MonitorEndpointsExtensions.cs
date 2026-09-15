@@ -1,5 +1,7 @@
+using System.Text.Json.Serialization;
 using Microsoft.Extensions.Options;
 using OllamaRouter.Options;
+using OllamaRouter.Serialization;
 using OllamaRouter.Services;
 
 namespace OllamaRouter.Endpoints;
@@ -34,70 +36,48 @@ public static class MonitorEndpointsExtensions
             var remoteOnline = !string.IsNullOrWhiteSpace(options.Value.RemoteUrl) &&
                                await modelCatalogCache.HasAnyModelsAsync(options.Value.RemoteUrl, cancellationToken);
 
-            return Results.Json(new
-            {
+            var monitorResponse = new MonitorStateResponse(
                 cloudEnabled,
-                targets = new
-                {
-                    local = targets.Local,
-                    remote = targets.Remote,
-                    cloud = targets.Cloud
-                },
-                online = new
-                {
-                    local = localOnline,
-                    remote = remoteOnline,
-                    cloud = cloudEnabled
-                },
-                busy = new
-                {
-                    local = snapshot.Busy.GetValueOrDefault(RoutingTarget.Local),
-                    remote = snapshot.Busy.GetValueOrDefault(RoutingTarget.Remote),
-                    cloud = snapshot.Busy.GetValueOrDefault(RoutingTarget.Cloud)
-                },
-                statistics = new
-                {
-                    today = new
-                    {
-                        local = statistics.Today[RoutingTarget.Local],
-                        remote = statistics.Today[RoutingTarget.Remote],
-                        cloud = statistics.Today[RoutingTarget.Cloud],
-                        total = statistics.TodayTotal
-                    },
-                    last7Days = new
-                    {
-                        local = statistics.Last7Days[RoutingTarget.Local],
-                        remote = statistics.Last7Days[RoutingTarget.Remote],
-                        cloud = statistics.Last7Days[RoutingTarget.Cloud],
-                        total = statistics.Last7DaysTotal
-                    }
-                },
-                inProgress = snapshot.InProgressRequests.Select(r => new
-                {
-                    target = r.Target.ToString(),
-                    model = r.Model,
-                    estimatedPromptTokens = r.EstimatedPromptTokens,
-                    elapsedMs = (now - r.StartedAt).TotalMilliseconds
-                }),
-                requests = snapshot.RecentRequests.Select(r => new
-                {
-                    timestamp = r.Timestamp,
-                    target = r.Target.ToString(),
-                    model = r.Model,
-                    estimatedPromptTokens = r.EstimatedPromptTokens,
-                    actualPromptTokens = r.ActualPromptTokens,
-                    actualResponseTokens = r.ActualResponseTokens,
-                    elapsedMs = r.ElapsedMilliseconds,
-                    statusCode = r.StatusCode,
-                    success = r.Success
-                })
-            });
+                new MonitorTargetsStatus(targets.Local, targets.Remote, targets.Cloud),
+                new MonitorTargetsStatus(localOnline, remoteOnline, cloudEnabled),
+                new MonitorBusyStatus(
+                    snapshot.Busy.GetValueOrDefault(RoutingTarget.Local),
+                    snapshot.Busy.GetValueOrDefault(RoutingTarget.Remote),
+                    snapshot.Busy.GetValueOrDefault(RoutingTarget.Cloud)),
+                new MonitorStatisticsStatus(
+                    new MonitorPeriodStatistics(
+                        statistics.Today[RoutingTarget.Local],
+                        statistics.Today[RoutingTarget.Remote],
+                        statistics.Today[RoutingTarget.Cloud],
+                        statistics.TodayTotal),
+                    new MonitorPeriodStatistics(
+                        statistics.Last7Days[RoutingTarget.Local],
+                        statistics.Last7Days[RoutingTarget.Remote],
+                        statistics.Last7Days[RoutingTarget.Cloud],
+                        statistics.Last7DaysTotal)),
+                snapshot.InProgressRequests.Select(r => new MonitorInProgressItem(
+                    r.Target.ToString(),
+                    r.Model,
+                    r.EstimatedPromptTokens,
+                    (now - r.StartedAt).TotalMilliseconds)).ToList(),
+                snapshot.RecentRequests.Select(r => new MonitorRecentRequestItem(
+                    r.Timestamp,
+                    r.Target.ToString(),
+                    r.Model,
+                    r.EstimatedPromptTokens,
+                    r.ActualPromptTokens,
+                    r.ActualResponseTokens,
+                    r.ElapsedMilliseconds,
+                    r.StatusCode,
+                    r.Success)).ToList());
+
+            return Results.Json(monitorResponse, OllamaRouterJsonSerializerContext.Default.MonitorStateResponse);
         });
 
         app.MapPost("/targets", (TargetsUpdateRequest request, ITargetAvailabilityService targetAvailability) =>
         {
             targetAvailability.Update(request.Local, request.Remote, request.Cloud);
-            return Results.Ok(new { request.Local, request.Remote, request.Cloud });
+            return Results.Ok(new TargetsUpdateResponse(request.Local, request.Remote, request.Cloud));
         });
 
         app.MapPost("/monitor/reclaim-vram", async (IOllamaModelCatalogClient catalogClient, ITargetAvailabilityService targetAvailability, IOptions<OllamaRouterOptions> options, CancellationToken cancellationToken) =>
@@ -108,35 +88,27 @@ public static class MonitorEndpointsExtensions
             var localUrl = options.Value.LocalUrl?.TrimEnd('/');
             if (string.IsNullOrWhiteSpace(localUrl))
             {
-                return Results.Ok(new
-                {
-                    success = false,
-                    message = "Local URL is not configured.",
-                    count = 0,
-                    unloadedModels = Array.Empty<string>(),
-                    localDisabled = true
-                });
+                return Results.Ok(new ReclaimVramResponse(
+                    Success: false,
+                    Message: "Local URL is not configured.",
+                    Count: 0,
+                    UnloadedModels: Array.Empty<string>(),
+                    LocalDisabled: true));
             }
 
             var unloaded = await catalogClient.StopRunningModelsAsync(localUrl, cancellationToken);
-            return Results.Ok(new
-            {
-                success = true,
-                count = unloaded.Count,
-                unloadedModels = unloaded,
-                localDisabled = true
-            });
+            return Results.Ok(new ReclaimVramResponse(
+                Success: true,
+                Message: null,
+                Count: unloaded.Count,
+                UnloadedModels: unloaded,
+                LocalDisabled: true));
         });
 
         app.MapGet("/monitor", () => Results.Content(MonitorPageHtml, "text/html"));
 
         return app;
     }
-
-    /// <summary>
-    /// Request payload for <c>POST /targets</c>.
-    /// </summary>
-    public sealed record TargetsUpdateRequest(bool Local, bool Remote, bool Cloud);
 
     private const string MonitorPageHtml = """
 <!DOCTYPE html>
@@ -478,3 +450,69 @@ setInterval(refresh, 2000);
 </html>
 """;
 }
+
+/// <summary>
+/// Request payload for <c>POST /targets</c>.
+/// </summary>
+public sealed record TargetsUpdateRequest(
+    [property: JsonPropertyName("local")] bool Local,
+    [property: JsonPropertyName("remote")] bool Remote,
+    [property: JsonPropertyName("cloud")] bool Cloud);
+
+public sealed record TargetsUpdateResponse(
+    [property: JsonPropertyName("local")] bool Local,
+    [property: JsonPropertyName("remote")] bool Remote,
+    [property: JsonPropertyName("cloud")] bool Cloud);
+
+public sealed record ReclaimVramResponse(
+    [property: JsonPropertyName("success")] bool Success,
+    [property: JsonPropertyName("message")] [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Message,
+    [property: JsonPropertyName("count")] int Count,
+    [property: JsonPropertyName("unloadedModels")] IReadOnlyList<string> UnloadedModels,
+    [property: JsonPropertyName("localDisabled")] bool LocalDisabled);
+
+public sealed record MonitorStateResponse(
+    [property: JsonPropertyName("cloudEnabled")] bool CloudEnabled,
+    [property: JsonPropertyName("targets")] MonitorTargetsStatus Targets,
+    [property: JsonPropertyName("online")] MonitorTargetsStatus Online,
+    [property: JsonPropertyName("busy")] MonitorBusyStatus Busy,
+    [property: JsonPropertyName("statistics")] MonitorStatisticsStatus Statistics,
+    [property: JsonPropertyName("inProgress")] IReadOnlyList<MonitorInProgressItem> InProgress,
+    [property: JsonPropertyName("requests")] IReadOnlyList<MonitorRecentRequestItem> Requests);
+
+public sealed record MonitorTargetsStatus(
+    [property: JsonPropertyName("local")] bool Local,
+    [property: JsonPropertyName("remote")] bool Remote,
+    [property: JsonPropertyName("cloud")] bool Cloud);
+
+public sealed record MonitorBusyStatus(
+    [property: JsonPropertyName("local")] bool Local,
+    [property: JsonPropertyName("remote")] bool Remote,
+    [property: JsonPropertyName("cloud")] bool Cloud);
+
+public sealed record MonitorStatisticsStatus(
+    [property: JsonPropertyName("today")] MonitorPeriodStatistics Today,
+    [property: JsonPropertyName("last7Days")] MonitorPeriodStatistics Last7Days);
+
+public sealed record MonitorPeriodStatistics(
+    [property: JsonPropertyName("local")] ActivityStatisticsTotals Local,
+    [property: JsonPropertyName("remote")] ActivityStatisticsTotals Remote,
+    [property: JsonPropertyName("cloud")] ActivityStatisticsTotals Cloud,
+    [property: JsonPropertyName("total")] ActivityStatisticsTotals Total);
+
+public sealed record MonitorInProgressItem(
+    [property: JsonPropertyName("target")] string Target,
+    [property: JsonPropertyName("model")] string Model,
+    [property: JsonPropertyName("estimatedPromptTokens")] int EstimatedPromptTokens,
+    [property: JsonPropertyName("elapsedMs")] double ElapsedMs);
+
+public sealed record MonitorRecentRequestItem(
+    [property: JsonPropertyName("timestamp")] DateTimeOffset Timestamp,
+    [property: JsonPropertyName("target")] string Target,
+    [property: JsonPropertyName("model")] string Model,
+    [property: JsonPropertyName("estimatedPromptTokens")] int EstimatedPromptTokens,
+    [property: JsonPropertyName("actualPromptTokens")] int? ActualPromptTokens,
+    [property: JsonPropertyName("actualResponseTokens")] int? ActualResponseTokens,
+    [property: JsonPropertyName("elapsedMs")] double ElapsedMs,
+    [property: JsonPropertyName("statusCode")] int? StatusCode,
+    [property: JsonPropertyName("success")] bool Success);

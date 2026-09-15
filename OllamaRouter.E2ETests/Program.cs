@@ -14,7 +14,12 @@ Scenario[] scenarios =
     OllamaNativeScenarios.ListRunningModels(),
     OllamaNativeScenarios.Chat(),
     OpenAiCompatibleScenarios.ListModels(),
-    OpenAiCompatibleScenarios.ChatCompletion()
+    OpenAiCompatibleScenarios.ChatCompletion(),
+    MonitorScenarios.GetMonitorHtml(),
+    MonitorScenarios.GetMonitorApi(),
+    MonitorScenarios.UpdateTargets(),
+    MonitorScenarios.ReclaimVram(),
+    MonitorScenarios.ServiceUnavailableWhenNoTargets()
 ];
 
 var failureCount = 0;

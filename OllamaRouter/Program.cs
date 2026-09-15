@@ -3,12 +3,18 @@ using OllamaRouter.Endpoints;
 using OllamaRouter.Middleware;
 using OllamaRouter.Options;
 using OllamaRouter.ReverseProxy;
+using OllamaRouter.Serialization;
 using OllamaRouter.Services;
 
 Console.OutputEncoding = Encoding.UTF8;
 Console.Title = "Ollama Router";
 
 var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.ConfigureHttpJsonOptions(options =>
+{
+    options.SerializerOptions.TypeInfoResolverChain.Insert(0, OllamaRouterJsonSerializerContext.Default);
+});
 
 builder.Services.AddOptions<OllamaRouterOptions>()
     .BindConfiguration(OllamaRouterOptions.SectionName);

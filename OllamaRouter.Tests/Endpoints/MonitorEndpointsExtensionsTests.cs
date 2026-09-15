@@ -8,6 +8,7 @@ using Microsoft.Extensions.Options;
 using Moq;
 using OllamaRouter.Endpoints;
 using OllamaRouter.Options;
+using OllamaRouter.Serialization;
 using OllamaRouter.Services;
 
 namespace OllamaRouter.Tests.Endpoints;
@@ -19,6 +20,10 @@ public class MonitorEndpointsExtensionsTests
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseUrls("http://127.0.0.1:0");
+        builder.Services.ConfigureHttpJsonOptions(options =>
+        {
+            options.SerializerOptions.TypeInfoResolverChain.Insert(0, OllamaRouterJsonSerializerContext.Default);
+        });
 
         var mocks = new Mocks(
             new Mock<IActivityMonitorService>(),
@@ -107,6 +112,31 @@ public class MonitorEndpointsExtensionsTests
 
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
             mocks.TargetAvailability.Verify(t => t.Update(false, true, true), Times.Once);
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task PostTargets_WithCamelCaseJson_ReturnsUpdatedTargets()
+    {
+        var (app, client, mocks) = await CreateTestAppAsync();
+        try
+        {
+            var content = new StringContent("""{"local": true, "remote": false, "cloud": true}""", System.Text.Encoding.UTF8, "application/json");
+            var response = await client.PostAsync("/targets", content);
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var json = await response.Content.ReadFromJsonAsync<JsonObject>();
+            Assert.NotNull(json);
+            Assert.True(json["local"]?.GetValue<bool>());
+            Assert.False(json["remote"]?.GetValue<bool>());
+            Assert.True(json["cloud"]?.GetValue<bool>());
+
+            mocks.TargetAvailability.Verify(t => t.Update(true, false, true), Times.Once);
         }
         finally
         {

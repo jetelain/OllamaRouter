@@ -1,5 +1,6 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using System.Text.Json.Serialization;
+using OllamaRouter.Serialization;
 
 namespace OllamaRouter.Services;
 
@@ -183,7 +184,7 @@ public class ActivityStatisticsService : IActivityStatisticsService
             try
             {
                 var json = File.ReadAllText(statsFile);
-                var loaded = JsonSerializer.Deserialize<List<ActivityStatisticsDate>>(json);
+                var loaded = JsonSerializer.Deserialize(json, OllamaRouterJsonSerializerContext.Default.ListActivityStatisticsDate);
                 if (loaded != null)
                 {
                     all.AddRange(loaded);
@@ -213,7 +214,7 @@ public class ActivityStatisticsService : IActivityStatisticsService
                 {
                     Directory.CreateDirectory(directory);
                 }
-                File.WriteAllText(statsFile, JsonSerializer.Serialize(all, new JsonSerializerOptions { WriteIndented = true }));
+                File.WriteAllText(statsFile, JsonSerializer.Serialize(all, OllamaRouterJsonSerializerContext.Default.ListActivityStatisticsDate));
             }
             catch (Exception ex)
             {

@@ -1,9 +1,11 @@
 using System.Diagnostics;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.Extensions.Options;
 using OllamaRouter.Options;
 using OllamaRouter.Parsing;
 using OllamaRouter.ReverseProxy;
+using OllamaRouter.Serialization;
 using OllamaRouter.Services;
 
 namespace OllamaRouter.Middleware;
@@ -85,7 +87,7 @@ public sealed class OllamaRoutingMiddleware(
             logger.LogWarning(ex, "No target could handle the request: {Message}", ex.Message);
             context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
             context.Response.ContentType = "application/json";
-            await context.Response.WriteAsync(JsonSerializer.Serialize(new { error = ex.Message }));
+            await context.Response.WriteAsync(JsonSerializer.Serialize(new OllamaErrorResponse(ex.Message), OllamaRouterJsonSerializerContext.Default.OllamaErrorResponse));
             return;
         }
         catch (Exception ex)
@@ -102,7 +104,7 @@ public sealed class OllamaRoutingMiddleware(
                 logger.LogWarning("No enabled routing target available for fallback.");
                 context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
                 context.Response.ContentType = "application/json";
-                await context.Response.WriteAsync(JsonSerializer.Serialize(new { error = "No enabled routing target is available." }));
+                await context.Response.WriteAsync(JsonSerializer.Serialize(new OllamaErrorResponse("No enabled routing target is available."), OllamaRouterJsonSerializerContext.Default.OllamaErrorResponse));
                 return;
             }
 
@@ -275,3 +277,6 @@ public sealed class OllamaRoutingMiddleware(
         return body;
     }
 }
+
+public sealed record OllamaErrorResponse(
+    [property: JsonPropertyName("error")] string Error);

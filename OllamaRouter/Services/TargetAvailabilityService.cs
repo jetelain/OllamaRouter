@@ -1,12 +1,12 @@
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
+using OllamaRouter.Serialization;
 
 namespace OllamaRouter.Services;
 
 /// <inheritdoc cref="ITargetAvailabilityService"/>
 public sealed class TargetAvailabilityService : ITargetAvailabilityService
 {
-    private static readonly JsonSerializerOptions SerializerOptions = new() { WriteIndented = true };
 
     private readonly string stateFilePath;
     private readonly ILogger<TargetAvailabilityService> logger;
@@ -58,7 +58,7 @@ public sealed class TargetAvailabilityService : ITargetAvailabilityService
                     Directory.CreateDirectory(directory);
                 }
 
-                File.WriteAllText(stateFilePath, JsonSerializer.Serialize(new TargetsState(local, remote, cloud), SerializerOptions));
+                File.WriteAllText(stateFilePath, JsonSerializer.Serialize(new TargetsState(local, remote, cloud), OllamaRouterJsonSerializerContext.Default.TargetsState));
             }
             catch (Exception ex)
             {
@@ -84,7 +84,7 @@ public sealed class TargetAvailabilityService : ITargetAvailabilityService
                     return;
                 }
 
-                var state = JsonSerializer.Deserialize<TargetsState>(File.ReadAllText(stateFilePath), SerializerOptions);
+                var state = JsonSerializer.Deserialize(File.ReadAllText(stateFilePath), OllamaRouterJsonSerializerContext.Default.TargetsState);
                 if (state is null)
                 {
                     return;
@@ -100,6 +100,6 @@ public sealed class TargetAvailabilityService : ITargetAvailabilityService
             }
         }
     }
-
-    private sealed record TargetsState(bool Local, bool Remote, bool Cloud);
 }
+
+public sealed record TargetsState(bool Local, bool Remote, bool Cloud);

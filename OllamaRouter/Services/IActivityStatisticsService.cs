@@ -1,4 +1,6 @@
-﻿namespace OllamaRouter.Services;
+using System.Text.Json.Serialization;
+
+namespace OllamaRouter.Services;
 
 public interface IActivityStatisticsService
 {
@@ -18,7 +20,10 @@ public interface IActivityStatisticsService
 /// <summary>
 /// Aggregated usage for a routing target (or for all targets combined, when used as a total).
 /// </summary>
-public sealed record ActivityStatisticsTotals(int Requests, int InputTokens, int OutputTokens);
+public sealed record ActivityStatisticsTotals(
+    [property: JsonPropertyName("requests")] int Requests,
+    [property: JsonPropertyName("inputTokens")] int InputTokens,
+    [property: JsonPropertyName("outputTokens")] int OutputTokens);
 
 /// <summary>
 /// Read-only snapshot of the persisted activity statistics.
