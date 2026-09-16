@@ -37,6 +37,12 @@ public sealed class OllamaRouterOptions
     /// A value of 1.1 adds a 10% margin on top of the raw estimate. Defaults to 1.0 (no correction).
     /// </summary>
     public double TokenEstimationOverheadFactor { get; set; } = 1.0;
+
+    /// <summary>
+    /// Optional pricing configuration used to estimate savings from local/remote execution
+    /// and the cost of cloud overflow. If not configured, cost estimates are not displayed.
+    /// </summary>
+    public PricingOptions? Pricing { get; set; }
 }
 
 /// <summary>
@@ -62,4 +68,56 @@ public sealed class ModelThresholds
     /// rewritten to this value. Leave null/empty to disable cloud overflow for this model.
     /// </summary>
     public string? CloudModel { get; set; }
+}
+
+/// <summary>
+/// Pricing configuration used to estimate savings and cloud overflow costs.
+/// </summary>
+public sealed class PricingOptions
+{
+    /// <summary>
+    /// Price per 1,000,000 prompt / input tokens (e.g. 0.20 for $0.20 / 1M tokens).
+    /// </summary>
+    public double? PromptPricePerMillion { get; set; }
+
+    /// <summary>
+    /// Alias for PromptPricePerMillion.
+    /// </summary>
+    public double? InputPricePerMillion
+    {
+        get => PromptPricePerMillion;
+        set => PromptPricePerMillion = value;
+    }
+
+    /// <summary>
+    /// Price per 1,000,000 completion / output tokens (e.g. 0.80 for $0.80 / 1M tokens).
+    /// </summary>
+    public double? CompletionPricePerMillion { get; set; }
+
+    /// <summary>
+    /// Alias for CompletionPricePerMillion.
+    /// </summary>
+    public double? OutputPricePerMillion
+    {
+        get => CompletionPricePerMillion;
+        set => CompletionPricePerMillion = value;
+    }
+
+    /// <summary>
+    /// Flat price per 1,000,000 tokens when input and output prices are not differentiated.
+    /// </summary>
+    public double? PricePerMillion { get; set; }
+
+    /// <summary>
+    /// Currency symbol or code to display (e.g. "$", "€", "USD"). Defaults to "$".
+    /// </summary>
+    public string Currency { get; set; } = "$";
+
+    /// <summary>
+    /// Returns true if at least one positive pricing rate is configured.
+    /// </summary>
+    public bool IsConfigured =>
+        (PromptPricePerMillion.HasValue && PromptPricePerMillion.Value >= 0) ||
+        (CompletionPricePerMillion.HasValue && CompletionPricePerMillion.Value >= 0) ||
+        (PricePerMillion.HasValue && PricePerMillion.Value >= 0);
 }

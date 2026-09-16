@@ -69,7 +69,8 @@ public static class MonitorEndpointsExtensions
                     r.ActualResponseTokens,
                     r.ElapsedMilliseconds,
                     r.StatusCode,
-                    r.Success)).ToList());
+                    r.Success)).ToList(),
+                CalculateCostStatus(statistics.Last7Days, options.Value.Pricing));
 
             return Results.Json(monitorResponse, OllamaRouterJsonSerializerContext.Default.MonitorStateResponse);
         });
@@ -148,10 +149,32 @@ public static class MonitorEndpointsExtensions
   .stats th { text-align: center; }
   .stats th:first-child, .stats td:first-child { text-align: left; }
   .stats .today { background: #262626; }
-  .target-Local { color: #6bc4ff; }
-  .target-Remote { color: #5ce8b5; }
+  .target-Local { color: #3f9eff; }
+  .target-Remote { color: #34e0a1; }
   .target-Cloud { color: #c48bff; }
   .empty { color: #777; font-style: italic; padding: 0.5rem 0.75rem; }
+  .stats-summary-row { display: flex; gap: 1rem; margin-top: 1rem; align-items: stretch; }
+  .usage-ratio-container { flex: 2; min-width: 0; background: #262626; border-radius: 8px; padding: 0.85rem 1.1rem; border: 1px solid #333; display: flex; flex-direction: column; justify-content: space-between; }
+  .progress-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.6rem; font-size: 0.85rem; color: #aaa; }
+  .progress-summary { font-size: 0.8rem; color: #888; }
+  .progress-bar { display: flex; height: 18px; border-radius: 6px; overflow: hidden; background: #181818; box-shadow: inset 0 1px 3px rgba(0,0,0,0.5); }
+  .progress-seg { height: 100%; position: relative; overflow: hidden; transition: width 0.3s ease; }
+  .progress-seg + .progress-seg { border-left: 2px solid #181818; }
+  .progress-seg-local { background-color: #3f9eff; background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.22) 0 6px, transparent 6px 12px); }
+  .progress-seg-remote { background-color: #34e0a1; background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.22) 0 6px, transparent 6px 12px); }
+  .progress-seg-cloud { background-color: #c48bff; background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.22) 0 6px, transparent 6px 12px); }
+  .progress-empty { width: 100%; display: flex; align-items: center; justify-content: center; font-size: 0.78rem; color: #666; font-style: italic; }
+  .progress-legend { display: flex; gap: 1.2rem; margin-top: 0.65rem; font-size: 0.82rem; flex-wrap: wrap; }
+  .legend-item { display: flex; align-items: center; gap: 6px; }
+  .legend-dot { width: 10px; height: 10px; border-radius: 2px; }
+  .cost-container { flex: 1; display: flex; gap: 1rem; min-width: 0; }
+  .cost-container.has-cloud { flex: 2; }
+  .cost-card { flex: 1; min-width: 0; background: #262626; border-radius: 8px; padding: 0.85rem 1.1rem; border: 1px solid #333; display: flex; flex-direction: column; justify-content: space-between; }
+  .cost-card.savings { border-left: 4px solid #34e0a1; }
+  .cost-card.overflow { border-left: 4px solid #c48bff; }
+  .cost-title { font-size: 0.82rem; color: #aaa; }
+  .cost-value { font-size: 1.4rem; font-weight: 700; color: #fff; line-height: 1.2; margin: 0.2rem 0; }
+  .cost-desc { font-size: 0.75rem; color: #888; }
 </style>
 </head>
 <body>
@@ -166,6 +189,30 @@ public static class MonitorEndpointsExtensions
   </thead>
   <tbody id="statsRows"></tbody>
 </table>
+
+<div class="stats-summary-row" id="statsSummaryRow">
+  <div class="usage-ratio-container" id="usageRatioContainer">
+    <div class="progress-header">
+      <span>Target usage ratio (last 7 days)</span>
+      <span id="usageRatioSummary" class="progress-summary"></span>
+    </div>
+    <div class="progress-bar" id="usageProgressBar"></div>
+    <div class="progress-legend" id="usageProgressLegend"></div>
+  </div>
+
+  <div class="cost-container" id="costContainer" style="display: none;">
+    <div class="cost-card savings">
+      <div class="cost-title">💰 Estimated savings (last 7 days)</div>
+      <div class="cost-value" id="estimatedSavingsValue">-</div>
+      <div class="cost-desc">Saved thanks to local & remote routing</div>
+    </div>
+    <div class="cost-card overflow" id="cloudCostCard">
+      <div class="cost-title">☁️ Cloud overflow cost (last 7 days)</div>
+      <div class="cost-value" id="cloudCostValue">-</div>
+      <div class="cost-desc">Cost incurred from cloud overflow</div>
+    </div>
+  </div>
+</div>
 
 <h2>In progress</h2>
 <table>
@@ -264,6 +311,113 @@ function renderStatistics(tbodyId, today, last7Days, cloudEnabled) {
     td(tokens(last7Days.total.inputTokens), 'num'),
     td(tokens(last7Days.total.outputTokens), 'num')
   ], 'total');
+}
+
+function formatCost(amount, currency) {
+  if (amount == null) {
+    return '-';
+  }
+  const curr = currency || '$';
+  if (amount === 0) {
+    return curr + '0.00';
+  }
+  if (amount < 0.01) {
+    return curr + amount.toFixed(4);
+  }
+  return curr + amount.toFixed(2);
+}
+
+function renderUsageRatio(last7Days, cloudEnabled) {
+  const localTokens = (last7Days.local ? last7Days.local.inputTokens + last7Days.local.outputTokens : 0);
+  const remoteTokens = (last7Days.remote ? last7Days.remote.inputTokens + last7Days.remote.outputTokens : 0);
+  const cloudTokens = (cloudEnabled && last7Days.cloud) ? (last7Days.cloud.inputTokens + last7Days.cloud.outputTokens) : 0;
+  const totalTokens = localTokens + remoteTokens + cloudTokens;
+
+  const localReq = last7Days.local ? last7Days.local.requests : 0;
+  const remoteReq = last7Days.remote ? last7Days.remote.requests : 0;
+  const cloudReq = (cloudEnabled && last7Days.cloud) ? last7Days.cloud.requests : 0;
+
+  const bar = document.getElementById('usageProgressBar');
+  const legend = document.getElementById('usageProgressLegend');
+  const summary = document.getElementById('usageRatioSummary');
+  clear(bar);
+  clear(legend);
+
+  if (totalTokens === 0) {
+    const emptyDiv = document.createElement('div');
+    emptyDiv.className = 'progress-empty';
+    emptyDiv.textContent = 'No token activity in the last 7 days';
+    bar.appendChild(emptyDiv);
+    summary.textContent = '0 tokens';
+    return;
+  }
+
+  summary.textContent = tokens(totalTokens) + ' tokens';
+
+  const localPct = (localTokens / totalTokens * 100);
+  const remotePct = (remoteTokens / totalTokens * 100);
+  const cloudPct = cloudEnabled ? (cloudTokens / totalTokens * 100) : 0;
+
+  function addSeg(className, pct, title) {
+    if (pct <= 0) return;
+    const seg = document.createElement('div');
+    seg.className = 'progress-seg ' + className;
+    seg.style.width = pct.toFixed(2) + '%';
+    seg.title = title;
+    bar.appendChild(seg);
+  }
+
+  addSeg('progress-seg-local', localPct, 'Local: ' + localPct.toFixed(1) + '% (' + tokens(localTokens) + ' tokens, ' + num(localReq) + ' req)');
+  addSeg('progress-seg-remote', remotePct, 'Remote: ' + remotePct.toFixed(1) + '% (' + tokens(remoteTokens) + ' tokens, ' + num(remoteReq) + ' req)');
+  if (cloudEnabled && cloudPct > 0) {
+    addSeg('progress-seg-cloud', cloudPct, 'Cloud: ' + cloudPct.toFixed(1) + '% (' + tokens(cloudTokens) + ' tokens, ' + num(cloudReq) + ' req)');
+  }
+
+  function addLegend(targetName, icon, pct, tok, req, colorClass) {
+    const item = document.createElement('div');
+    item.className = 'legend-item';
+    const dot = document.createElement('span');
+    dot.className = 'legend-dot ' + colorClass;
+    item.appendChild(dot);
+    const span = document.createElement('span');
+    span.textContent = (icon ? icon + ' ' : '') + targetName + ': ' + pct.toFixed(1) + '%';
+    item.appendChild(span);
+    legend.appendChild(item);
+  }
+
+  addLegend('Local', targetIcons.Local, localPct, localTokens, localReq, 'progress-seg-local');
+  addLegend('Remote', targetIcons.Remote, remotePct, remoteTokens, remoteReq, 'progress-seg-remote');
+  if (cloudEnabled) {
+    addLegend('Cloud', targetIcons.Cloud, cloudPct, cloudTokens, cloudReq, 'progress-seg-cloud');
+  }
+}
+
+function renderCost(cost, cloudEnabled) {
+  const container = document.getElementById('costContainer');
+  if (!cost) {
+    container.style.display = 'none';
+    return;
+  }
+  container.style.display = 'flex';
+
+  const savingsEl = document.getElementById('estimatedSavingsValue');
+  const cloudCostEl = document.getElementById('cloudCostValue');
+  const cloudCard = document.getElementById('cloudCostCard');
+
+  savingsEl.textContent = formatCost(cost.estimatedSavings, cost.currency);
+  cloudCostEl.textContent = formatCost(cost.cloudOverflowCost, cost.currency);
+
+  if (cloudEnabled) {
+    container.classList.add('has-cloud');
+    if (cloudCard) {
+      cloudCard.style.display = 'flex';
+    }
+  } else {
+    container.classList.remove('has-cloud');
+    if (cloudCard) {
+      cloudCard.style.display = 'none';
+    }
+  }
 }
 
 let isReclaiming = false;
@@ -389,6 +543,8 @@ async function refresh() {
     }
 
     renderStatistics('statsRows', data.statistics.today, data.statistics.last7Days, data.cloudEnabled);
+    renderUsageRatio(data.statistics.last7Days, data.cloudEnabled);
+    renderCost(data.cost, data.cloudEnabled);
 
     const inProgressRows = document.getElementById('inProgressRows');
     clear(inProgressRows);
@@ -449,6 +605,36 @@ setInterval(refresh, 2000);
 </body>
 </html>
 """;
+    public static MonitorCostStatus? CalculateCostStatus(
+        IReadOnlyDictionary<RoutingTarget, ActivityStatisticsTotals> last7Days,
+        PricingOptions? pricing)
+    {
+        if (pricing == null || !pricing.IsConfigured)
+        {
+            return null;
+        }
+
+        var effectiveInputPrice = pricing.PromptPricePerMillion ?? pricing.PricePerMillion ?? 0.0;
+        var effectiveOutputPrice = pricing.CompletionPricePerMillion ?? pricing.PricePerMillion ?? 0.0;
+
+        var localStats = last7Days.GetValueOrDefault(RoutingTarget.Local) ?? new ActivityStatisticsTotals(0, 0, 0);
+        var remoteStats = last7Days.GetValueOrDefault(RoutingTarget.Remote) ?? new ActivityStatisticsTotals(0, 0, 0);
+        var cloudStats = last7Days.GetValueOrDefault(RoutingTarget.Cloud) ?? new ActivityStatisticsTotals(0, 0, 0);
+
+        long localRemoteInputTokens = (long)localStats.InputTokens + remoteStats.InputTokens;
+        long localRemoteOutputTokens = (long)localStats.OutputTokens + remoteStats.OutputTokens;
+
+        var estimatedSavings = (localRemoteInputTokens / 1_000_000.0 * effectiveInputPrice) +
+                               (localRemoteOutputTokens / 1_000_000.0 * effectiveOutputPrice);
+
+        var cloudOverflowCost = (cloudStats.InputTokens / 1_000_000.0 * effectiveInputPrice) +
+                                (cloudStats.OutputTokens / 1_000_000.0 * effectiveOutputPrice);
+
+        return new MonitorCostStatus(
+            pricing.Currency,
+            Math.Round(estimatedSavings, 4),
+            Math.Round(cloudOverflowCost, 4));
+    }
 }
 
 /// <summary>
@@ -471,6 +657,11 @@ public sealed record ReclaimVramResponse(
     [property: JsonPropertyName("unloadedModels")] IReadOnlyList<string> UnloadedModels,
     [property: JsonPropertyName("localDisabled")] bool LocalDisabled);
 
+public sealed record MonitorCostStatus(
+    [property: JsonPropertyName("currency")] string Currency,
+    [property: JsonPropertyName("estimatedSavings")] double EstimatedSavings,
+    [property: JsonPropertyName("cloudOverflowCost")] double CloudOverflowCost);
+
 public sealed record MonitorStateResponse(
     [property: JsonPropertyName("cloudEnabled")] bool CloudEnabled,
     [property: JsonPropertyName("targets")] MonitorTargetsStatus Targets,
@@ -478,7 +669,8 @@ public sealed record MonitorStateResponse(
     [property: JsonPropertyName("busy")] MonitorBusyStatus Busy,
     [property: JsonPropertyName("statistics")] MonitorStatisticsStatus Statistics,
     [property: JsonPropertyName("inProgress")] IReadOnlyList<MonitorInProgressItem> InProgress,
-    [property: JsonPropertyName("requests")] IReadOnlyList<MonitorRecentRequestItem> Requests);
+    [property: JsonPropertyName("requests")] IReadOnlyList<MonitorRecentRequestItem> Requests,
+    [property: JsonPropertyName("cost")] [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] MonitorCostStatus? Cost = null);
 
 public sealed record MonitorTargetsStatus(
     [property: JsonPropertyName("local")] bool Local,

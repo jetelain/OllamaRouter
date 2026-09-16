@@ -16,7 +16,9 @@ namespace OllamaRouter.Tests.Endpoints;
 public class MonitorEndpointsExtensionsTests
 {
     private static async Task<(WebApplication App, HttpClient Client, Mocks Bag)> CreateTestAppAsync(
-        string localUrl = "http://127.0.0.1:11435")
+        string localUrl = "http://127.0.0.1:11435",
+        PricingOptions? pricing = null,
+        ActivityStatisticsSnapshot? statisticsSnapshot = null)
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseUrls("http://127.0.0.1:0");
@@ -35,22 +37,24 @@ public class MonitorEndpointsExtensionsTests
         mocks.ActivityMonitor.Setup(m => m.GetSnapshot())
             .Returns(new ActivityMonitorSnapshot(new Dictionary<RoutingTarget, bool>(), [], []));
 
+        var defaultSnapshot = statisticsSnapshot ?? new ActivityStatisticsSnapshot(
+            new Dictionary<RoutingTarget, ActivityStatisticsTotals>
+            {
+                [RoutingTarget.Local] = new(0, 0, 0),
+                [RoutingTarget.Remote] = new(0, 0, 0),
+                [RoutingTarget.Cloud] = new(0, 0, 0)
+            },
+            new(0, 0, 0),
+            new Dictionary<RoutingTarget, ActivityStatisticsTotals>
+            {
+                [RoutingTarget.Local] = new(0, 0, 0),
+                [RoutingTarget.Remote] = new(0, 0, 0),
+                [RoutingTarget.Cloud] = new(0, 0, 0)
+            },
+            new(0, 0, 0));
+
         mocks.ActivityStatistics.Setup(s => s.GetSnapshot())
-            .Returns(new ActivityStatisticsSnapshot(
-                new Dictionary<RoutingTarget, ActivityStatisticsTotals>
-                {
-                    [RoutingTarget.Local] = new(0, 0, 0),
-                    [RoutingTarget.Remote] = new(0, 0, 0),
-                    [RoutingTarget.Cloud] = new(0, 0, 0)
-                },
-                new(0, 0, 0),
-                new Dictionary<RoutingTarget, ActivityStatisticsTotals>
-                {
-                    [RoutingTarget.Local] = new(0, 0, 0),
-                    [RoutingTarget.Remote] = new(0, 0, 0),
-                    [RoutingTarget.Cloud] = new(0, 0, 0)
-                },
-                new(0, 0, 0)));
+            .Returns(defaultSnapshot);
 
         mocks.TargetAvailability.Setup(t => t.GetSnapshot())
             .Returns(new TargetAvailabilitySnapshot(true, true, false));
@@ -62,7 +66,8 @@ public class MonitorEndpointsExtensionsTests
         builder.Services.AddSingleton(mocks.ModelCatalogCache.Object);
         builder.Services.AddSingleton(Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions
         {
-            LocalUrl = localUrl
+            LocalUrl = localUrl,
+            Pricing = pricing
         }));
 
         var app = builder.Build();
@@ -259,5 +264,185 @@ public class MonitorEndpointsExtensionsTests
             await app.StopAsync();
             await app.DisposeAsync();
         }
+    }
+
+    [Fact]
+    public async Task GetMonitor_ReturnsHtmlWithProgressBarAndCostElements()
+    {
+        var (app, client, _) = await CreateTestAppAsync();
+        try
+        {
+            var response = await client.GetAsync("/monitor");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var html = await response.Content.ReadAsStringAsync();
+            Assert.Contains("statsSummaryRow", html);
+            Assert.Contains("usageRatioContainer", html);
+            Assert.Contains("usageProgressBar", html);
+            Assert.Contains("usageProgressLegend", html);
+            Assert.Contains("renderUsageRatio", html);
+            Assert.Contains("costContainer", html);
+            Assert.Contains("has-cloud", html);
+            Assert.Contains("estimatedSavingsValue", html);
+            Assert.Contains("cloudCostValue", html);
+            Assert.Contains("renderCost", html);
+            Assert.Contains("formatCost", html);
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task GetMonitorApi_WithoutPricing_CostIsNull()
+    {
+        var (app, client, _) = await CreateTestAppAsync();
+        try
+        {
+            var response = await client.GetAsync("/monitor/api");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var json = await response.Content.ReadFromJsonAsync<JsonObject>();
+
+            Assert.NotNull(json);
+            Assert.True(json["cost"] == null, "Cost should be null or omitted when pricing is not configured.");
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task GetMonitorApi_WithPricing_ReturnsEstimatedSavingsAndCloudCost()
+    {
+        var stats = new ActivityStatisticsSnapshot(
+            Today: new Dictionary<RoutingTarget, ActivityStatisticsTotals>
+            {
+                [RoutingTarget.Local] = new(0, 0, 0),
+                [RoutingTarget.Remote] = new(0, 0, 0),
+                [RoutingTarget.Cloud] = new(0, 0, 0)
+            },
+            TodayTotal: new(0, 0, 0),
+            Last7Days: new Dictionary<RoutingTarget, ActivityStatisticsTotals>
+            {
+                [RoutingTarget.Local] = new(Requests: 10, InputTokens: 200_000, OutputTokens: 50_000),
+                [RoutingTarget.Remote] = new(Requests: 5, InputTokens: 800_000, OutputTokens: 150_000),
+                [RoutingTarget.Cloud] = new(Requests: 2, InputTokens: 100_000, OutputTokens: 20_000)
+            },
+            Last7DaysTotal: new(17, 1_100_000, 220_000));
+
+        var pricing = new PricingOptions
+        {
+            PromptPricePerMillion = 0.20,
+            CompletionPricePerMillion = 0.80,
+            Currency = "$"
+        };
+
+        var (app, client, _) = await CreateTestAppAsync(pricing: pricing, statisticsSnapshot: stats);
+        try
+        {
+            var response = await client.GetAsync("/monitor/api");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var json = await response.Content.ReadFromJsonAsync<JsonObject>();
+
+            Assert.NotNull(json);
+            var cost = json["cost"];
+            Assert.NotNull(cost);
+
+            // Local + Remote input = 1,000,000; output = 200,000
+            // Savings = (1.0 * 0.20) + (0.2 * 0.80) = 0.20 + 0.16 = 0.36
+            Assert.Equal(0.36, cost["estimatedSavings"]?.GetValue<double>());
+
+            // Cloud input = 100,000; output = 20,000
+            // Cloud cost = (0.1 * 0.20) + (0.02 * 0.80) = 0.02 + 0.016 = 0.036
+            Assert.Equal(0.036, cost["cloudOverflowCost"]?.GetValue<double>());
+            Assert.Equal("$", cost["currency"]?.GetValue<string>());
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public void CalculateCostStatus_NullPricing_ReturnsNull()
+    {
+        var last7Days = new Dictionary<RoutingTarget, ActivityStatisticsTotals>
+        {
+            [RoutingTarget.Local] = new(10, 100_000, 50_000)
+        };
+
+        var result = MonitorEndpointsExtensions.CalculateCostStatus(last7Days, null);
+
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public void CalculateCostStatus_UnconfiguredPricing_ReturnsNull()
+    {
+        var last7Days = new Dictionary<RoutingTarget, ActivityStatisticsTotals>
+        {
+            [RoutingTarget.Local] = new(10, 100_000, 50_000)
+        };
+
+        var pricing = new PricingOptions();
+        var result = MonitorEndpointsExtensions.CalculateCostStatus(last7Days, pricing);
+
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public void CalculateCostStatus_FlatRate_CalculatesSavingsAndCost()
+    {
+        var last7Days = new Dictionary<RoutingTarget, ActivityStatisticsTotals>
+        {
+            [RoutingTarget.Local] = new(10, 500_000, 500_000),
+            [RoutingTarget.Remote] = new(5, 500_000, 500_000),
+            [RoutingTarget.Cloud] = new(2, 200_000, 100_000)
+        };
+
+        var pricing = new PricingOptions
+        {
+            PricePerMillion = 1.0,
+            Currency = "€"
+        };
+
+        var result = MonitorEndpointsExtensions.CalculateCostStatus(last7Days, pricing);
+
+        Assert.NotNull(result);
+        // Local + Remote total tokens = 2,000,000 -> 2.0 * 1.0 = 2.0
+        Assert.Equal(2.0, result.EstimatedSavings);
+        // Cloud total tokens = 300,000 -> 0.3 * 1.0 = 0.3
+        Assert.Equal(0.3, result.CloudOverflowCost);
+        Assert.Equal("€", result.Currency);
+    }
+
+    [Fact]
+    public void CalculateCostStatus_InputOutputAliases_WorksCorrectly()
+    {
+        var last7Days = new Dictionary<RoutingTarget, ActivityStatisticsTotals>
+        {
+            [RoutingTarget.Local] = new(1, 1_000_000, 0),
+            [RoutingTarget.Remote] = new(0, 0, 0),
+            [RoutingTarget.Cloud] = new(1, 0, 1_000_000)
+        };
+
+        var pricing = new PricingOptions
+        {
+            InputPricePerMillion = 0.50,
+            OutputPricePerMillion = 2.00
+        };
+
+        var result = MonitorEndpointsExtensions.CalculateCostStatus(last7Days, pricing);
+
+        Assert.NotNull(result);
+        Assert.Equal(0.50, result.EstimatedSavings);
+        Assert.Equal(2.00, result.CloudOverflowCost);
     }
 }
