@@ -445,4 +445,113 @@ public class MonitorEndpointsExtensionsTests
         Assert.Equal(0.50, result.EstimatedSavings);
         Assert.Equal(2.00, result.CloudOverflowCost);
     }
+
+    [Fact]
+    public void CalculateOverheadStatus_NoValidSamples_ReturnsNullOverallFactor()
+    {
+        var requests = new List<ActivityLogEntry>
+        {
+            new(DateTimeOffset.UtcNow, RoutingTarget.Local, "qwen3:8b", 100, null, 50, 200, 200, true),
+            new(DateTimeOffset.UtcNow, RoutingTarget.Local, "qwen3:8b", 100, 0, 50, 200, 200, true),
+            new(DateTimeOffset.UtcNow, RoutingTarget.Local, "qwen3:8b", 100, 100, 50, 200, 500, false)
+        };
+
+        var result = MonitorEndpointsExtensions.CalculateOverheadStatus(requests, 1.10, "Tiktoken");
+
+        Assert.NotNull(result);
+        Assert.Equal(1.10, result.ConfiguredFactor);
+        Assert.Equal("Tiktoken", result.Estimator);
+        Assert.Null(result.OverallObservedFactor);
+        Assert.Equal(0, result.SampleCount);
+        Assert.Empty(result.Models);
+    }
+
+    [Fact]
+    public void CalculateOverheadStatus_WithExplicitRawTokens_ComputesAccurateFactors()
+    {
+        var requests = new List<ActivityLogEntry>
+        {
+            new(DateTimeOffset.UtcNow, RoutingTarget.Local, "qwen3:8b", 110, 109, 50, 200, 200, true, RawPromptTokens: 100),
+            new(DateTimeOffset.UtcNow, RoutingTarget.Local, "qwen3:8b", 220, 218, 50, 200, 200, true, RawPromptTokens: 200),
+            new(DateTimeOffset.UtcNow, RoutingTarget.Remote, "llama3.2:latest", 100, 100, 30, 150, 200, true, RawPromptTokens: 100)
+        };
+
+        var result = MonitorEndpointsExtensions.CalculateOverheadStatus(requests, 1.0, "Heuristic");
+
+        Assert.NotNull(result);
+        Assert.Equal(1.0, result.ConfiguredFactor);
+        Assert.Equal("Heuristic", result.Estimator);
+        Assert.Equal(3, result.SampleCount);
+        // Total raw = 400, total actual = 427 -> 427 / 400 = 1.0675 -> 1.07
+        Assert.Equal(1.07, result.OverallObservedFactor);
+        Assert.Equal(2, result.Models.Count);
+
+        var qwen = result.Models.Single(m => m.Model == "qwen3:8b");
+        Assert.Equal(2, qwen.SampleCount);
+        Assert.Equal(1.09, qwen.ObservedFactor); // 327 / 300 = 1.09
+
+        var llama = result.Models.Single(m => m.Model == "llama3.2:latest");
+        Assert.Equal(1, llama.SampleCount);
+        Assert.Equal(1.00, llama.ObservedFactor);
+    }
+
+    [Fact]
+    public void CalculateOverheadStatus_FallbackWhenRawPromptTokensNotAvailable_CalculatesFromEstimatedAndConfigured()
+    {
+        var requests = new List<ActivityLogEntry>
+        {
+            // Estimated is 110, ConfiguredFactor is 1.10 -> raw = round(110 / 1.10) = 100
+            // Actual is 115 -> factor = 115 / 100 = 1.15
+            new(DateTimeOffset.UtcNow, RoutingTarget.Local, "qwen3:8b", 110, 115, 50, 200, 200, true, RawPromptTokens: null)
+        };
+
+        var result = MonitorEndpointsExtensions.CalculateOverheadStatus(requests, 1.10, "Tiktoken");
+
+        Assert.NotNull(result);
+        Assert.Equal(1, result.SampleCount);
+        Assert.Equal(1.15, result.OverallObservedFactor);
+        Assert.Single(result.Models);
+        Assert.Equal(1.15, result.Models[0].ObservedFactor);
+    }
+
+    [Fact]
+    public async Task GetMonitorApi_IncludesOverheadStatus_InResponse()
+    {
+        var requests = new List<ActivityLogEntry>
+        {
+            new(DateTimeOffset.UtcNow, RoutingTarget.Local, "qwen3:8b", 110, 109, 50, 200, 200, true, RawPromptTokens: 100)
+        };
+
+        var (app, client, mocks) = await CreateTestAppAsync();
+        try
+        {
+            mocks.ActivityMonitor.Setup(m => m.GetSnapshot())
+                .Returns(new ActivityMonitorSnapshot(new Dictionary<RoutingTarget, bool>(), [], requests));
+
+            var response = await client.GetAsync("/monitor/api");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var json = await response.Content.ReadFromJsonAsync<JsonObject>();
+
+            Assert.NotNull(json);
+            var overhead = json["overhead"];
+            Assert.NotNull(overhead);
+            Assert.Equal(1.0, overhead["configuredFactor"]?.GetValue<double>());
+            Assert.Equal("Heuristic", overhead["estimator"]?.GetValue<string>());
+            Assert.Equal(1.09, overhead["overallObservedFactor"]?.GetValue<double>());
+            Assert.Equal(1, overhead["sampleCount"]?.GetValue<int>());
+
+            var models = overhead["models"]?.AsArray();
+            Assert.NotNull(models);
+            Assert.Single(models);
+            Assert.Equal("qwen3:8b", models[0]?["model"]?.GetValue<string>());
+            Assert.Equal(1.09, models[0]?["observedFactor"]?.GetValue<double>());
+            Assert.Equal(1, models[0]?["sampleCount"]?.GetValue<int>());
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
 }

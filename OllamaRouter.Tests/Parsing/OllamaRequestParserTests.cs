@@ -271,4 +271,53 @@ public class OllamaRequestParserTests
 
         Assert.Equal("", modelName);
     }
+
+    [Fact]
+    public void ParseCompletionRequest_ChatFormat_ExtractsAllFieldsInSinglePass()
+    {
+        var body = """
+        {
+            "model": "qwen2.5:7b",
+            "messages": [
+                { "role": "system", "content": "You are helpful." },
+                { "role": "user", "content": "Hello!" }
+            ],
+            "context": [101, 102, 103]
+        }
+        """;
+
+        var result = OllamaRequestParser.ParseCompletionRequest(body);
+
+        Assert.Equal("qwen2.5:7b", result.ModelName);
+        Assert.Equal(new[] { "You are helpful.", "Hello!" }, result.ContextParts);
+        Assert.Equal(3, result.PriorContextTokenCount);
+    }
+
+    [Fact]
+    public void ParseCompletionRequest_GenerateFormat_ExtractsAllFields()
+    {
+        var body = """
+        {
+            "model": "llama3:8b",
+            "prompt": "Tell me a joke",
+            "system": "Be funny"
+        }
+        """;
+
+        var result = OllamaRequestParser.ParseCompletionRequest(body);
+
+        Assert.Equal("llama3:8b", result.ModelName);
+        Assert.Equal(new[] { "Tell me a joke", "Be funny" }, result.ContextParts);
+        Assert.Equal(0, result.PriorContextTokenCount);
+    }
+
+    [Fact]
+    public void ParseCompletionRequest_InvalidJson_ReturnsEmptyInfo()
+    {
+        var result = OllamaRequestParser.ParseCompletionRequest("invalid-json");
+
+        Assert.Equal("", result.ModelName);
+        Assert.Empty(result.ContextParts);
+        Assert.Equal(0, result.PriorContextTokenCount);
+    }
 }

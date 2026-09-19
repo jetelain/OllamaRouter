@@ -12,7 +12,8 @@ public sealed record ActivityLogEntry(
     int? ActualResponseTokens,
     long ElapsedMilliseconds,
     int StatusCode,
-    bool Success);
+    bool Success,
+    int? RawPromptTokens = null);
 
 /// <summary>
 /// A chat/generate request that is currently being processed by an instance.

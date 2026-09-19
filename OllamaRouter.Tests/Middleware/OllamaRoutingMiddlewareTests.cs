@@ -64,7 +64,7 @@ public class OllamaRoutingMiddlewareTests
 
         Assert.Equal("Local", context.Request.Headers["X-Ollama-Target"]);
         Assert.True(nextCalled);
-        tokenEstimator.Verify(t => t.EstimateTokens(It.IsAny<string>()), Times.Never);
+        tokenEstimator.Verify(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>()), Times.Never);
         routingDecisionService.Verify(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
@@ -74,7 +74,7 @@ public class OllamaRoutingMiddlewareTests
         var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Bonjour" }""");
 
         var tokenEstimator = new Mock<ITokenEstimator>();
-        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<string>())).Returns(100);
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
@@ -95,7 +95,7 @@ public class OllamaRoutingMiddlewareTests
         var context = BuildContext("/api/generate", """{ "model": "llama3", "prompt": "Bonjour" }""");
 
         var tokenEstimator = new Mock<ITokenEstimator>();
-        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<string>())).Returns(50);
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(50);
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
@@ -115,7 +115,7 @@ public class OllamaRoutingMiddlewareTests
         var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Bonjour" }""");
 
         var tokenEstimator = new Mock<ITokenEstimator>();
-        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<string>())).Throws(new InvalidOperationException("boom"));
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Throws(new InvalidOperationException("boom"));
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
 
@@ -132,7 +132,7 @@ public class OllamaRoutingMiddlewareTests
         var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Bonjour" }""");
 
         var tokenEstimator = new Mock<ITokenEstimator>();
-        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<string>())).Returns(100);
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
@@ -154,7 +154,7 @@ public class OllamaRoutingMiddlewareTests
         var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Bonjour" }""");
 
         var tokenEstimator = new Mock<ITokenEstimator>();
-        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<string>())).Throws(new InvalidOperationException("boom"));
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Throws(new InvalidOperationException("boom"));
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         var targetAvailability = new Mock<ITargetAvailabilityService>();
@@ -175,7 +175,7 @@ public class OllamaRoutingMiddlewareTests
         var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Bonjour" }""");
 
         var tokenEstimator = new Mock<ITokenEstimator>();
-        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<string>())).Throws(new InvalidOperationException("boom"));
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Throws(new InvalidOperationException("boom"));
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         var targetAvailability = new Mock<ITargetAvailabilityService>();
@@ -196,7 +196,7 @@ public class OllamaRoutingMiddlewareTests
         var context = BuildContext("/api/generate", """{ "model": "llama3", "prompt": "Continue", "context": [1, 2, 3, 4, 5] }""");
 
         var tokenEstimator = new Mock<ITokenEstimator>();
-        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<string>())).Returns(100);
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
@@ -259,7 +259,7 @@ public class OllamaRoutingMiddlewareTests
         context.Response.Body = responseBody;
 
         var tokenEstimator = new Mock<ITokenEstimator>();
-        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<string>())).Returns(100);
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
@@ -306,7 +306,7 @@ public class OllamaRoutingMiddlewareTests
         var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Bonjour" }""");
 
         var tokenEstimator = new Mock<ITokenEstimator>();
-        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<string>())).Returns(100);
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
@@ -336,7 +336,7 @@ public class OllamaRoutingMiddlewareTests
         context.Response.Body = responseBody;
 
         var tokenEstimator = new Mock<ITokenEstimator>();
-        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<string>())).Returns(100);
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService

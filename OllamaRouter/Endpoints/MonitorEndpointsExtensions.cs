@@ -69,8 +69,10 @@ public static class MonitorEndpointsExtensions
                     r.ActualResponseTokens,
                     r.ElapsedMilliseconds,
                     r.StatusCode,
-                    r.Success)).ToList(),
-                CalculateCostStatus(statistics.Last7Days, options.Value.Pricing));
+                    r.Success,
+                    r.RawPromptTokens)).ToList(),
+                CalculateCostStatus(statistics.Last7Days, options.Value.Pricing),
+                CalculateOverheadStatus(snapshot.RecentRequests, options.Value.TokenEstimationOverheadFactor, options.Value.TokenEstimator));
 
             return Results.Json(monitorResponse, OllamaRouterJsonSerializerContext.Default.MonitorStateResponse);
         });
@@ -229,6 +231,8 @@ public static class MonitorEndpointsExtensions
   </thead>
   <tbody id="rows"></tbody>
 </table>
+<h2>Token estimation overhead recommendation</h2>
+<div id="overheadContent"></div>
 <script>
 const targetIcons = { Local: '🖥️', Remote: '📡', Cloud: '☁️' };
 
@@ -578,9 +582,46 @@ async function refresh() {
         td(r.statusCode, 'num')
       ], r.success ? null : 'fail');
     }
+
+    renderOverhead(data.overhead);
   } catch (e) {
     console.error(e);
   }
+}
+
+function renderOverhead(overhead) {
+  const container = document.getElementById('overheadContent');
+  if (!container) return;
+
+  if (!overhead) {
+    container.innerHTML = '<span class="empty">No overhead recommendation data available.</span>';
+    return;
+  }
+
+  if (!overhead.overallObservedFactor || overhead.sampleCount === 0) {
+    container.innerHTML = `<span class="empty">💡 No completion requests with actual token metrics recorded yet. Recommendations will appear here once Ollama completes requests (Current configured: <strong>${overhead.configuredFactor}</strong>, Estimator: <strong>${overhead.estimator}</strong>).</span>`;
+    return;
+  }
+
+  const factor = overhead.overallObservedFactor.toFixed(2);
+  const diff = Math.round((overhead.overallObservedFactor - overhead.configuredFactor) * 100) / 100;
+  const diffText = Math.abs(diff) < 0.005 ? 'matches current configuration' : (diff > 0 ? `+${diff.toFixed(2)} above configured` : `${diff.toFixed(2)} below configured`);
+
+  let html = `<div style="margin-bottom: 0.4rem;">
+    💡 <strong>Observed overhead factor:</strong> <span style="font-size: 1.15rem; font-weight: 700; color: #34e0a1; margin-left: 4px;">${factor}</span>
+    <span style="color: #888; font-size: 0.82rem; margin-left: 8px;">(${diffText} ${overhead.configuredFactor}, based on ${overhead.sampleCount} request${overhead.sampleCount > 1 ? 's' : ''}, Estimator: <strong>${overhead.estimator}</strong>)</span>
+  </div>
+  <div style="font-size: 0.85rem; color: #bbb;">
+    Recommended setting for <code>appsettings.json</code>: <code style="background: #181818; padding: 2px 6px; border-radius: 4px; color: #3f9eff;">"TokenEstimationOverheadFactor": ${factor}</code>
+  </div>`;
+
+  if (overhead.models && overhead.models.length > 1) {
+    html += `<div style="margin-top: 0.6rem; font-size: 0.82rem; color: #aaa;"><strong>Per-model observed factors:</strong> `;
+    html += overhead.models.map(m => `<span>${m.model}: <strong style="color: #ddd;">${m.observedFactor.toFixed(2)}</strong> (${m.sampleCount} req)</span>`).join(' &bull; ');
+    html += `</div>`;
+  }
+
+  container.innerHTML = html;
 }
 
 async function toggleTarget(name, checked, currentTargets) {
@@ -635,6 +676,49 @@ setInterval(refresh, 2000);
             Math.Round(estimatedSavings, 4),
             Math.Round(cloudOverflowCost, 4));
     }
+
+    public static MonitorOverheadStatus CalculateOverheadStatus(
+        IReadOnlyList<ActivityLogEntry> recentRequests,
+        double configuredFactor,
+        string estimator)
+    {
+        var validSamples = recentRequests
+            .Where(r => r.Success && r.ActualPromptTokens.HasValue && r.ActualPromptTokens.Value > 0)
+            .Select(r =>
+            {
+                int raw = r.RawPromptTokens.GetValueOrDefault(0);
+                if (raw <= 0)
+                {
+                    raw = (int)Math.Round(r.EstimatedPromptTokens / (configuredFactor > 0 ? configuredFactor : 1.0));
+                }
+                return (r.Model, Raw: raw, Actual: r.ActualPromptTokens!.Value);
+            })
+            .Where(x => x.Raw > 0)
+            .ToList();
+
+        if (validSamples.Count == 0)
+        {
+            return new MonitorOverheadStatus(configuredFactor, estimator, null, 0, Array.Empty<MonitorOverheadRecommendation>());
+        }
+
+        var modelGroups = validSamples
+            .GroupBy(x => x.Model)
+            .Select(g =>
+            {
+                long sumRaw = g.Sum(x => (long)x.Raw);
+                long sumActual = g.Sum(x => (long)x.Actual);
+                double factor = sumRaw > 0 ? Math.Round((double)sumActual / sumRaw, 2) : 1.0;
+                return new MonitorOverheadRecommendation(g.Key, factor, g.Count());
+            })
+            .OrderByDescending(m => m.SampleCount)
+            .ToList();
+
+        long totalRaw = validSamples.Sum(x => (long)x.Raw);
+        long totalActual = validSamples.Sum(x => (long)x.Actual);
+        double overallFactor = totalRaw > 0 ? Math.Round((double)totalActual / totalRaw, 2) : 1.0;
+
+        return new MonitorOverheadStatus(configuredFactor, estimator, overallFactor, validSamples.Count, modelGroups);
+    }
 }
 
 /// <summary>
@@ -670,7 +754,8 @@ public sealed record MonitorStateResponse(
     [property: JsonPropertyName("statistics")] MonitorStatisticsStatus Statistics,
     [property: JsonPropertyName("inProgress")] IReadOnlyList<MonitorInProgressItem> InProgress,
     [property: JsonPropertyName("requests")] IReadOnlyList<MonitorRecentRequestItem> Requests,
-    [property: JsonPropertyName("cost")] [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] MonitorCostStatus? Cost = null);
+    [property: JsonPropertyName("cost")] [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] MonitorCostStatus? Cost = null,
+    [property: JsonPropertyName("overhead")] [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] MonitorOverheadStatus? Overhead = null);
 
 public sealed record MonitorTargetsStatus(
     [property: JsonPropertyName("local")] bool Local,
@@ -707,4 +792,17 @@ public sealed record MonitorRecentRequestItem(
     [property: JsonPropertyName("actualResponseTokens")] int? ActualResponseTokens,
     [property: JsonPropertyName("elapsedMs")] double ElapsedMs,
     [property: JsonPropertyName("statusCode")] int? StatusCode,
-    [property: JsonPropertyName("success")] bool Success);
+    [property: JsonPropertyName("success")] bool Success,
+    [property: JsonPropertyName("rawPromptTokens")] [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? RawPromptTokens = null);
+
+public sealed record MonitorOverheadRecommendation(
+    [property: JsonPropertyName("model")] string Model,
+    [property: JsonPropertyName("observedFactor")] double ObservedFactor,
+    [property: JsonPropertyName("sampleCount")] int SampleCount);
+
+public sealed record MonitorOverheadStatus(
+    [property: JsonPropertyName("configuredFactor")] double ConfiguredFactor,
+    [property: JsonPropertyName("estimator")] string Estimator,
+    [property: JsonPropertyName("overallObservedFactor")] double? OverallObservedFactor,
+    [property: JsonPropertyName("sampleCount")] int SampleCount,
+    [property: JsonPropertyName("models")] IReadOnlyList<MonitorOverheadRecommendation> Models);

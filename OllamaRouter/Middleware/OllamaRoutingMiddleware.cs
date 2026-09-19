@@ -68,14 +68,15 @@ public sealed class OllamaRoutingMiddleware(
 
         var modelName = "unknown";
         var tokenCount = 0;
+        var rawTokenCount = 0;
         RoutingTarget target;
 
         try
         {
-            var contextText = OllamaRequestParser.ExtractContextText(body);
-            modelName = OllamaRequestParser.ExtractModelName(body);
-            var rawTokenCount = tokenEstimator.EstimateTokens(contextText)
-                + OllamaRequestParser.ExtractPriorContextTokenCount(body);
+            var requestInfo = OllamaRequestParser.ParseCompletionRequest(body);
+            modelName = string.IsNullOrEmpty(requestInfo.ModelName) ? "unknown" : requestInfo.ModelName;
+            rawTokenCount = tokenEstimator.EstimateTokens(requestInfo.ContextParts)
+                + requestInfo.PriorContextTokenCount;
             tokenCount = (int)Math.Ceiling(rawTokenCount * options.Value.TokenEstimationOverheadFactor);
 
             target = await routingDecisionService.DecideAsync(tokenCount, modelName, context.RequestAborted);
@@ -160,7 +161,8 @@ public sealed class OllamaRoutingMiddleware(
                 actualResponseTokens,
                 stopwatch.ElapsedMilliseconds,
                 context.Response.StatusCode,
-                success);
+                success,
+                rawTokenCount);
 
             activityMonitor.CompleteRequest(requestId, entry);
             activityStatistics.Add(entry);

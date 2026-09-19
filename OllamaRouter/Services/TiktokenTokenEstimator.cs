@@ -8,15 +8,26 @@ namespace OllamaRouter.Services;
 /// </summary>
 public sealed class TiktokenTokenEstimator : ITokenEstimator
 {
-    private readonly TiktokenTokenizer _tokenizer = TiktokenTokenizer.CreateForModel("gpt-3.5-turbo");
+    private readonly Lazy<TiktokenTokenizer> _tokenizer = new(() => TiktokenTokenizer.CreateForModel("gpt-3.5-turbo"));
 
-    public int EstimateTokens(string text)
+    public int EstimateTokens(IReadOnlyList<string> texts)
     {
-        if (string.IsNullOrEmpty(text))
+        if (texts == null || texts.Count == 0)
         {
             return 0;
         }
 
-        return _tokenizer.EncodeToIds(text).Count;
+        var tokenizer = _tokenizer.Value;
+        int total = 0;
+        for (int i = 0; i < texts.Count; i++)
+        {
+            var text = texts[i];
+            if (!string.IsNullOrEmpty(text))
+            {
+                total += tokenizer.CountTokens(text);
+            }
+        }
+
+        return total;
     }
 }

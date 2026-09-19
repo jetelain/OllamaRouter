@@ -10,15 +10,36 @@ namespace OllamaRouter.Middleware;
 internal sealed class ResponseCapturingStream(Stream inner) : Stream
 {
     private const int MaxTailLength = 4096;
-    private readonly StringBuilder _tail = new();
+    private readonly object _gate = new();
+    private readonly byte[] _buffer = new byte[MaxTailLength];
+    private int _head = 0;
+    private int _count = 0;
 
     public string CapturedTail
     {
         get
         {
-            lock (_tail)
+            lock (_gate)
             {
-                return _tail.ToString();
+                if (_count == 0)
+                {
+                    return string.Empty;
+                }
+
+                if (_count < MaxTailLength)
+                {
+                    return Encoding.UTF8.GetString(_buffer, 0, _count);
+                }
+
+                Span<byte> ordered = stackalloc byte[MaxTailLength];
+                int firstPart = MaxTailLength - _head;
+                _buffer.AsSpan(_head, firstPart).CopyTo(ordered);
+                if (_head > 0)
+                {
+                    _buffer.AsSpan(0, _head).CopyTo(ordered.Slice(firstPart));
+                }
+
+                return Encoding.UTF8.GetString(ordered);
             }
         }
     }
@@ -30,15 +51,26 @@ internal sealed class ResponseCapturingStream(Stream inner) : Stream
             return;
         }
 
-        var text = Encoding.UTF8.GetString(buffer);
-
-        lock (_tail)
+        lock (_gate)
         {
-            _tail.Append(text);
-            if (_tail.Length > MaxTailLength)
+            if (buffer.Length >= MaxTailLength)
             {
-                _tail.Remove(0, _tail.Length - MaxTailLength);
+                buffer.Slice(buffer.Length - MaxTailLength).CopyTo(_buffer);
+                _head = 0;
+                _count = MaxTailLength;
+                return;
             }
+
+            int firstChunk = Math.Min(buffer.Length, MaxTailLength - _head);
+            buffer.Slice(0, firstChunk).CopyTo(_buffer.AsSpan(_head));
+            int secondChunk = buffer.Length - firstChunk;
+            if (secondChunk > 0)
+            {
+                buffer.Slice(firstChunk, secondChunk).CopyTo(_buffer.AsSpan(0));
+            }
+
+            _head = (_head + buffer.Length) % MaxTailLength;
+            _count = Math.Min(_count + buffer.Length, MaxTailLength);
         }
     }
 

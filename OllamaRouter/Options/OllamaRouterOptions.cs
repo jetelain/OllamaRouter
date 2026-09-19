@@ -39,6 +39,11 @@ public sealed class OllamaRouterOptions
     public double TokenEstimationOverheadFactor { get; set; } = 1.0;
 
     /// <summary>
+    /// Token estimation strategy: "Heuristic" (default, zero heap memory overhead) or "Tiktoken" (Microsoft.ML.Tokenizers cl100k_base).
+    /// </summary>
+    public string TokenEstimator { get; set; } = "Heuristic";
+
+    /// <summary>
     /// Optional pricing configuration used to estimate savings from local/remote execution
     /// and the cost of cloud overflow. If not configured, cost estimates are not displayed.
     /// </summary>

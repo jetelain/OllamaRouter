@@ -40,18 +40,34 @@ public static class OllamaRequestParser
     }
 
     /// <summary>
-    /// Extracts the full textual context of a request (all messages, system prompt, template...),
-    /// so that token estimation is not limited to the last prompt/message only.
+    /// Parses a completion or chat request in a single JSON pass, extracting the model name,
+    /// combined textual context, and any prior context tokens without redundant DOM allocations.
     /// </summary>
-    public static string ExtractContextText(string jsonBody)
+    public static OllamaCompletionRequestInfo ParseCompletionRequest(string jsonBody)
     {
         try
         {
             using var doc = JsonDocument.Parse(jsonBody);
             var root = doc.RootElement;
+
+            string modelName = "";
+            if (root.TryGetProperty("model", out var modelElement))
+            {
+                modelName = modelElement.GetString() ?? "";
+            }
+            else if (root.TryGetProperty("name", out var nameElement))
+            {
+                modelName = nameElement.GetString() ?? "";
+            }
+
+            int priorContextTokenCount = 0;
+            if (root.TryGetProperty("context", out var context) && context.ValueKind == JsonValueKind.Array)
+            {
+                priorContextTokenCount = context.GetArrayLength();
+            }
+
             var parts = new List<string>();
 
-            // Handles the /api/chat and /v1/chat/completions format: concatenate every message content.
             if (root.TryGetProperty("messages", out var messages) && messages.ValueKind == JsonValueKind.Array)
             {
                 foreach (var message in messages.EnumerateArray())
@@ -61,8 +77,6 @@ public static class OllamaRequestParser
                         AppendContent(content, parts);
                     }
 
-                    // Assistant messages requesting tool/function calls: include the call payload
-                    // (name + arguments), since it is also part of the model's context.
                     if (message.TryGetProperty("tool_calls", out var toolCalls) && toolCalls.ValueKind == JsonValueKind.Array)
                     {
                         foreach (var toolCall in toolCalls.EnumerateArray())
@@ -73,7 +87,6 @@ public static class OllamaRequestParser
                 }
             }
 
-            // Handles the /api/generate and /v1/completions format.
             if (root.TryGetProperty("prompt", out var prompt) && prompt.ValueKind == JsonValueKind.String)
             {
                 var text = prompt.GetString();
@@ -83,7 +96,6 @@ public static class OllamaRequestParser
                 }
             }
 
-            // Optional system prompt, present in both formats.
             if (root.TryGetProperty("system", out var system) && system.ValueKind == JsonValueKind.String)
             {
                 var text = system.GetString();
@@ -93,7 +105,6 @@ public static class OllamaRequestParser
                 }
             }
 
-            // Optional custom prompt template.
             if (root.TryGetProperty("template", out var template) && template.ValueKind == JsonValueKind.String)
             {
                 var text = template.GetString();
@@ -103,8 +114,6 @@ public static class OllamaRequestParser
                 }
             }
 
-            // Optional tool/function definitions (chat and OpenAI-compatible formats): their JSON
-            // schema is injected into the model's context and can be sizeable.
             if (root.TryGetProperty("tools", out var tools) && tools.ValueKind == JsonValueKind.Array)
             {
                 foreach (var tool in tools.EnumerateArray())
@@ -113,15 +122,29 @@ public static class OllamaRequestParser
                 }
             }
 
-            return string.Join("\n", parts);
+            return new OllamaCompletionRequestInfo(modelName, parts, priorContextTokenCount);
         }
         catch
         {
-            // Invalid or non-JSON request body: no usable context.
+            return new OllamaCompletionRequestInfo("", Array.Empty<string>(), 0);
         }
-
-        return "";
     }
+
+    /// <summary>
+    /// Extracts the full textual context of a request (all messages, system prompt, template...),
+    /// so that token estimation is not limited to the last prompt/message only.
+    /// </summary>
+    public static string ExtractContextText(string jsonBody)
+    {
+        var parts = ParseCompletionRequest(jsonBody).ContextParts;
+        return parts.Count switch
+        {
+            0 => "",
+            1 => parts[0],
+            _ => string.Join("\n", parts)
+        };
+    }
+
 
     /// <summary>
     /// Extracts the size (in tokens) of a previous conversation context carried over via the
@@ -247,3 +270,8 @@ public static class OllamaRequestParser
         return jsonBody;
     }
 }
+
+public readonly record struct OllamaCompletionRequestInfo(
+    string ModelName,
+    IReadOnlyList<string> ContextParts,
+    int PriorContextTokenCount);

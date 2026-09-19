@@ -32,7 +32,14 @@ builder.Services.AddHttpClient<IOllamaModelCatalogClient, OllamaModelCatalogClie
 });
 builder.Services.AddMemoryCache();
 
-builder.Services.AddSingleton<ITokenEstimator, TiktokenTokenEstimator>();
+if (string.Equals(ollamaOptions.TokenEstimator, "Tiktoken", StringComparison.OrdinalIgnoreCase))
+{
+    builder.Services.AddSingleton<ITokenEstimator, TiktokenTokenEstimator>();
+}
+else
+{
+    builder.Services.AddSingleton<ITokenEstimator, HeuristicTokenEstimator>();
+}
 builder.Services.AddSingleton<IGpuVramProvider, NvidiaSmiVramProvider>();
 builder.Services.AddTransient<IRoutingTargetHandler, LocalRoutingTargetHandler>();
 builder.Services.AddTransient<IRoutingTargetHandler, RemoteRoutingTargetHandler>();
