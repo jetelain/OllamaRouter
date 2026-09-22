@@ -6,6 +6,7 @@
 	  <PublishAot>true</PublishAot>
 	  <InvariantGlobalization>true</InvariantGlobalization>
 	  <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ApplicationIcon>icon.ico</ApplicationIcon>
   </PropertyGroup>
 
   <!-- Required for single-file publish: Microsoft.ML.Tokenizers ships native libraries. -->

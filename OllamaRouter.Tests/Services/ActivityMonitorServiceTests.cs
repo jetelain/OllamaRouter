@@ -136,4 +136,102 @@ public class ActivityMonitorServiceTests
         var recorded = Assert.Single(sut.GetSnapshot().RecentRequests);
         Assert.Equal(entry, recorded);
     }
+
+    [Fact]
+    public void GetConsecutiveFailures_EmptyHistory_ReturnsZero()
+    {
+        var sut = new ActivityMonitorService();
+
+        var count = sut.GetConsecutiveFailures(RoutingTarget.Remote, 91_300);
+
+        Assert.Equal(0, count);
+    }
+
+    [Fact]
+    public void GetConsecutiveFailures_MultipleConsecutiveFailuresSameTokenCount_ReturnsCount()
+    {
+        var sut = new ActivityMonitorService();
+        var tokenCount = 91_300;
+
+        for (int i = 0; i < 3; i++)
+        {
+            var reqId = sut.StartRequest(RoutingTarget.Remote, "Qwen3.8-27B:latest", tokenCount);
+            sut.CompleteRequest(reqId, new ActivityLogEntry(
+                DateTimeOffset.UtcNow, RoutingTarget.Remote, "Qwen3.8-27B:latest", tokenCount, null, null, 300_000, 400, false));
+        }
+
+        var count = sut.GetConsecutiveFailures(RoutingTarget.Remote, tokenCount);
+
+        Assert.Equal(3, count);
+    }
+
+    [Fact]
+    public void GetConsecutiveFailures_BrokenBySuccess_ReturnsZero()
+    {
+        var sut = new ActivityMonitorService();
+        var tokenCount = 91_300;
+
+        for (int i = 0; i < 3; i++)
+        {
+            var reqId = sut.StartRequest(RoutingTarget.Remote, "Qwen3.8-27B:latest", tokenCount);
+            sut.CompleteRequest(reqId, new ActivityLogEntry(
+                DateTimeOffset.UtcNow, RoutingTarget.Remote, "Qwen3.8-27B:latest", tokenCount, null, null, 300_000, 400, false));
+        }
+
+        // Newer request with same tokenCount succeeds
+        var successId = sut.StartRequest(RoutingTarget.Cloud, "glm-5.3-flash:cloud", tokenCount);
+        sut.CompleteRequest(successId, new ActivityLogEntry(
+            DateTimeOffset.UtcNow, RoutingTarget.Cloud, "glm-5.3-flash:cloud", tokenCount, tokenCount, 50, 1000, 200, true));
+
+        var count = sut.GetConsecutiveFailures(RoutingTarget.Remote, tokenCount);
+
+        Assert.Equal(0, count);
+    }
+
+    [Fact]
+    public void GetConsecutiveFailures_BrokenByDifferentTokenCount_ReturnsZero()
+    {
+        var sut = new ActivityMonitorService();
+        var tokenCount = 91_300;
+
+        for (int i = 0; i < 3; i++)
+        {
+            var reqId = sut.StartRequest(RoutingTarget.Remote, "Qwen3.8-27B:latest", tokenCount);
+            sut.CompleteRequest(reqId, new ActivityLogEntry(
+                DateTimeOffset.UtcNow, RoutingTarget.Remote, "Qwen3.8-27B:latest", tokenCount, null, null, 300_000, 400, false));
+        }
+
+        // Newer request has different token count (e.g. 500) and also failed
+        var differentId = sut.StartRequest(RoutingTarget.Local, "llama3", 500);
+        sut.CompleteRequest(differentId, new ActivityLogEntry(
+            DateTimeOffset.UtcNow, RoutingTarget.Local, "llama3", 500, null, null, 500, 500, false));
+
+        var count = sut.GetConsecutiveFailures(RoutingTarget.Remote, tokenCount);
+
+        Assert.Equal(0, count);
+    }
+
+    [Fact]
+    public void GetConsecutiveFailures_WithMultiTargetStreak_CountsTargetFailuresAccurately()
+    {
+        var sut = new ActivityMonitorService();
+        var tokenCount = 91_300;
+
+        // 3 failures on Remote
+        for (int i = 0; i < 3; i++)
+        {
+            var reqId = sut.StartRequest(RoutingTarget.Remote, "Qwen3.8-27B:latest", tokenCount);
+            sut.CompleteRequest(reqId, new ActivityLogEntry(
+                DateTimeOffset.UtcNow, RoutingTarget.Remote, "Qwen3.8-27B:latest", tokenCount, null, null, 300_000, 400, false));
+        }
+
+        // Then 1 failure on Cloud for the same tokenCount
+        var cloudId = sut.StartRequest(RoutingTarget.Cloud, "glm-5.3-flash:cloud", tokenCount);
+        sut.CompleteRequest(cloudId, new ActivityLogEntry(
+            DateTimeOffset.UtcNow, RoutingTarget.Cloud, "glm-5.3-flash:cloud", tokenCount, null, null, 1000, 500, false));
+
+        Assert.Equal(3, sut.GetConsecutiveFailures(RoutingTarget.Remote, tokenCount));
+        Assert.Equal(1, sut.GetConsecutiveFailures(RoutingTarget.Cloud, tokenCount));
+        Assert.Equal(0, sut.GetConsecutiveFailures(RoutingTarget.Local, tokenCount));
+    }
 }

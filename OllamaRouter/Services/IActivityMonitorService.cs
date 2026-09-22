@@ -63,4 +63,11 @@ public interface IActivityMonitorService
     /// than <see cref="GetSnapshot"/> when only the busy state of a single target is needed.
     /// </summary>
     bool IsBusy(RoutingTarget target);
+
+    /// <summary>
+    /// Returns the number of consecutive failed adjacent requests for the specified target and estimated token count,
+    /// scanning backwards from the most recent completed request until a request with a different token count
+    /// or a successful request is encountered.
+    /// </summary>
+    int GetConsecutiveFailures(RoutingTarget target, int estimatedPromptTokens);
 }

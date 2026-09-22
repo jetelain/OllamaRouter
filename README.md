@@ -10,6 +10,7 @@ The goal is to get the best of both worlds: use the fast local GPU whenever the 
 OllamaRouter is more than a simple two-tier proxy, it also provides:
 
 - **Cloud overflow** (optional, per model). When both instances are busy, requests can **overflow to [ollama.com cloud](https://ollama.com)** models, so a slow/unavailable Local or Remote instance never fully blocks incoming requests. See [Cloud overflow](#cloud-overflow).
+- **Target failover on consecutive errors**. When client retries repeatedly fail on a target (e.g. context limit HTTP 400 or timeouts), requests automatically switch to the next target in the chain. See [Target failover on consecutive errors](#target-failover-on-consecutive-errors).
 - **A built-in monitoring page**. A lightweight, dependency-free page at `/monitor` shows which targets are busy, which requests are in progress and what has been processed recently, and lets you enable/disable the **Local**, **Remote** and **Cloud** targets at runtime — switching the router between operating modes without restarting it. See [Monitoring](#monitoring).
 
 ## How it works
@@ -76,6 +77,23 @@ When a model's configuration includes a `CloudModel` entry (e.g. `deepseek-v3.1:
 - Cloud overflow is entirely opt-in per model: leave `CloudModel` unset (the default) to keep the original Local/Remote-only behavior.
 
 > **Note.** Unlike Local/Remote, OllamaRouter does not talk directly to ollama.com: it relies on the Local Ollama instance's own cloud relay and credentials. No API key or cloud URL needs to be configured in OllamaRouter itself.
+
+### Target failover on consecutive errors
+
+When errors or timeouts arise (such as HTTP 400 Bad Request because a prompt exceeds an instance's context size, or gateway timeouts), LLM clients typically retry the request repeatedly until success. If the chosen target cannot process the request, these retries can take an extremely long time.
+
+To alleviate this, OllamaRouter correlates requests using only their **estimated prompt token count** and tracks consecutive failures across **adjacent requests**:
+
+- If adjacent requests with the same estimated token count fail **3 times** on the same target (configurable via `MaxConsecutiveFailures`, defaulting to `3`), the router dynamically skips that target and routes subsequent retries to the next target in the chain (**Local** → **Remote** → **Cloud**).
+- For example, if a large 91.3k-token request fails 3 times on **Remote** (e.g. returning 400 errors or timing out):
+  ```
+  02:36:08   📡 Remote   Qwen3.8-27B:latest   91.3k / -   -   307.3s   400
+  02:42:08   📡 Remote   Qwen3.8-27B:latest   91.3k / -   -   358.1s   400
+  02:43:59   📡 Remote   Qwen3.8-27B:latest   91.3k / -   -   332.4s   400
+  ```
+  The next 91.3k retry will be dispatched to **Cloud** if enabled. If Cloud is disabled or has no `CloudModel` configured, it keeps the Remote target as fallback.
+- Similarly, if a request fails 3 times on **Local**, it fails over to **Remote**; if Remote also fails 3 times, it fails over to **Cloud**.
+- Adjacency is strict: any request with a different token count breaks adjacency and resets tracking, and any successful response (`HTTP status < 400`) clears the failure count.
 
 ### Other endpoints
 
@@ -179,6 +197,7 @@ Configuration is provided through the `OllamaRouter` section of `appsettings.jso
 | `BindAddress`      | Address the router itself listens on. Defaults to `http://localhost:11434`. Set it to e.g. `http://0.0.0.0:11434` to accept connections from other machines. |
 | `TokenEstimator`   | Token estimation strategy: `"Heuristic"` (default, fast, zero heap memory overhead, saves ~24 MB RAM by omitting the BPE dictionary) or `"Tiktoken"` (uses Microsoft.ML.Tokenizers `cl100k_base`). |
 | `TokenEstimationOverheadFactor` | Multiplicative correction applied to the estimated token count, to compensate for the systematic underestimation of the generic tokenizer versus the actual tokenizer and chat template of targeted models. Defaults to `1.0` (no correction); see [recommendations below](#token-estimation-overhead-recommendations). |
+| `MaxConsecutiveFailures` | Number of consecutive failures on a target for adjacent requests with the same estimated token count before switching to the next target in the chain (`Local` → `Remote` → `Cloud`). Defaults to `3`. Set to `0` to disable automatic target switching. |
 | `Pricing:PromptPricePerMillion` | Optional price per 1,000,000 prompt / input tokens. Used to calculate 7-day estimated savings and cloud overflow cost. Alias: `InputPricePerMillion`. |
 | `Pricing:CompletionPricePerMillion` | Optional price per 1,000,000 completion / output tokens. Used to calculate 7-day estimated savings and cloud overflow cost. Alias: `OutputPricePerMillion`. |
 | `Pricing:PricePerMillion` | Optional flat price per 1,000,000 tokens when prompt and completion rates are not differentiated. |
@@ -190,7 +209,7 @@ OllamaRouter estimates prompt token count prior to routing so it can check again
 
 | Model Family | Vocabulary Size | Recommended (`Tiktoken`) | Recommended (`Heuristic`) | Notes |
 | :--- | :---: | :---: | :---: | :--- |
-| **Qwen 3.8** (e.g. `Qwen3.8-27B`) | 248k | **1.09** | **0.95** | Qwen 3.8 expands token embeddings to 248,320. 1.09 is empirically validated for high-context workloads. |
+| **Qwen 3.8** (e.g. `Qwen3.8-27B`) | 248k | **1.09** | **1.11** | Qwen 3.8 expands token embeddings to 248,320. 1.09 is empirically validated for high-context workloads. |
 
 > **Tip.** The monitoring page (`/monitor`) dynamically measures the ratio between raw estimated tokens and Ollama's actual reported prompt tokens for every completed request, providing you with a tailored recommendation for your exact models and prompts.
 >

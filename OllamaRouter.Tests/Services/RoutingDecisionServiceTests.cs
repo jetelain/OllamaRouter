@@ -52,7 +52,7 @@ public class RoutingDecisionServiceTests
             new CloudRoutingTargetHandler(activityMonitor.Object, targetAvailability.Object)
         };
 
-        return new RoutingDecisionService(handlers, options, modelCatalogCacheService.Object, NullLogger<RoutingDecisionService>.Instance);
+        return new RoutingDecisionService(handlers, options, modelCatalogCacheService.Object, activityMonitor.Object, NullLogger<RoutingDecisionService>.Instance);
     }
 
     private static Mock<IActivityMonitorService> CreateActivityMonitorNotBusy()
@@ -703,5 +703,163 @@ public class RoutingDecisionServiceTests
 
         var instance = serviceProvider.GetRequiredService<IRoutingDecisionService>();
         Assert.NotNull(instance);
+    }
+
+    [Fact]
+    public async Task DecideAsync_WhenRemoteFails3Times_AndCloudEnabled_SwitchesToCloud()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        var activityMonitor = CreateActivityMonitorNotBusy();
+
+        // Remote has failed 3 times for 91,300 tokens
+        activityMonitor
+            .Setup(a => a.GetConsecutiveFailures(RoutingTarget.Remote, 91_300))
+            .Returns(3);
+
+        var sut = CreateSut(
+            catalogClient,
+            gpuVramProvider,
+            maxLocalTokens: 36_864, // 91.3k > 36.8k so Local cannot process
+            modelName: "Qwen3.8-27B",
+            cloudModel: "glm-5.3-flash:cloud",
+            activityMonitor: activityMonitor);
+
+        var decision = await sut.DecideAsync(tokenCount: 91_300, modelName: "Qwen3.8-27B:latest");
+
+        Assert.Equal(RoutingTarget.Cloud, decision);
+    }
+
+    [Fact]
+    public async Task DecideAsync_WhenRemoteFails3Times_AndCloudDisabled_KeepsRemote()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        var activityMonitor = CreateActivityMonitorNotBusy();
+
+        activityMonitor
+            .Setup(a => a.GetConsecutiveFailures(RoutingTarget.Remote, 91_300))
+            .Returns(3);
+
+        // Cloud target is disabled
+        var targets = new TargetAvailabilitySnapshot(Local: true, Remote: true, Cloud: false);
+
+        var sut = CreateSut(
+            catalogClient,
+            gpuVramProvider,
+            maxLocalTokens: 36_864,
+            modelName: "Qwen3.8-27B",
+            cloudModel: "glm-5.3-flash:cloud",
+            activityMonitor: activityMonitor,
+            targets: targets);
+
+        var decision = await sut.DecideAsync(tokenCount: 91_300, modelName: "Qwen3.8-27B:latest");
+
+        Assert.Equal(RoutingTarget.Remote, decision);
+    }
+
+    [Fact]
+    public async Task DecideAsync_WhenRemoteFails3Times_AndNoCloudModelConfigured_KeepsRemote()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        var activityMonitor = CreateActivityMonitorNotBusy();
+
+        activityMonitor
+            .Setup(a => a.GetConsecutiveFailures(RoutingTarget.Remote, 91_300))
+            .Returns(3);
+
+        // cloudModel is null
+        var sut = CreateSut(
+            catalogClient,
+            gpuVramProvider,
+            maxLocalTokens: 36_864,
+            modelName: "Qwen3.8-27B",
+            cloudModel: null,
+            activityMonitor: activityMonitor);
+
+        var decision = await sut.DecideAsync(tokenCount: 91_300, modelName: "Qwen3.8-27B:latest");
+
+        Assert.Equal(RoutingTarget.Remote, decision);
+    }
+
+    [Fact]
+    public async Task DecideAsync_WhenLocalFails3Times_SwitchesToRemote()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
+        var activityMonitor = CreateActivityMonitorNotBusy();
+
+        // Local has failed 3 times for 2,000 tokens
+        activityMonitor
+            .Setup(a => a.GetConsecutiveFailures(RoutingTarget.Local, 2_000))
+            .Returns(3);
+
+        var sut = CreateSut(
+            catalogClient,
+            gpuVramProvider,
+            maxLocalTokens: 40_000,
+            modelName: "llama3",
+            cloudModel: "glm-5.3-flash:cloud",
+            activityMonitor: activityMonitor);
+
+        var decision = await sut.DecideAsync(tokenCount: 2_000, modelName: "llama3");
+
+        Assert.Equal(RoutingTarget.Remote, decision);
+    }
+
+    [Fact]
+    public async Task DecideAsync_WhenLocalAndRemoteBothFail3Times_SwitchesToCloud()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
+        var activityMonitor = CreateActivityMonitorNotBusy();
+
+        // Both Local and Remote have failed 3 times
+        activityMonitor
+            .Setup(a => a.GetConsecutiveFailures(RoutingTarget.Local, 2_000))
+            .Returns(3);
+        activityMonitor
+            .Setup(a => a.GetConsecutiveFailures(RoutingTarget.Remote, 2_000))
+            .Returns(3);
+
+        var sut = CreateSut(
+            catalogClient,
+            gpuVramProvider,
+            maxLocalTokens: 40_000,
+            modelName: "llama3",
+            cloudModel: "glm-5.3-flash:cloud",
+            activityMonitor: activityMonitor);
+
+        var decision = await sut.DecideAsync(tokenCount: 2_000, modelName: "llama3");
+
+        Assert.Equal(RoutingTarget.Cloud, decision);
+    }
+
+    [Fact]
+    public async Task DecideAsync_WhenFailuresBelowThreshold_KeepsOriginalTarget()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        var activityMonitor = CreateActivityMonitorNotBusy();
+
+        // Only 2 failures (below threshold of 3)
+        activityMonitor
+            .Setup(a => a.GetConsecutiveFailures(RoutingTarget.Remote, 91_300))
+            .Returns(2);
+
+        var sut = CreateSut(
+            catalogClient,
+            gpuVramProvider,
+            maxLocalTokens: 36_864,
+            modelName: "Qwen3.8-27B",
+            cloudModel: "glm-5.3-flash:cloud",
+            activityMonitor: activityMonitor);
+
+        var decision = await sut.DecideAsync(tokenCount: 91_300, modelName: "Qwen3.8-27B:latest");
+
+        Assert.Equal(RoutingTarget.Remote, decision);
     }
 }

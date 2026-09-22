@@ -48,6 +48,12 @@ public sealed class OllamaRouterOptions
     /// and the cost of cloud overflow. If not configured, cost estimates are not displayed.
     /// </summary>
     public PricingOptions? Pricing { get; set; }
+
+    /// <summary>
+    /// Number of consecutive failures on a target for adjacent requests with the same estimated token count
+    /// before switching to the next target. Defaults to 3. Set to 0 to disable automatic target switching.
+    /// </summary>
+    public int MaxConsecutiveFailures { get; set; } = 3;
 }
 
 /// <summary>

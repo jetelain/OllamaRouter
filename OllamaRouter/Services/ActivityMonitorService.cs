@@ -51,4 +51,27 @@ public sealed class ActivityMonitorService : IActivityMonitorService
     {
         return _inProgress.Values.Any(r => r.Target == target);
     }
+
+    public int GetConsecutiveFailures(RoutingTarget target, int estimatedPromptTokens)
+    {
+        var entries = _history.ToArray();
+        int count = 0;
+
+        for (int i = entries.Length - 1; i >= 0; i--)
+        {
+            var entry = entries[i];
+
+            if (entry.EstimatedPromptTokens != estimatedPromptTokens || entry.Success)
+            {
+                break;
+            }
+
+            if (entry.Target == target)
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
 }
