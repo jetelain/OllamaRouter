@@ -54,6 +54,39 @@ public sealed class OllamaRouterOptions
     /// before switching to the next target. Defaults to 3. Set to 0 to disable automatic target switching.
     /// </summary>
     public int MaxConsecutiveFailures { get; set; } = 3;
+
+    /// <summary>
+    /// Optional recording mode, to investigate the difference between the estimated token count
+    /// (used for routing) and the actual token count reported by the Ollama instances: each
+    /// inference request is appended to a JSON Lines manifest and its full request body is saved
+    /// as a pretty-printed payload file. Disabled by default.
+    /// </summary>
+    public RecordingOptions? Recording { get; set; }
+}
+
+/// <summary>
+/// Configuration of the optional inference request recording mode.
+/// </summary>
+public sealed class RecordingOptions
+{
+    /// <summary>
+    /// Enables the recording mode. Defaults to false (nothing is written to disk).
+    /// </summary>
+    public bool Enabled { get; set; }
+
+    /// <summary>
+    /// Directory where the records are stored: a "requests.jsonl" manifest plus one payload file
+    /// per request containing the full request body. Defaults to the "inference-requests" folder
+    /// in the local application data folder.
+    /// </summary>
+    public string? OutputDirectory { get; set; }
+
+    /// <summary>
+    /// Maximum number of payload files to keep in the output directory; the oldest records are
+    /// deleted once this count is exceeded (and the manifest is trimmed accordingly).
+    /// Defaults to 500. Set to 0 to keep all files.
+    /// </summary>
+    public int MaxFiles { get; set; } = 500;
 }
 
 /// <summary>

@@ -198,6 +198,9 @@ Configuration is provided through the `OllamaRouter` section of `appsettings.jso
 | `TokenEstimator`   | Token estimation strategy: `"Heuristic"` (default, fast, zero heap memory overhead, saves ~24 MB RAM by omitting the BPE dictionary) or `"Tiktoken"` (uses Microsoft.ML.Tokenizers `cl100k_base`). |
 | `TokenEstimationOverheadFactor` | Multiplicative correction applied to the estimated token count, to compensate for the systematic underestimation of the generic tokenizer versus the actual tokenizer and chat template of targeted models. Defaults to `1.0` (no correction); see [recommendations below](#token-estimation-overhead-recommendations). |
 | `MaxConsecutiveFailures` | Number of consecutive failures on a target for adjacent requests with the same estimated token count before switching to the next target in the chain (`Local` → `Remote` → `Cloud`). Defaults to `3`. Set to `0` to disable automatic target switching. |
+| `Recording:Enabled` | Enables the optional [inference request recording](#inference-request-recording-optional), saving each request's metadata and full request body for investigation of estimated vs actual token counts. Defaults to `false`. |
+| `Recording:OutputDirectory` | Directory where the records are stored: a `requests.jsonl` manifest plus one pretty-printed payload file per request. Defaults to the `inference-requests` folder in the local application data folder (`%LOCALAPPDATA%\OllamaRouter\inference-requests` on Windows). |
+| `Recording:MaxFiles` | Maximum number of payload files to keep in the output directory; the oldest records are deleted once this count is exceeded (and the manifest is trimmed to match). Defaults to `500`. Set to `0` to keep all files. |
 | `Pricing:PromptPricePerMillion` | Optional price per 1,000,000 prompt / input tokens. Used to calculate 7-day estimated savings and cloud overflow cost. Alias: `InputPricePerMillion`. |
 | `Pricing:CompletionPricePerMillion` | Optional price per 1,000,000 completion / output tokens. Used to calculate 7-day estimated savings and cloud overflow cost. Alias: `OutputPricePerMillion`. |
 | `Pricing:PricePerMillion` | Optional flat price per 1,000,000 tokens when prompt and completion rates are not differentiated. |
@@ -214,6 +217,27 @@ OllamaRouter estimates prompt token count prior to routing so it can check again
 > **Tip.** The monitoring page (`/monitor`) dynamically measures the ratio between raw estimated tokens and Ollama's actual reported prompt tokens for every completed request, providing you with a tailored recommendation for your exact models and prompts.
 >
 > If your prompts are predominantly non-English (e.g. French, German, Chinese) or contain heavy code indentation, add an extra `+0.05` margin to the overhead factor to prevent unexpected overflows.
+
+### Inference request recording (optional)
+
+Because the optimal overhead factor depends on your exact models and prompt mix, OllamaRouter can record every inference request so the difference between the **estimated** token count (used for routing) and the **actual** token count (reported by Ollama) can be investigated per request. This recording mode is **disabled by default**.
+
+Enable it in `appsettings.json`:
+
+```json
+"Recording": {
+  "Enabled": true
+}
+```
+
+Each recorded request then produces, in the output directory (default `%LOCALAPPDATA%\OllamaRouter\inference-requests\` on Windows):
+
+- one line in `requests.jsonl` with the routing metadata: `timestamp`, `target`, `model`, `endpoint`, `estimatedPromptTokens` (after applying `TokenEstimationOverheadFactor`), `rawPromptTokens` (before the factor), `actualPromptTokens` / `actualResponseTokens` as reported by the Ollama instance, `elapsedMilliseconds`, `statusCode`, `success`, and the name of the payload `file`;
+- a payload file named `&lt;utc-timestamp&gt;_&lt;sequence&gt;_&lt;model&gt;.json` (e.g. `20260925-153012-123_000042_Qwen3.8-27B.json`) containing the **full request body**, pretty-printed and ready to open in an editor. File names begin with a sortable UTC timestamp followed by a per-process sequence, so files list in chronological order and remain unique even for rapid successive requests.
+
+With both numbers and the exact payload of each request, you can tokenize locally with the model's actual tokenizer and pinpoint what drives the gap (chat template overhead, non-Latin scripts, code indentation, …) before tuning `TokenEstimationOverheadFactor`.
+
+The output directory is capped at `Recording:MaxFiles` payload files (default `500`); when the cap is exceeded, the oldest records are deleted and the manifest is rewritten so it only references still-existing payloads. The recorder is best-effort: an I/O failure only produces a log entry and never affects routing.
 
 ## Installation
 
@@ -279,6 +303,7 @@ The page auto-refreshes every 2 seconds by polling `/monitor/api`. A clickable l
 - `Services/ActivityMonitorService.cs` – in-memory bookkeeping of busy state, in-progress requests and recent request history used by the monitoring UI.
 - `Services/ActivityStatisticsService.cs` – per-target counters (requests, actual input/output tokens) with current-day and last-7-days aggregation, persisted on a best-effort basis to a dedicated JSON file in the application data folder (`%LOCALAPPDATA%\OllamaRouter\activity-statistics.json` on Windows) and exposed via `/monitor/api`.
 - `Services/TargetAvailabilityService.cs` – in-memory state of the Local/Remote/Cloud enable/disable flags, loaded at startup from and persisted on a best-effort basis to a dedicated JSON state file in the application data folder (`%LOCALAPPDATA%\OllamaRouter\targets.json` on Windows), toggled via `POST /targets`.
+- `Services/InferenceRequestRecorder.cs` – optional, best-effort recorder of inference requests (a `requests.jsonl` metadata manifest plus one pretty-printed payload file per request with the full request body) used to investigate estimated vs actual token counts; disabled by default, records are stored in the application data folder (`%LOCALAPPDATA%\OllamaRouter\inference-requests\` on Windows).
 
 ## Tests
 

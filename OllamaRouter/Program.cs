@@ -48,6 +48,9 @@ builder.Services.AddTransient<IRoutingDecisionService, RoutingDecisionService>()
 builder.Services.AddSingleton<IModelCatalogCacheService, ModelCatalogCacheService>();
 builder.Services.AddSingleton<IOllamaProcessLauncher, OllamaProcessLauncher>();
 builder.Services.AddSingleton<IActivityMonitorService, ActivityMonitorService>();
+// Optional inference request recording (estimated vs actual token counts + full request bodies);
+// a no-op when "OllamaRouter:Recording:Enabled" is not set to true.
+builder.Services.AddSingleton<IInferenceRequestRecorder, InferenceRequestRecorder>();
 builder.Services.AddSingleton<IActivityStatisticsService>(sp =>
     new ActivityStatisticsService(
         Path.Combine(

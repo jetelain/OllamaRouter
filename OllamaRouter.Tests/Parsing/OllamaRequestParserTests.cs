@@ -312,6 +312,58 @@ public class OllamaRequestParserTests
     }
 
     [Fact]
+    public void ParseCompletionRequest_ReasoningOnMessage_IsIncludedInContextParts()
+    {
+        var body = """
+        {
+            "model": "qwen3.8-27b",
+            "messages": [
+                { "role": "user", "content": "Hello!" },
+                { "role": "assistant", "content": "Hi there.", "reasoning": "Let me think about this." }
+            ]
+        }
+        """;
+
+        var result = OllamaRequestParser.ParseCompletionRequest(body);
+
+        Assert.Equal(new[] { "Hello!", "Hi there.", "Let me think about this." }, result.ContextParts);
+    }
+
+    [Fact]
+    public void ParseCompletionRequest_ReasoningAsContentObject_IsIncludedInContextParts()
+    {
+        var body = """
+        {
+            "model": "qwen3.8-27b",
+            "messages": [
+                { "role": "assistant", "content": "", "reasoning": { "content": "thinking as an object." } }
+            ]
+        }
+        """;
+
+        var result = OllamaRequestParser.ParseCompletionRequest(body);
+
+        Assert.Equal(new[] { "thinking as an object." }, result.ContextParts);
+    }
+
+    [Fact]
+    public void ParseCompletionRequest_NullReasoning_IsIgnored()
+    {
+        var body = """
+        {
+            "model": "qwen3.8-27b",
+            "messages": [
+                { "role": "assistant", "content": "Hi.", "reasoning": null }
+            ]
+        }
+        """;
+
+        var result = OllamaRequestParser.ParseCompletionRequest(body);
+
+        Assert.Equal(new[] { "Hi." }, result.ContextParts);
+    }
+
+    [Fact]
     public void ParseCompletionRequest_InvalidJson_ReturnsEmptyInfo()
     {
         var result = OllamaRequestParser.ParseCompletionRequest("invalid-json");

@@ -27,6 +27,7 @@ public class OllamaRoutingMiddlewareTests
         Mock<IModelCatalogCacheService>? modelCatalogCache = null,
         Mock<IActivityMonitorService>? activityMonitor = null,
         Mock<IActivityStatisticsService>? activityStatistics = null,
+        Mock<IInferenceRequestRecorder>? inferenceRequestRecorder = null,
         Mock<ITargetAvailabilityService>? targetAvailability = null)
     {
         var effectiveTargetAvailability = targetAvailability ?? new Mock<ITargetAvailabilityService>();
@@ -42,6 +43,7 @@ public class OllamaRoutingMiddlewareTests
             (modelCatalogCache ?? new Mock<IModelCatalogCacheService>()).Object,
             (activityMonitor ?? new Mock<IActivityMonitorService>()).Object,
             (activityStatistics ?? new Mock<IActivityStatisticsService>()).Object,
+            (inferenceRequestRecorder ?? new Mock<IInferenceRequestRecorder>()).Object,
             effectiveTargetAvailability.Object,
             MsOptions.Create(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
             NullLogger<OllamaRoutingMiddleware>.Instance);
@@ -325,6 +327,34 @@ public class OllamaRoutingMiddlewareTests
 
         activityStatistics.Verify(
             s => s.Add(It.Is<ActivityLogEntry>(e => e.Target == RoutingTarget.Local && e.EstimatedPromptTokens == 100)),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_CompletionRequest_RecordsFullRequestBody()
+    {
+        const string requestBody = """{ "model": "qwen", "messages": [ { "role": "user", "content": "hello" } ] }""";
+        var context = BuildContext("/api/chat", requestBody);
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(100, "qwen", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var inferenceRequestRecorder = new Mock<IInferenceRequestRecorder>();
+
+        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService, inferenceRequestRecorder: inferenceRequestRecorder);
+
+        await sut.InvokeAsync(context);
+
+        inferenceRequestRecorder.Verify(
+            r => r.Record(
+                It.Is<ActivityLogEntry>(e => e.Target == RoutingTarget.Local),
+                "/api/chat",
+                requestBody),
             Times.Once);
     }
 

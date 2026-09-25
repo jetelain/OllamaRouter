@@ -22,6 +22,7 @@ public sealed class OllamaRoutingMiddleware(
     IModelCatalogCacheService modelCatalogCache,
     IActivityMonitorService activityMonitor,
     IActivityStatisticsService activityStatistics,
+    IInferenceRequestRecorder inferenceRequestRecorder,
     ITargetAvailabilityService targetAvailability,
     IOptions<OllamaRouterOptions> options,
     ILogger<OllamaRoutingMiddleware> logger)
@@ -65,6 +66,7 @@ public sealed class OllamaRoutingMiddleware(
     private async Task RouteAndTrackCompletionRequestAsync(HttpContext context)
     {
         var body = await ReadBodyAsync(context.Request);
+        var endpoint = context.Request.Path.Value ?? "/";
 
         var modelName = "unknown";
         var tokenCount = 0;
@@ -129,6 +131,7 @@ public sealed class OllamaRoutingMiddleware(
                 var bodyBytes = System.Text.Encoding.UTF8.GetBytes(rewrittenBody);
                 context.Request.Body = new MemoryStream(bodyBytes);
                 context.Request.ContentLength = bodyBytes.Length;
+                body = rewrittenBody; // Record the payload actually sent to the cloud target.
             }
         }
 
@@ -166,6 +169,7 @@ public sealed class OllamaRoutingMiddleware(
 
             activityMonitor.CompleteRequest(requestId, entry);
             activityStatistics.Add(entry);
+            inferenceRequestRecorder.Record(entry, endpoint, body);
         }
     }
 

@@ -84,6 +84,14 @@ public static class OllamaRequestParser
                             parts.Add(toolCall.GetRawText());
                         }
                     }
+
+                    // OpenCode-style clients echo prior reasoning (thinking) content back on assistant
+                    // messages under a custom "reasoning" key. Ollama renders it into the prompt, so it
+                    // must be counted or the prompt size is severely underestimated for agent sessions.
+                    if (message.TryGetProperty("reasoning", out var reasoning) && reasoning.ValueKind != JsonValueKind.Null)
+                    {
+                        AppendContent(reasoning, parts);
+                    }
                 }
             }
 
@@ -171,9 +179,10 @@ public static class OllamaRequestParser
     }
 
     /// <summary>
-    /// Appends the textual content of a message's "content" property, which may be either a
-    /// plain string or an array of content parts (OpenAI-compatible multimodal format, e.g.
-    /// [{ "type": "text", "text": "..." }, { "type": "image_url", ... }]).
+    /// Appends the textual content of a message field (e.g. "content" or "reasoning"), which may
+    /// be either a plain string, an array of content parts (OpenAI-compatible multimodal format,
+    /// e.g. [{ "type": "text", "text": "..." }, { "type": "image_url", ... }]), or a single object
+    /// holding its text under a "text" (OpenAI) or "content" property.
     /// </summary>
     private static void AppendContent(JsonElement content, List<string> parts)
     {
@@ -205,6 +214,20 @@ public static class OllamaRequestParser
                         parts.Add(text);
                     }
                 }
+            }
+        }
+        else if (content.ValueKind == JsonValueKind.Object)
+        {
+            // A single object holding its text under a "content" or "text" property.
+            var text = (content.TryGetProperty("content", out var objContent) && objContent.ValueKind == JsonValueKind.String)
+                ? objContent.GetString()
+                : (content.TryGetProperty("text", out var objText) && objText.ValueKind == JsonValueKind.String
+                    ? objText.GetString()
+                    : null);
+
+            if (!string.IsNullOrEmpty(text))
+            {
+                parts.Add(text);
             }
         }
     }
