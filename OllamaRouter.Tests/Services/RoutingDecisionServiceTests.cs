@@ -49,7 +49,7 @@ public class RoutingDecisionServiceTests
         {
             new LocalRoutingTargetHandler(options, catalogClient.Object, gpuVramProvider.Object, activityMonitor.Object, targetAvailability.Object),
             new RemoteRoutingTargetHandler(activityMonitor.Object, targetAvailability.Object),
-            new CloudRoutingTargetHandler(activityMonitor.Object, targetAvailability.Object)
+            new CloudRoutingTargetHandler(targetAvailability.Object)
         };
 
         return new RoutingDecisionService(handlers, options, modelCatalogCacheService.Object, activityMonitor.Object, NullLogger<RoutingDecisionService>.Instance);
@@ -862,4 +862,71 @@ public class RoutingDecisionServiceTests
 
         Assert.Equal(RoutingTarget.Remote, decision);
     }
+
+    [Fact]
+    public async Task DecideAsync_ConcurrentRequests_WhenLocalAndRemoteBusyAndCloudBusy_RoutesAllSubsequentRequestsToCloud()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        var activityMonitor = new Mock<IActivityMonitorService>();
+
+        // Local, Remote and Cloud are ALL busy
+        activityMonitor.Setup(a => a.IsBusy(RoutingTarget.Local)).Returns(true);
+        activityMonitor.Setup(a => a.IsBusy(RoutingTarget.Remote)).Returns(true);
+        activityMonitor.Setup(a => a.IsBusy(RoutingTarget.Cloud)).Returns(true);
+
+        var sut = CreateSut(catalogClient, gpuVramProvider, cloudModel: "deepseek-v3.1:671b-cloud", activityMonitor: activityMonitor);
+
+        // Multiple concurrent requests should ALL route to Cloud despite Cloud already being busy
+        var decision1 = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
+        var decision2 = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
+        var decision3 = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
+
+        Assert.Equal(RoutingTarget.Cloud, decision1);
+        Assert.Equal(RoutingTarget.Cloud, decision2);
+        Assert.Equal(RoutingTarget.Cloud, decision3);
+    }
+
+    [Fact]
+    public async Task DecideAsync_ProgressiveLoad_FirstToLocal_SecondToRemote_SubsequentAllToCloud()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var gpuVramProvider = new Mock<IGpuVramProvider>();
+        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
+
+        var localBusy = false;
+        var remoteBusy = false;
+        var cloudBusy = false;
+
+        var activityMonitor = new Mock<IActivityMonitorService>();
+        activityMonitor.Setup(a => a.IsBusy(RoutingTarget.Local)).Returns(() => localBusy);
+        activityMonitor.Setup(a => a.IsBusy(RoutingTarget.Remote)).Returns(() => remoteBusy);
+        activityMonitor.Setup(a => a.IsBusy(RoutingTarget.Cloud)).Returns(() => cloudBusy);
+
+        var sut = CreateSut(catalogClient, gpuVramProvider, cloudModel: "deepseek-v3.1:671b-cloud", activityMonitor: activityMonitor);
+
+        // Request 1: Local is idle -> routes to Local
+        var r1 = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
+        Assert.Equal(RoutingTarget.Local, r1);
+        localBusy = true; // Request 1 is now in progress on Local
+
+        // Request 2: Local is busy, Remote is idle -> routes to Remote
+        var r2 = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
+        Assert.Equal(RoutingTarget.Remote, r2);
+        remoteBusy = true; // Request 2 is now in progress on Remote
+
+        // Request 3: Local and Remote are busy -> routes to Cloud
+        var r3 = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
+        Assert.Equal(RoutingTarget.Cloud, r3);
+        cloudBusy = true; // Request 3 is now in progress on Cloud
+
+        // Request 4: Local, Remote, and Cloud have requests in progress -> still routes to Cloud!
+        var r4 = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
+        Assert.Equal(RoutingTarget.Cloud, r4);
+
+        // Request 5: Still all busy -> still routes to Cloud!
+        var r5 = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
+        Assert.Equal(RoutingTarget.Cloud, r5);
+    }
 }
+

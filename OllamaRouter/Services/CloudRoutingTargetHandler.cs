@@ -1,12 +1,9 @@
-using Microsoft.Extensions.Logging;
-
 namespace OllamaRouter.Services;
 
 /// <summary>
 /// Handles overflow routing logic and availability for the ollama.com cloud target.
 /// </summary>
 public sealed class CloudRoutingTargetHandler(
-    IActivityMonitorService activityMonitor,
     ITargetAvailabilityService targetAvailability,
     ILogger<CloudRoutingTargetHandler>? logger = null) : IRoutingTargetHandler
 {
@@ -16,10 +13,12 @@ public sealed class CloudRoutingTargetHandler(
 
     public bool IsEnabled => targetAvailability.IsEnabled(RoutingTarget.Cloud);
 
-    public bool IsAvailable()
-    {
-        return IsEnabled && !activityMonitor.IsBusy(RoutingTarget.Cloud);
-    }
+    /// <summary>
+    /// Determines whether the cloud target is currently available.
+    /// Since Cloud serves as an overflow target that handles concurrent requests without
+    /// single-GPU concurrency constraints, it is always available as long as it is enabled.
+    /// </summary>
+    public bool IsAvailable() =>  IsEnabled;
 
     public Task<bool> CanProcessAsync(RoutingContext context, CancellationToken cancellationToken = default)
     {
