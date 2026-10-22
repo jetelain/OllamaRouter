@@ -220,4 +220,153 @@ public class OllamaModelCatalogClientTests
 
         Assert.Empty(tags);
     }
+
+    [Fact]
+    public async Task GetTagsWithDigestAsync_ValidResponse_ReturnsModelsAndSha256Digest()
+    {
+        const string raw = """{ "models": [ { "name": "llama3", "size": 1234 } ] }""";
+        var (sut, handler) = CreateSut(_ => JsonResponse(raw));
+
+        var (tags, digest) = await sut.GetTagsWithDigestAsync("http://127.0.0.1:11435");
+
+        Assert.Single(tags);
+        Assert.Equal("llama3", tags[0]!["name"]!.ToString());
+        Assert.Equal("http://127.0.0.1:11435/api/tags", handler.LastRequest?.RequestUri?.ToString());
+
+        // Digest is the 64-char lowercase hex SHA-256 of the raw response body.
+        var expected = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(raw))).ToLowerInvariant();
+        Assert.Matches("^[0-9a-f]{64}$", digest);
+        Assert.Equal(expected, digest);
+    }
+
+    [Fact]
+    public async Task GetTagsWithDigestAsync_IdenticalBodies_SameDigest_DifferentBodies_DifferentDigest()
+    {
+        var handler = new FakeHttpMessageHandler(_ => JsonResponse("""{ "models": [ { "name": "llama3" } ] }"""));
+        var sut = new OllamaModelCatalogClient(new HttpClient(handler));
+
+        var (_, digest1) = await sut.GetTagsWithDigestAsync("http://127.0.0.1:11435");
+        var (_, digest2) = await sut.GetTagsWithDigestAsync("http://127.0.0.1:11435");
+        Assert.Equal(digest1, digest2);
+
+        // A different body yields a different digest.
+        var otherHandler = new FakeHttpMessageHandler(_ => JsonResponse("""{ "models": [ { "name": "qwen3:8b" } ] }"""));
+        var otherSut = new OllamaModelCatalogClient(new HttpClient(otherHandler));
+        var (_, digestOther) = await otherSut.GetTagsWithDigestAsync("http://127.0.0.1:11435");
+        Assert.NotEqual(digest1, digestOther);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task GetTagsWithDigestAsync_MissingBaseUrl_ReturnsEmptyArrayAndEmptyDigest(string? url)
+    {
+        var (sut, _) = CreateSut(_ => throw new HttpRequestException("should not be called"));
+
+        var (tags, digest) = await sut.GetTagsWithDigestAsync(url);
+
+        Assert.Empty(tags);
+        Assert.Equal("", digest);
+    }
+
+    [Fact]
+    public async Task GetTagsWithDigestAsync_HttpError_ReturnsEmptyArrayAndEmptyDigest()
+    {
+        var (sut, _) = CreateSut(_ => new HttpResponseMessage(HttpStatusCode.InternalServerError));
+
+        var (tags, digest) = await sut.GetTagsWithDigestAsync("http://127.0.0.1:11435");
+
+        Assert.Empty(tags);
+        Assert.Equal("", digest);
+    }
+
+    [Fact]
+    public async Task GetTagsWithDigestAsync_ThrowingHandler_ReturnsEmptyArrayAndEmptyDigest()
+    {
+        var (sut, _) = CreateSut(_ => throw new HttpRequestException("connection refused"));
+
+        var (tags, digest) = await sut.GetTagsWithDigestAsync("http://127.0.0.1:11435");
+
+        Assert.Empty(tags);
+        Assert.Equal("", digest);
+    }
+
+    [Fact]
+    public async Task GetShowAsync_ValidRequest_PostsToApiShowWithModelPayload()
+    {
+        var showJson = """
+            {
+              "model": { "name": "qwen3:latest", "size": 17305205760 },
+              "parameters": "num_ctx 49152\nnum_predict 4096\n",
+              "details": { "family": "qwen3", "parameter_size": "27.8B" },
+              "model_info": { "general.parameter_count": 27800000000 }
+            }
+            """;
+        var (sut, handler) = CreateSut(_ => JsonResponse(showJson));
+
+        var show = await sut.GetShowAsync("http://127.0.0.1:11435", "qwen3:latest");
+
+        Assert.NotNull(show);
+        Assert.Equal("http://127.0.0.1:11435/api/show", handler.LastRequest?.RequestUri?.ToString());
+        Assert.Equal(HttpMethod.Post, handler.LastRequest?.Method);
+        Assert.Equal("qwen3", show?["details"]?["family"]?.ToString());
+        Assert.Contains("\"model\":\"qwen3:latest\"", handler.LastRequestBody);
+    }
+
+    [Theory]
+    [InlineData(null, "llama3")]
+    [InlineData("", "llama3")]
+    [InlineData("http://127.0.0.1:11435", null)]
+    [InlineData("http://127.0.0.1:11435", "")]
+    [InlineData("http://127.0.0.1:11435", "   ")]
+    public async Task GetShowAsync_MissingUrlOrModel_ReturnsNull(string? url, string? model)
+    {
+        var (sut, _) = CreateSut(_ => throw new HttpRequestException("should not be called"));
+
+        var show = await sut.GetShowAsync(url, model!);
+
+        Assert.Null(show);
+    }
+
+    [Fact]
+    public async Task GetShowAsync_HttpError_ReturnsNull()
+    {
+        var (sut, _) = CreateSut(_ => new HttpResponseMessage(HttpStatusCode.InternalServerError));
+
+        var show = await sut.GetShowAsync("http://127.0.0.1:11435", "llama3");
+
+        Assert.Null(show);
+    }
+
+    [Fact]
+    public async Task GetShowAsync_InvalidJson_ReturnsNull()
+    {
+        var (sut, _) = CreateSut(_ => JsonResponse("not json"));
+
+        var show = await sut.GetShowAsync("http://127.0.0.1:11435", "llama3");
+
+        Assert.Null(show);
+    }
+
+    [Fact]
+    public async Task GetShowAsync_ThrowingHandler_ReturnsNull()
+    {
+        var (sut, _) = CreateSut(_ => throw new HttpRequestException("connection refused"));
+
+        var show = await sut.GetShowAsync("http://127.0.0.1:11435", "llama3");
+
+        Assert.Null(show);
+    }
+
+    [Fact]
+    public async Task GetShowAsync_NonObjectRoot_ReturnsNull()
+    {
+        var (sut, _) = CreateSut(_ => JsonResponse("[1, 2, 3]"));
+
+        var show = await sut.GetShowAsync("http://127.0.0.1:11435", "llama3");
+
+        Assert.Null(show);
+    }
 }

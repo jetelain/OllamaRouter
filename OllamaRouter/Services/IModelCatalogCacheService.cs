@@ -28,4 +28,35 @@ public interface IModelCatalogCacheService
     /// A null/empty <paramref name="baseUrl"/> is a no-op that returns an empty list.
     /// </summary>
     Task<IReadOnlyList<string>> RefreshAsync(string? baseUrl, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Force-fetches the /api/tags catalog for the instance at <paramref name="baseUrl"/>
+    /// (bypassing any existing cached entry), re-populates the per-URL name cache slot, and
+    /// returns the fetched model names together with the SHA-256 hex digest of the raw
+    /// response body. When the digest changes, only this target's previously recorded
+    /// capability cache keys (see ModelCapabilityEngine) are invalidated. A null/empty
+    /// <paramref name="baseUrl"/> is a no-op that returns ([], ""); an unreachable instance
+    /// returns ([], "").
+    /// </summary>
+    Task<(IReadOnlyList<string> Names, string Digest)> RefreshWithDigestAsync(string? baseUrl, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Returns the digest of the most recent /api/tags refresh for the instance at
+    /// <paramref name="baseUrl"/>, triggering a refresh when none is known yet.
+    /// Returns "" for a null/empty base URL or when the instance is unreachable/empty.
+    /// </summary>
+    Task<string> GetCurrentDigestAsync(string? baseUrl, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Synchronous accessor for the digest of the most recent /api/tags refresh of the
+    /// instance at <paramref name="baseUrl"/> ("" when unknown or empty).
+    /// </summary>
+    string CurrentDigest(string? baseUrl);
+
+    /// <summary>
+    /// Records capability cache keys owned by <see cref="ModelCapabilityEngine"/> for a given
+    /// instance so that a catalog digest change can invalidate them. Keys recorded under a
+    /// digest different from the current one are discarded.
+    /// </summary>
+    void RegisterCapabilityCacheKeys(string baseUrl, IEnumerable<string> keys, string digest);
 }

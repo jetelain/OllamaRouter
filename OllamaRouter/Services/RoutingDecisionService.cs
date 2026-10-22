@@ -11,6 +11,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
     private readonly IOptions<OllamaRouterOptions> _options;
     private readonly IModelCatalogCacheService _modelCatalogCacheService;
     private readonly IActivityMonitorService? _activityMonitor;
+    private readonly ModelCapabilityEngine? _capabilityEngine;
     private readonly ILogger<RoutingDecisionService> _logger;
 
     public RoutingDecisionService(
@@ -18,7 +19,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         IOptions<OllamaRouterOptions> options,
         IModelCatalogCacheService modelCatalogCacheService,
         ILogger<RoutingDecisionService> logger)
-        : this(targets, options, modelCatalogCacheService, null, logger)
+        : this(targets, options, modelCatalogCacheService, null, logger, null)
     {
     }
 
@@ -28,11 +29,23 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         IModelCatalogCacheService modelCatalogCacheService,
         IActivityMonitorService? activityMonitor,
         ILogger<RoutingDecisionService> logger)
+        : this(targets, options, modelCatalogCacheService, activityMonitor, logger, null)
+    {
+    }
+
+    public RoutingDecisionService(
+        IEnumerable<IRoutingTargetHandler> targets,
+        IOptions<OllamaRouterOptions> options,
+        IModelCatalogCacheService modelCatalogCacheService,
+        IActivityMonitorService? activityMonitor,
+        ILogger<RoutingDecisionService> logger,
+        ModelCapabilityEngine? capabilityEngine)
     {
         _targets = targets.ToList();
         _options = options;
         _modelCatalogCacheService = modelCatalogCacheService;
         _activityMonitor = activityMonitor;
+        _capabilityEngine = capabilityEngine;
         _logger = logger;
     }
 
@@ -50,7 +63,9 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             _modelCatalogCacheService,
             settings.LocalUrl.TrimEnd('/'),
             settings.RemoteUrl.TrimEnd('/'),
-            cancellationToken);
+            cancellationToken,
+            _capabilityEngine,
+            settings.GetEffectiveTargets(_logger));
 
         var primaryTarget = await TrySelectTargetAsync(context, _targets, cancellationToken);
         if (primaryTarget is null)

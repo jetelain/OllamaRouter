@@ -38,6 +38,23 @@ public interface IOllamaModelCatalogClient
     Task<JsonArray> GetTagsAsync(string? baseUrl, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Fetches the raw list of models exposed via /api/tags by a single instance (no merging)
+    /// together with a SHA-256 hex digest of the raw response body. The digest identifies the
+    /// exact catalog contents so digest-keyed capability caches can be invalidated when the
+    /// catalog of this instance changes. Returns (empty array, "") for an empty/unreachable
+    /// instance.
+    /// </summary>
+    Task<(JsonArray Tags, string Digest)> GetTagsWithDigestAsync(string? baseUrl, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Inspects a single model on the specified instance via POST /api/show and returns the
+    /// parsed response (parameters block, Modelfile, details, model_info). Returns null when
+    /// the instance is unconfigured/unreachable, the request fails, or the response is not
+    /// valid JSON (fail-soft, matching <see cref="GetTagsAsync"/>).
+    /// </summary>
+    Task<JsonObject?> GetShowAsync(string? baseUrl, string modelName, CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Fetches the list of currently running model names on the specified instance via /api/ps.
     /// </summary>
     Task<IReadOnlyList<string>> GetRunningModelNamesAsync(string? baseUrl, CancellationToken cancellationToken = default);

@@ -322,6 +322,13 @@ public sealed class ModelThresholds
     /// rewritten to this value. Leave null/empty to disable cloud overflow for this model.
     /// </summary>
     public string? CloudModel { get; set; }
+
+    /// <summary>
+    /// Explicit architecture pin: "Dense" or "Moe" (case-insensitive). Wins over all
+    /// auto-detection for this model. "Dense" applies SmallDense/LargeDense rules from the
+    /// parameter count (unknown count ⇒ LargeDense). Unknown values are ignored.
+    /// </summary>
+    public string? Architecture { get; set; }
 }
 
 /// <summary>

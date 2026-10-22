@@ -1,0 +1,299 @@
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Logging;
+using OllamaRouter.Options;
+
+namespace OllamaRouter.Services;
+
+/// <summary>
+/// Coarse model architecture classes used by the zero-config routing rules.
+/// </summary>
+public enum ModelArchitectureKind
+{
+    /// <summary>
+    /// Mixture-of-Experts model (only a subset of experts is active per token).
+    /// </summary>
+    Moe,
+
+    /// <summary>
+    /// Dense model below the <see cref="ModelCapabilityEngine.LargeDenseParameterThreshold"/>
+    /// parameter count.
+    /// </summary>
+    SmallDense,
+
+    /// <summary>
+    /// Dense model at or above the <see cref="ModelCapabilityEngine.LargeDenseParameterThreshold"/>
+    /// parameter count (all parameters active per token).
+    /// </summary>
+    LargeDense
+}
+
+/// <summary>
+/// Records WHY a <see cref="ModelArchitectureKind"/> classification happened, for logs and
+/// tests (e.g. to prove the permissive MoE fallback or an explicit configuration pin).
+/// </summary>
+public enum ArchitectureDetectionSource
+{
+    /// <summary>
+    /// An explicit "Dense"/"Moe" pin from the model's <c>Architecture</c> configuration override.
+    /// </summary>
+    Pinned,
+
+    /// <summary>
+    /// Detected via a <c>*.expert_count &gt; 0</c> entry in the /api/show <c>model_info</c>.
+    /// </summary>
+    MoeExpertCount,
+
+    /// <summary>
+    /// Detected via the /api/show <c>details.family</c> containing "moe".
+    /// </summary>
+    MoeFamily,
+
+    /// <summary>
+    /// No MoE signal was available at all (<c>model_info</c> absent, e.g. an older Ollama
+    /// version): permissively treated as MoE so an unknown model never triggers a false
+    /// LargeDense veto.
+    /// </summary>
+    PermissiveFallback,
+
+    /// <summary>
+    /// Classified by parameter count (below/above the 14B threshold).
+    /// </summary>
+    DenseParameterCount
+}
+
+/// <summary>
+/// Per-target derived capability for one (target, model) pair: the architecture
+/// classification plus the baseline context (<see cref="CDefault"/>) and the maximum elastic
+/// context ceiling (<see cref="CMax"/>) for requests routed to that target.
+/// </summary>
+public sealed record TargetModelCapability(
+    string Target,
+    ModelArchitectureKind Architecture,
+    ArchitectureDetectionSource Source,
+    int CDefault,
+    int CMax,
+    bool HardwareCapable,
+    int? AvailableVramForKVCacheMB);
+
+/// <summary>
+/// Discovers model capabilities per target by inspecting the target's /api/tags entry and
+/// POST /api/show, caches the parsed <see cref="ModelMetadata"/> keyed by target + model +
+/// catalog digest, and derives the architecture classification and the per-target context
+/// ceilings (C_default / C_max) through the zero-config routing hierarchy:
+/// explicit Modelfile num_ctx → client options.num_ctx clamping (request time) →
+/// hardware-derived safe ceiling.
+/// </summary>
+public sealed class ModelCapabilityEngine(
+    IOllamaModelCatalogClient catalogClient,
+    IMemoryCache memoryCache,
+    ILogger<ModelCapabilityEngine> logger,
+    IModelCatalogCacheService? keyRegistry = null)
+{
+    /// <summary>
+    /// Default Ollama context window when the Modelfile omits an explicit num_ctx.
+    /// </summary>
+    public const int OllamaDefaultContext = 4096;
+
+    /// <summary>
+    /// Context ceiling for "16gb" desktop-class targets (48k = 48 × 1024).
+    /// </summary>
+    public const int DesktopCeiling = 49152;
+
+    /// <summary>
+    /// Context ceiling for "96gb" server-class targets.
+    /// </summary>
+    public const int ServerCeiling = 262144;
+
+    /// <summary>
+    /// Targets with fewer megabytes of VRAM than this are "small" (8gb laptop-class) targets.
+    /// </summary>
+    public const int SmallTargetVramThresholdMB = 12_000;
+
+    /// <summary>
+    /// Parameter count at/above which a dense model is classified as
+    /// <see cref="ModelArchitectureKind.LargeDense"/>.
+    /// </summary>
+    public const long LargeDenseParameterThreshold = 14_000_000_000;
+
+    /// <summary>
+    /// Minimum effective VRAM (in MB) of a server-class ("96gb") target.
+    /// </summary>
+    private const int ServerCeilingMB = 98304;
+
+    private static readonly TimeSpan CapabilityCacheDuration = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Fetches (or returns the cached) <see cref="ModelMetadata"/> for one model on one
+    /// target: the /api/tags entry (weight size) plus the POST /api/show response. The result
+    /// is cached under the target's catalog digest for 30 s with single-flight semantics per
+    /// key. A null/empty <paramref name="targetUrl"/> or an empty digest returns degraded
+    /// ("unknown") metadata without any network call, and network/parse failures degrade to
+    /// the same metadata so classification falls back to the permissive MoE path.
+    /// </summary>
+    public async Task<ModelMetadata> GetMetadataAsync(string? targetUrl, string modelName, string catalogDigest, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(targetUrl) || string.IsNullOrEmpty(modelName) || string.IsNullOrEmpty(catalogDigest))
+        {
+            return new ModelMetadata(modelName, 0, null, 0, null, null, false, null);
+        }
+
+        var cacheKey = BuildCacheKey(targetUrl, catalogDigest, modelName);
+        var factory = async (ICacheEntry entry) =>
+        {
+            entry.AbsoluteExpirationRelativeToNow = CapabilityCacheDuration;
+
+            var (tags, _) = await catalogClient.GetTagsWithDigestAsync(targetUrl, ct);
+            var show = await catalogClient.GetShowAsync(targetUrl, modelName, ct);
+            var parsed = ModelMetadataParser.ParseModelMetadata(modelName, tags, show);
+
+            logger.LogDebug(
+                "Discovered capabilities for {Model} on {Target} (digest {Digest}): arch signals expertCount={ExpertCount}, family={Family}, parameterCount={ParameterCount}, numCtx={NumCtx}.",
+                modelName, targetUrl, catalogDigest, parsed.ExpertCount, parsed.ModelFamily, parsed.ParameterCount, parsed.ModelfileNumCtx);
+
+            RegisterCacheKey(targetUrl, catalogDigest, cacheKey);
+            return parsed;
+        };
+
+        return (ModelMetadata?)await memoryCache.GetOrCreateAsync(cacheKey, factory) ??
+               new ModelMetadata(modelName, 0, null, 0, null, null, false, null);
+    }
+
+    /// <summary>
+    /// Classifies the model architecture of <paramref name="metadata"/> using the documented
+    /// fallback chain: explicit pin → expert_count → family containing "moe" → permissive MoE
+    /// fallback (no model_info) → dense parameter count. Unknown pin values are ignored.
+    /// </summary>
+    public (ModelArchitectureKind Architecture, ArchitectureDetectionSource Source) ClassifyArchitecture(ModelMetadata metadata, string? pinnedArchitecture)
+    {
+        if (string.Equals(pinnedArchitecture, "Moe", StringComparison.OrdinalIgnoreCase))
+        {
+            return (ModelArchitectureKind.Moe, ArchitectureDetectionSource.Pinned);
+        }
+
+        if (string.Equals(pinnedArchitecture, "Dense", StringComparison.OrdinalIgnoreCase))
+        {
+            // The pin wins over ALL detection: apply the SmallDense/LargeDense rules from the
+            // parameter count (unknown count ⇒ LargeDense).
+            var (architecture, source) = DenseByParamCount(metadata);
+            return (architecture, ArchitectureDetectionSource.Pinned);
+        }
+
+        if (!string.IsNullOrWhiteSpace(pinnedArchitecture))
+        {
+            logger.LogDebug(
+                "Ignoring unknown Architecture pin '{Pin}'; proceeding with auto-detection.", pinnedArchitecture);
+        }
+
+        if (metadata.ExpertCount > 0)
+        {
+            return (ModelArchitectureKind.Moe, ArchitectureDetectionSource.MoeExpertCount);
+        }
+
+        if (metadata.ModelFamily is { } family && family.Contains("moe", StringComparison.Ordinal))
+        {
+            return (ModelArchitectureKind.Moe, ArchitectureDetectionSource.MoeFamily);
+        }
+
+        if (!metadata.HasModelInfo)
+        {
+            // Older Ollama versions (or failures): no MoE signal at all. Permissively treat
+            // the model as MoE so unknown models are never hard-vetoed as LargeDense.
+            return (ModelArchitectureKind.Moe, ArchitectureDetectionSource.PermissiveFallback);
+        }
+
+        return DenseByParamCount(metadata);
+    }
+
+    /// <summary>
+    /// Derives the per-target capability (architecture, C_default, C_max, hardware
+    /// capability flag, remaining VRAM for the KV cache) from the discovered metadata and
+    /// the target's effective VRAM budget.
+    /// </summary>
+    public TargetModelCapability DeriveCapability(ModelMetadata metadata, string targetName, OllamaTargetOptions target, string? pinnedArchitecture)
+    {
+        var (architecture, source) = ClassifyArchitecture(metadata, pinnedArchitecture);
+
+        var maxVram = target.GetEffectiveMaxVramMB();
+        var weightMB = (int)(metadata.WeightSizeBytes / 1_048_576);
+        var availableMB = maxVram.HasValue ? (int?)(maxVram.Value - weightMB) : null;
+
+        // Hierarchy level 1: an explicit Modelfile num_ctx wins outright.
+        var cMax = metadata.ModelfileNumCtx is { } explicitNumCtx
+            ? explicitNumCtx
+            : HardwareCeiling(maxVram);
+
+        // 8gb / &lt;12000 MB hard veto for LargeDense only: MoE and SmallDense are NEVER
+        // VRAM-vetoed (MoE is capable on all targets; see the zero-config routing plan §2.1).
+        var hardwareCapable = !(architecture == ModelArchitectureKind.LargeDense &&
+                                (maxVram is null || maxVram < SmallTargetVramThresholdMB));
+
+        return new TargetModelCapability(
+            Target: targetName,
+            Architecture: architecture,
+            Source: source,
+            CDefault: metadata.ModelfileNumCtx ?? OllamaDefaultContext,
+            CMax: cMax,
+            HardwareCapable: hardwareCapable,
+            AvailableVramForKVCacheMB: availableMB);
+    }
+
+    /// <summary>
+    /// Request-time clamping helper (hierarchy level 2): computes whether a target with
+    /// ceiling <paramref name="cMax"/> is qualified for a request of
+    /// <paramref name="estimatedTokens"/> (plus the safety margin) and the <c>num_ctx</c>
+    /// value to inject: min(client-requested num_ctx ?? effective required, cMax).
+    /// </summary>
+    public static (bool Qualified, int InjectedNumCtx) EvaluateClientContext(
+        int estimatedTokens,
+        int? clientRequestedNumCtx,
+        int cMax,
+        double margin = 1.25)
+    {
+        var effectiveRequired = (long)Math.Ceiling((double)estimatedTokens * margin);
+        if (clientRequestedNumCtx.HasValue)
+        {
+            effectiveRequired = Math.Min(effectiveRequired, clientRequestedNumCtx.Value);
+        }
+
+        var qualified = effectiveRequired <= cMax;
+        var injected = (int)Math.Min(clientRequestedNumCtx ?? effectiveRequired, cMax);
+        return (qualified, injected);
+    }
+
+    private (ModelArchitectureKind, ArchitectureDetectionSource) DenseByParamCount(ModelMetadata metadata)
+    {
+        if (!metadata.ParameterCount.HasValue)
+        {
+            // Known-dense shape but no count: conservative.
+            return (ModelArchitectureKind.LargeDense, ArchitectureDetectionSource.DenseParameterCount);
+        }
+
+        var kind = metadata.ParameterCount.Value >= LargeDenseParameterThreshold
+            ? ModelArchitectureKind.LargeDense
+            : ModelArchitectureKind.SmallDense;
+
+        return (kind, ArchitectureDetectionSource.DenseParameterCount);
+    }
+
+    private static int HardwareCeiling(int? maxVram)
+    {
+        // Per target class (hierarchy level 3): 96gb server → 262144; 16gb desktop → 49152;
+        // 8gb small → 262144 elastic ceiling for MoE/SmallDense (LargeDense is vetoed
+        // separately); unknown VRAM → Ollama default, no headroom claims.
+        return maxVram switch
+        {
+            >= ServerCeilingMB => ServerCeiling,
+            >= SmallTargetVramThresholdMB => DesktopCeiling,
+            >= 0 => ServerCeiling,
+            _ => OllamaDefaultContext
+        };
+    }
+
+    private static string BuildCacheKey(string targetUrl, string catalogDigest, string modelName) =>
+        $"{ModelCatalogCacheService.CapabilityKeyPrefix}{targetUrl}:{catalogDigest}:{modelName}";
+
+    private void RegisterCacheKey(string targetUrl, string catalogDigest, string cacheKey)
+    {
+        keyRegistry?.RegisterCapabilityCacheKeys(targetUrl, [cacheKey], catalogDigest);
+    }
+}

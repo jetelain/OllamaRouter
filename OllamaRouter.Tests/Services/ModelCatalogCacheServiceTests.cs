@@ -183,9 +183,11 @@ public class ModelCatalogCacheServiceTests
     {
         var catalogClient = new Mock<IOllamaModelCatalogClient>();
         catalogClient
-            .SetupSequence(c => c.GetTagsAsync(BaseUrl, It.IsAny<CancellationToken>()))
-            .ReturnsAsync(Tags("llama3"))
-            .ReturnsAsync(Tags("llama3", "qwen3:8b"));
+            .Setup(c => c.GetTagsAsync(BaseUrl, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Tags("llama3"));
+        catalogClient
+            .Setup(c => c.GetTagsWithDigestAsync(BaseUrl, It.IsAny<CancellationToken>()))
+            .ReturnsAsync((Tags("llama3", "qwen3:8b"), "digest-v2"));
         var sut = CreateSut(catalogClient);
 
         // Populate the cache with the stale (single-model) list.
@@ -212,5 +214,127 @@ public class ModelCatalogCacheServiceTests
 
         Assert.Empty(result);
         catalogClient.Verify(c => c.GetTagsAsync(It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task RefreshWithDigestAsync_ReturnsNamesAndDigest_UpdatesCurrentDigest()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        catalogClient.Setup(c => c.GetTagsWithDigestAsync(BaseUrl, It.IsAny<CancellationToken>()))
+            .ReturnsAsync((Tags("llama3"), "digest-abc"));
+        var sut = CreateSut(catalogClient);
+
+        var (names, digest) = await sut.RefreshWithDigestAsync(BaseUrl);
+
+        Assert.Equal(["llama3"], names);
+        Assert.Equal("digest-abc", digest);
+        Assert.Equal("digest-abc", sut.CurrentDigest(BaseUrl));
+        Assert.Equal("digest-abc", await sut.GetCurrentDigestAsync(BaseUrl));
+    }
+
+    [Fact]
+    public async Task RefreshWithDigestAsync_EmptyBaseUrl_ReturnsEmptyDigest()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var sut = CreateSut(catalogClient);
+
+        var (names, digest) = await sut.RefreshWithDigestAsync("");
+
+        Assert.Empty(names);
+        Assert.Equal("", digest);
+    }
+
+    [Fact]
+    public async Task GetCurrentDigestAsync_UnknownBaseUrl_TriggersRefresh()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        catalogClient.Setup(c => c.GetTagsWithDigestAsync(BaseUrl, It.IsAny<CancellationToken>()))
+            .ReturnsAsync((Tags("llama3"), "digest-xyz"));
+        var sut = CreateSut(catalogClient);
+
+        var digest = await sut.GetCurrentDigestAsync(BaseUrl);
+
+        Assert.Equal("digest-xyz", digest);
+        catalogClient.Verify(c => c.GetTagsWithDigestAsync(BaseUrl, It.IsAny<CancellationToken>()), Times.Once);
+
+        // Second call is served from the registry without another fetch.
+        var again = await sut.GetCurrentDigestAsync(BaseUrl);
+        Assert.Equal("digest-xyz", again);
+        catalogClient.Verify(c => c.GetTagsWithDigestAsync(BaseUrl, It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task GetCurrentDigestAsync_UnknownBaseUrl_EmptyCatalog_ReturnsEmpty()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        catalogClient.Setup(c => c.GetTagsWithDigestAsync(BaseUrl, It.IsAny<CancellationToken>()))
+            .ReturnsAsync((new JsonArray(), ""));
+        var sut = CreateSut(catalogClient);
+
+        var digest = await sut.GetCurrentDigestAsync(BaseUrl);
+
+        Assert.Equal("", digest);
+    }
+
+    [Fact]
+    public async Task DigestChange_RemovesOnlyThatTargetsCapabilityKeys()
+    {
+        const string targetB = "http://aiserver.local:11434";
+
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        catalogClient.SetupSequence(c => c.GetTagsWithDigestAsync(BaseUrl, It.IsAny<CancellationToken>()))
+            .ReturnsAsync((Tags("llama3"), "digest-d1"))
+            .ReturnsAsync((Tags("llama3", "qwen3:8b"), "digest-d2"));
+        catalogClient.Setup(c => c.GetTagsWithDigestAsync(targetB, It.IsAny<CancellationToken>()))
+            .ReturnsAsync((Tags("qwen3:8b"), "digest-d1"));
+
+        var memoryCache = new MemoryCache(new MemoryCacheOptions());
+        var sut = CreateSut(catalogClient, memoryCache);
+
+        // Initial refreshes record the digests.
+        await sut.RefreshWithDigestAsync(BaseUrl);
+        await sut.RefreshWithDigestAsync(targetB);
+
+        // Capability engine records keys under digest d1 on both targets.
+        const string keyA = "ModelCapabilityEngine:" + BaseUrl + ":digest-d1:llama3";
+        const string keyB = "ModelCapabilityEngine:" + targetB + ":digest-d1:qwen3:8b";
+        memoryCache.Set(keyA, "meta-a", TimeSpan.FromSeconds(30));
+        memoryCache.Set(keyB, "meta-b", TimeSpan.FromSeconds(30));
+        sut.RegisterCapabilityCacheKeys(BaseUrl, [keyA], "digest-d1");
+        sut.RegisterCapabilityCacheKeys(targetB, [keyB], "digest-d1");
+
+        Assert.NotNull(memoryCache.Get(keyA));
+        Assert.NotNull(memoryCache.Get(keyB));
+
+        // Catalog digest of target A changes ⇒ only A's capability keys are removed.
+        await sut.RefreshWithDigestAsync(BaseUrl);
+
+        Assert.Equal("digest-d2", sut.CurrentDigest(BaseUrl));
+        Assert.Equal("digest-d1", sut.CurrentDigest(targetB));
+        Assert.Null(memoryCache.Get(keyA));
+        Assert.NotNull(memoryCache.Get(keyB));
+    }
+
+    [Fact]
+    public async Task SameDigestRefresh_DoesNotRemoveCapabilityKeys()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        catalogClient.SetupSequence(c => c.GetTagsWithDigestAsync(BaseUrl, It.IsAny<CancellationToken>()))
+            .ReturnsAsync((Tags("llama3"), "digest-d1"))
+            .ReturnsAsync((Tags("llama3"), "digest-d1"));
+
+        var memoryCache = new MemoryCache(new MemoryCacheOptions());
+        var sut = CreateSut(catalogClient, memoryCache);
+
+        await sut.RefreshWithDigestAsync(BaseUrl);
+
+        const string keyA = "ModelCapabilityEngine:" + BaseUrl + ":digest-d1:llama3";
+        memoryCache.Set(keyA, "meta-a", TimeSpan.FromSeconds(30));
+        sut.RegisterCapabilityCacheKeys(BaseUrl, [keyA], "digest-d1");
+
+        // Refresh with the unchanged digest.
+        await sut.RefreshWithDigestAsync(BaseUrl);
+
+        Assert.NotNull(memoryCache.Get(keyA));
     }
 }

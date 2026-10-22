@@ -70,6 +70,10 @@ builder.Services.AddTransient<IRoutingTargetHandler, RemoteRoutingTargetHandler>
 builder.Services.AddTransient<IRoutingTargetHandler, CloudRoutingTargetHandler>();
 builder.Services.AddTransient<IRoutingDecisionService, RoutingDecisionService>();
 builder.Services.AddSingleton<IModelCatalogCacheService, ModelCatalogCacheService>();
+// Model capability discovery engine (Phase 2): inspects /api/tags + /api/show per target,
+// caches parsed capabilities keyed by target + model + catalog digest, and derives the
+// architecture classification and per-target context ceilings.
+builder.Services.AddSingleton<ModelCapabilityEngine>();
 builder.Services.AddSingleton<IOllamaProcessLauncher, OllamaProcessLauncher>();
 builder.Services.AddSingleton<IActivityMonitorService, ActivityMonitorService>();
 // Optional inference request recording (estimated vs actual token counts + full request bodies);

@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Nodes;
 
@@ -21,7 +22,54 @@ public sealed class OllamaModelCatalogClient(HttpClient httpClient) : IOllamaMod
 
     public async Task<JsonArray> GetTagsAsync(string? baseUrl, CancellationToken cancellationToken = default)
     {
-        return await FetchArraySafeAsync(BuildUrl(baseUrl, "/api/tags"), "models", cancellationToken);
+        var (tags, _) = await GetTagsWithDigestAsync(baseUrl, cancellationToken);
+        return tags;
+    }
+
+    public async Task<(JsonArray Tags, string Digest)> GetTagsWithDigestAsync(string? baseUrl, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(baseUrl))
+        {
+            return ([], string.Empty);
+        }
+
+        try
+        {
+            var raw = await httpClient.GetStringAsync(BuildUrl(baseUrl, "/api/tags"), cancellationToken);
+            var digest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(raw))).ToLowerInvariant();
+            var json = JsonNode.Parse(raw);
+            return (json?["models"]?.AsArray() ?? [], digest);
+        }
+        catch
+        {
+            return ([], string.Empty);
+        }
+    }
+
+    public async Task<JsonObject?> GetShowAsync(string? baseUrl, string modelName, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(baseUrl) || string.IsNullOrWhiteSpace(modelName))
+        {
+            return null;
+        }
+
+        try
+        {
+            var payload = new JsonObject { ["model"] = modelName };
+            using var content = new StringContent(payload.ToJsonString(), Encoding.UTF8, "application/json");
+            var response = await httpClient.PostAsync(BuildUrl(baseUrl, "/api/show"), content, cancellationToken);
+            if (!response.IsSuccessStatusCode)
+            {
+                return null;
+            }
+
+            var raw = await response.Content.ReadAsStringAsync(cancellationToken);
+            return JsonNode.Parse(raw) as JsonObject;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     public async Task<JsonArray> GetMergedOpenAIModelsAsync(string? localUrl, string? remoteUrl, CancellationToken cancellationToken = default)

@@ -45,6 +45,21 @@ public class TargetLivenessServiceTests : IDisposable
             RefreshedUrls.Add(baseUrl);
             return Task.FromResult<IReadOnlyList<string>>([]);
         }
+
+        public Task<(IReadOnlyList<string> Names, string Digest)> RefreshWithDigestAsync(string? baseUrl, CancellationToken cancellationToken = default)
+        {
+            RefreshCount++;
+            RefreshedUrls.Add(baseUrl);
+            return Task.FromResult((new List<string>() as IReadOnlyList<string>, string.Empty));
+        }
+
+        public Task<string> GetCurrentDigestAsync(string? baseUrl, CancellationToken cancellationToken = default) => Task.FromResult("");
+
+        public string CurrentDigest(string? baseUrl) => "";
+
+        public void RegisterCapabilityCacheKeys(string baseUrl, IEnumerable<string> keys, string digest)
+        {
+        }
     }
 
     private static HttpResponseMessage Ok() => new(HttpStatusCode.OK)
