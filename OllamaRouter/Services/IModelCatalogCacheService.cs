@@ -19,5 +19,13 @@ public interface IModelCatalogCacheService
     /// Results are cached for a short duration.
     /// </summary>
     Task<bool> HasAnyModelsAsync(string? baseUrl, CancellationToken cancellationToken = default);
-}
 
+    /// <summary>
+    /// Force-fetches the /api/tags catalog for the instance at <paramref name="baseUrl"/>
+    /// (bypassing any existing cached entry) and re-populates the same per-URL cache slot
+    /// with the same 30 s / 10 s (empty) expirations, so the refreshed names are immediately
+    /// visible to <see cref="ModelExistsAsync"/> and <see cref="HasAnyModelsAsync"/>.
+    /// A null/empty <paramref name="baseUrl"/> is a no-op that returns an empty list.
+    /// </summary>
+    Task<IReadOnlyList<string>> RefreshAsync(string? baseUrl, CancellationToken cancellationToken = default);
+}

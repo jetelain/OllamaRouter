@@ -1,4 +1,6 @@
+using System.Net.Http;
 using System.Text;
+using Microsoft.Extensions.Options;
 using OllamaRouter.Endpoints;
 using OllamaRouter.Middleware;
 using OllamaRouter.Options;
@@ -37,6 +39,20 @@ var fleetTargets = BuildFleetTargets(ollamaOptions, startupLoggerFactory.CreateL
 builder.Services.AddHttpClient<IOllamaModelCatalogClient, OllamaModelCatalogClient>(client =>
 {
     client.Timeout = TimeSpan.FromSeconds(4);
+});
+
+// Dedicated liveness probe client: short 1.5 s timeout so an on-demand probe can never
+// block a request longer than that, and a 10 s pooled-connection lifetime so a
+// sleeping-then-woken machine with a changed IP does not keep hitting dead pooled sockets.
+builder.Services.AddHttpClient("LivenessProbe", client =>
+{
+    client.Timeout = TimeSpan.FromMilliseconds(1500);
+})
+.ConfigurePrimaryHttpMessageHandler(_ =>
+{
+    // A 10 s pooled-connection lifetime so a sleeping-then-woken machine with a
+    // changed IP does not keep hitting dead pooled sockets.
+    return new SocketsHttpHandler { PooledConnectionLifetime = TimeSpan.FromSeconds(10) };
 });
 builder.Services.AddMemoryCache();
 
@@ -84,6 +100,19 @@ if (disableTui)
     builder.Services.PostConfigure<OllamaRouterOptions>(opt => opt.TerminalMonitoring.Enabled = false);
 }
 builder.Services.AddHostedService<TerminalMonitoringHostedService>();
+
+// Target liveness prober (singleton + hosted service): asynchronous fleet probe at boot
+// and a 10 s background re-prober that rejoins sleeping/roaming machines. Named-client
+// pattern (not AddHttpClient<T>) because the typed-client registration is transient and
+// this must be a singleton; the probe HttpClient from IHttpClientFactory is NOT disposed
+// by the service (only its CancellationTokenSource is).
+builder.Services.AddSingleton<ITargetLivenessService>(sp => new TargetLivenessService(
+    sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
+    sp.GetRequiredService<IModelCatalogCacheService>(),
+    sp.GetRequiredService<IHttpClientFactory>().CreateClient("LivenessProbe"),
+    sp.GetRequiredService<ILogger<TargetLivenessService>>(),
+    TimeSpan.FromSeconds(10)));
+builder.Services.AddHostedService(sp => (IHostedService)sp.GetRequiredService<ITargetLivenessService>());
 
 var app = builder.Build();
 

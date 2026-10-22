@@ -25,9 +25,15 @@ public sealed class OllamaRoutingMiddleware(
     IActivityStatisticsService activityStatistics,
     IInferenceRequestRecorder inferenceRequestRecorder,
     ITargetAvailabilityService targetAvailability,
+    ITargetLivenessService targetLiveness,
     IOptions<OllamaRouterOptions> options,
     ILogger<OllamaRoutingMiddleware> logger)
 {
+    // During the first 10 s after the liveness prober started, an unresolved (Unknown)
+    // target is treated as routable rather than offline, so a request arriving before the
+    // boot probe completes is never bounced to 503 merely because probing is slow.
+    private static readonly TimeSpan StartupGracePeriod = TimeSpan.FromSeconds(10);
+
     public async Task InvokeAsync(HttpContext context)
     {
         if (IsCompletionRequest(context))
@@ -132,6 +138,89 @@ public sealed class OllamaRoutingMiddleware(
         return true;
     }
 
+    // A pinned target is routable when its liveness is Online, or — during the 10 s startup
+    // grace window — still Unknown (the boot probe may simply not have completed yet). After
+    // the grace window an unresolved Unknown is treated as Offline.
+    private bool IsPinnedTargetRoutable(TargetLivenessState state)
+    {
+        if (state == TargetLivenessState.Online)
+        {
+            return true;
+        }
+
+        return state == TargetLivenessState.Unknown &&
+               DateTimeOffset.UtcNow - targetLiveness.ServiceStartTimeUtc < StartupGracePeriod;
+    }
+
+    // All-offline predicate: no ENABLED fleet target is routable. A target is routable when
+    // the TTL-aware IsOnline is true, OR — during the 10 s startup grace window — when its
+    // raw state is still Unknown (the boot probe has not definitively resolved it yet, so we
+    // do not bounce a request to 503 merely because probing is slow). A TTL-expired stale
+    // Online entry is NOT routable (so the 10 s re-prober keeps trying to bring it back).
+    private bool IsFleetAllOffline()
+    {
+        var fleetTargets = targetLiveness.GetFleetTargets();
+        if (fleetTargets.Count == 0)
+        {
+            return true;
+        }
+
+        var withinGrace = IsWithinStartupGrace();
+        var entries = targetLiveness.GetEntries();
+        return !fleetTargets.Any(t =>
+            targetAvailability.IsEnabled(t) &&
+            (targetLiveness.IsOnline(t) ||
+             (withinGrace && entries.TryGetValue(t, out var entry) && entry.State == TargetLivenessState.Unknown)));
+    }
+
+    // True while the liveness prober is within its 10 s startup grace window. A zero/MinValue
+    // ServiceStartTimeUtc (service never started) is NOT a grace window.
+    private bool IsWithinStartupGrace()
+    {
+        var start = targetLiveness.ServiceStartTimeUtc;
+        return start != DateTimeOffset.MinValue &&
+               DateTimeOffset.UtcNow - start < StartupGracePeriod;
+    }
+
+    // Cloud Overflow availability for this request (mirrors CloudRoutingTargetHandler's
+    // predicate): the model has a configured CloudModel AND the Cloud target is enabled.
+    private bool IsCloudOverflowAvailable(string modelName)
+    {
+        if (!targetAvailability.IsEnabled(RoutingTarget.Cloud))
+        {
+            return false;
+        }
+
+        var normalizedName = RoutingDecisionService.NormalizeModelName(modelName);
+        return options.Value.Models.TryGetValue(normalizedName, out var thresholds) &&
+               !string.IsNullOrEmpty(thresholds.CloudModel);
+    }
+
+    // Diagnostics payload for the all-offline 503: enumerates the ENABLED fleet targets
+    // in fleet order with their raw (non-TTL) state lowercased and the last probe error.
+    // cloud_enabled is false by construction (the 503 path is only taken when Cloud is NOT
+    // available). The request is never forwarded and no activity statistics are recorded.
+    private AllOfflineDiagnostics BuildAllOfflineDiagnostics()
+    {
+        var entries = targetLiveness.GetEntries();
+        var targets = targetLiveness.GetFleetTargets()
+            .Where(t => targetAvailability.IsEnabled(t))
+            .Select(t =>
+            {
+                var entry = entries.TryGetValue(t, out var found) ? found : default;
+                return new OfflineTargetInfo(
+                    t.ToString(),
+                    entry is null ? "unknown" : entry.State.ToString().ToLowerInvariant(),
+                    entry?.LastError);
+            })
+            .ToList();
+
+        return new AllOfflineDiagnostics(
+            "All fleet targets are offline or disabled.",
+            targets,
+            CloudEnabled: false);
+    }
+
     private static bool IsCompletionRequest(HttpContext context)
     {
         return context.Request.Method == HttpMethods.Post &&
@@ -170,8 +259,23 @@ public sealed class OllamaRoutingMiddleware(
             {
                 if (targetAvailability.IsEnabled(requestedTarget))
                 {
-                    target = requestedTarget;
-                    logger.LogInformation("Routing target explicitly pinned via request header: {Target}", target);
+                    // Pinned-target liveness gate: never forward to a dead daemon. Cloud is a
+                    // relay (never probed); fleet targets are probed on demand (bounded at
+                    // the 1.5 s probe timeout) before being trusted.
+                    var pinnedState = requestedTarget == RoutingTarget.Cloud
+                        ? TargetLivenessState.Online
+                        : await targetLiveness.EnsureKnownAsync(requestedTarget, context.RequestAborted);
+
+                    if (IsPinnedTargetRoutable(pinnedState))
+                    {
+                        target = requestedTarget;
+                        logger.LogInformation("Routing target explicitly pinned via request header: {Target}", target);
+                    }
+                    else
+                    {
+                        logger.LogWarning("Requested target {Target} is offline (liveness {State}). Falling back to dynamic routing.", requestedTarget, pinnedState);
+                        target = await routingDecisionService.DecideAsync(tokenCount, modelName, context.RequestAborted);
+                    }
                 }
                 else
                 {
@@ -208,6 +312,36 @@ public sealed class OllamaRoutingMiddleware(
             }
 
             target = (RoutingTarget)fallback;
+        }
+
+        // All-offline gate (completion requests only): runs AFTER the pinned/dynamic decision
+        // is resolved (and a final on-demand probe of the chosen fleet target, bounded at the
+        // 1.5 s probe timeout) and BEFORE the target header, response telemetry headers and
+        // activity statistics — the 503 path performs no forwarding and records nothing.
+        // Cloud is a relay and is never gated by liveness (the Q4-A resolution: hand off to
+        // Cloud whenever Cloud is available, regardless of relay-target liveness).
+        if (target != RoutingTarget.Cloud)
+        {
+            await targetLiveness.EnsureKnownAsync(target, context.RequestAborted);
+
+            if (IsFleetAllOffline())
+            {
+                if (IsCloudOverflowAvailable(modelName))
+                {
+                    logger.LogWarning("All fleet targets are offline; handing {ModelName} off to Cloud Overflow.", modelName);
+                    target = RoutingTarget.Cloud;
+                }
+                else
+                {
+                    logger.LogWarning("All fleet targets are offline or disabled and Cloud Overflow is unavailable; returning 503 for {ModelName}.", modelName);
+                    context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+                    context.Response.ContentType = "application/json";
+                    await context.Response.WriteAsync(JsonSerializer.Serialize(
+                        BuildAllOfflineDiagnostics(),
+                        OllamaRouterJsonSerializerContext.Default.AllOfflineDiagnostics));
+                    return;
+                }
+            }
         }
 
         context.Request.Headers[OllamaReverseProxyConfig.TargetHeader] = MapTargetToHeader(target);
@@ -450,3 +584,23 @@ public sealed class OllamaRoutingMiddleware(
 
 public sealed record OllamaErrorResponse(
     [property: JsonPropertyName("error")] string Error);
+
+/// <summary>
+/// Diagnostics payload returned as <c>503 Service Unavailable</c> when all enabled
+/// fleet targets are offline/unknown and Cloud Overflow is not available for the
+/// request. The <c>error</c> field mirrors <see cref="OllamaErrorResponse"/> so clients
+/// that parse <c>error</c> keep working.
+/// </summary>
+public sealed record AllOfflineDiagnostics(
+    [property: JsonPropertyName("error")] string Error,
+    [property: JsonPropertyName("targets")] IReadOnlyList<OfflineTargetInfo> Targets,
+    [property: JsonPropertyName("cloud_enabled")] bool CloudEnabled);
+
+/// <summary>
+/// Per-target diagnostics for the all-offline payload: the raw (non-TTL) liveness
+/// state, lowercased, plus the most recent probe error (null for Unknown).
+/// </summary>
+public sealed record OfflineTargetInfo(
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("state")] string State,
+    [property: JsonPropertyName("last_error")] string? LastError);

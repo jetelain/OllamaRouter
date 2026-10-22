@@ -177,4 +177,40 @@ public class ModelCatalogCacheServiceTests
         Assert.True(exists);
         catalogClient.Verify(c => c.GetTagsAsync(BaseUrl, It.IsAny<CancellationToken>()), Times.Once);
     }
+
+    [Fact]
+    public async Task RefreshAsync_BypassesStaleCache_RepopulatesWithNewNames()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        catalogClient
+            .SetupSequence(c => c.GetTagsAsync(BaseUrl, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Tags("llama3"))
+            .ReturnsAsync(Tags("llama3", "qwen3:8b"));
+        var sut = CreateSut(catalogClient);
+
+        // Populate the cache with the stale (single-model) list.
+        Assert.True(await sut.ModelExistsAsync(BaseUrl, "llama3"));
+        Assert.False(await sut.ModelExistsAsync(BaseUrl, "qwen3:8b")); // Stale cache says no.
+
+        // Force-refresh: the client now returns the expanded list.
+        var refreshed = await sut.RefreshAsync(BaseUrl);
+        Assert.Equal(2, refreshed.Count);
+
+        // The refreshed names are immediately visible (cache was repopulated).
+        Assert.True(await sut.ModelExistsAsync(BaseUrl, "qwen3:8b"));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    public async Task RefreshAsync_MissingBaseUrl_ReturnsEmpty_WithoutQueryingCatalog(string? baseUrl)
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var sut = CreateSut(catalogClient);
+
+        var result = await sut.RefreshAsync(baseUrl);
+
+        Assert.Empty(result);
+        catalogClient.Verify(c => c.GetTagsAsync(It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
 }

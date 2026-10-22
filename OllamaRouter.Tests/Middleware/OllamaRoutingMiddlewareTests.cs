@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -30,12 +31,38 @@ public class OllamaRoutingMiddlewareTests
         Mock<IActivityMonitorService>? activityMonitor = null,
         Mock<IActivityStatisticsService>? activityStatistics = null,
         Mock<IInferenceRequestRecorder>? inferenceRequestRecorder = null,
-        Mock<ITargetAvailabilityService>? targetAvailability = null)
+        Mock<ITargetAvailabilityService>? targetAvailability = null,
+        Mock<ITargetLivenessService>? targetLiveness = null)
     {
         var effectiveTargetAvailability = targetAvailability ?? new Mock<ITargetAvailabilityService>();
         if (targetAvailability is null)
         {
             effectiveTargetAvailability.Setup(t => t.IsEnabled(It.IsAny<RoutingTarget>())).Returns(true);
+        }
+
+        // Permissive liveness default: everything is Online and the startup grace window
+        // has already elapsed, so existing tests exercise normal routing (never 503).
+        var effectiveTargetLiveness = targetLiveness ?? new Mock<ITargetLivenessService>();
+        if (targetLiveness is null)
+        {
+            effectiveTargetLiveness
+                .Setup(t => t.EnsureKnownAsync(It.IsAny<RoutingTarget>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(TargetLivenessState.Online);
+            effectiveTargetLiveness.Setup(t => t.IsOnline(It.IsAny<RoutingTarget>())).Returns(true);
+            effectiveTargetLiveness.SetupGet(t => t.ServiceStartTimeUtc).Returns(DateTimeOffset.UtcNow);
+            effectiveTargetLiveness
+                .Setup(t => t.GetFleetTargets())
+                .Returns(new[] { RoutingTarget.Local, RoutingTarget.Remote });
+            effectiveTargetLiveness
+                .Setup(t => t.GetEntries())
+                .Returns(new Dictionary<RoutingTarget, TargetLivenessEntry>
+                {
+                    [RoutingTarget.Local] = new TargetLivenessEntry(RoutingTarget.Local, TargetLivenessState.Online, null, DateTimeOffset.UtcNow),
+                    [RoutingTarget.Remote] = new TargetLivenessEntry(RoutingTarget.Remote, TargetLivenessState.Online, null, DateTimeOffset.UtcNow)
+                });
+            effectiveTargetLiveness
+                .Setup(t => t.GetSnapshot())
+                .Returns(new TargetLivenessSnapshot(new List<TargetLivenessEntry>()));
         }
 
         return new OllamaRoutingMiddleware(
@@ -47,6 +74,7 @@ public class OllamaRoutingMiddlewareTests
             (activityStatistics ?? new Mock<IActivityStatisticsService>()).Object,
             (inferenceRequestRecorder ?? new Mock<IInferenceRequestRecorder>()).Object,
             effectiveTargetAvailability.Object,
+            effectiveTargetLiveness.Object,
             MsOptions.Create(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
             NullLogger<OllamaRoutingMiddleware>.Instance);
     }
@@ -726,5 +754,327 @@ public class OllamaRoutingMiddlewareTests
         Assert.Equal("Local", context.Response.Headers["X-OllamaRouter-Target"]);
         // Because Remote was disabled, it fell back to dynamic routing
         routingDecisionService.Verify(r => r.DecideAsync(50, "llama3", It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    // Build a liveness mock where every target is Offline: EnsureKnownAsync returns Offline,
+    // IsOnline is false, and the entries expose an offline state with a last error.
+    private static Mock<ITargetLivenessService> AllOfflineLiveness()
+    {
+        var liveness = new Mock<ITargetLivenessService>();
+        liveness.Setup(t => t.EnsureKnownAsync(It.IsAny<RoutingTarget>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(TargetLivenessState.Offline);
+        liveness.Setup(t => t.IsOnline(It.IsAny<RoutingTarget>())).Returns(false);
+        liveness.SetupGet(t => t.ServiceStartTimeUtc).Returns(DateTimeOffset.UtcNow);
+        liveness.Setup(t => t.GetFleetTargets())
+            .Returns(new[] { RoutingTarget.Local, RoutingTarget.Remote });
+        liveness.Setup(t => t.GetEntries())
+            .Returns(new Dictionary<RoutingTarget, TargetLivenessEntry>
+            {
+                [RoutingTarget.Local] = new(RoutingTarget.Local, TargetLivenessState.Offline, "connection error", DateTimeOffset.UtcNow),
+                [RoutingTarget.Remote] = new(RoutingTarget.Remote, TargetLivenessState.Offline, "timeout", DateTimeOffset.UtcNow)
+            });
+        liveness.Setup(t => t.GetSnapshot())
+            .Returns(new TargetLivenessSnapshot(
+            [
+                new(RoutingTarget.Local, TargetLivenessState.Offline, "connection error", DateTimeOffset.UtcNow),
+                new(RoutingTarget.Remote, TargetLivenessState.Offline, "timeout", DateTimeOffset.UtcNow)
+            ]));
+        return liveness;
+    }
+
+    private static (OllamaRouterOptions Options, Microsoft.Extensions.Options.IOptions<OllamaRouterOptions> OptionsWrapper) OptionsWithCloud(string? cloudModel)
+    {
+        var options = new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" };
+        if (cloudModel is not null)
+        {
+            options.Models["llama3"] = new ModelThresholds { CloudModel = cloudModel };
+        }
+
+        return (options, MsOptions.Create(options));
+    }
+
+    [Fact]
+    public async Task AllOffline_CloudDisabled_Returns503WithDiagnostics_ForwardsNothing()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Bonjour" }""");
+        var responseBody = new MemoryStream();
+        context.Response.Body = responseBody;
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var targetAvailability = new Mock<ITargetAvailabilityService>();
+        targetAvailability.Setup(t => t.IsEnabled(RoutingTarget.Local)).Returns(true);
+        targetAvailability.Setup(t => t.IsEnabled(RoutingTarget.Remote)).Returns(true);
+        targetAvailability.Setup(t => t.IsEnabled(RoutingTarget.Cloud)).Returns(false);
+
+        var activityMonitor = new Mock<IActivityMonitorService>();
+
+        var (options, optionsWrapper) = OptionsWithCloud(cloudModel: null);
+        var liveness = AllOfflineLiveness();
+
+        var nextCalled = false;
+        // Manually wire the middleware so we can override the options instance.
+        var sut = new OllamaRoutingMiddleware(
+            _ => { nextCalled = true; return Task.CompletedTask; },
+            tokenEstimator.Object,
+            routingDecisionService.Object,
+            new Mock<IModelCatalogCacheService>().Object,
+            activityMonitor.Object,
+            new Mock<IActivityStatisticsService>().Object,
+            new Mock<IInferenceRequestRecorder>().Object,
+            targetAvailability.Object,
+            liveness.Object,
+            optionsWrapper,
+            NullLogger<OllamaRoutingMiddleware>.Instance);
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal(StatusCodes.Status503ServiceUnavailable, context.Response.StatusCode);
+        Assert.False(nextCalled);
+        Assert.False(context.Request.Headers.ContainsKey("X-Ollama-Target"));
+        activityMonitor.Verify(m => m.StartRequest(It.IsAny<RoutingTarget>(), It.IsAny<string>(), It.IsAny<int>()), Times.Never);
+
+        responseBody.Seek(0, SeekOrigin.Begin);
+        using var bodyReader = new StreamReader(responseBody);
+        var bodyJson = bodyReader.ReadToEnd();
+        var json = JsonDocument.Parse(bodyJson).RootElement;
+        Assert.Equal("All fleet targets are offline or disabled.", json.GetProperty("error").GetString());
+        Assert.False(json.GetProperty("cloud_enabled").GetBoolean());
+        var targets = json.GetProperty("targets").EnumerateArray().ToList();
+        Assert.Equal(2, targets.Count);
+        Assert.Equal("Local", targets[0].GetProperty("name").GetString());
+        Assert.Equal("offline", targets[0].GetProperty("state").GetString());
+        Assert.Equal("connection error", targets[0].GetProperty("last_error").GetString());
+        Assert.Equal("Remote", targets[1].GetProperty("name").GetString());
+        Assert.Equal("offline", targets[1].GetProperty("state").GetString());
+        Assert.Equal("timeout", targets[1].GetProperty("last_error").GetString());
+    }
+
+    [Fact]
+    public async Task AllOffline_CloudAvailable_HandsOffToCloudEvenWhenRelayIsOffline()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Bonjour" }""");
+        var requestBytes = new MemoryStream();
+
+        var tokenEstimator = new Mock<ITokenEstimator>();        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var targetAvailability = new Mock<ITargetAvailabilityService>();
+        targetAvailability.Setup(t => t.IsEnabled(RoutingTarget.Local)).Returns(true);
+        targetAvailability.Setup(t => t.IsEnabled(RoutingTarget.Remote)).Returns(true);
+        targetAvailability.Setup(t => t.IsEnabled(RoutingTarget.Cloud)).Returns(true);
+
+        var (options, optionsWrapper) = OptionsWithCloud(cloudModel: "llama3-cloud");
+        var liveness = AllOfflineLiveness(); // Even the relay (Local) is offline — Q4-A: hand off anyway.
+
+        string? capturedModel = null;
+        string? capturedTargetHeader = null;
+        bool nextCalled = false;
+        var sut = new OllamaRoutingMiddleware(
+            c =>
+            {
+                nextCalled = true;
+                capturedTargetHeader = c.Request.Headers["X-Ollama-Target"].ToString();
+                using var reader = new StreamReader(c.Request.Body);
+                var body = reader.ReadToEnd();
+                using var doc = JsonDocument.Parse(body);
+                capturedModel = doc.RootElement.GetProperty("model").GetString();
+                return Task.CompletedTask;
+            },
+            tokenEstimator.Object,
+            routingDecisionService.Object,
+            new Mock<IModelCatalogCacheService>().Object,
+            new Mock<IActivityMonitorService>().Object,
+            new Mock<IActivityStatisticsService>().Object,
+            new Mock<IInferenceRequestRecorder>().Object,
+            targetAvailability.Object,
+            liveness.Object,
+            optionsWrapper,
+            NullLogger<OllamaRoutingMiddleware>.Instance);
+
+        await sut.InvokeAsync(context);
+
+        Assert.True(nextCalled);
+        // Cloud is relayed through the Local-named cluster.
+        Assert.Equal("Local", capturedTargetHeader);
+        Assert.Equal("llama3-cloud", capturedModel);
+        Assert.Equal("Cloud", context.Response.Headers["X-OllamaRouter-Target"]);
+    }
+
+    [Fact]
+    public async Task OneTargetOnline_RoutesNormally_No503()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Bonjour" }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        // Local is online, Remote is offline → the fleet is NOT all offline.
+        var liveness = new Mock<ITargetLivenessService>();
+        liveness.Setup(t => t.EnsureKnownAsync(It.IsAny<RoutingTarget>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(TargetLivenessState.Online);
+        liveness.Setup(t => t.IsOnline(RoutingTarget.Local)).Returns(true);
+        liveness.Setup(t => t.IsOnline(RoutingTarget.Remote)).Returns(false);
+        liveness.SetupGet(t => t.ServiceStartTimeUtc).Returns(DateTimeOffset.UtcNow);
+        liveness.Setup(t => t.GetFleetTargets()).Returns(new[] { RoutingTarget.Local, RoutingTarget.Remote });
+
+        var nextCalled = false;
+        var sut = CreateSut(_ => { nextCalled = true; return Task.CompletedTask; }, tokenEstimator, routingDecisionService,
+            targetLiveness: liveness);
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal(StatusCodes.Status200OK, context.Response.StatusCode);
+        Assert.True(nextCalled);
+        Assert.Equal("Local", context.Request.Headers["X-Ollama-Target"]);
+    }
+
+    [Fact]
+    public async Task PinnedTargetOffline_FallsBackToDynamicRouting()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Bonjour" }""");
+        context.Request.Headers["X-OllamaRouter-Target"] = "Remote";
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(50);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(50, "llama3", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var targetAvailability = new Mock<ITargetAvailabilityService>();
+        targetAvailability.Setup(t => t.IsEnabled(It.IsAny<RoutingTarget>())).Returns(true);
+
+        // Pinned Remote is offline → dynamic routing is used; Local is online so no 503.
+        var liveness = new Mock<ITargetLivenessService>();
+        liveness.Setup(t => t.EnsureKnownAsync(RoutingTarget.Remote, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(TargetLivenessState.Offline);
+        liveness.Setup(t => t.EnsureKnownAsync(RoutingTarget.Local, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(TargetLivenessState.Online);
+        liveness.Setup(t => t.IsOnline(RoutingTarget.Local)).Returns(true);
+        liveness.Setup(t => t.IsOnline(RoutingTarget.Remote)).Returns(false);
+        liveness.SetupGet(t => t.ServiceStartTimeUtc).Returns(DateTimeOffset.UtcNow);
+        liveness.Setup(t => t.GetFleetTargets()).Returns(new[] { RoutingTarget.Local, RoutingTarget.Remote });
+
+        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService,
+            targetAvailability: targetAvailability, targetLiveness: liveness);
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("Local", context.Request.Headers["X-Ollama-Target"]);
+        routingDecisionService.Verify(r => r.DecideAsync(50, "llama3", It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task StartupUnknownWithinGraceWindow_IsRoutable_Not503()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Bonjour" }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var targetAvailability = new Mock<ITargetAvailabilityService>();
+        targetAvailability.Setup(t => t.IsEnabled(It.IsAny<RoutingTarget>())).Returns(true);
+
+        // Unknown liveness, service just started (within the 10 s grace window), no Cloud.
+        var liveness = new Mock<ITargetLivenessService>();
+        liveness.Setup(t => t.EnsureKnownAsync(It.IsAny<RoutingTarget>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(TargetLivenessState.Unknown);
+        liveness.Setup(t => t.IsOnline(It.IsAny<RoutingTarget>())).Returns(false);
+        liveness.SetupGet(t => t.ServiceStartTimeUtc).Returns(DateTimeOffset.UtcNow);
+        liveness.Setup(t => t.GetFleetTargets()).Returns(new[] { RoutingTarget.Local, RoutingTarget.Remote });
+        liveness.Setup(t => t.GetEntries())
+            .Returns(new Dictionary<RoutingTarget, TargetLivenessEntry>
+            {
+                [RoutingTarget.Local] = new(RoutingTarget.Local, TargetLivenessState.Unknown, null, DateTimeOffset.MinValue),
+                [RoutingTarget.Remote] = new(RoutingTarget.Remote, TargetLivenessState.Unknown, null, DateTimeOffset.MinValue)
+            });
+
+        var (options, optionsWrapper) = OptionsWithCloud(cloudModel: null);
+        var nextCalled = false;
+        var sut = new OllamaRoutingMiddleware(
+            _ => { nextCalled = true; return Task.CompletedTask; },
+            tokenEstimator.Object,
+            routingDecisionService.Object,
+            new Mock<IModelCatalogCacheService>().Object,
+            new Mock<IActivityMonitorService>().Object,
+            new Mock<IActivityStatisticsService>().Object,
+            new Mock<IInferenceRequestRecorder>().Object,
+            targetAvailability.Object,
+            liveness.Object,
+            optionsWrapper,
+            NullLogger<OllamaRoutingMiddleware>.Instance);
+
+        await sut.InvokeAsync(context);
+
+        // During the grace window the Unknown target is treated as routable, so it forwards.
+        Assert.True(nextCalled);
+        Assert.Equal("Local", context.Request.Headers["X-Ollama-Target"]);
+    }
+
+    [Fact]
+    public async Task StreamingFailure_DoesNotTripLivenessState_NoFurtherLivenessCalls()
+    {
+        var context = BuildContext("/v1/chat/completions", """{ "model": "qwen", "stream": true }""");
+        var responseBody = new MemoryStream();
+        context.Response.Body = responseBody;
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Remote);
+
+        var liveness = new Mock<ITargetLivenessService>();
+        liveness.Setup(t => t.EnsureKnownAsync(It.IsAny<RoutingTarget>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(TargetLivenessState.Online);
+        liveness.Setup(t => t.IsOnline(It.IsAny<RoutingTarget>())).Returns(true);
+        liveness.SetupGet(t => t.ServiceStartTimeUtc).Returns(DateTimeOffset.UtcNow);
+        liveness.Setup(t => t.GetFleetTargets()).Returns(new[] { RoutingTarget.Local, RoutingTarget.Remote });
+
+        // A streamed response that fails mid-stream (YARP sets a ForwarderError).
+        var forwarderErrorFeatureMock = new Mock<IForwarderErrorFeature>();
+        forwarderErrorFeatureMock.SetupGet(f => f.Error).Returns(ForwarderError.ResponseBodyCanceled);
+
+        RequestDelegate next = c =>
+        {
+            c.Response.StatusCode = 200;
+            c.Response.ContentType = "text/event-stream";
+            c.Response.WriteAsync("data: {\"choices\":[]}\n\n");
+            c.Features.Set<IForwarderErrorFeature>(forwarderErrorFeatureMock.Object);
+            return Task.CompletedTask;
+        };
+
+        var sut = CreateSut(next, tokenEstimator, routingDecisionService, targetLiveness: liveness);
+
+        await sut.InvokeAsync(context);
+
+        // The liveness service is consulted only up front (for the pinned/chosen gate),
+        // never after the streamed failure — the breaker is inference-isolated.
+        liveness.Verify(t => t.EnsureKnownAsync(It.IsAny<RoutingTarget>(), It.IsAny<CancellationToken>()), Times.Exactly(1));
+        liveness.Verify(t => t.IsOnline(It.IsAny<RoutingTarget>()), Times.Once);
     }
 }
