@@ -72,7 +72,9 @@ internal static class MonitorScenarios
         }
 
         var targets = node["targets"];
-        if (targets?["local"] is null || targets["remote"] is null || targets["cloud"] is null)
+        // Target names are exposed as configured ("Local"/"Remote"/"Cloud" for the legacy
+        // synthesized fleet); look up case-insensitively.
+        if (FindTargetFlag(targets, "local") is null || FindTargetFlag(targets, "remote") is null || FindTargetFlag(targets, "cloud") is null)
         {
             return "Missing target status flags (local, remote, cloud) in /monitor/api response.";
         }
@@ -233,11 +235,30 @@ internal static class MonitorScenarios
         var json = JsonNode.Parse(await response.Content.ReadAsStringAsync());
         var targets = json?["targets"];
 
+        // Case-insensitive key lookup: the legacy fleet exposes "Local"/"Remote"/"Cloud".
         return (
-            targets?["local"]?.GetValue<bool>() ?? true,
-            targets?["remote"]?.GetValue<bool>() ?? true,
-            targets?["cloud"]?.GetValue<bool>() ?? false
+            FindTargetFlag(targets, "local") ?? true,
+            FindTargetFlag(targets, "remote") ?? true,
+            FindTargetFlag(targets, "cloud") ?? false
         );
+    }
+
+    private static bool? FindTargetFlag(JsonNode? targets, string key)
+    {
+        if (targets is not JsonObject targetObject)
+        {
+            return null;
+        }
+
+        foreach (var (name, value) in targetObject)
+        {
+            if (string.Equals(name, key, StringComparison.OrdinalIgnoreCase))
+            {
+                return value?.GetValue<bool>();
+            }
+        }
+
+        return null;
     }
 
     private static async Task SetTargetsAsync(HttpClient http, bool local, bool remote, bool cloud)
@@ -248,4 +269,3 @@ internal static class MonitorScenarios
         response.EnsureSuccessStatusCode();
     }
 }
-

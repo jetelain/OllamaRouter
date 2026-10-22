@@ -19,12 +19,20 @@ builder.Services.ConfigureHttpJsonOptions(options =>
 builder.Services.AddOptions<OllamaRouterOptions>()
     .BindConfiguration(OllamaRouterOptions.SectionName);
 
-// Code-based YARP configuration: only the local/remote addresses come from configuration.
+// Code-based YARP configuration: routes/clusters are generated dynamically from the effective
+// fleet target list (synthesized from LocalUrl/RemoteUrl in the legacy configuration).
 var ollamaOptions = builder.Configuration.GetSection(OllamaRouterOptions.SectionName).Get<OllamaRouterOptions>()
     ?? new OllamaRouterOptions();
 var (routes, clusters) = OllamaReverseProxyConfig.Build(ollamaOptions);
 builder.Services.AddReverseProxy()
     .LoadFromMemory(routes, clusters);
+
+// Effective fleet targets plus the Cloud pseudo-target (always present); used by the
+// availability and statistics services so state is keyed per target.
+// Invalid Targets entries are skipped with a warning logged here, at startup.
+var startupLoggerFactory = LoggerFactory.Create(loggingBuilder =>
+    loggingBuilder.AddConfiguration(builder.Configuration.GetSection("Logging")));
+var fleetTargets = BuildFleetTargets(ollamaOptions, startupLoggerFactory.CreateLogger("OllamaRouter.Startup"));
 
 builder.Services.AddHttpClient<IOllamaModelCatalogClient, OllamaModelCatalogClient>(client =>
 {
@@ -57,6 +65,7 @@ builder.Services.AddSingleton<IActivityStatisticsService>(sp =>
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "OllamaRouter",
             "activity-statistics.json"),
+        fleetTargets,
         sp.GetRequiredService<IHostApplicationLifetime>(),
         sp.GetRequiredService<ILogger<ActivityStatisticsService>>()));
 builder.Services.AddSingleton<ITargetAvailabilityService>(sp =>
@@ -65,6 +74,7 @@ builder.Services.AddSingleton<ITargetAvailabilityService>(sp =>
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "OllamaRouter",
             "targets.json"),
+        fleetTargets,
         sp.GetRequiredService<ILogger<TargetAvailabilityService>>()));
 
 var disableTui = args.Any(a => string.Equals(a, "--no-tui", StringComparison.OrdinalIgnoreCase));
@@ -76,6 +86,46 @@ if (disableTui)
 builder.Services.AddHostedService<TerminalMonitoringHostedService>();
 
 var app = builder.Build();
+
+// Resolves the configured fleet targets plus the Cloud pseudo-target (deduplicated, case-insensitively).
+static IReadOnlyList<RoutingTarget> BuildFleetTargets(OllamaRouterOptions options, ILogger logger)
+{
+    var targets = options.GetEffectiveTargets(logger)
+        .Where(t => !string.IsNullOrWhiteSpace(t.Name))
+        .Select(t => (RoutingTarget)t.Name!)
+        .DistinctBy(t => t.Value ?? "");
+
+    var list = targets.ToList();
+    if (!list.Any(t => t == RoutingTarget.Cloud))
+    {
+        list.Add(RoutingTarget.Cloud);
+    }
+
+    return list;
+}
+
+// Startup fleet log line + deprecation warnings.
+{
+    var startupLogger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("OllamaRouter.Startup");
+    startupLogger.LogInformation("Effective fleet targets: {Targets}", string.Join(", ", fleetTargets.Select(t => t.Value ?? "")));
+
+    if (ollamaOptions.Targets.Count > 0)
+    {
+        startupLogger.LogWarning(
+            "OllamaRouter:Targets is configured: routing decisions currently still operate on the legacy LocalUrl/RemoteUrl two-tier logic (full fleet decision logic is planned for a follow-up release). LocalUrl/RemoteUrl remain the instances used by the routing handlers.");
+    }
+
+    var nonDefaultModels = ollamaOptions.Models
+        .Where(pair => pair.Value.MaxLocalTokens != ModelThresholds.DefaultMaxLocalTokens ||
+                    pair.Value.MinRequiredVramMB != ModelThresholds.DefaultMinRequiredVramMB)
+        .Select(pair => pair.Key)
+        .ToList();
+    if (nonDefaultModels.Count > 0)
+    {
+        startupLogger.LogWarning(
+            "OllamaRouter:Models[{Models}]:MaxLocalTokens/MinRequiredVramMB are deprecated and will be superseded by hardware suitability rules; they are slated for removal after the transition release (the keys keep working in this release).", string.Join(", ", nonDefaultModels));
+    }
+}
 
 // Ensure local Ollama is running (Windows only).
 app.Services.GetRequiredService<IOllamaProcessLauncher>().EnsureRunning();

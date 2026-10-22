@@ -11,6 +11,24 @@ public class RoutingDecisionServiceTests
 {
     private const string ModelName = "llama3";
 
+    // The legacy fleet: the well-known three targets, all enabled.
+    private static TargetAvailabilitySnapshot AllEnabledTargets() =>
+        new(new Dictionary<RoutingTarget, bool>
+        {
+            [RoutingTarget.Local] = true,
+            [RoutingTarget.Remote] = true,
+            [RoutingTarget.Cloud] = true
+        });
+
+    // All legacy targets enabled except the given ones.
+    private static TargetAvailabilitySnapshot AllExcept(params RoutingTarget[] disabled) =>
+        new(new Dictionary<RoutingTarget, bool>
+        {
+            [RoutingTarget.Local] = !disabled.Contains(RoutingTarget.Local),
+            [RoutingTarget.Remote] = !disabled.Contains(RoutingTarget.Remote),
+            [RoutingTarget.Cloud] = !disabled.Contains(RoutingTarget.Cloud)
+        });
+
     private static RoutingDecisionService CreateSut(
         Mock<IOllamaModelCatalogClient> catalogClient,
         Mock<IGpuVramProvider> gpuVramProvider,
@@ -40,10 +58,10 @@ public class RoutingDecisionServiceTests
         });
 
         var targetAvailability = new Mock<ITargetAvailabilityService>();
-        var effectiveTargets = targets ?? new TargetAvailabilitySnapshot(true, true, true);
-        targetAvailability.Setup(t => t.IsEnabled(RoutingTarget.Local)).Returns(effectiveTargets.Local);
-        targetAvailability.Setup(t => t.IsEnabled(RoutingTarget.Remote)).Returns(effectiveTargets.Remote);
-        targetAvailability.Setup(t => t.IsEnabled(RoutingTarget.Cloud)).Returns(effectiveTargets.Cloud);
+        var effectiveTargets = targets ?? AllEnabledTargets();
+        targetAvailability.Setup(t => t.IsEnabled(RoutingTarget.Local)).Returns(effectiveTargets.Flags[RoutingTarget.Local]);
+        targetAvailability.Setup(t => t.IsEnabled(RoutingTarget.Remote)).Returns(effectiveTargets.Flags[RoutingTarget.Remote]);
+        targetAvailability.Setup(t => t.IsEnabled(RoutingTarget.Cloud)).Returns(effectiveTargets.Flags[RoutingTarget.Cloud]);
 
         modelCatalogCacheService ??= CreateModelCatalogCacheServiceAvailableOnBoth();
         activityMonitor ??= CreateActivityMonitorNotBusy();
@@ -389,7 +407,7 @@ public class RoutingDecisionServiceTests
         var sut = CreateSut(catalogClient, gpuVramProvider,
             cloudModel: "deepseek-v3.1:671b-cloud",
             activityMonitor: activityMonitor,
-            targets: new TargetAvailabilitySnapshot(false, true, true));
+            targets: AllExcept(RoutingTarget.Local));
 
         var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
 
@@ -403,7 +421,7 @@ public class RoutingDecisionServiceTests
         var gpuVramProvider = new Mock<IGpuVramProvider>();
         var sut = CreateSut(catalogClient, gpuVramProvider,
             cloudModel: "deepseek-v3.1:671b-cloud",
-            targets: new TargetAvailabilitySnapshot(true, false, true));
+            targets: AllExcept(RoutingTarget.Remote));
 
         var target = await sut.DecideAsync(tokenCount: 50_000, modelName: ModelName);
 
@@ -420,7 +438,7 @@ public class RoutingDecisionServiceTests
         var sut = CreateSut(catalogClient, gpuVramProvider,
             cloudModel: "deepseek-v3.1:671b-cloud",
             activityMonitor: activityMonitor,
-            targets: new TargetAvailabilitySnapshot(true, true, false));
+            targets: AllExcept(RoutingTarget.Cloud));
 
         var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
 
@@ -434,7 +452,7 @@ public class RoutingDecisionServiceTests
         var gpuVramProvider = new Mock<IGpuVramProvider>();
         var sut = CreateSut(catalogClient, gpuVramProvider,
             cloudModel: "deepseek-v3.1:671b-cloud",
-            targets: new TargetAvailabilitySnapshot(true, false, false));
+            targets: AllExcept(RoutingTarget.Remote, RoutingTarget.Cloud));
 
         await Assert.ThrowsAsync<NoAvailableTargetException>(() => sut.DecideAsync(tokenCount: 50_000, modelName: ModelName));
     }
@@ -447,7 +465,7 @@ public class RoutingDecisionServiceTests
         gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
         var sut = CreateSut(catalogClient, gpuVramProvider,
             cloudModel: "deepseek-v3.1:671b-cloud",
-            targets: new TargetAvailabilitySnapshot(true, false, false));
+            targets: AllExcept(RoutingTarget.Remote, RoutingTarget.Cloud));
 
         var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
 
@@ -465,7 +483,7 @@ public class RoutingDecisionServiceTests
         activityMonitor.Setup(a => a.IsBusy(RoutingTarget.Remote)).Returns(false);
         var sut = CreateSut(catalogClient, gpuVramProvider,
             activityMonitor: activityMonitor,
-            targets: new TargetAvailabilitySnapshot(true, false, false));
+            targets: AllExcept(RoutingTarget.Remote, RoutingTarget.Cloud));
 
         var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
 
@@ -479,7 +497,7 @@ public class RoutingDecisionServiceTests
         var gpuVramProvider = new Mock<IGpuVramProvider>();
         gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
         var sut = CreateSut(catalogClient, gpuVramProvider,
-            targets: new TargetAvailabilitySnapshot(false, false, false));
+            targets: AllExcept(RoutingTarget.Local, RoutingTarget.Remote, RoutingTarget.Cloud));
 
         await Assert.ThrowsAsync<NoAvailableTargetException>(() => sut.DecideAsync(tokenCount: 1_000, modelName: ModelName));
     }
@@ -770,7 +788,7 @@ public class RoutingDecisionServiceTests
             .Returns(3);
 
         // Cloud target is disabled
-        var targets = new TargetAvailabilitySnapshot(Local: true, Remote: true, Cloud: false);
+        var targets = AllExcept(RoutingTarget.Cloud);
 
         var sut = CreateSut(
             catalogClient,
@@ -957,4 +975,3 @@ public class RoutingDecisionServiceTests
         Assert.Equal(RoutingTarget.Cloud, r5);
     }
 }
-

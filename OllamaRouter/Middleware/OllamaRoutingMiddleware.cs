@@ -42,11 +42,94 @@ public sealed class OllamaRoutingMiddleware(
         else
         {
             // Default (pull, push, delete...): target the local instance if enabled, otherwise remote.
-            context.Request.Headers[OllamaReverseProxyConfig.TargetHeader] = targetAvailability.IsEnabled(RoutingTarget.Local)
-                ? OllamaReverseProxyConfig.LocalTarget
-                : OllamaReverseProxyConfig.RemoteTarget;
+            context.Request.Headers[OllamaReverseProxyConfig.TargetHeader] = GetDefaultHeaderValue();
             await next(context);
         }
+    }
+
+    // The header value for non-inspected requests: the name of the target named "Local"
+    // (case-insensitive) when enabled, otherwise the first other enabled effective target
+    // (Remote in the legacy configuration, preserving the previous behavior exactly).
+    private string GetDefaultHeaderValue()
+    {
+        var effectiveTargets = options.Value.GetEffectiveTargets(logger);
+        if (effectiveTargets.Count == 0)
+        {
+            return OllamaReverseProxyConfig.LocalTarget;
+        }
+
+        var local = effectiveTargets.FirstOrDefault(t => string.Equals(t.Name, OllamaReverseProxyConfig.LocalTarget, StringComparison.OrdinalIgnoreCase));
+        if (local is not null && targetAvailability.IsEnabled(local.Name))
+        {
+            return local.Name!;
+        }
+
+        var fallback = effectiveTargets.FirstOrDefault(t => t.Name is not null && targetAvailability.IsEnabled(t.Name));
+        return fallback?.Name ?? effectiveTargets[0].Name!;
+    }
+
+    // Last-resort fallback when request inspection fails: prefer the "Remote" named target,
+    // then the "Local" named target, then any other enabled effective target — mirroring
+    // the legacy Remote-then-Local preference. Returns null when no target is enabled.
+    private string? GetFallbackHeaderValue()
+    {
+        var effectiveTargets = options.Value.GetEffectiveTargets(logger);
+        return effectiveTargets.FirstOrDefault(t => string.Equals(t.Name, OllamaReverseProxyConfig.RemoteTarget, StringComparison.OrdinalIgnoreCase)
+                && targetAvailability.IsEnabled(t.Name))?.Name
+            ?? effectiveTargets.FirstOrDefault(t => string.Equals(t.Name, OllamaReverseProxyConfig.LocalTarget, StringComparison.OrdinalIgnoreCase)
+                && targetAvailability.IsEnabled(t.Name))?.Name
+            ?? effectiveTargets.FirstOrDefault(t => t.Name is not null && targetAvailability.IsEnabled(t.Name))?.Name;
+    }
+
+    // Cloud traffic is relayed through the "local" instance (signed in to ollama.com); the
+    // X-Ollama-Target header therefore carries the relay target's name: a target named "Local"
+    // (case-insensitive) when present, otherwise the first effective target. Any other target
+    // is mapped to its own name.
+    private string MapTargetToHeader(RoutingTarget target)
+    {
+        if (target == RoutingTarget.Cloud)
+        {
+            var effectiveTargets = options.Value.GetEffectiveTargets(logger);
+            var relay = effectiveTargets.FirstOrDefault(t => string.Equals(t.Name, OllamaReverseProxyConfig.LocalTarget, StringComparison.OrdinalIgnoreCase))
+                ?? (effectiveTargets.Count > 0 ? effectiveTargets[0] : null);
+            if (relay is null)
+            {
+                logger.LogWarning("Cloud target requested but no effective targets are configured; falling back to '{LocalTarget}'.", OllamaReverseProxyConfig.LocalTarget);
+                return OllamaReverseProxyConfig.LocalTarget;
+            }
+
+            logger.LogInformation("Cloud overflow request is relayed through target {RelayTarget}.", relay.Name);
+            return relay.Name!;
+        }
+
+        return target.ToString();
+    }
+
+    // Case-insensitive lookup of the pinned target over the configured fleet targets plus the
+    // Cloud pseudo-target; unknown names do not match (the request falls back to dynamic routing).
+    private bool TryParsePinnedTarget(string? headerValue, out RoutingTarget target)
+    {
+        target = default;
+        if (string.IsNullOrWhiteSpace(headerValue))
+        {
+            return false;
+        }
+
+        if (string.Equals(headerValue, RoutingTarget.Cloud.Value, StringComparison.OrdinalIgnoreCase))
+        {
+            target = RoutingTarget.Cloud;
+            return true;
+        }
+
+        var match = options.Value.GetEffectiveTargets(logger)
+            .FirstOrDefault(t => string.Equals(t.Name, headerValue, StringComparison.OrdinalIgnoreCase));
+        if (match is null || string.IsNullOrWhiteSpace(match.Name))
+        {
+            return false;
+        }
+
+        target = (RoutingTarget)match.Name!;
+        return true;
     }
 
     private static bool IsCompletionRequest(HttpContext context)
@@ -83,7 +166,7 @@ public sealed class OllamaRoutingMiddleware(
             tokenCount = (int)Math.Ceiling(rawTokenCount * options.Value.TokenEstimationOverheadFactor);
 
             if (context.Request.Headers.TryGetValue("X-OllamaRouter-Target", out var requestedTargetHeader) &&
-                Enum.TryParse<RoutingTarget>(requestedTargetHeader.ToString(), ignoreCase: true, out var requestedTarget))
+                TryParsePinnedTarget(requestedTargetHeader.ToString(), out var requestedTarget))
             {
                 if (targetAvailability.IsEnabled(requestedTarget))
                 {
@@ -114,12 +197,7 @@ public sealed class OllamaRoutingMiddleware(
         catch (Exception ex)
         {
             logger.LogError(ex, "Error while inspecting the request. Falling back to default routing.");
-            var fallback = targetAvailability.IsEnabled(RoutingTarget.Remote)
-                ? RoutingTarget.Remote
-                : targetAvailability.IsEnabled(RoutingTarget.Local)
-                    ? RoutingTarget.Local
-                    : (RoutingTarget?)null;
-
+            var fallback = GetFallbackHeaderValue();
             if (fallback is null)
             {
                 logger.LogWarning("No enabled routing target available for fallback.");
@@ -129,15 +207,10 @@ public sealed class OllamaRoutingMiddleware(
                 return;
             }
 
-            target = fallback.Value;
+            target = (RoutingTarget)fallback;
         }
 
-        context.Request.Headers[OllamaReverseProxyConfig.TargetHeader] = target switch
-        {
-            RoutingTarget.Local => OllamaReverseProxyConfig.LocalTarget,
-            RoutingTarget.Cloud => OllamaReverseProxyConfig.LocalTarget,
-            _ => OllamaReverseProxyConfig.RemoteTarget
-        };
+        context.Request.Headers[OllamaReverseProxyConfig.TargetHeader] = MapTargetToHeader(target);
 
         context.Response.Headers["X-OllamaRouter-Target"] = target.ToString();
         context.Response.Headers["X-OllamaRouter-Model"] = modelName;

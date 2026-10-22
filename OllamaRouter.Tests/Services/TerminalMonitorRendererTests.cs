@@ -45,12 +45,39 @@ public class TerminalMonitorRendererTests
 
         return new MonitorStateResponse(
             cloudEnabled,
-            new MonitorTargetsStatus(localEnabled, remoteEnabled, cloudEnabledTarget),
-            new MonitorTargetsStatus(localOnline, remoteOnline, cloudOnline),
-            new MonitorBusyStatus(localBusy, remoteBusy, cloudBusy),
+            Targets: new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Local"] = localEnabled,
+                ["Remote"] = remoteEnabled,
+                ["Cloud"] = cloudEnabledTarget
+            },
+            Online: new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Local"] = localOnline,
+                ["Remote"] = remoteOnline,
+                ["Cloud"] = cloudOnline
+            },
+            Busy: new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Local"] = localBusy,
+                ["Remote"] = remoteBusy,
+                ["Cloud"] = cloudBusy
+            },
             new MonitorStatisticsStatus(
-                new MonitorPeriodStatistics(tl, tr, tc, tTot),
-                new MonitorPeriodStatistics(l7l, l7r, l7c, l7Tot)),
+                new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["Local"] = tl,
+                    ["Remote"] = tr,
+                    ["Cloud"] = tc,
+                    ["total"] = tTot
+                },
+                new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["Local"] = l7l,
+                    ["Remote"] = l7r,
+                    ["Cloud"] = l7c,
+                    ["total"] = l7Tot
+                }),
             inProgress ?? [],
             recentRequests ?? [],
             cost,
@@ -69,7 +96,7 @@ public class TerminalMonitorRendererTests
         Assert.Contains("Full monitor: http://localhost:11434/monitor", output);
         Assert.Contains("Local: ● Idle", output);
         Assert.Contains("Remote: ● Idle", output);
-        Assert.DoesNotContain("Cloud", output);
+        Assert.Contains("Cloud: ● Idle", output); // the Cloud pseudo-target is always present
         Assert.Contains("No request in progress", output);
         Assert.Contains("No recent requests", output);
         Assert.Contains("No token activity in the last 7 days", output);
@@ -280,6 +307,50 @@ public class TerminalMonitorRendererTests
             var width = TerminalMonitorRenderer.GetDisplayWidth(line);
             Assert.True(width <= 79, $"Line exceeded 79 columns ({width} cols): '{line}'");
         }
+    }
+
+    [Fact]
+    public void Render_FleetNamedTarget_DisplaysNameWithoutWellKnownIcon()
+    {
+        var stats = new MonitorStatisticsStatus(
+            new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["desktop"] = new ActivityStatisticsTotals(1, 100, 50),
+                ["Cloud"] = new ActivityStatisticsTotals(0, 0, 0),
+                ["total"] = new ActivityStatisticsTotals(1, 100, 50)
+            },
+            new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["desktop"] = new ActivityStatisticsTotals(1, 100, 50),
+                ["Cloud"] = new ActivityStatisticsTotals(0, 0, 0),
+                ["total"] = new ActivityStatisticsTotals(1, 100, 50)
+            });
+
+        var state = new MonitorStateResponse(
+            CloudEnabled: false,
+            Targets: new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["desktop"] = true,
+                ["Cloud"] = true
+            },
+            Online: new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["desktop"] = true,
+                ["Cloud"] = false
+            },
+            Busy: new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["desktop"] = false,
+                ["Cloud"] = false
+            },
+            stats,
+            [], [], null, null);
+
+        var output = TerminalMonitorRenderer.Render(state, "http://localhost:11434/monitor", enableAnsi: false);
+
+        // Fleet names are displayed as plain names (no well-known icon prefix) and keep a neutral style.
+        Assert.Contains("desktop: \u25CF Idle", output);
+        Assert.DoesNotContain("\uD83D\uDDA5\uFE0F desktop", output, StringComparison.Ordinal);
     }
 
     [Fact]

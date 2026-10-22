@@ -5,10 +5,13 @@ using Yarp.ReverseProxy.Forwarder;
 namespace OllamaRouter.ReverseProxy;
 
 /// <summary>
-/// Builds the YARP configuration by code: one route/cluster for the local Ollama instance and
-/// one for the remote instance, selected via the <c>X-Ollama-Target</c> header set by
-/// <see cref="Middleware.OllamaRoutingMiddleware"/>. Only the local and remote addresses remain
-/// driven by configuration (<see cref="OllamaRouterOptions"/>).
+/// Builds the YARP configuration by code: one route/cluster per effective fleet target
+/// (<see cref="OllamaRouterOptions.GetEffectiveTargets"/>), selected via the <c>X-Ollama-Target</c>
+/// header set by <see cref="Middleware.OllamaRoutingMiddleware"/>. A legacy configuration
+/// (LocalUrl/RemoteUrl, no Targets) synthesizes exactly the "Local" and "Remote" targets, so the
+/// generated routes/clusters are byte-identical to the previous two-tier configuration.
+/// No YARP route is generated for the Cloud pseudo-target (it is relayed through the local
+/// instance by the middleware).
 /// </summary>
 public static class OllamaReverseProxyConfig
 {
@@ -16,22 +19,19 @@ public static class OllamaReverseProxyConfig
     public const string LocalTarget = "Local";
     public const string RemoteTarget = "Remote";
 
-    private const string LocalClusterId = "localCluster";
-    private const string RemoteClusterId = "remoteCluster";
-
     public static (IReadOnlyList<RouteConfig> Routes, IReadOnlyList<ClusterConfig> Clusters) Build(OllamaRouterOptions options)
     {
-        var routes = new[]
-        {
-            BuildRoute("localRoute", LocalClusterId, LocalTarget),
-            BuildRoute("remoteRoute", RemoteClusterId, RemoteTarget)
-        };
+        var routes = new List<RouteConfig>();
+        var clusters = new List<ClusterConfig>();
 
-        var clusters = new[]
+        foreach (var target in options.GetEffectiveTargets())
         {
-            BuildCluster(LocalClusterId, "localOllama", options.LocalUrl),
-            BuildCluster(RemoteClusterId, "remoteOllama", options.RemoteUrl)
-        };
+            // The header match value is the target name exactly as configured (the route
+            // selector is case-sensitive), while the ids embed the name so each target gets
+            // a distinct route/cluster/destination.
+            routes.Add(BuildRoute($"{target.Name}Route", $"{target.Name}Cluster", target.Name!));
+            clusters.Add(BuildCluster($"{target.Name}Cluster", $"{target.Name}Ollama", target.Url!));
+        }
 
         return (routes, clusters);
     }

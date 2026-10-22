@@ -25,9 +25,12 @@ public class ActivityStatisticsServiceTests : IDisposable
         Directory.Delete(tempDirectory, recursive: true);
     }
 
-    private ActivityStatisticsService CreateSut()
+    private static IReadOnlyList<RoutingTarget> LegacyTargets() =>
+        [RoutingTarget.Local, RoutingTarget.Remote, RoutingTarget.Cloud];
+
+    private ActivityStatisticsService CreateSut(IReadOnlyList<RoutingTarget>? targets = null)
     {
-        return new ActivityStatisticsService(statsFilePath, lifetime, NullLogger<ActivityStatisticsService>.Instance);
+        return new ActivityStatisticsService(statsFilePath, targets ?? LegacyTargets(), lifetime, NullLogger<ActivityStatisticsService>.Instance);
     }
 
     private static ActivityLogEntry Entry(RoutingTarget target, int? promptTokens, int? responseTokens, bool success = true)
@@ -203,9 +206,46 @@ public class ActivityStatisticsServiceTests : IDisposable
 
         // A fresh lifetime: the shared one is already stopped, which would immediately fire
         // this instance's registered Save with its still-empty state and wipe the file.
-        var second = new ActivityStatisticsService(statsFilePath, new FakeHostApplicationLifetime(), NullLogger<ActivityStatisticsService>.Instance);
+        var second = new ActivityStatisticsService(statsFilePath, LegacyTargets(), new FakeHostApplicationLifetime(), NullLogger<ActivityStatisticsService>.Instance);
 
         Assert.Equal(1, second.GetSnapshot().Today[RoutingTarget.Cloud].Requests);
+    }
+
+    [Fact]
+    public void NewDayBucket_IsPrePopulatedWithConfiguredTargetsAndCloud()
+    {
+        var sut = CreateSut();
+
+        var snapshot = sut.GetSnapshot();
+
+        // Cloud is always present; legacy fleet targets are synthesized from the configuration.
+        Assert.True(snapshot.Today.ContainsKey(RoutingTarget.Local));
+        Assert.True(snapshot.Today.ContainsKey(RoutingTarget.Remote));
+        Assert.True(snapshot.Today.ContainsKey(RoutingTarget.Cloud));
+        Assert.Equal(0, snapshot.Today[RoutingTarget.Cloud].Requests);
+    }
+
+    [Fact]
+    public void GetSnapshot_ThreeTargetFleet_ZeroFillsTargetsWithoutTraffic()
+    {
+        var fleet = new[] { new RoutingTarget("desktop"), new RoutingTarget("laptop"), new RoutingTarget("server1"), RoutingTarget.Cloud };
+        var sut = CreateSut(fleet);
+
+        sut.Add(Entry(new RoutingTarget("desktop"), 10, 5));
+
+        var snapshot = sut.GetSnapshot();
+
+        Assert.Equal(1, snapshot.Today[new RoutingTarget("desktop")].Requests);
+        // Zero-filled entries for the targets without traffic.
+        Assert.Equal(0, snapshot.Today[new RoutingTarget("laptop")].Requests);
+        Assert.Equal(0, snapshot.Today[new RoutingTarget("server1")].Requests);
+        Assert.Equal(0, snapshot.Today[RoutingTarget.Cloud].Requests);
+        Assert.Equal(1, snapshot.TodayTotal.Requests);
+
+        Assert.Equal(1, snapshot.Last7Days[new RoutingTarget("desktop")].Requests);
+        Assert.Equal(0, snapshot.Last7Days[new RoutingTarget("laptop")].Requests);
+        Assert.Equal(0, snapshot.Last7Days[RoutingTarget.Cloud].Requests);
+        Assert.Equal(1, snapshot.Last7DaysTotal.Requests);
     }
 
     // Gives fire-and-forget saves (Task.Run) time to finish so the stats file is stable to read.

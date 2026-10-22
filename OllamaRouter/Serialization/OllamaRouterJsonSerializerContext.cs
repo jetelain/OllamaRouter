@@ -6,7 +6,8 @@ using OllamaRouter.Services;
 namespace OllamaRouter.Serialization;
 
 [JsonSourceGenerationOptions(WriteIndented = true, PropertyNameCaseInsensitive = true)]
-[JsonSerializable(typeof(TargetsState))]
+[JsonSerializable(typeof(Dictionary<string, bool>))]
+[JsonSerializable(typeof(Dictionary<string, ActivityStatisticsTotals>))]
 [JsonSerializable(typeof(List<ActivityStatisticsDate>))]
 [JsonSerializable(typeof(OllamaErrorResponse))]
 [JsonSerializable(typeof(MonitorStateResponse))]
@@ -19,4 +20,3 @@ namespace OllamaRouter.Serialization;
 public partial class OllamaRouterJsonSerializerContext : JsonSerializerContext
 {
 }
-

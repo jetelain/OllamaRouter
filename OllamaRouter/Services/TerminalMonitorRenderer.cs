@@ -127,17 +127,42 @@ public static class TerminalMonitorRenderer
         sb.Append("INSTANCES: ");
         if (enableAnsi) sb.Append(Reset);
 
-        AppendInstanceStatus(sb, "Local", "🖥️ Local", state.Targets.Local, state.Online.Local, state.Busy.Local, enableAnsi);
-        sb.Append("   ");
-        AppendInstanceStatus(sb, "Remote", "📡 Remote", state.Targets.Remote, state.Online.Remote, state.Busy.Remote, enableAnsi);
-
-        if (state.CloudEnabled)
+        var first = true;
+        foreach (var (name, enabled) in state.Targets)
         {
-            sb.Append("   ");
-            AppendInstanceStatus(sb, "Cloud", "☁️ Cloud", state.Targets.Cloud, state.Online.Cloud, state.Busy.Cloud, enableAnsi);
+            if (!first)
+            {
+                sb.Append("   ");
+            }
+            first = false;
+            AppendInstanceStatus(sb, name, TargetLabel(name), enabled, state.Online.GetValueOrDefault(name, true), state.Busy.GetValueOrDefault(name), enableAnsi);
         }
 
         lines.Add(sb.ToString());
+    }
+
+    // Display label (icon + name) with Local/Remote/Cloud icons and a plain-name fallback for
+    // fleet targets.
+    public static string TargetLabel(string target)
+    {
+        return target.ToLowerInvariant() switch
+        {
+            "local" => "🖥️ Local",
+            "remote" => "📡 Remote",
+            "cloud" => "☁️ Cloud",
+            _ => target
+        };
+    }
+
+    private static string TargetColor(string targetKey)
+    {
+        return targetKey.ToLowerInvariant() switch
+        {
+            "local" => BrightCyan,
+            "remote" => BrightGreen,
+            "cloud" => BrightMagenta,
+            _ => ""
+        };
     }
 
     private static void AppendInstanceStatus(
@@ -149,13 +174,7 @@ public static class TerminalMonitorRenderer
         bool busy,
         bool enableAnsi)
     {
-        string targetColor = targetKey switch
-        {
-            "Local" => BrightCyan,
-            "Remote" => BrightGreen,
-            "Cloud" => BrightMagenta,
-            _ => ""
-        };
+        var targetColor = TargetColor(targetKey);
 
         if (enableAnsi) sb.Append(Bold).Append(targetColor);
         sb.Append(displayName).Append(": ");
@@ -201,16 +220,13 @@ public static class TerminalMonitorRenderer
         var today = state.Statistics.Today;
         var last7Days = state.Statistics.Last7Days;
 
-        lines.Add(FormatStatsRow("🖥️ Local", BrightCyan, today.Local, last7Days.Local, enableAnsi));
-        lines.Add(FormatStatsRow("📡 Remote", BrightGreen, today.Remote, last7Days.Remote, enableAnsi));
-
-        if (state.CloudEnabled)
+        foreach (var name in today.Keys.Where(key => key != "total"))
         {
-            lines.Add(FormatStatsRow("☁️ Cloud", BrightMagenta, today.Cloud, last7Days.Cloud, enableAnsi));
+            lines.Add(FormatStatsRow(TargetLabel(name), TargetColor(name), today[name], last7Days.GetValueOrDefault(name, new ActivityStatisticsTotals(0, 0, 0)), enableAnsi));
         }
 
         lines.Add("   ─────────────┼──────────────────────────┼──────────────────────────");
-        lines.Add(FormatStatsRow("Total", Bold, today.Total, last7Days.Total, enableAnsi, isTotal: true));
+        lines.Add(FormatStatsRow("Total", Bold, today["total"], last7Days["total"], enableAnsi, isTotal: true));
     }
 
     private static string FormatStatsRow(
@@ -242,10 +258,11 @@ public static class TerminalMonitorRenderer
     private static void AppendUsageRatio(List<string> lines, MonitorStateResponse state, int width, bool enableAnsi)
     {
         var last7 = state.Statistics.Last7Days;
-        long localTokens = (long)last7.Local.InputTokens + last7.Local.OutputTokens;
-        long remoteTokens = (long)last7.Remote.InputTokens + last7.Remote.OutputTokens;
-        long cloudTokens = state.CloudEnabled ? ((long)last7.Cloud.InputTokens + last7.Cloud.OutputTokens) : 0;
-        long totalTokens = localTokens + remoteTokens + cloudTokens;
+        var entries = last7.Keys
+            .Where(name => name != "total")
+            .Select(name => (Name: name, Stats: last7.GetValueOrDefault(name, new ActivityStatisticsTotals(0, 0, 0))))
+            .ToList();
+        long totalTokens = entries.Sum(e => (long)e.Stats.InputTokens + e.Stats.OutputTokens);
 
         var header = new StringBuilder();
         header.Append(" ");
@@ -267,35 +284,40 @@ public static class TerminalMonitorRenderer
         lines.Add(header.ToString());
 
         int barLength = Math.Clamp(width - 40, 24, 40);
-        int localChars = (int)Math.Round((double)localTokens / totalTokens * barLength);
-        int remoteChars = (int)Math.Round((double)remoteTokens / totalTokens * barLength);
-        int cloudChars = state.CloudEnabled ? Math.Max(0, barLength - localChars - remoteChars) : 0;
-
-        if (localChars + remoteChars + cloudChars > barLength)
-        {
-            if (cloudChars > 0) cloudChars = Math.Max(0, barLength - localChars - remoteChars);
-            else remoteChars = Math.Max(0, barLength - localChars);
-        }
-
         var barSb = new StringBuilder();
         barSb.Append("   [");
-        if (localChars > 0)
+
+        var legendSb = new StringBuilder();
+        legendSb.Append("   ");
+        var firstLegend = true;
+
+        for (int i = 0; i < entries.Count; i++)
         {
-            if (enableAnsi) barSb.Append(BrightCyan);
-            barSb.Append(new string('█', localChars));
-        }
-        if (remoteChars > 0)
-        {
-            if (enableAnsi) barSb.Append(BrightGreen);
-            barSb.Append(new string('█', remoteChars));
-        }
-        if (cloudChars > 0)
-        {
-            if (enableAnsi) barSb.Append(BrightMagenta);
-            barSb.Append(new string('█', cloudChars));
+            var entry = entries[i];
+            var entryTokens = (long)entry.Stats.InputTokens + entry.Stats.OutputTokens;
+            int chars = i < entries.Count - 1
+                ? (int)Math.Round((double)entryTokens / totalTokens * barLength)
+                : Math.Max(0, barLength - entries.Take(i).Sum(prev => (int)Math.Round((double)((long)prev.Stats.InputTokens + prev.Stats.OutputTokens) / totalTokens * barLength)));
+            chars = Math.Clamp(chars, 0, barLength);
+
+            if (chars > 0)
+            {
+                if (enableAnsi) barSb.Append(TargetColor(entry.Name));
+                barSb.Append(new string('█', chars));
+            }
+
+            var pct = entryTokens * 100.0 / totalTokens;
+            if (!firstLegend)
+            {
+                legendSb.Append(" • ");
+            }
+            firstLegend = false;
+            if (enableAnsi) legendSb.Append(TargetColor(entry.Name));
+            legendSb.Append(TargetLabel(entry.Name)).Append(": ").Append(pct.ToString("0.0", CultureInfo.InvariantCulture)).Append("%");
+            if (enableAnsi) legendSb.Append(Reset);
         }
 
-        int emptyChars = barLength - (localChars + remoteChars + cloudChars);
+        var emptyChars = barLength - CountBarChars(barSb);
         if (emptyChars > 0)
         {
             if (enableAnsi) barSb.Append(Gray);
@@ -304,31 +326,31 @@ public static class TerminalMonitorRenderer
         if (enableAnsi) barSb.Append(Reset);
         barSb.Append(']');
 
-        double localPct = localTokens * 100.0 / totalTokens;
-        double remotePct = remoteTokens * 100.0 / totalTokens;
-        double cloudPct = cloudTokens * 100.0 / totalTokens;
-
-        var legendSb = new StringBuilder();
-        legendSb.Append("   ");
-        if (enableAnsi) legendSb.Append(BrightCyan);
-        legendSb.Append("🖥️ Local: ").Append(localPct.ToString("0.0", CultureInfo.InvariantCulture)).Append("%");
-        if (enableAnsi) legendSb.Append(Reset);
-
-        legendSb.Append(" • ");
-        if (enableAnsi) legendSb.Append(BrightGreen);
-        legendSb.Append("📡 Remote: ").Append(remotePct.ToString("0.0", CultureInfo.InvariantCulture)).Append("%");
-        if (enableAnsi) legendSb.Append(Reset);
-
-        if (state.CloudEnabled && cloudTokens > 0)
-        {
-            legendSb.Append(" • ");
-            if (enableAnsi) legendSb.Append(BrightMagenta);
-            legendSb.Append("☁️ Cloud: ").Append(cloudPct.ToString("0.0", CultureInfo.InvariantCulture)).Append("%");
-            if (enableAnsi) legendSb.Append(Reset);
-        }
-
         lines.Add(barSb.ToString());
         lines.Add(legendSb.ToString());
+    }
+
+    // Counts the filled '█' characters appended to the bar so far (the ANSI codes are not counted).
+    private static int CountBarChars(StringBuilder barSb)
+    {
+        var text = barSb.ToString();
+        int count = 0;
+        for (int i = 0; i < text.Length; i++)
+        {
+            if (text[i] == '█')
+            {
+                count++;
+            }
+            else if (text[i] == '\u001b')
+            {
+                // Skip ANSI escape sequences.
+                while (i < text.Length && text[i] != 'm')
+                {
+                    i++;
+                }
+            }
+        }
+        return count;
     }
 
     private static void AppendCostAndSavings(List<string> lines, MonitorStateResponse state, bool enableAnsi)
@@ -483,21 +505,8 @@ public static class TerminalMonitorRenderer
 
     private static void AppendTargetBadge(StringBuilder sb, string target, bool enableAnsi, int padLength)
     {
-        string color = target switch
-        {
-            "Local" => BrightCyan,
-            "Remote" => BrightGreen,
-            "Cloud" => BrightMagenta,
-            _ => ""
-        };
-
-        string icon = target switch
-        {
-            "Local" => "🖥️ Local",
-            "Remote" => "📡 Remote",
-            "Cloud" => "☁️ Cloud",
-            _ => target
-        };
+        var color = TargetColor(target);
+        var icon = TargetLabel(target);
 
         if (enableAnsi) sb.Append(color);
         sb.Append(PadRightDisplay(icon, padLength));

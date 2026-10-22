@@ -57,7 +57,12 @@ public class MonitorEndpointsExtensionsTests
             .Returns(defaultSnapshot);
 
         mocks.TargetAvailability.Setup(t => t.GetSnapshot())
-            .Returns(new TargetAvailabilitySnapshot(true, true, false));
+            .Returns(new TargetAvailabilitySnapshot(new Dictionary<RoutingTarget, bool>
+            {
+                [RoutingTarget.Local] = true,
+                [RoutingTarget.Remote] = true,
+                [RoutingTarget.Cloud] = false
+            }));
 
         builder.Services.AddSingleton(mocks.ActivityMonitor.Object);
         builder.Services.AddSingleton(mocks.ActivityStatistics.Object);
@@ -78,6 +83,12 @@ public class MonitorEndpointsExtensionsTests
         return (app, client, mocks);
     }
 
+    private static TargetAvailabilitySnapshot TargetFlags(params (RoutingTarget Target, bool Enabled)[] entries) =>
+        new(entries.ToDictionary(pair => pair.Target, pair => pair.Enabled));
+
+    private static Dictionary<string, bool> StringFlags(params (string Name, bool Value)[] entries) =>
+        entries.ToDictionary(pair => pair.Name, pair => pair.Value, StringComparer.OrdinalIgnoreCase);
+
     private sealed record Mocks(
         Mock<IActivityMonitorService> ActivityMonitor,
         Mock<IActivityStatisticsService> ActivityStatistics,
@@ -95,7 +106,7 @@ public class MonitorEndpointsExtensionsTests
 
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
             var html = await response.Content.ReadAsStringAsync();
-            Assert.Contains("🎮 Reclaim local VRAM", html);
+            Assert.Contains("\uD83C\uDFAE Reclaim local VRAM", html);
             Assert.Contains("reclaimLocalVram", html);
             Assert.Contains("reclaimBtn", html);
             Assert.Contains("reclaimStatus", html);
@@ -116,7 +127,9 @@ public class MonitorEndpointsExtensionsTests
             var response = await client.PostAsJsonAsync("/targets", new { Local = false, Remote = true, Cloud = true });
 
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            mocks.TargetAvailability.Verify(t => t.Update(false, true, true), Times.Once);
+            mocks.TargetAvailability.Verify(t => t.Update(It.Is<IReadOnlyDictionary<string, bool>>(f =>
+                    f.ContainsKey("Local") && !f["Local"] && f.ContainsKey("Remote") && f["Remote"] &&
+                    f.ContainsKey("Cloud") && f["Cloud"])), Times.Once);
         }
         finally
         {
@@ -137,11 +150,63 @@ public class MonitorEndpointsExtensionsTests
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
             var json = await response.Content.ReadFromJsonAsync<JsonObject>();
             Assert.NotNull(json);
-            Assert.True(json["local"]?.GetValue<bool>());
-            Assert.False(json["remote"]?.GetValue<bool>());
-            Assert.True(json["cloud"]?.GetValue<bool>());
 
-            mocks.TargetAvailability.Verify(t => t.Update(true, false, true), Times.Once);
+            // Target names are matched case-insensitively, so the applied flags come back keyed
+            // by the requested names.
+            var lookup = StringFlags();
+            foreach (var (key, value) in json)
+            {
+                lookup[key] = (bool)value!;
+            }
+            Assert.True(lookup["local"]);
+            Assert.False(lookup["remote"]);
+            Assert.True(lookup["cloud"]);
+
+            mocks.TargetAvailability.Verify(t => t.Update(It.Is<IReadOnlyDictionary<string, bool>>(f =>
+                    f.ContainsKey("local") && f["local"] && f.ContainsKey("remote") && !f["remote"] &&
+                    f.ContainsKey("cloud") && f["cloud"])), Times.Once);
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task GetMonitorApi_TargetsOnlineBusyAreNameKeyedObjectsContainingCloud()
+    {
+        var (app, client, _) = await CreateTestAppAsync();
+        try
+        {
+            var response = await client.GetAsync("/monitor/api");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var json = await response.Content.ReadFromJsonAsync<JsonObject>();
+
+            Assert.NotNull(json);
+            var targets = json["targets"]!;
+            var online = json["online"]!;
+            var busy = json["busy"]!;
+
+            // Legacy configuration synthesizes exactly "Local" (no RemoteUrl in this test app).
+            Assert.True(targets["Local"]?.GetValue<bool>() is true);
+            Assert.False(online["Local"]?.GetValue<bool>() is true); // no models in the cache mock
+            Assert.False(busy["Local"]?.GetValue<bool>() is true);
+            // Cloud is always present.
+            Assert.NotNull(targets["Cloud"]);
+            Assert.NotNull(online["Cloud"]);
+            Assert.NotNull(busy["Cloud"]);
+
+            // statistics periods contain one entry per target plus the reserved "total" key.
+            var today = json["statistics"]?["today"]!;
+            var last7 = json["statistics"]?["last7Days"]!;
+            Assert.NotNull(today["Local"]);
+            Assert.NotNull(today["Cloud"]);
+            Assert.NotNull(today["total"]);
+            Assert.NotNull(last7["Local"]);
+            Assert.NotNull(last7["Cloud"]);
+            Assert.NotNull(last7["total"]);
         }
         finally
         {
@@ -156,9 +221,6 @@ public class MonitorEndpointsExtensionsTests
         var (app, client, mocks) = await CreateTestAppAsync("http://127.0.0.1:11435");
         try
         {
-            mocks.TargetAvailability.Setup(t => t.GetSnapshot())
-                .Returns(new TargetAvailabilitySnapshot(true, true, false));
-
             mocks.CatalogClient.Setup(c => c.StopRunningModelsAsync("http://127.0.0.1:11435", It.IsAny<CancellationToken>()))
                 .ReturnsAsync(["llama3.2:latest", "qwen3:8b"]);
 
@@ -178,8 +240,9 @@ public class MonitorEndpointsExtensionsTests
             Assert.Equal("llama3.2:latest", unloadedArray[0]?.ToString());
             Assert.Equal("qwen3:8b", unloadedArray[1]?.ToString());
 
-            // Target availability must have been updated to disable Local (Local = false)
-            mocks.TargetAvailability.Verify(t => t.Update(false, true, false), Times.Once);
+            // Target availability must have been updated to disable the target named "Local".
+            mocks.TargetAvailability.Verify(t => t.Update(It.Is<IReadOnlyDictionary<string, bool>>(f =>
+                    f.ContainsKey("Local") && !f["Local"])), Times.Once);
             mocks.CatalogClient.Verify(c => c.StopRunningModelsAsync("http://127.0.0.1:11435", It.IsAny<CancellationToken>()), Times.Once);
         }
         finally
@@ -195,9 +258,6 @@ public class MonitorEndpointsExtensionsTests
         var (app, client, mocks) = await CreateTestAppAsync("http://127.0.0.1:11435");
         try
         {
-            mocks.TargetAvailability.Setup(t => t.GetSnapshot())
-                .Returns(new TargetAvailabilitySnapshot(true, true, false));
-
             mocks.CatalogClient.Setup(c => c.StopRunningModelsAsync("http://127.0.0.1:11435", It.IsAny<CancellationToken>()))
                 .ReturnsAsync(["llama3.2:latest"]);
 
@@ -212,7 +272,7 @@ public class MonitorEndpointsExtensionsTests
             Assert.Equal(1, json["count"]?.GetValue<int>());
 
             // Target availability must NOT have been updated
-            mocks.TargetAvailability.Verify(t => t.Update(It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<bool>()), Times.Never);
+            mocks.TargetAvailability.Verify(t => t.Update(It.IsAny<IReadOnlyDictionary<string, bool>>()), Times.Never);
             mocks.CatalogClient.Verify(c => c.StopRunningModelsAsync("http://127.0.0.1:11435", It.IsAny<CancellationToken>()), Times.Once);
         }
         finally
@@ -228,9 +288,6 @@ public class MonitorEndpointsExtensionsTests
         var (app, client, mocks) = await CreateTestAppAsync("http://127.0.0.1:11435");
         try
         {
-            mocks.TargetAvailability.Setup(t => t.GetSnapshot())
-                .Returns(new TargetAvailabilitySnapshot(true, true, false));
-
             mocks.CatalogClient.Setup(c => c.StopRunningModelsAsync("http://127.0.0.1:11435", It.IsAny<CancellationToken>()))
                 .ReturnsAsync(["qwen3:8b"]);
 
@@ -245,7 +302,7 @@ public class MonitorEndpointsExtensionsTests
             Assert.Equal(1, json["count"]?.GetValue<int>());
 
             // Local must NOT have been disabled
-            mocks.TargetAvailability.Verify(t => t.Update(It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<bool>()), Times.Never);
+            mocks.TargetAvailability.Verify(t => t.Update(It.IsAny<IReadOnlyDictionary<string, bool>>()), Times.Never);
             mocks.CatalogClient.Verify(c => c.StopRunningModelsAsync("http://127.0.0.1:11435", It.IsAny<CancellationToken>()), Times.Once);
         }
         finally
@@ -261,9 +318,6 @@ public class MonitorEndpointsExtensionsTests
         var (app, client, mocks) = await CreateTestAppAsync(localUrl: "");
         try
         {
-            mocks.TargetAvailability.Setup(t => t.GetSnapshot())
-                .Returns(new TargetAvailabilitySnapshot(true, true, false));
-
             var response = await client.PostAsync("/monitor/reclaim-vram", null);
 
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
@@ -273,8 +327,9 @@ public class MonitorEndpointsExtensionsTests
             Assert.False(json["success"]?.GetValue<bool>());
             Assert.True(json["localDisabled"]?.GetValue<bool>());
 
-            // Still disabled local
-            mocks.TargetAvailability.Verify(t => t.Update(false, true, false), Times.Once);
+            // Still disabled the target named "Local" (skipped silently when absent from the fleet).
+            mocks.TargetAvailability.Verify(t => t.Update(It.Is<IReadOnlyDictionary<string, bool>>(f =>
+                    f.ContainsKey("Local") && !f["Local"])), Times.Once);
             mocks.CatalogClient.Verify(c => c.StopRunningModelsAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
         }
         finally
@@ -322,8 +377,8 @@ public class MonitorEndpointsExtensionsTests
             Assert.NotNull(json);
             var online = json["online"];
             Assert.NotNull(online);
-            Assert.True(online["local"]?.GetValue<bool>());
-            Assert.False(online["remote"]?.GetValue<bool>()); // remoteUrl not configured, so false
+            Assert.True(online["Local"]?.GetValue<bool>());
+            Assert.False(online["Cloud"]?.GetValue<bool>()); // cloud models not configured
         }
         finally
         {

@@ -2,7 +2,7 @@
   "codeStack": "dotnet",
   "buildCommand": "dotnet build",
   "testCommand": "dotnet test --no-build",
-  "formatCommand": "dotnet format",
+  "formatCommand": "",
   "buildTimeoutSeconds": 180,
   "testTimeoutSeconds": 180,
   "ncfVersion": "1.0.0",

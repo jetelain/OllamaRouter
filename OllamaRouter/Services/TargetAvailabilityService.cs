@@ -7,32 +7,36 @@ namespace OllamaRouter.Services;
 /// <inheritdoc cref="ITargetAvailabilityService"/>
 public sealed class TargetAvailabilityService : ITargetAvailabilityService
 {
-
     private readonly string stateFilePath;
     private readonly ILogger<TargetAvailabilityService> logger;
+    private readonly IReadOnlyList<RoutingTarget> targets;
+    private readonly Dictionary<RoutingTarget, bool> flags = new();
     private readonly object gate = new();
-    private bool local = true;
-    private bool remote = true;
-    private bool cloud = true;
 
-    public TargetAvailabilityService(string stateFilePath, ILogger<TargetAvailabilityService> logger)
+    public TargetAvailabilityService(
+        string stateFilePath,
+        IReadOnlyList<RoutingTarget> targets,
+        ILogger<TargetAvailabilityService> logger)
     {
         this.stateFilePath = stateFilePath;
+        this.targets = DedupeCaseInsensitive(targets);
         this.logger = logger;
-        Load();
+
+        // All targets default to enabled; the persisted state (if any) overrides them.
+        var persisted = LoadPersistedState();
+        foreach (var target in this.targets)
+        {
+            // Case-insensitive key match; unknown persisted keys are ignored, missing keys default to true.
+            var match = persisted.FirstOrDefault(pair => string.Equals(pair.Key, target.Value, StringComparison.OrdinalIgnoreCase));
+            flags[target] = match.Key is null ? true : match.Value;
+        }
     }
 
     public bool IsEnabled(RoutingTarget target)
     {
         lock (gate)
         {
-            return target switch
-            {
-                RoutingTarget.Local => local,
-                RoutingTarget.Remote => remote,
-                RoutingTarget.Cloud => cloud,
-                _ => true
-            };
+            return flags.GetValueOrDefault(target, true);
         }
     }
 
@@ -40,16 +44,30 @@ public sealed class TargetAvailabilityService : ITargetAvailabilityService
     {
         lock (gate)
         {
-            return new TargetAvailabilitySnapshot(local, remote, cloud);
+            return new TargetAvailabilitySnapshot(
+                flags.ToDictionary(pair => pair.Key, pair => pair.Value));
         }
     }
 
-    public void Update(bool local, bool remote, bool cloud)
+    public void Update(IReadOnlyDictionary<string, bool> flags)
     {
         lock (gate)
         {
-            // Failsafe: the in-memory state (used by routing decisions and the monitoring UI)
-            // is always updated; persisting to the state file is best-effort only.
+            // Apply the matched flags in memory (the in-memory state is used by routing
+            // decisions and the monitoring UI, and is always updated, even if the persistence
+            // below fails: failsafe behavior). Unknown keys are ignored.
+            foreach (var (name, value) in flags)
+            {
+                foreach (var target in this.targets)
+                {
+                    if (string.Equals(target.Value, name, StringComparison.OrdinalIgnoreCase))
+                    {
+                        this.flags[target] = value;
+                    }
+                }
+            }
+
+            // Best-effort persistence of the full state as a flat { [targetName]: bool } object.
             try
             {
                 var directory = Path.GetDirectoryName(stateFilePath);
@@ -58,48 +76,48 @@ public sealed class TargetAvailabilityService : ITargetAvailabilityService
                     Directory.CreateDirectory(directory);
                 }
 
-                File.WriteAllText(stateFilePath, JsonSerializer.Serialize(new TargetsState(local, remote, cloud), OllamaRouterJsonSerializerContext.Default.TargetsState));
+                var state = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+                foreach (var target in this.targets)
+                {
+                    state[target.Value] = this.flags.TryGetValue(target, out var enabled) ? enabled : true;
+                }
+
+                File.WriteAllText(stateFilePath, JsonSerializer.Serialize(state, OllamaRouterJsonSerializerContext.Default.DictionaryStringBoolean));
             }
             catch (Exception ex)
             {
-                logger.LogWarning(ex, "Failed to persist target availability to {StateFilePath}: Local={Local}, Remote={Remote}, Cloud={Cloud}", stateFilePath, local, remote, cloud);
+                logger.LogWarning(ex, "Failed to persist target availability to {StateFilePath}: {Flags}", stateFilePath, string.Join(", ", this.flags.Select(pair => $"{pair.Key}={pair.Value}")));
             }
-
-            this.local = local;
-            this.remote = remote;
-            this.cloud = cloud;
         }
 
-        logger.LogInformation("Targets updated via monitoring UI: Local={Local}, Remote={Remote}, Cloud={Cloud}", local, remote, cloud);
+        logger.LogInformation("Targets updated via monitoring UI: {Flags}", string.Join(", ", flags.Select(pair => $"{pair.Key}={pair.Value}")));
     }
 
-    private void Load()
+    // Case-insensitive dedup so a target configured with a different casing (or Cloud
+    // appearing both in the list and as the pseudo-target) maps to a single slot.
+    private static IReadOnlyList<RoutingTarget> DedupeCaseInsensitive(IEnumerable<RoutingTarget> targets) =>
+        targets.DistinctBy(target => target.Value, StringComparer.OrdinalIgnoreCase).ToList();
+
+    // Reads the persisted state file without touching the in-memory flags; a missing or
+    // corrupt file yields an empty dictionary (all targets stay enabled: failsafe behavior).
+    private Dictionary<string, bool> LoadPersistedState()
     {
         lock (gate)
         {
             try
             {
-                if (!File.Exists(stateFilePath))
+                if (File.Exists(stateFilePath))
                 {
-                    return;
+                    return JsonSerializer.Deserialize(File.ReadAllText(stateFilePath), OllamaRouterJsonSerializerContext.Default.DictionaryStringBoolean)
+                        ?? new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
                 }
-
-                var state = JsonSerializer.Deserialize(File.ReadAllText(stateFilePath), OllamaRouterJsonSerializerContext.Default.TargetsState);
-                if (state is null)
-                {
-                    return;
-                }
-
-                local = state.Local;
-                remote = state.Remote;
-                cloud = state.Cloud;
             }
             catch (Exception ex)
             {
                 logger.LogWarning(ex, "Failed to read target availability from {StateFilePath}; all targets will be considered enabled.", stateFilePath);
             }
         }
+
+        return new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
     }
 }
-
-public sealed record TargetsState(bool Local, bool Remote, bool Cloud);

@@ -26,14 +26,26 @@ public class ActivityStatisticsService : IActivityStatisticsService
     // All day buckets (oldest first), loaded from disk once.
     private readonly List<ActivityStatisticsDate> all = new();
     private readonly string statsFile;
+    // Fleet targets (configured targets + the Cloud pseudo-target) that new day buckets are
+    // pre-populated with, and that aggregation zero-fills.
+    private readonly IReadOnlyList<RoutingTarget> targets;
     private bool isLoaded;
     // TickCount64 of the last successful save; used for throttling by SaveThrottled.
     private long lastSaveAt;
     private readonly ILogger<ActivityStatisticsService> logger;
 
-    public ActivityStatisticsService(string statsFile, IHostApplicationLifetime lifetime, ILogger<ActivityStatisticsService> logger)
+    public ActivityStatisticsService(
+        string statsFile,
+        IReadOnlyList<RoutingTarget> targets,
+        IHostApplicationLifetime lifetime,
+        ILogger<ActivityStatisticsService> logger)
     {
         this.statsFile = statsFile;
+        this.targets = targets
+            .Where(target => !string.IsNullOrWhiteSpace(target.Value))
+            .GroupBy(target => target.Value, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToList();
         this.logger = logger;
 
         lifetime.ApplicationStopped.Register(Save);
@@ -107,11 +119,11 @@ public class ActivityStatisticsService : IActivityStatisticsService
         }
     }
 
-    // Sums the given day buckets into a per-target totals dictionary; every RoutingTarget
+    // Sums the given day buckets into a per-target totals dictionary; every fleet target
     // appears in the result (zero-filled when a target never received traffic).
-    private static Dictionary<RoutingTarget, ActivityStatisticsTotals> AggregateByTarget(IEnumerable<ActivityStatisticsDate> days)
+    private Dictionary<RoutingTarget, ActivityStatisticsTotals> AggregateByTarget(IEnumerable<ActivityStatisticsDate> days)
     {
-        var totals = Enum.GetValues<RoutingTarget>()
+        var totals = targets
             .ToDictionary(target => target, _ => (Requests: 0, InputTokens: 0, OutputTokens: 0));
 
         foreach (var day in days)
@@ -161,9 +173,17 @@ public class ActivityStatisticsService : IActivityStatisticsService
                 }
                 if (today == null || today.Date != date)
                 {
+                    var statistics = new Dictionary<RoutingTarget, ActivityStatisticsEntry>();
+                    foreach (var target in targets)
+                    {
+                        statistics[target] = new ActivityStatisticsEntry();
+                    }
+
                     today = new ActivityStatisticsDate()
                     {
-                        Date = date
+                        Date = date,
+                        // A new day bucket is pre-populated with one entry per fleet target.
+                        Statistics = statistics
                     };
                     all.Add(today);
 
@@ -241,16 +261,12 @@ public class ActivityStatisticsEntry
 }
 
 /// <summary>
-/// One calendar day of statistics, with a pre-populated entry per known RoutingTarget.
+/// One calendar day of statistics; new buckets are pre-populated by the service with one entry
+/// per fleet target (configured targets + the Cloud pseudo-target).
 /// </summary>
 public class ActivityStatisticsDate
 {
     public DateTime Date { get; set; }
 
-    public Dictionary<RoutingTarget, ActivityStatisticsEntry> Statistics { get; set; } = new()
-    {
-        [RoutingTarget.Local] = new ActivityStatisticsEntry(),
-        [RoutingTarget.Remote] = new ActivityStatisticsEntry(),
-        [RoutingTarget.Cloud] = new ActivityStatisticsEntry()
-    };
+    public Dictionary<RoutingTarget, ActivityStatisticsEntry> Statistics { get; set; } = new();
 }

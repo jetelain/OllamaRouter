@@ -40,8 +40,9 @@ public static class MonitorEndpointsExtensions
 
         app.MapPost("/targets", (TargetsUpdateRequest request, ITargetAvailabilityService targetAvailability) =>
         {
-            targetAvailability.Update(request.Local, request.Remote, request.Cloud);
-            return Results.Ok(new TargetsUpdateResponse(request.Local, request.Remote, request.Cloud));
+            var flags = request.AsFlags();
+            targetAvailability.Update(flags);
+            return Results.Ok(new TargetsUpdateResponse(flags));
         });
 
         app.MapPost("/monitor/reclaim-vram", async (
@@ -55,8 +56,7 @@ public static class MonitorEndpointsExtensions
 
             if (shouldDisable)
             {
-                var targets = targetAvailability.GetSnapshot();
-                targetAvailability.Update(local: false, targets.Remote, targets.Cloud);
+                DisableLocalTarget(targetAvailability);
             }
 
             var localUrl = options.Value.LocalUrl?.TrimEnd('/');
@@ -90,8 +90,7 @@ public static class MonitorEndpointsExtensions
 
             if (shouldDisable)
             {
-                var targets = targetAvailability.GetSnapshot();
-                targetAvailability.Update(local: false, targets.Remote, targets.Cloud);
+                DisableLocalTarget(targetAvailability);
             }
 
             var localUrl = options.Value.LocalUrl?.TrimEnd('/');
@@ -117,6 +116,17 @@ public static class MonitorEndpointsExtensions
         app.MapGet("/monitor", () => Results.Content(MonitorPageHtml, "text/html"));
 
         return app;
+    }
+
+    // "Reclaim" behavior: disable the target named "Local" (case-insensitive); when no such
+    // target exists in the fleet the availability service ignores the unknown name (skip).
+    private static void DisableLocalTarget(ITargetAvailabilityService targetAvailability)
+    {
+        targetAvailability.Update(
+            new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Local"] = false
+            });
     }
 
     private const string MonitorPageHtml = """
@@ -160,6 +170,10 @@ public static class MonitorEndpointsExtensions
   .target-Local { color: #3f9eff; }
   .target-Remote { color: #34e0a1; }
   .target-Cloud { color: #c48bff; }
+  .progress-seg-local { background-color: #3f9eff; background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.22) 0 6px, transparent 6px 12px); }
+  .progress-seg-remote { background-color: #34e0a1; background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.22) 0 6px, transparent 6px 12px); }
+  .progress-seg-cloud { background-color: #c48bff; background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.22) 0 6px, transparent 6px 12px); }
+  .progress-seg-neutral { background-color: #7a8aa0; background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.22) 0 6px, transparent 6px 12px); }
   .empty { color: #777; font-style: italic; padding: 0.5rem 0.75rem; }
   .stats-summary-row { display: flex; gap: 1rem; margin-top: 1rem; align-items: stretch; }
   .usage-ratio-container { flex: 2; min-width: 0; background: #262626; border-radius: 8px; padding: 0.85rem 1.1rem; border: 1px solid #333; display: flex; flex-direction: column; justify-content: space-between; }
@@ -168,9 +182,6 @@ public static class MonitorEndpointsExtensions
   .progress-bar { display: flex; height: 18px; border-radius: 6px; overflow: hidden; background: #181818; box-shadow: inset 0 1px 3px rgba(0,0,0,0.5); }
   .progress-seg { height: 100%; position: relative; overflow: hidden; transition: width 0.3s ease; }
   .progress-seg + .progress-seg { border-left: 2px solid #181818; }
-  .progress-seg-local { background-color: #3f9eff; background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.22) 0 6px, transparent 6px 12px); }
-  .progress-seg-remote { background-color: #34e0a1; background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.22) 0 6px, transparent 6px 12px); }
-  .progress-seg-cloud { background-color: #c48bff; background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.22) 0 6px, transparent 6px 12px); }
   .progress-empty { width: 100%; display: flex; align-items: center; justify-content: center; font-size: 0.78rem; color: #666; font-style: italic; }
   .progress-legend { display: flex; gap: 1.2rem; margin-top: 0.65rem; font-size: 0.82rem; flex-wrap: wrap; }
   .legend-item { display: flex; align-items: center; gap: 6px; }
@@ -242,6 +253,30 @@ public static class MonitorEndpointsExtensions
 <script>
 const targetIcons = { Local: '🖥️', Remote: '📡', Cloud: '☁️' };
 
+// Case-insensitive lookup of the display icon for a target name (fleet names have no icon).
+function targetIcon(name) {
+  for (const key of Object.keys(targetIcons)) {
+    if (name.toLowerCase() === key.toLowerCase()) {
+      return targetIcons[key];
+    }
+  }
+  return '';
+}
+
+// Case-insensitive lookup of the CSS color class for a target name (neutral fallback for fleet names).
+function targetColorClass(name) {
+  for (const key of ['Local', 'Remote', 'Cloud']) {
+    if (name.toLowerCase() === key.toLowerCase()) {
+      return key.toLowerCase();
+    }
+  }
+  return 'neutral';
+}
+
+function targetLabel(name) {
+  return (targetIcon(name) ? targetIcon(name) + ' ' : '') + name;
+}
+
 function td(text, className) {
   const cell = document.createElement('td');
   if (className) {
@@ -255,7 +290,7 @@ function targetCell(target) {
   const cell = document.createElement('td');
   const span = document.createElement('span');
     span.className = 'target-' + target;
-    span.textContent = (targetIcons[target] ? targetIcons[target] + ' ' : '') + target;
+    span.textContent = targetLabel(target);
     cell.appendChild(span);
   return cell;
 }
@@ -294,16 +329,13 @@ function tokens(value) {
   return value >= 1000 ? (value / 1000).toFixed(1) + 'k' : String(value);
 }
 
-function renderStatistics(tbodyId, today, last7Days, cloudEnabled) {
+function renderStatistics(tbodyId, today, last7Days) {
   const tbody = document.getElementById(tbodyId);
   clear(tbody);
-  const names = ['local', 'remote'];
-  if (cloudEnabled) {
-    names.push('cloud');
-  }
+  const names = Object.keys(today).filter(name => name !== 'total');
   for (const name of names) {
     addRow(tbody, [
-      targetCell(name.charAt(0).toUpperCase() + name.slice(1)),
+      targetCell(name),
       td(num(today[name].requests), 'num today'),
       td(tokens(today[name].inputTokens), 'num today'),
       td(tokens(today[name].outputTokens), 'num today'),
@@ -337,15 +369,13 @@ function formatCost(amount, currency) {
   return curr + amount.toFixed(2);
 }
 
-function renderUsageRatio(last7Days, cloudEnabled) {
-  const localTokens = (last7Days.local ? last7Days.local.inputTokens + last7Days.local.outputTokens : 0);
-  const remoteTokens = (last7Days.remote ? last7Days.remote.inputTokens + last7Days.remote.outputTokens : 0);
-  const cloudTokens = (cloudEnabled && last7Days.cloud) ? (last7Days.cloud.inputTokens + last7Days.cloud.outputTokens) : 0;
-  const totalTokens = localTokens + remoteTokens + cloudTokens;
-
-  const localReq = last7Days.local ? last7Days.local.requests : 0;
-  const remoteReq = last7Days.remote ? last7Days.remote.requests : 0;
-  const cloudReq = (cloudEnabled && last7Days.cloud) ? last7Days.cloud.requests : 0;
+function renderUsageRatio(last7Days) {
+  const names = Object.keys(last7Days).filter(name => name !== 'total');
+  const entries = names.map(name => {
+    const stats = last7Days[name] || { inputTokens: 0, outputTokens: 0, requests: 0 };
+    return { name, tokens: stats.inputTokens + stats.outputTokens, requests: stats.requests };
+  });
+  const totalTokens = entries.reduce((sum, e) => sum + e.tokens, 0);
 
   const bar = document.getElementById('usageProgressBar');
   const legend = document.getElementById('usageProgressLegend');
@@ -364,10 +394,6 @@ function renderUsageRatio(last7Days, cloudEnabled) {
 
   summary.textContent = tokens(totalTokens) + ' tokens';
 
-  const localPct = (localTokens / totalTokens * 100);
-  const remotePct = (remoteTokens / totalTokens * 100);
-  const cloudPct = cloudEnabled ? (cloudTokens / totalTokens * 100) : 0;
-
   function addSeg(className, pct, title) {
     if (pct <= 0) return;
     const seg = document.createElement('div');
@@ -377,28 +403,22 @@ function renderUsageRatio(last7Days, cloudEnabled) {
     bar.appendChild(seg);
   }
 
-  addSeg('progress-seg-local', localPct, 'Local: ' + localPct.toFixed(1) + '% (' + tokens(localTokens) + ' tokens, ' + num(localReq) + ' req)');
-  addSeg('progress-seg-remote', remotePct, 'Remote: ' + remotePct.toFixed(1) + '% (' + tokens(remoteTokens) + ' tokens, ' + num(remoteReq) + ' req)');
-  if (cloudEnabled && cloudPct > 0) {
-    addSeg('progress-seg-cloud', cloudPct, 'Cloud: ' + cloudPct.toFixed(1) + '% (' + tokens(cloudTokens) + ' tokens, ' + num(cloudReq) + ' req)');
+  for (const entry of entries) {
+    const pct = entry.tokens / totalTokens * 100;
+    addSeg('progress-seg-' + targetColorClass(entry.name), pct, entry.name + ': ' + pct.toFixed(1) + '% (' + tokens(entry.tokens) + ' tokens, ' + num(entry.requests) + ' req)');
   }
 
-  function addLegend(targetName, icon, pct, tok, req, colorClass) {
+  for (const entry of entries) {
+    const pct = entry.tokens / totalTokens * 100;
     const item = document.createElement('div');
     item.className = 'legend-item';
     const dot = document.createElement('span');
-    dot.className = 'legend-dot ' + colorClass;
+    dot.className = 'legend-dot progress-seg-' + targetColorClass(entry.name);
     item.appendChild(dot);
     const span = document.createElement('span');
-    span.textContent = (icon ? icon + ' ' : '') + targetName + ': ' + pct.toFixed(1) + '%';
+    span.textContent = targetLabel(entry.name) + ': ' + pct.toFixed(1) + '%';
     item.appendChild(span);
     legend.appendChild(item);
-  }
-
-  addLegend('Local', targetIcons.Local, localPct, localTokens, localReq, 'progress-seg-local');
-  addLegend('Remote', targetIcons.Remote, remotePct, remoteTokens, remoteReq, 'progress-seg-remote');
-  if (cloudEnabled) {
-    addLegend('Cloud', targetIcons.Cloud, cloudPct, cloudTokens, cloudReq, 'progress-seg-cloud');
   }
 }
 
@@ -486,13 +506,9 @@ async function refresh() {
 
     const instances = document.getElementById('instances');
     clear(instances);
-    for (const name of ['local', 'remote', 'cloud']) {
-      if (name === 'cloud' && !data.cloudEnabled) {
-        continue;
-      }
-      const busy = data.busy[name];
-      const enabled = data.targets[name];
-      const online = data.online ? data.online[name] : true;
+    for (const [name, enabled] of Object.entries(data.targets)) {
+      const busy = data.busy[name] || false;
+      const online = data.online ? (data.online[name] !== undefined ? data.online[name] : true) : true;
 
       let statusClass = 'idle';
       let statusText = 'Idle';
@@ -512,8 +528,7 @@ async function refresh() {
       const dot = document.createElement('span');
       dot.className = 'dot';
       div.appendChild(dot);
-      const targetName = name.charAt(0).toUpperCase() + name.slice(1);
-      const label = (targetIcons[targetName] + ' ') + targetName + ': ' + statusText;
+      const label = targetLabel(name) + ': ' + statusText;
       div.appendChild(document.createTextNode(label));
 
       const toggle = document.createElement('label');
@@ -526,7 +541,7 @@ async function refresh() {
       toggle.appendChild(document.createTextNode('Enabled'));
       div.appendChild(toggle);
 
-      if (name === 'local') {
+      if (name.toLowerCase() === 'local') {
         const col = document.createElement('div');
         col.className = 'instance-col';
         col.appendChild(div);
@@ -552,8 +567,8 @@ async function refresh() {
       }
     }
 
-    renderStatistics('statsRows', data.statistics.today, data.statistics.last7Days, data.cloudEnabled);
-    renderUsageRatio(data.statistics.last7Days, data.cloudEnabled);
+    renderStatistics('statsRows', data.statistics.today, data.statistics.last7Days);
+    renderUsageRatio(data.statistics.last7Days);
     renderCost(data.cost, data.cloudEnabled);
 
     const inProgressRows = document.getElementById('inProgressRows');
@@ -631,7 +646,8 @@ function renderOverhead(overhead) {
 }
 
 async function toggleTarget(name, checked, currentTargets) {
-  const updated = { local: currentTargets.local, remote: currentTargets.remote, cloud: currentTargets.cloud };
+  // Post the full targets object with the toggled key updated.
+  const updated = { ...currentTargets };
   updated[name] = checked;
   try {
     await fetch('/targets', {
@@ -668,30 +684,45 @@ setInterval(refresh, 2000);
         var cloudEnabled = options.Value.Models.Values.Any(m => !string.IsNullOrEmpty(m.CloudModel));
         var targets = targetAvailability.GetSnapshot();
 
-        var localOnline = !string.IsNullOrWhiteSpace(options.Value.LocalUrl) &&
-                          await modelCatalogCache.HasAnyModelsAsync(options.Value.LocalUrl, cancellationToken);
-        var remoteOnline = !string.IsNullOrWhiteSpace(options.Value.RemoteUrl) &&
-                           await modelCatalogCache.HasAnyModelsAsync(options.Value.RemoteUrl, cancellationToken);
+        var effectiveTargets = options.Value.GetEffectiveTargets();
+
+        // Name-keyed status objects, in fleet order, with the Cloud pseudo-target always last.
+        // (Invalid Targets entries were already warned about at startup; this read-only path
+        // uses the default no-logger overload to avoid repeated warnings on every request.)
+        var targetsByName = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        var onlineByName = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        var busyByName = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        var periodByName = new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var target in effectiveTargets)
+        {
+            var name = target.Name!;
+            targetsByName[name] = targets.Flags.TryGetValue((RoutingTarget)name, out var enabled) ? enabled : true;
+            onlineByName[name] = !string.IsNullOrWhiteSpace(target.Url) &&
+                                 await modelCatalogCache.HasAnyModelsAsync(target.Url, cancellationToken);
+            busyByName[name] = snapshot.Busy.GetValueOrDefault((RoutingTarget)name);
+            periodByName[name] = statistics.Last7Days.GetValueOrDefault((RoutingTarget)name) ?? new ActivityStatisticsTotals(0, 0, 0);
+        }
+
+        targetsByName[RoutingTarget.Cloud.Value] = targets.Flags.TryGetValue(RoutingTarget.Cloud, out var cloudFlag) ? cloudFlag : cloudEnabled;
+        onlineByName[RoutingTarget.Cloud.Value] = cloudEnabled;
+        busyByName[RoutingTarget.Cloud.Value] = snapshot.Busy.GetValueOrDefault(RoutingTarget.Cloud);
+        periodByName[RoutingTarget.Cloud.Value] = statistics.Last7Days.GetValueOrDefault(RoutingTarget.Cloud) ?? new ActivityStatisticsTotals(0, 0, 0);
+
+        var todayByName = new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase);
+        foreach (var name in periodByName.Keys)
+        {
+            todayByName[name] = statistics.Today.GetValueOrDefault((RoutingTarget)name) ?? new ActivityStatisticsTotals(0, 0, 0);
+        }
+        todayByName["total"] = statistics.TodayTotal;
+        periodByName["total"] = statistics.Last7DaysTotal;
 
         return new MonitorStateResponse(
             cloudEnabled,
-            new MonitorTargetsStatus(targets.Local, targets.Remote, targets.Cloud),
-            new MonitorTargetsStatus(localOnline, remoteOnline, cloudEnabled),
-            new MonitorBusyStatus(
-                snapshot.Busy.GetValueOrDefault(RoutingTarget.Local),
-                snapshot.Busy.GetValueOrDefault(RoutingTarget.Remote),
-                snapshot.Busy.GetValueOrDefault(RoutingTarget.Cloud)),
-            new MonitorStatisticsStatus(
-                new MonitorPeriodStatistics(
-                    statistics.Today[RoutingTarget.Local],
-                    statistics.Today[RoutingTarget.Remote],
-                    statistics.Today[RoutingTarget.Cloud],
-                    statistics.TodayTotal),
-                new MonitorPeriodStatistics(
-                    statistics.Last7Days[RoutingTarget.Local],
-                    statistics.Last7Days[RoutingTarget.Remote],
-                    statistics.Last7Days[RoutingTarget.Cloud],
-                    statistics.Last7DaysTotal)),
+            targetsByName,
+            onlineByName,
+            busyByName,
+            new MonitorStatisticsStatus(todayByName, periodByName),
             snapshot.InProgressRequests.Select(r => new MonitorInProgressItem(
                 r.Target.ToString(),
                 r.Model,
@@ -790,17 +821,47 @@ setInterval(refresh, 2000);
 }
 
 /// <summary>
-/// Request payload for <c>POST /targets</c>.
+/// Request payload for <c>POST /targets</c>: a flat JSON object of target-name to enabled flag
+/// (e.g. {"Local": true, "Remote": false, "Cloud": true}); keys are matched case-insensitively
+/// against the fleet target names, so legacy lowercase clients keep working.
 /// </summary>
-public sealed record TargetsUpdateRequest(
-    [property: JsonPropertyName("local")] bool Local,
-    [property: JsonPropertyName("remote")] bool Remote,
-    [property: JsonPropertyName("cloud")] bool Cloud);
+public sealed class TargetsUpdateRequest
+{
+    [JsonExtensionData]
+    public Dictionary<string, object>? Values { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
-public sealed record TargetsUpdateResponse(
-    [property: JsonPropertyName("local")] bool Local,
-    [property: JsonPropertyName("remote")] bool Remote,
-    [property: JsonPropertyName("cloud")] bool Cloud);
+    /// <summary>
+    /// Interprets the flat extension-data object as a target-name to enabled-flag dictionary.
+    /// </summary>
+    public IReadOnlyDictionary<string, bool> AsFlags() =>
+        (Values ?? new Dictionary<string, object>())
+            .Select(pair => (Key: pair.Key, Value: pair.Value))
+            .Where(pair => pair.Value is bool || pair.Value is System.Text.Json.JsonElement)
+            .ToDictionary(
+                pair => pair.Key,
+                pair => pair.Value is bool b ? b : ((System.Text.Json.JsonElement)pair.Value!).GetBoolean(),
+                StringComparer.OrdinalIgnoreCase);
+}
+
+/// <summary>
+/// Response payload for <c>POST /targets</c>: the same flat target-name to enabled flag object
+/// that was applied.
+/// </summary>
+public sealed class TargetsUpdateResponse
+{
+    [JsonExtensionData]
+    public Dictionary<string, object> Values { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    public TargetsUpdateResponse() { }
+
+    public TargetsUpdateResponse(IReadOnlyDictionary<string, bool> values)
+    {
+        foreach (var (key, value) in values)
+        {
+            Values[key] = value;
+        }
+    }
+}
 
 public sealed record ReclaimVramResponse(
     [property: JsonPropertyName("success")] bool Success,
@@ -816,34 +877,21 @@ public sealed record MonitorCostStatus(
 
 public sealed record MonitorStateResponse(
     [property: JsonPropertyName("cloudEnabled")] bool CloudEnabled,
-    [property: JsonPropertyName("targets")] MonitorTargetsStatus Targets,
-    [property: JsonPropertyName("online")] MonitorTargetsStatus Online,
-    [property: JsonPropertyName("busy")] MonitorBusyStatus Busy,
+    [property: JsonPropertyName("targets")] IReadOnlyDictionary<string, bool> Targets,
+    [property: JsonPropertyName("online")] IReadOnlyDictionary<string, bool> Online,
+    [property: JsonPropertyName("busy")] IReadOnlyDictionary<string, bool> Busy,
     [property: JsonPropertyName("statistics")] MonitorStatisticsStatus Statistics,
     [property: JsonPropertyName("inProgress")] IReadOnlyList<MonitorInProgressItem> InProgress,
     [property: JsonPropertyName("requests")] IReadOnlyList<MonitorRecentRequestItem> Requests,
     [property: JsonPropertyName("cost")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] MonitorCostStatus? Cost = null,
     [property: JsonPropertyName("overhead")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] MonitorOverheadStatus? Overhead = null);
 
-public sealed record MonitorTargetsStatus(
-    [property: JsonPropertyName("local")] bool Local,
-    [property: JsonPropertyName("remote")] bool Remote,
-    [property: JsonPropertyName("cloud")] bool Cloud);
-
-public sealed record MonitorBusyStatus(
-    [property: JsonPropertyName("local")] bool Local,
-    [property: JsonPropertyName("remote")] bool Remote,
-    [property: JsonPropertyName("cloud")] bool Cloud);
-
+/// <summary>
+/// Per-period usage statistics keyed by display target name, plus a reserved "total" key.
+/// </summary>
 public sealed record MonitorStatisticsStatus(
-    [property: JsonPropertyName("today")] MonitorPeriodStatistics Today,
-    [property: JsonPropertyName("last7Days")] MonitorPeriodStatistics Last7Days);
-
-public sealed record MonitorPeriodStatistics(
-    [property: JsonPropertyName("local")] ActivityStatisticsTotals Local,
-    [property: JsonPropertyName("remote")] ActivityStatisticsTotals Remote,
-    [property: JsonPropertyName("cloud")] ActivityStatisticsTotals Cloud,
-    [property: JsonPropertyName("total")] ActivityStatisticsTotals Total);
+    [property: JsonPropertyName("today")] IReadOnlyDictionary<string, ActivityStatisticsTotals> Today,
+    [property: JsonPropertyName("last7Days")] IReadOnlyDictionary<string, ActivityStatisticsTotals> Last7Days);
 
 public sealed record MonitorInProgressItem(
     [property: JsonPropertyName("target")] string Target,
