@@ -2,6 +2,7 @@ using System.Net.Http;
 using System.Text;
 using Microsoft.Extensions.Options;
 using OllamaRouter.Endpoints;
+using OllamaRouter.Extensions;
 using OllamaRouter.Middleware;
 using OllamaRouter.Options;
 using OllamaRouter.ReverseProxy;
@@ -64,7 +65,7 @@ else
 {
     builder.Services.AddSingleton<ITokenEstimator, HeuristicTokenEstimator>();
 }
-builder.Services.AddSingleton<IGpuVramProvider, NvidiaSmiVramProvider>();
+builder.Services.AddGpuVramProviders();
 builder.Services.AddTransient<IRoutingTargetHandler, LocalRoutingTargetHandler>();
 builder.Services.AddTransient<IRoutingTargetHandler, RemoteRoutingTargetHandler>();
 builder.Services.AddTransient<IRoutingTargetHandler, CloudRoutingTargetHandler>();

@@ -2,7 +2,7 @@
 
 OllamaRouter is a lightweight reverse proxy that sits in front of two [Ollama](https://ollama.com) instances and transparently routes each request to the most appropriate one:
 
-- A **local** Ollama instance, running on a machine with a powerful GPU but **limited VRAM** (assumed to be a nVidia card).
+- A **local** Ollama instance, running on a machine with a powerful GPU but **limited VRAM** (NVIDIA, AMD, or Intel GPU).
 - A **remote** Ollama instance (e.g. a server), with a lot of **unified RAM or VRAM** but a **less powerful GPU**.
 
 The goal is to get the best of both worlds: use the fast local GPU whenever the request can fit in its available VRAM, and fall back to the remote server for everything else (larger contexts, models that don't fit locally, etc.).
@@ -55,7 +55,7 @@ Requests to the following endpoints are inspected to extract the prompt and the 
 For these requests, the routing decision is orchestrated by `RoutingDecisionService` using a priority-ordered chain of target handlers (`IRoutingTargetHandler`: **Local** → **Remote** → **Cloud**):
 
 1. **Available target dispatch:** The router evaluates targets in order and dispatches the request to the first target that is **available** (enabled and not busy) and **capable** of handling it (`CanProcessAsync`):
-   - **Local (`LocalRoutingTargetHandler`)**: Eligible if the model is configured under `OllamaRouter:Models`, exists in the local catalog, the estimated token count fits within `MaxLocalTokens`, and the model is either already loaded in memory (checked via `/api/ps`) or sufficient free GPU VRAM is available (checked via `nvidia-smi` against `MinRequiredVramMB`). If a model is only available locally, Local handles it exclusively.
+   - **Local (`LocalRoutingTargetHandler`)**: Eligible if the model is configured under `OllamaRouter:Models`, exists in the local catalog, the estimated token count fits within `MaxLocalTokens`, and the model is either already loaded in memory (checked via `/api/ps`) or sufficient free GPU VRAM is available (checked via the GPU vendor tooling, see “GPU/VRAM detection” against `MinRequiredVramMB`). If a model is only available locally, Local handles it exclusively.
    - **Remote (`RemoteRoutingTargetHandler`)**: Accepts requests for models that are available remotely (unconfigured models, models exceeding local token limits, or models that don't fit local VRAM naturally fall through to Remote).
    - **Cloud (`CloudRoutingTargetHandler`, overflow)**: Acts as an overflow target. If Local and Remote are unavailable or cannot handle the request, Cloud accepts it if enabled and a `CloudModel` is configured for the requested model (see [Cloud overflow](#cloud-overflow)).
 2. **Busy fallback:** If all eligible targets are currently busy:
@@ -204,20 +204,20 @@ Configuration is provided through the `OllamaRouter` section of `appsettings.jso
 ```json
 {
   "OllamaRouter": {
-	"Models": {
-	  "Qwen3.8-27B": {
-		  "MaxLocalTokens": 36864,
-		  "MinRequiredVramMB": 13500,
-		  "CloudModel": "deepseek-v3.1:671b-cloud"
-		},
-	  "llama3": {
-		"MaxLocalTokens": 24576,
-		"MinRequiredVramMB": 4096
-	  }
-	},
-	"LocalUrl": "http://127.0.0.1:11435",
-	"RemoteUrl": "http://aiserver.local:11434"
-	}
+  "Models": {
+    "Qwen3.8-27B": {
+      "MaxLocalTokens": 36864,
+      "MinRequiredVramMB": 13500,
+      "CloudModel": "deepseek-v3.1:671b-cloud"
+    },
+    "llama3": {
+    "MaxLocalTokens": 24576,
+    "MinRequiredVramMB": 4096
+    }
+  },
+  "LocalUrl": "http://127.0.0.1:11435",
+  "RemoteUrl": "http://aiserver.local:11434"
+  }
 }
 ```
 
@@ -303,7 +303,7 @@ By default, the router listens on `http://localhost:11434`, the standard Ollama 
 
 ## Monitoring
 
-OllamaRouter exposes a very lightweight, dependency-free monitoring page at `/monitor` (e.g. `http://localhost:11434/monitor`), backed by a JSON endpoint at `/monitor/api`. 
+OllamaRouter exposes a very lightweight, dependency-free monitoring page at `/monitor` (e.g. `http://localhost:11434/monitor`), backed by a JSON endpoint at `/monitor/api`.
 
 The page shows:
 
@@ -344,7 +344,22 @@ OllamaRouter.exe --no-tui
 
 - .NET 9 / .NET 10 SDK
 - Two reachable Ollama instances (local and remote)
-- `nvidia-smi` available on the local machine to report free VRAM (returns 0 if not available, which effectively disables local routing based on VRAM)
+- A GPU VRAM probe tool on the local machine (see “GPU/VRAM detection”); if none is present the probe returns 0, which effectively disables VRAM-gated local routing
+
+## GPU/VRAM detection
+
+OllamaRouter probes the local GPU's free VRAM through a composite provider that runs vendor-specific CLI tools in a fixed order and uses the **first non-zero result**:
+
+1. **NVIDIA** — `nvidia-smi` (any OS, must be on `PATH`); reports exact free VRAM in MB.
+2. **AMD** — `rocm-smi` (Linux only, ROCm required); reports exact free VRAM (summed across all AMD GPUs).
+3. **Intel** — `xpu-smi` (Linux, Intel GPU Tools) or, as a fallback, `intel_gpu_top` (Linux); reports exact free VRAM.
+4. **Windows non-NVIDIA fallback** — WMI `Win32_VideoController.AdapterRAM` (Windows only). **Degraded: this reports TOTAL VRAM, not free VRAM**, and is only reached when `nvidia-smi` reports 0 (i.e. no usable NVIDIA device).
+
+Notes:
+
+- AMD and Intel probes are only attempted on Linux; the WMI fallback is only attempted on Windows. On macOS (or a machine with no probe tool installed at all) the probe returns 0.
+- If **all** probes report 0, the composite returns 0, which effectively disables VRAM-gated local routing (requests fall through to the remote target).
+- Each probe result is logged at `Trace` level for diagnostics (e.g. “VRAM probe RocmSmiVramProvider: 1234MB”).
 
 ## Project structure
 
