@@ -7,6 +7,7 @@ using OllamaRouter.Parsing;
 using OllamaRouter.ReverseProxy;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services;
+using OllamaRouter.Transforms;
 using Yarp.ReverseProxy.Forwarder;
 
 namespace OllamaRouter.Middleware;
@@ -26,6 +27,7 @@ public sealed class OllamaRoutingMiddleware(
     IInferenceRequestRecorder inferenceRequestRecorder,
     ITargetAvailabilityService targetAvailability,
     ITargetLivenessService targetLiveness,
+    ModelCapabilityEngine capabilityEngine,
     IOptions<OllamaRouterOptions> options,
     ILogger<OllamaRoutingMiddleware> logger)
 {
@@ -407,15 +409,37 @@ public sealed class OllamaRoutingMiddleware(
 
         context.Request.Headers[OllamaReverseProxyConfig.TargetHeader] = MapTargetToHeader(target);
 
+        // Dynamic context sizing (Phase 2): for non-cloud targets, consult the decided
+        // target's derived capability and inject/overwrite options.num_ctx with the selected
+        // hardware-safe bucket. The Cloud path is never rewritten (the cloud relay decides its
+        // own context). Any lookup failure degrades to a full pass-through (no rewrite, no
+        // header) - a sizing miss never blocks inference.
+        var (injectedNumCtx, sizedBody) = target != RoutingTarget.Cloud
+            ? await TryApplyDynamicContextSizingAsync(context, target, modelName, tokenCount, body)
+            : (null, null);
+        if (sizedBody is not null)
+        {
+            body = sizedBody; // Record the payload actually sent to the target.
+        }
+
         context.Response.Headers["X-OllamaRouter-Target"] = target.ToString();
         context.Response.Headers["X-OllamaRouter-Model"] = modelName;
         context.Response.Headers["X-OllamaRouter-Estimated-Tokens"] = tokenCount.ToString();
+        if (injectedNumCtx.HasValue)
+        {
+            context.Response.Headers["X-OllamaRouter-Context-Size"] = injectedNumCtx.Value.ToString();
+        }
 
         context.Response.OnStarting(() =>
         {
             context.Response.Headers["X-OllamaRouter-Target"] = target.ToString();
             context.Response.Headers["X-OllamaRouter-Model"] = modelName;
             context.Response.Headers["X-OllamaRouter-Estimated-Tokens"] = tokenCount.ToString();
+            if (injectedNumCtx.HasValue)
+            {
+                context.Response.Headers["X-OllamaRouter-Context-Size"] = injectedNumCtx.Value.ToString();
+            }
+
             return Task.CompletedTask;
         });
 
@@ -608,6 +632,115 @@ public sealed class OllamaRoutingMiddleware(
         var body = await reader.ReadToEndAsync();
         request.Body.Position = 0;
         return body;
+    }
+
+    /// <summary>
+    /// Resolves the decided fleet target's derived capability, computes the dynamic context
+    /// sizing decision for this request, and rewrites the request body with the selected
+    /// bucket. Returns (injected <c>num_ctx</c>, rewritten body) when a rewrite happened,
+    /// otherwise (null, null) (disabled, unresolvable URL/digest, capability discovery
+    /// failure, or not hardware capable) - the permissive pass-through never blocks the
+    /// request.
+    /// </summary>
+    private async Task<(int? InjectedNumCtx, string? RewrittenBody)> TryApplyDynamicContextSizingAsync(
+        HttpContext context,
+        RoutingTarget target,
+        string modelName,
+        int tokenCount,
+        string body)
+    {
+        var dynamicOptions = options.Value.DynamicContext;
+        if (!dynamicOptions.Enabled)
+        {
+            return (null, null);
+        }
+
+        var normalizedName = RoutingDecisionService.NormalizeModelName(modelName);
+        OllamaTargetOptions? targetOptions = null;
+        foreach (var t in options.Value.GetEffectiveTargets(logger))
+        {
+            if (string.Equals(t.Name, target.Value, StringComparison.OrdinalIgnoreCase))
+            {
+                targetOptions = t;
+                break;
+            }
+        }
+
+        var targetUrl = targetOptions?.Url
+            ?? (target == RoutingTarget.Local ? options.Value.LocalUrl : null)
+            ?? (target == RoutingTarget.Remote ? options.Value.RemoteUrl : null);
+
+        if (targetOptions is null || string.IsNullOrWhiteSpace(targetUrl) || string.Equals(modelName, "unknown", StringComparison.Ordinal))
+        {
+            return (null, null);
+        }
+
+        try
+        {
+            var digest = await modelCatalogCache.GetCurrentDigestAsync(targetUrl, context.RequestAborted);
+            if (string.IsNullOrEmpty(digest))
+            {
+                return (null, null);
+            }
+
+            var metadata = await capabilityEngine.GetMetadataAsync(targetUrl, modelName, digest, context.RequestAborted);
+
+            ModelThresholds? thresholds = null;
+            options.Value.Models.TryGetValue(normalizedName, out thresholds);
+
+            var capability = capabilityEngine.DeriveCapability(metadata, target.Value, targetOptions, thresholds?.Architecture);
+            if (!DynamicContextSizingEngine.IsHardwareSuitable(capability))
+            {
+                // Stage-1 hard veto (e.g. LargeDense on < 12 GB): never size/rewrite for a
+                // hardware-incapable target (the veto ignores activity state entirely).
+                logger.LogInformation(
+                    "Dynamic context sizing skipped: {Model} is not hardware-suitable on target {Target}.",
+                    modelName, target.Value);
+                return (null, null);
+            }
+
+            // Hierarchy level 1 (explicit Modelfile num_ctx) already caps CMax in
+            // DeriveCapability, so ceiling = CMax.
+            var clientNumCtx = DynamicContextPayloadTransformer.ExtractClientNumCtx(body);
+            var decision = DynamicContextSizingEngine.Decide(
+                dynamicOptions,
+                capability.Architecture,
+                targetOptions.GetEffectiveMaxVramMB(),
+                capability.CMax,
+                tokenCount,
+                clientNumCtx);
+
+            var (rewritten, injected) = DynamicContextPayloadTransformer.Apply(body, decision, dynamicOptions);
+            if (injected is null)
+            {
+                return (null, null);
+            }
+
+            var bodyBytes = System.Text.Encoding.UTF8.GetBytes(rewritten);
+            context.Request.Body = new MemoryStream(bodyBytes);
+            context.Request.ContentLength = bodyBytes.Length;
+            context.Request.Body.Position = 0; // Ready for the forwarder (and the recorder) to read.
+
+            logger.LogInformation(
+                "Dynamic context sizing: {Model} on {Target} - {Tokens} estimated tokens, client num_ctx {ClientNumCtx}, injected bucket {Injected} (profile {Profile}, ceiling {Ceiling}, clamped {Clamped}).",
+                modelName,
+                target.Value,
+                tokenCount,
+                clientNumCtx?.ToString() ?? "none",
+                injected.Value,
+                decision.ProfileName,
+                decision.EffectiveCeiling,
+                decision.ClientRequestedClamped);
+
+            return (injected, rewritten);
+        }
+        catch (Exception ex)
+        {
+            // Permissive pass-through: a sizing miss (network, parse, anything) never blocks
+            // inference - the request is forwarded with its original body.
+            logger.LogDebug(ex, "Dynamic context sizing failed for {Model} on {Target}; forwarding the request unchanged.", modelName, target.Value);
+            return (null, null);
+        }
     }
 }
 

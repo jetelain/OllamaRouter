@@ -114,6 +114,13 @@ public sealed class OllamaRouterOptions
     public AggregationOptions Aggregation { get; set; } = new();
 
     /// <summary>
+    /// Dynamic context sizing configuration (Phase 2): when enabled, the router selects a
+    /// quantized context bucket per (target, model, prompt) triple and injects/overwrites
+    /// <c>options.num_ctx</c> in the outgoing inference payload. Enabled by default.
+    /// </summary>
+    public DynamicContextOptions DynamicContext { get; set; } = new();
+
+    /// <summary>
     /// Returns the effective fleet target list: the configured <see cref="Targets"/> in order
     /// (skipping invalid entries with a null/empty <c>Name</c> or <c>Url</c>, logging a warning
     /// for each skipped entry), or — when no targets are configured — a synthesized legacy list
@@ -255,6 +262,189 @@ public sealed class AggregationOptions
     /// unresponsive daemon can never hang the IDE beyond this value. Defaults to 500.
     /// </summary>
     public int PerTargetTimeoutMs { get; set; } = 500;
+}
+
+/// <summary>
+/// A quantized elastic context bucket profile: the baseline bucket (<see cref="DefaultContext"/>),
+/// an optional hand-tuned intermediate bucket (<see cref="IntermediateContext"/>) and the
+/// elastic ceiling bucket (<see cref="MaxContext"/>). For operator-defined custom profiles that
+/// only set <see cref="DefaultContext"/> and <see cref="MaxContext"/> (null intermediate), the
+/// intermediate bucket is synthesized on the <c>BucketStepTokens</c> grid as
+/// <c>snapUpToStep(ceil((baseline + max) / 2), step)</c>, clamped to ≤ max.
+/// </summary>
+public sealed class DynamicContextProfile
+{
+    /// <summary>
+    /// Creates a bucket profile from its three explicit bucket values (the built-in defaults
+    /// ship hand-tuned values that are NOT on the step grid, e.g. MoE 221,184).
+    /// </summary>
+    public DynamicContextProfile(int defaultContext, int? intermediateContext, int maxContext)
+    {
+        DefaultContext = defaultContext;
+        IntermediateContext = intermediateContext;
+        MaxContext = maxContext;
+    }
+
+    /// <summary>
+    /// Parameterless constructor for config binding of custom (operator-defined) profiles,
+    /// which typically only set <see cref="DefaultContext"/> and <see cref="MaxContext"/>.
+    /// </summary>
+    public DynamicContextProfile()
+    {
+    }
+
+    /// <summary>
+    /// Baseline bucket (in tokens): the smallest context the profile can serve. A request whose
+    /// requirement is ≤ this value is sized at the baseline bucket.
+    /// </summary>
+    public int DefaultContext { get; set; }
+
+    /// <summary>
+    /// Optional explicit intermediate bucket (in tokens). When null (custom profiles), the
+    /// intermediate is synthesized from <c>BucketStepTokens</c>; when set outside the
+    /// (baseline, max) range it is ignored.
+    /// </summary>
+    public int? IntermediateContext { get; set; }
+
+    /// <summary>
+    /// Elastic ceiling bucket (in tokens): the largest context the profile can serve. The
+    /// injected value never exceeds the minimum of this value and the target's effective
+    /// hardware ceiling.
+    /// </summary>
+    public int MaxContext { get; set; }
+}
+
+/// <summary>
+/// Dynamic context sizing configuration (Phase 2, items 3-4 of the Multi-Target Zero-Config
+/// Routing Plan): per-request quantized elastic context bucketing with
+/// <c>options.num_ctx</c> injection. Sizing is stateless per request in this release; the
+/// Auto-Shrink hysteresis options are bound and stored here but consumed by the Auto-Shrink
+/// Manager in a later task.
+/// </summary>
+public sealed class DynamicContextOptions
+{
+    /// <summary>Default <see cref="BucketStepTokens"/> value (32,768).</summary>
+    public const int DefaultBucketStepTokens = 32_768;
+
+    /// <summary>Built-in profile name for Mixture-of-Experts models (any VRAM class).</summary>
+    public const string MoeProfileName = "Moe";
+
+    /// <summary>Built-in profile name for large dense models on desktop-class (16 GB) targets.</summary>
+    public const string DenseDesktop16gbProfileName = "DenseDesktop16gb";
+
+    /// <summary>Built-in profile name for large dense models on server-class (96 GB) targets.</summary>
+    public const string DenseServer96gbProfileName = "DenseServer96gb";
+
+    /// <summary>Built-in profile name for small dense models.</summary>
+    public const string SmallDenseProfileName = "SmallDense";
+
+    /// <summary>
+    /// Enables dynamic context sizing. When false, the payload is NEVER rewritten (pass-through)
+    /// and no sizing capability lookups are performed by the router middleware. Defaults to true.
+    /// </summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    /// Grid step (in tokens) used to synthesize the intermediate bucket of custom profiles
+    /// (operator-defined profiles that omit <see cref="DynamicContextProfile.IntermediateContext"/>).
+    /// The built-in profiles ship explicit hand-tuned buckets and are not affected by this grid.
+    /// Must be &gt; 0; values ≤ 0 are clamped to <see cref="DefaultBucketStepTokens"/> by
+    /// <see cref="Normalize"/>. Defaults to 32,768.
+    /// </summary>
+    public int BucketStepTokens { get; set; } = DefaultBucketStepTokens;
+
+    /// <summary>
+    /// Cooldown (in turns) applied by the Auto-Shrink Manager after an auto-shrink event before
+    /// the context may shrink again. Stored in this release and consumed by the Auto-Shrink
+    /// Manager in a later task. Defaults to 3.
+    /// </summary>
+    public int AutoShrinkCooldownTurns { get; set; } = 3;
+
+    /// <summary>
+    /// Idle timeout (in seconds) the Auto-Shrink Manager waits before shrinking an active
+    /// session's context. Stored in this release and consumed by the Auto-Shrink Manager in a
+    /// later task. Defaults to 60.
+    /// </summary>
+    public int AutoShrinkIdleTimeoutSeconds { get; set; } = 60;
+
+    /// <summary>
+    /// Bucket profiles keyed by profile name (case-insensitive). The built-in defaults (see
+    /// <see cref="DefaultProfileNames"/>) ship the plan's explicit bucket triples verbatim;
+    /// operators may override built-ins or add custom profiles (DefaultContext + MaxContext are
+    /// sufficient; the intermediate is synthesized). .NET config binding replaces the whole
+    /// dictionary when any "Profiles:*" key is set, so a partial override drops the other
+    /// built-ins — <see cref="Normalize"/> (invoked via PostConfigure) restores them.
+    /// </summary>
+    public Dictionary<string, DynamicContextProfile> Profiles { get; set; } = DefaultProfiles();
+
+    /// <summary>
+    /// The built-in profile names (case-insensitive) restored by <see cref="Normalize"/>.
+    /// </summary>
+    public static IReadOnlyList<string> DefaultProfileNames { get; } =
+        new[] { MoeProfileName, DenseDesktop16gbProfileName, DenseServer96gbProfileName, SmallDenseProfileName };
+
+    /// <summary>
+    /// Looks up a profile by name (case-insensitive). Returns a stateless conservative
+    /// fallback profile (baseline 32,768 / max 32,768) for unknown names, so a miss can never
+    /// inflate the context or throw at request time.
+    /// </summary>
+    public DynamicContextProfile GetProfile(string profileName)
+    {
+        if (!string.IsNullOrWhiteSpace(profileName) &&
+            Profiles is { } profiles &&
+            profiles.TryGetValue(profileName, out var profile) &&
+            profile is not null)
+        {
+            return profile;
+        }
+
+        return new DynamicContextProfile(32_768, null, 32_768);
+    }
+
+    /// <summary>
+    /// Normalizes the section after config binding: clamps a non-positive
+    /// <see cref="BucketStepTokens"/> to <see cref="DefaultBucketStepTokens"/> and restores
+    /// missing or zero-valued built-in profiles from the defaults, so a config that overrides
+    /// only "Profiles:Moe:MaxContext" keeps the other built-in profiles intact. Never throws.
+    /// </summary>
+    public void Normalize()
+    {
+        if (BucketStepTokens <= 0)
+        {
+            BucketStepTokens = DefaultBucketStepTokens;
+        }
+
+        Profiles ??= new Dictionary<string, DynamicContextProfile>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var name in DefaultProfileNames)
+        {
+            if (!Profiles.TryGetValue(name, out var existing) || IsInvalid(existing))
+            {
+                Profiles[name] = GetDefaultProfile(name);
+            }
+        }
+    }
+
+    private static bool IsInvalid(DynamicContextProfile? profile) =>
+        profile is null || profile.DefaultContext <= 0 || profile.MaxContext <= 0;
+
+    private static DynamicContextProfile GetDefaultProfile(string name) => name switch
+    {
+        // Plan §2.3 profile table (hand-tuned buckets, not on the step grid).
+        MoeProfileName => new DynamicContextProfile(184_320, 221_184, 262_144),
+        DenseDesktop16gbProfileName => new DynamicContextProfile(32_768, 40_960, 49_152),
+        DenseServer96gbProfileName => new DynamicContextProfile(65_536, 131_072, 262_144),
+        _ => new DynamicContextProfile(32_768, 65_536, 131_072)
+    };
+
+    private static Dictionary<string, DynamicContextProfile> DefaultProfiles() =>
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            [MoeProfileName] = GetDefaultProfile(MoeProfileName),
+            [DenseDesktop16gbProfileName] = GetDefaultProfile(DenseDesktop16gbProfileName),
+            [DenseServer96gbProfileName] = GetDefaultProfile(DenseServer96gbProfileName),
+            [SmallDenseProfileName] = GetDefaultProfile(SmallDenseProfileName)
+        };
 }
 
 /// <summary>

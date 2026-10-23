@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using OllamaRouter.Middleware;
@@ -32,7 +33,8 @@ public class OllamaRoutingMiddlewareTests
         Mock<IActivityStatisticsService>? activityStatistics = null,
         Mock<IInferenceRequestRecorder>? inferenceRequestRecorder = null,
         Mock<ITargetAvailabilityService>? targetAvailability = null,
-        Mock<ITargetLivenessService>? targetLiveness = null)
+        Mock<ITargetLivenessService>? targetLiveness = null,
+        ModelCapabilityEngine? capabilityEngine = null)
     {
         var effectiveTargetAvailability = targetAvailability ?? new Mock<ITargetAvailabilityService>();
         if (targetAvailability is null)
@@ -65,6 +67,14 @@ public class OllamaRoutingMiddlewareTests
                 .Returns(new TargetLivenessSnapshot(new List<TargetLivenessEntry>()));
         }
 
+        // By default the capability engine has an empty catalog digest and an unreachable
+        // client, so dynamic context sizing degrades to a permissive pass-through (existing
+        // tests keep their body untouched).
+        var effectiveCapabilityEngine = capabilityEngine ?? new ModelCapabilityEngine(
+            new Mock<IOllamaModelCatalogClient>().Object,
+            new MemoryCache(new MemoryCacheOptions()),
+            NullLogger<ModelCapabilityEngine>.Instance);
+
         return new OllamaRoutingMiddleware(
             next,
             tokenEstimator.Object,
@@ -75,6 +85,7 @@ public class OllamaRoutingMiddlewareTests
             (inferenceRequestRecorder ?? new Mock<IInferenceRequestRecorder>()).Object,
             effectiveTargetAvailability.Object,
             effectiveTargetLiveness.Object,
+            effectiveCapabilityEngine,
             MsOptions.Create(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
             NullLogger<OllamaRoutingMiddleware>.Instance);
     }
@@ -958,6 +969,7 @@ public class OllamaRoutingMiddlewareTests
             new Mock<IInferenceRequestRecorder>().Object,
             targetAvailability.Object,
             liveness.Object,
+            new ModelCapabilityEngine(new Mock<IOllamaModelCatalogClient>().Object, new MemoryCache(new MemoryCacheOptions()), NullLogger<ModelCapabilityEngine>.Instance),
             optionsWrapper,
             NullLogger<OllamaRoutingMiddleware>.Instance);
 
@@ -1027,6 +1039,7 @@ public class OllamaRoutingMiddlewareTests
             new Mock<IInferenceRequestRecorder>().Object,
             targetAvailability.Object,
             liveness.Object,
+            new ModelCapabilityEngine(new Mock<IOllamaModelCatalogClient>().Object, new MemoryCache(new MemoryCacheOptions()), NullLogger<ModelCapabilityEngine>.Instance),
             optionsWrapper,
             NullLogger<OllamaRoutingMiddleware>.Instance);
 
@@ -1151,6 +1164,7 @@ public class OllamaRoutingMiddlewareTests
             new Mock<IInferenceRequestRecorder>().Object,
             targetAvailability.Object,
             liveness.Object,
+            new ModelCapabilityEngine(new Mock<IOllamaModelCatalogClient>().Object, new MemoryCache(new MemoryCacheOptions()), NullLogger<ModelCapabilityEngine>.Instance),
             optionsWrapper,
             NullLogger<OllamaRoutingMiddleware>.Instance);
 
@@ -1204,5 +1218,411 @@ public class OllamaRoutingMiddlewareTests
         // never after the streamed failure — the breaker is inference-isolated.
         liveness.Verify(t => t.EnsureKnownAsync(It.IsAny<RoutingTarget>(), It.IsAny<CancellationToken>()), Times.Exactly(1));
         liveness.Verify(t => t.IsOnline(It.IsAny<RoutingTarget>()), Times.Once);
+    }
+
+    // ================================================================================
+    // Dynamic context sizing (Phase 2): the decided target's capability drives the
+    // options.num_ctx bucket injection for the four inference endpoints.
+    // ================================================================================
+
+    private static ModelCapabilityEngine CreateCapabilityEngine(out Mock<IOllamaModelCatalogClient> catalogClient)
+    {
+        catalogClient = new Mock<IOllamaModelCatalogClient>();
+        catalogClient
+            .Setup(c => c.GetTagsWithDigestAsync(It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((new JsonArray(), "digest-1"));
+
+        return new ModelCapabilityEngine(
+            catalogClient.Object,
+            new MemoryCache(new MemoryCacheOptions()),
+            NullLogger<ModelCapabilityEngine>.Instance);
+    }
+
+    private static OllamaRoutingMiddleware CreateSizingSut(
+        RequestDelegate next,
+        Mock<ITokenEstimator> tokenEstimator,
+        Mock<IRoutingDecisionService> routingDecisionService,
+        OllamaRouterOptions options,
+        ModelCapabilityEngine capabilityEngine,
+        Mock<IModelCatalogCacheService> modelCatalogCache,
+        Mock<IActivityMonitorService>? activityMonitor = null)
+    {
+        var availability = new Mock<ITargetAvailabilityService>();
+        availability.Setup(t => t.IsEnabled(It.IsAny<RoutingTarget>())).Returns(true);
+
+        var liveness = new Mock<ITargetLivenessService>();
+        liveness.Setup(t => t.EnsureKnownAsync(It.IsAny<RoutingTarget>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(TargetLivenessState.Online);
+        liveness.Setup(t => t.IsOnline(It.IsAny<RoutingTarget>())).Returns(true);
+        liveness.SetupGet(t => t.ServiceStartTimeUtc).Returns(DateTimeOffset.UtcNow.AddHours(1));
+        liveness.Setup(t => t.GetFleetTargets()).Returns(new[] { RoutingTarget.Local, RoutingTarget.Remote });
+
+        return new OllamaRoutingMiddleware(
+            next,
+            tokenEstimator.Object,
+            routingDecisionService.Object,
+            modelCatalogCache.Object,
+            (activityMonitor ?? new Mock<IActivityMonitorService>()).Object,
+            new Mock<IActivityStatisticsService>().Object,
+            new Mock<IInferenceRequestRecorder>().Object,
+            availability.Object,
+            liveness.Object,
+            capabilityEngine,
+            MsOptions.Create(options),
+            NullLogger<OllamaRoutingMiddleware>.Instance);
+    }
+
+    private static Mock<IModelCatalogCacheService> DigestCache(string digest)
+    {
+        var cache = new Mock<IModelCatalogCacheService>();
+        cache.Setup(c => c.GetCurrentDigestAsync(It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(digest);
+        return cache;
+    }
+
+    private static RequestDelegate CaptureBodyDelegate(string[] captured)
+    {
+        return async c =>
+        {
+            c.Request.Body.Position = 0;
+            using var reader = new StreamReader(c.Request.Body);
+            captured[0] = await reader.ReadToEndAsync();
+        };
+    }
+
+    [Fact]
+    public async Task Sizing_Moe200kPrompt_96GBTarget_ModelfilePin221184_Injects221184_AndEmitsContextSizeHeader()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "qwen3.6-35b-a3b", "messages": [ { "role": "user", "content": "a long prompt" } ] }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(200_000);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(200_000, "qwen3.6-35b-a3b", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var capabilityEngine = CreateCapabilityEngine(out var catalogClient);
+        // 35B-A3B MoE: expert_count present; the Modelfile pins num_ctx 221184 (hierarchy
+        // level 1), capping the effective ceiling at the 221,184 bucket.
+        catalogClient
+            .Setup(c => c.GetShowAsync("http://localhost:11435", "qwen3.6-35b-a3b", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new JsonObject
+            {
+                ["parameters"] = "num_ctx 221184\nnum_predict 4096",
+                ["model_info"] = new JsonObject { ["qwen35.expert_count"] = 128 }
+            });
+
+        var options = new OllamaRouterOptions { LocalUrl = "http://localhost:11435" };
+        options.Targets.Add(new OllamaTargetOptions { Name = "Local", Url = "http://localhost:11435", HardwareHint = "96gb" });
+
+        var captured = new string[1];
+        var sut = CreateSizingSut(
+            CaptureBodyDelegate(captured),
+            tokenEstimator,
+            routingDecisionService,
+            options,
+            capabilityEngine,
+            DigestCache("digest-1"));
+
+        await sut.InvokeAsync(context);
+
+        Assert.NotNull(captured[0]);
+        using var doc = JsonDocument.Parse(captured[0]!);
+        Assert.Equal(221_184, doc.RootElement.GetProperty("options").GetProperty("num_ctx").GetInt32());
+        // The routing decision is untouched: the bucket is hosted by the current (96 GB) target.
+        Assert.Equal("Local", context.Request.Headers["X-Ollama-Target"]);
+        Assert.Equal("221184", context.Response.Headers["X-OllamaRouter-Context-Size"]);
+    }
+
+    [Fact]
+    public async Task Sizing_DenseDesktop2kPrompt_Client131072_ClampedTo49152_RoutingUnchanged()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "qwen3.8-27b", "messages": [ { "role": "user", "content": "hi" } ], "options": { "num_ctx": 131072 } }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(2_000);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(2_000, "qwen3.8-27b", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var capabilityEngine = CreateCapabilityEngine(out var catalogClient);
+        // 27B dense: parameter count above the 14B threshold, no experts.
+        catalogClient
+            .Setup(c => c.GetShowAsync("http://localhost:11435", "qwen3.8-27b", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new JsonObject
+            {
+                ["model_info"] = new JsonObject { ["general.parameter_count"] = 27_800_000_000L }
+            });
+
+        // Legacy configuration: the synthesized "Local" target carries HardwareHint "16gb".
+        var options = new OllamaRouterOptions { LocalUrl = "http://localhost:11435" };
+
+        var captured = new string[1];
+        var sut = CreateSizingSut(
+            CaptureBodyDelegate(captured),
+            tokenEstimator,
+            routingDecisionService,
+            options,
+            capabilityEngine,
+            DigestCache("digest-1"));
+
+        await sut.InvokeAsync(context);
+
+        Assert.NotNull(captured[0]);
+        using var doc = JsonDocument.Parse(captured[0]!);
+        // The large static client value is clamped to the 48k desktop ceiling — never disqualified.
+        Assert.Equal(49_152, doc.RootElement.GetProperty("options").GetProperty("num_ctx").GetInt32());
+        Assert.Equal("49152", context.Response.Headers["X-OllamaRouter-Context-Size"]);
+        // Routing is unchanged: still the Desktop-equivalent 16 GB target.
+        Assert.Equal("Local", context.Request.Headers["X-Ollama-Target"]);
+        Assert.Equal("Local", context.Response.Headers["X-OllamaRouter-Target"]);
+    }
+
+    [Theory]
+    [InlineData("/api/chat")]
+    [InlineData("/api/generate")]
+    [InlineData("/v1/chat/completions")]
+    [InlineData("/v1/completions")]
+    public async Task Sizing_RewritesAllFourInferenceEndpoints(string path)
+    {
+        var context = BuildContext(path, """{ "model": "qwen3.6-35b-a3b", "prompt": "hello" }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100_000);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(100_000, "qwen3.6-35b-a3b", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var capabilityEngine = CreateCapabilityEngine(out var catalogClient);
+        catalogClient
+            .Setup(c => c.GetShowAsync(It.IsAny<string?>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new JsonObject { ["model_info"] = new JsonObject { ["qwen35.expert_count"] = 128 } });
+
+        var options = new OllamaRouterOptions { LocalUrl = "http://localhost:11435" };
+
+        var captured = new string[1];
+        var sut = CreateSizingSut(
+            CaptureBodyDelegate(captured),
+            tokenEstimator,
+            routingDecisionService,
+            options,
+            capabilityEngine,
+            DigestCache("digest-1"));
+
+        await sut.InvokeAsync(context);
+
+        Assert.NotNull(captured[0]);
+        using var doc = JsonDocument.Parse(captured[0]!);
+        // 100k tokens on the 16 GB MoE target: the 184,320 baseline is selected, then the
+        // hardware CMax (49,152 for the 16gb class) clamps the injected value.
+        Assert.Equal(49_152, doc.RootElement.GetProperty("options").GetProperty("num_ctx").GetInt32());
+    }
+
+    [Fact]
+    public async Task Sizing_Disabled_NoRewriteAndNoCatalogInteraction()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "m", "prompt": "hi" }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(100, "m", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var capabilityEngine = CreateCapabilityEngine(out var catalogClient);
+
+        var options = new OllamaRouterOptions { LocalUrl = "http://localhost:11435" };
+        options.DynamicContext.Enabled = false;
+
+        var captured = new string[1];
+        var cache = DigestCache("digest-1");
+        var sut = CreateSizingSut(
+            CaptureBodyDelegate(captured),
+            tokenEstimator,
+            routingDecisionService,
+            options,
+            capabilityEngine,
+            cache);
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("""{ "model": "m", "prompt": "hi" }""", captured[0]);
+        Assert.False(context.Response.Headers.ContainsKey("X-OllamaRouter-Context-Size"));
+        // No capability/catalog interaction when disabled.
+        catalogClient.Verify(c => c.GetTagsWithDigestAsync(It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Never);
+        catalogClient.Verify(c => c.GetShowAsync(It.IsAny<string?>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Theory]
+    [InlineData("GET", "/api/tags")]
+    [InlineData("GET", "/api/ps")]
+    [InlineData("POST", "/api/embeddings")]
+    public async Task Sizing_NonInferenceEndpoints_NeverRewritten(string method, string path)
+    {
+        const string body = """{ "model": "m", "input": "hello" }""";
+        var context = new DefaultHttpContext();
+        context.Request.Method = method;
+        context.Request.Path = path;
+        context.Request.Body = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(body));
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+
+        var capabilityEngine = CreateCapabilityEngine(out var catalogClient);
+
+        var options = new OllamaRouterOptions { LocalUrl = "http://localhost:11435" };
+
+        var captured = new string[1];
+        var cache = DigestCache("digest-1");
+        var sut = CreateSizingSut(
+            CaptureBodyDelegate(captured),
+            tokenEstimator,
+            routingDecisionService,
+            options,
+            capabilityEngine,
+            cache);
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal(body, captured[0]);
+        Assert.False(context.Response.Headers.ContainsKey("X-OllamaRouter-Context-Size"));
+        catalogClient.Verify(c => c.GetTagsWithDigestAsync(It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Never);
+        cache.Verify(c => c.GetCurrentDigestAsync(It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task Sizing_CloudTarget_BodyOnlyModelRewritten_NoNumCtxInjection()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Bonjour" }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var capabilityEngine = CreateCapabilityEngine(out var catalogClient);
+
+        var options = new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" };
+        options.Models["llama3"] = new ModelThresholds { CloudModel = "llama3-cloud" };
+
+        var captured = new string[1];
+        var cache = DigestCache("digest-1");
+
+        // All fleet targets are offline → the request is handed off to Cloud Overflow.
+        var liveness = AllOfflineLiveness();
+        var availability = new Mock<ITargetAvailabilityService>();
+        availability.Setup(t => t.IsEnabled(It.IsAny<RoutingTarget>())).Returns(true);
+        var sut = new OllamaRoutingMiddleware(
+            CaptureBodyDelegate(captured),
+            tokenEstimator.Object,
+            routingDecisionService.Object,
+            cache.Object,
+            new Mock<IActivityMonitorService>().Object,
+            new Mock<IActivityStatisticsService>().Object,
+            new Mock<IInferenceRequestRecorder>().Object,
+            availability.Object,
+            liveness.Object,
+            capabilityEngine,
+            MsOptions.Create(options),
+            NullLogger<OllamaRoutingMiddleware>.Instance);
+
+        await sut.InvokeAsync(context);
+
+        Assert.NotNull(captured[0]);
+        using var doc = JsonDocument.Parse(captured[0]!);
+        // The cloud model rewrite still happens...
+        Assert.Equal("llama3-cloud", doc.RootElement.GetProperty("model").GetString());
+        // ...but the sizing transformer never touches the Cloud path.
+        Assert.False(doc.RootElement.TryGetProperty("options", out _));
+        Assert.False(context.Response.Headers.ContainsKey("X-OllamaRouter-Context-Size"));
+        catalogClient.Verify(c => c.GetShowAsync(It.IsAny<string?>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task Sizing_CapabilityLookupFailure_EmptyDigest_PassesThrough_RoutingSucceeds()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "m", "prompt": "hi" }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(100, "m", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var capabilityEngine = CreateCapabilityEngine(out var catalogClient);
+
+        var options = new OllamaRouterOptions { LocalUrl = "http://localhost:11435" };
+
+        var captured = new string[1];
+        // The instance is unreachable/empty: the catalog digest is "" → permissive pass-through.
+        var sut = CreateSizingSut(
+            CaptureBodyDelegate(captured),
+            tokenEstimator,
+            routingDecisionService,
+            options,
+            capabilityEngine,
+            DigestCache(""));
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("""{ "model": "m", "prompt": "hi" }""", captured[0]);
+        Assert.False(context.Response.Headers.ContainsKey("X-OllamaRouter-Context-Size"));
+        // Routing still succeeds: the request is forwarded to the decided target.
+        Assert.Equal("Local", context.Request.Headers["X-Ollama-Target"]);
+        catalogClient.Verify(c => c.GetShowAsync(It.IsAny<string?>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task Sizing_ModelfileNumCtxBelowBucket_ClampsInjectedValueToModelfile()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "pinned", "prompt": "hello there" }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(3_000);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(3_000, "pinned", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var capabilityEngine = CreateCapabilityEngine(out var catalogClient);
+        // The Modelfile pins num_ctx 24576: hierarchy level 1 caps CMax below any bucket.
+        catalogClient
+            .Setup(c => c.GetShowAsync(It.IsAny<string?>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new JsonObject
+            {
+                ["parameters"] = "num_ctx 24576\nnum_predict 4096",
+                ["model_info"] = new JsonObject { ["general.parameter_count"] = 4_000_000_000L }
+            });
+
+        var options = new OllamaRouterOptions { LocalUrl = "http://localhost:11435" };
+
+        var captured = new string[1];
+        var sut = CreateSizingSut(
+            CaptureBodyDelegate(captured),
+            tokenEstimator,
+            routingDecisionService,
+            options,
+            capabilityEngine,
+            DigestCache("digest-1"));
+
+        await sut.InvokeAsync(context);
+
+        Assert.NotNull(captured[0]);
+        using var doc = JsonDocument.Parse(captured[0]!);
+        Assert.Equal(24_576, doc.RootElement.GetProperty("options").GetProperty("num_ctx").GetInt32());
     }
 }

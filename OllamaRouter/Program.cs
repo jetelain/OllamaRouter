@@ -20,7 +20,12 @@ builder.Services.ConfigureHttpJsonOptions(options =>
 });
 
 builder.Services.AddOptions<OllamaRouterOptions>()
-    .BindConfiguration(OllamaRouterOptions.SectionName);
+    .BindConfiguration(OllamaRouterOptions.SectionName)
+    // Dynamic context sizing: clamp zero/negative BucketStepTokens and restore missing or
+    // zero-valued built-in profiles from the defaults (.NET config binding replaces the whole
+    // Profiles dictionary when any "Profiles:*" key is set, so partial overrides would
+    // otherwise drop the other built-in profiles).
+    .PostConfigure(o => o.DynamicContext.Normalize());
 
 // Code-based YARP configuration: routes/clusters are generated dynamically from the effective
 // fleet target list (synthesized from LocalUrl/RemoteUrl in the legacy configuration).
