@@ -69,4 +69,14 @@ public interface IOllamaModelCatalogClient
     /// Returns the list of model names that were unloaded.
     /// </summary>
     Task<IReadOnlyList<string>> StopRunningModelsAsync(string? baseUrl, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Fetches a JSON array endpoint of a single instance with an explicit per-target time
+    /// budget (linked cancellation on top of the client's own timeout). Parses the
+    /// <paramref name="arrayPropertyName"/> root property ("models" or "data") and returns
+    /// (null, false) on timeout, error, or unconfigured URL — as distinct from a genuine
+    /// empty catalog, which returns ([], true). Used by the parallel fleet aggregation so a
+    /// slow target can fall back to its cached catalog instead of blocking the response.
+    /// </summary>
+    Task<(JsonArray? Array, bool Succeeded)> FetchArrayBoundedAsync(string? baseUrl, string path, string arrayPropertyName, TimeSpan budget, CancellationToken cancellationToken = default);
 }

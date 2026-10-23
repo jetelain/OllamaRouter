@@ -38,16 +38,21 @@ public sealed class OllamaRoutingMiddleware(
     {
         if (IsCompletionRequest(context))
         {
+            // The completion pipeline performs the forwarding (or a 503 short-circuit) itself.
             await RouteAndTrackCompletionRequestAsync(context);
         }
-        else if (IsShowRequest(context))
+        else if (IsPinnedManagementRequest(context))
         {
-            await RouteShowRequestAsync(context);
+            // Pinned class (pull/delete/create/copy): X-OllamaRouter-Target honored when valid +
+            // enabled + online/grace, otherwise the primary target (the exact legacy default).
+            // YARP forwards, so streams (pull progress) work unchanged.
+            await RoutePinnedManagementRequestAsync(context);
             await next(context);
         }
         else
         {
-            // Default (pull, push, delete...): target the local instance if enabled, otherwise remote.
+            // Default (everything else, incl. the short-circuited hybrid GET endpoints whose
+            // response never reaches YARP): target the local instance if enabled, otherwise remote.
             context.Request.Headers[OllamaReverseProxyConfig.TargetHeader] = GetDefaultHeaderValue();
             await next(context);
         }
@@ -227,13 +232,69 @@ public sealed class OllamaRoutingMiddleware(
                (context.Request.Path.StartsWithSegments("/api/chat") ||
                 context.Request.Path.StartsWithSegments("/api/generate") ||
                 context.Request.Path.StartsWithSegments("/v1/chat/completions") ||
-                context.Request.Path.StartsWithSegments("/v1/completions"));
+                context.Request.Path.StartsWithSegments("/v1/completions") ||
+                context.Request.Path.StartsWithSegments("/api/embeddings"));
     }
 
-    private static bool IsShowRequest(HttpContext context)
+    // The pinned-management class: model lifecycle endpoints that are directed at a single
+    // daemon (the X-OllamaRouter-Target pin, or the primary target when absent).
+    private static bool IsPinnedManagementRequest(HttpContext context)
     {
-        return context.Request.Method == HttpMethods.Post &&
-               context.Request.Path.StartsWithSegments("/api/show");
+        return (context.Request.Method == HttpMethods.Post &&
+                (context.Request.Path.StartsWithSegments("/api/pull") ||
+                 context.Request.Path.StartsWithSegments("/api/create") ||
+                 context.Request.Path.StartsWithSegments("/api/copy"))) ||
+               (context.Request.Method == HttpMethods.Delete &&
+                context.Request.Path.StartsWithSegments("/api/delete"));
+    }
+
+    // Pinned-management routing: honor the X-OllamaRouter-Target pin when it names a real,
+    // enabled, online/grace target; otherwise fall back to the primary target
+    // (GetDefaultHeaderValue — "Local" when present+enabled, else first enabled effective
+    // target, else first effective target). The served target is echoed in the response
+    // telemetry header X-OllamaRouter-Target. Unlike completions, there is no token parsing,
+    // no dynamic DecideAsync and no all-offline gate: a pinned lifecycle request always goes
+    // somewhere (YARP will report 502/504 if that daemon is unreachable).
+    private async Task RoutePinnedManagementRequestAsync(HttpContext context)
+    {
+        RoutingTarget? pinned = null;
+        if (context.Request.Headers.TryGetValue("X-OllamaRouter-Target", out var requestedTargetHeader) &&
+            TryParsePinnedTarget(requestedTargetHeader.ToString(), out var requestedTarget))
+        {
+            if (targetAvailability.IsEnabled(requestedTarget))
+            {
+                var pinnedState = requestedTarget == RoutingTarget.Cloud
+                    ? TargetLivenessState.Online
+                    : await targetLiveness.EnsureKnownAsync(requestedTarget, context.RequestAborted);
+
+                if (IsPinnedTargetRoutable(pinnedState))
+                {
+                    pinned = requestedTarget;
+                    logger.LogInformation("Pinned management request routed to pinned target: {Target}", pinned);
+                }
+                else
+                {
+                    logger.LogWarning("Pinned target {Target} is offline (liveness {State}); routing the management request to the primary target.", requestedTarget, pinnedState);
+                }
+            }
+            else
+            {
+                logger.LogWarning("Pinned target {Target} is disabled; routing the management request to the primary target.", requestedTarget);
+            }
+        }
+
+        var served = pinned is not null ? pinned : (RoutingTarget)GetDefaultHeaderValue();
+        context.Request.Headers[OllamaReverseProxyConfig.TargetHeader] = served.ToString();
+
+        // Response telemetry header (mirrors the completion path: set eagerly so it is visible
+        // before the response starts, and re-asserted in OnStarting so streamed pull progress
+        // responses carry it too).
+        context.Response.Headers["X-OllamaRouter-Target"] = served.ToString();
+        context.Response.OnStarting(() =>
+        {
+            context.Response.Headers["X-OllamaRouter-Target"] = served.ToString();
+            return Task.CompletedTask;
+        });
     }
 
     private async Task RouteAndTrackCompletionRequestAsync(HttpContext context)
@@ -538,38 +599,6 @@ public sealed class OllamaRoutingMiddleware(
         }
 
         return (null, null);
-    }
-
-    private async Task RouteShowRequestAsync(HttpContext context)
-    {
-        var body = await ReadBodyAsync(context.Request);
-
-        try
-        {
-            var modelName = OllamaRequestParser.ExtractModelName(body);
-
-            var remoteEnabled = targetAvailability.IsEnabled(RoutingTarget.Remote);
-            var localEnabled = targetAvailability.IsEnabled(RoutingTarget.Local);
-
-            // Prefer the remote instance when enabled and the model is known to be available there;
-            // otherwise fall back to local if enabled, or remote if it is the only enabled target.
-            var existsRemotely = remoteEnabled && await modelCatalogCache.ModelExistsAsync(options.Value.RemoteUrl, modelName, context.RequestAborted);
-
-            var target = (existsRemotely || (remoteEnabled && !localEnabled))
-                ? OllamaReverseProxyConfig.RemoteTarget
-                : OllamaReverseProxyConfig.LocalTarget;
-
-            logger.LogInformation("{ModelName} - /api/show => {Target}", modelName, target);
-
-            context.Request.Headers[OllamaReverseProxyConfig.TargetHeader] = target;
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, "Error while inspecting the /api/show request. Falling back to default routing.");
-            context.Request.Headers[OllamaReverseProxyConfig.TargetHeader] = targetAvailability.IsEnabled(RoutingTarget.Remote)
-                ? OllamaReverseProxyConfig.RemoteTarget
-                : OllamaReverseProxyConfig.LocalTarget;
-        }
     }
 
     private static async Task<string> ReadBodyAsync(HttpRequest request)

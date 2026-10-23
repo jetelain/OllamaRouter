@@ -108,6 +108,12 @@ public sealed class OllamaRouterOptions
     public TerminalMonitoringOptions TerminalMonitoring { get; set; } = new();
 
     /// <summary>
+    /// Configuration of the parallel fleet aggregation used by the unified catalog endpoints
+    /// (GET /api/tags, /v1/models, /api/ps) and the model-directed /api/show endpoint.
+    /// </summary>
+    public AggregationOptions Aggregation { get; set; } = new();
+
+    /// <summary>
     /// Returns the effective fleet target list: the configured <see cref="Targets"/> in order
     /// (skipping invalid entries with a null/empty <c>Name</c> or <c>Url</c>, logging a warning
     /// for each skipped entry), or — when no targets are configured — a synthesized legacy list
@@ -235,6 +241,20 @@ public sealed class OllamaTargetOptions
             _ => null
         };
     }
+}
+
+/// <summary>
+/// Configuration of the parallel fleet aggregation endpoints.
+/// </summary>
+public sealed class AggregationOptions
+{
+    /// <summary>
+    /// Maximum time (in milliseconds) a single target may hold up the aggregated response
+    /// (GET /api/tags, /v1/models, /api/ps and the /api/show fetch). When a target misses the
+    /// budget, its last cached catalog is served instead (stale-while-revalidate), so an
+    /// unresponsive daemon can never hang the IDE beyond this value. Defaults to 500.
+    /// </summary>
+    public int PerTargetTimeoutMs { get; set; } = 500;
 }
 
 /// <summary>

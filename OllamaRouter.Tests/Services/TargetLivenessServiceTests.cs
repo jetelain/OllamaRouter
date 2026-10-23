@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json.Nodes;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using OllamaRouter.Options;
@@ -60,6 +61,13 @@ public class TargetLivenessServiceTests : IDisposable
         public void RegisterCapabilityCacheKeys(string baseUrl, IEnumerable<string> keys, string digest)
         {
         }
+
+        public Task<JsonArray?> GetStaleTagsAsync(string url) => Task.FromResult<JsonArray?>(null);
+        public void SetStaleTags(string url, JsonArray tags) { }
+        public Task<JsonArray?> GetStaleV1ModelsAsync(string url) => Task.FromResult<JsonArray?>(null);
+        public void SetStaleV1Models(string url, JsonArray data) { }
+        public Task<JsonArray?> GetStalePsAsync(string url) => Task.FromResult<JsonArray?>(null);
+        public void SetStalePs(string url, JsonArray models) { }
     }
 
     private static HttpResponseMessage Ok() => new(HttpStatusCode.OK)

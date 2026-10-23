@@ -23,8 +23,11 @@ public sealed class ModelCatalogCacheService(
 {
     internal const string CapabilityKeyPrefix = "ModelCapabilityEngine:";
 
+    private const string StaleSlotPrefix = "FleetAggregation:";
+
     private static readonly TimeSpan CacheDuration = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan OfflineCacheDuration = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan StaleSlotDuration = TimeSpan.FromSeconds(60);
 
     // Per-instance capability cache key registry: baseUrl → (digest, recorded capability keys).
     // On digest change the recorded keys of the previous digest are removed from the shared
@@ -164,6 +167,73 @@ public sealed class ModelCatalogCacheService(
             new HashSet<string>(result.Names, StringComparer.OrdinalIgnoreCase),
             new MemoryCacheEntryOptions { AbsoluteExpirationRelativeToNow = result.Names.Count > 0 ? CacheDuration : OfflineCacheDuration });
     }
+
+    public Task<JsonArray?> GetStaleTagsAsync(string url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return Task.FromResult<JsonArray?>(null);
+        }
+
+        return GetStaleSlotAsync(StaleSlotKey("tags", url));
+    }
+
+    public void SetStaleTags(string url, JsonArray tags)
+    {
+        SetStaleSlot(StaleSlotKey("tags", url), tags);
+    }
+
+    public Task<JsonArray?> GetStaleV1ModelsAsync(string url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return Task.FromResult<JsonArray?>(null);
+        }
+
+        return GetStaleSlotAsync(StaleSlotKey("v1models", url));
+    }
+
+    public void SetStaleV1Models(string url, JsonArray data)
+    {
+        SetStaleSlot(StaleSlotKey("v1models", url), data);
+    }
+
+    public Task<JsonArray?> GetStalePsAsync(string url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return Task.FromResult<JsonArray?>(null);
+        }
+
+        return GetStaleSlotAsync(StaleSlotKey("ps", url));
+    }
+
+    public void SetStalePs(string url, JsonArray models)
+    {
+        SetStaleSlot(StaleSlotKey("ps", url), models);
+    }
+
+    // Stale-while-revalidate slot for the unified fleet endpoints: populated only on a
+    // successful live fetch (write-through) and never cleared by a failed fetch, so a
+    // slow/asleep daemon keeps serving its last known catalog until the 60 s TTL lapses.
+    private Task<JsonArray?> GetStaleSlotAsync(string cacheKey)
+    {
+        // GetAsync (no factory): a slot is created only by Set* (live success), so a
+        // null miss must NOT create a persistent null entry.
+        return Task.FromResult(memoryCache.TryGetValue<JsonArray>(cacheKey, out var slot) ? (JsonArray?)slot.DeepClone() : null);
+    }
+
+    private void SetStaleSlot(string cacheKey, JsonArray value)
+    {
+        if (string.IsNullOrWhiteSpace(cacheKey))
+        {
+            return;
+        }
+
+        memoryCache.Set(cacheKey, value.DeepClone(), new MemoryCacheEntryOptions { AbsoluteExpirationRelativeToNow = StaleSlotDuration });
+    }
+
+    private static string StaleSlotKey(string kind, string url) => $"{StaleSlotPrefix}{kind}:{url}";
 
     private Task<HashSet<string>> GetModelNamesAsync(string baseUrl, CancellationToken cancellationToken)
     {

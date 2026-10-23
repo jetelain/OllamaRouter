@@ -167,6 +167,72 @@ public sealed class OllamaModelCatalogClient(HttpClient httpClient) : IOllamaMod
         return unloaded;
     }
 
+    public async Task<(JsonArray? Array, bool Succeeded)> FetchArrayBoundedAsync(string? baseUrl, string path, string arrayPropertyName, TimeSpan budget, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(baseUrl))
+        {
+            return (null, false);
+        }
+
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        if (budget > TimeSpan.Zero)
+        {
+            linkedCts.CancelAfter(budget);
+        }
+
+        try
+        {
+            var response = await httpClient.GetStringAsync(BuildUrl(baseUrl, path), linkedCts.Token);
+            var json = JsonNode.Parse(response);
+            var array = json?[arrayPropertyName]?.AsArray();
+            // A successful HTTP response without the expected array property (e.g. an Ollama
+            // error body) is a failed fetch: surface (null, false) so the caller falls back to
+            // the cached catalog instead of treating a missing array as an empty one.
+            return (array, array is not null);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // The caller itself was cancelled (e.g. client disconnect); propagate.
+            throw;
+        }
+        catch
+        {
+            // Budget exceeded (per-target timeout) or transport/parse failure: surface as a
+            // failed fetch so the aggregation layer falls back to the cached catalog.
+            return (null, false);
+        }
+    }
+
+    /// <summary>
+    /// Merges the given JSON arrays in argument order WITHOUT deduping entries that repeat
+    /// across arrays (unlike <see cref="MergeByKey"/>): an entry from every array is appended,
+    /// preserving per-array order. Used for /api/ps so the same model loaded on two daemons
+    /// appears twice (disambiguated by pid + the injected router_target field).
+    /// Entries lacking the key property are still appended (they carry their own identity,
+    /// e.g. a pid).
+    /// </summary>
+    public static JsonArray MergeUnion(params JsonArray[] arrays)
+    {
+        var merged = new List<JsonNode>();
+        foreach (var array in arrays)
+        {
+            if (array is null)
+            {
+                continue;
+            }
+
+            foreach (var entry in array)
+            {
+                if (entry is not null)
+                {
+                    merged.Add(entry.DeepClone());
+                }
+            }
+        }
+
+        return new JsonArray(merged.ToArray());
+    }
+
     private static string BuildUrl(string? baseUrl, string path) => $"{baseUrl?.TrimEnd('/')}{path}";
 
     private async Task<JsonArray> FetchArraySafeAsync(string url, string arrayPropertyName, CancellationToken cancellationToken)

@@ -71,6 +71,10 @@ builder.Services.AddTransient<IRoutingTargetHandler, RemoteRoutingTargetHandler>
 builder.Services.AddTransient<IRoutingTargetHandler, CloudRoutingTargetHandler>();
 builder.Services.AddTransient<IRoutingDecisionService, RoutingDecisionService>();
 builder.Services.AddSingleton<IModelCatalogCacheService, ModelCatalogCacheService>();
+// Parallel fleet aggregation (Phase 4): GET /api/tags, /v1/models, /api/ps fan out over the
+// online targets with a strict per-target budget (stale-while-revalidate fallback), and
+// POST /api/show is model-directed with a 30 s in-memory response cache.
+builder.Services.AddSingleton<IFleetAggregationService, FleetAggregationService>();
 // Model capability discovery engine (Phase 2): inspects /api/tags + /api/show per target,
 // caches parsed capabilities keyed by target + model + catalog digest, and derives the
 // architecture classification and per-target context ceilings.

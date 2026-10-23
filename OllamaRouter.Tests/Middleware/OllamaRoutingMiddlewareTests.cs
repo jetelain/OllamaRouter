@@ -244,43 +244,171 @@ public class OllamaRoutingMiddlewareTests
     }
 
     [Fact]
-    public async Task InvokeAsync_ShowRequest_ModelExistsRemotely_SetsHeaderToRemote()
+    public async Task InvokeAsync_ShowRequest_IsNotHandledByMiddleware_DefaultTargetHeaderSet()
     {
+        // POST /api/show is now a short-circuited hybrid endpoint (served by
+        // IFleetAggregationService); the middleware no longer inspects it and only falls
+        // through to the default branch (harmless for the short-circuit).
         var context = BuildContext("/api/show", """{ "model": "llama3" }""");
 
         var tokenEstimator = new Mock<ITokenEstimator>();
         var routingDecisionService = new Mock<IRoutingDecisionService>();
 
-        var modelCatalogCache = new Mock<IModelCatalogCacheService>();
-        modelCatalogCache
-            .Setup(c => c.ModelExistsAsync("http://remote:11434", "llama3", It.IsAny<CancellationToken>()))
-            .ReturnsAsync(true);
+        var nextCalled = false;
+        var sut = CreateSut(_ => { nextCalled = true; return Task.CompletedTask; }, tokenEstimator, routingDecisionService);
 
-        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService, modelCatalogCache);
+        await sut.InvokeAsync(context);
+
+        Assert.True(nextCalled);
+        Assert.Equal("Local", context.Request.Headers["X-Ollama-Target"]);
+        tokenEstimator.Verify(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>()), Times.Never);
+        routingDecisionService.Verify(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task PinnedManagementRequest_ValidOnlinePin_ForwardsToPinnedTarget_WithTelemetryHeader()
+    {
+        var context = BuildContext("/api/pull", """{ "model": "llama3" }""");
+        context.Request.Headers["X-OllamaRouter-Target"] = "Remote";
+
+        var sut = CreateSut(_ => Task.CompletedTask, new Mock<ITokenEstimator>(), new Mock<IRoutingDecisionService>());
 
         await sut.InvokeAsync(context);
 
         Assert.Equal("Remote", context.Request.Headers["X-Ollama-Target"]);
+        Assert.Equal("Remote", context.Response.Headers["X-OllamaRouter-Target"]);
     }
 
     [Fact]
-    public async Task InvokeAsync_ShowRequest_ModelNotFoundRemotely_SetsHeaderToLocal()
+    public async Task PinnedManagementRequest_AbsentPin_FallsBackToPrimaryLocal()
     {
-        var context = BuildContext("/api/show", """{ "model": "local-only" }""");
+        var context = BuildContext("/api/pull", """{ "model": "llama3" }""");
 
-        var tokenEstimator = new Mock<ITokenEstimator>();
-        var routingDecisionService = new Mock<IRoutingDecisionService>();
-
-        var modelCatalogCache = new Mock<IModelCatalogCacheService>();
-        modelCatalogCache
-            .Setup(c => c.ModelExistsAsync("http://remote:11434", "local-only", It.IsAny<CancellationToken>()))
-            .ReturnsAsync(false);
-
-        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService, modelCatalogCache);
+        var sut = CreateSut(_ => Task.CompletedTask, new Mock<ITokenEstimator>(), new Mock<IRoutingDecisionService>());
 
         await sut.InvokeAsync(context);
 
         Assert.Equal("Local", context.Request.Headers["X-Ollama-Target"]);
+        Assert.Equal("Local", context.Response.Headers["X-OllamaRouter-Target"]);
+    }
+
+    [Fact]
+    public async Task PinnedManagementRequest_InvalidPinName_FallsBackToPrimaryLocal()
+    {
+        var context = BuildContext("/api/pull", """{ "model": "llama3" }""");
+        context.Request.Headers["X-OllamaRouter-Target"] = "DoesNotExist";
+
+        var sut = CreateSut(_ => Task.CompletedTask, new Mock<ITokenEstimator>(), new Mock<IRoutingDecisionService>());
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("Local", context.Request.Headers["X-Ollama-Target"]);
+    }
+
+    [Fact]
+    public async Task PinnedManagementRequest_DisabledPin_FallsBackToPrimaryLocal()
+    {
+        var context = BuildContext("/api/pull", """{ "model": "llama3" }""");
+        context.Request.Headers["X-OllamaRouter-Target"] = "Remote";
+
+        var targetAvailability = new Mock<ITargetAvailabilityService>();
+        targetAvailability.Setup(t => t.IsEnabled(RoutingTarget.Remote)).Returns(false);
+        targetAvailability.Setup(t => t.IsEnabled(RoutingTarget.Local)).Returns(true);
+
+        var sut = CreateSut(_ => Task.CompletedTask, new Mock<ITokenEstimator>(), new Mock<IRoutingDecisionService>(), targetAvailability: targetAvailability);
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("Local", context.Request.Headers["X-Ollama-Target"]);
+    }
+
+    [Fact]
+    public async Task PinnedManagementRequest_OfflinePin_FallsBackToPrimaryLocal()
+    {
+        var context = BuildContext("/api/pull", """{ "model": "llama3" }""");
+        context.Request.Headers["X-OllamaRouter-Target"] = "Remote";
+
+        var targetAvailability = new Mock<ITargetAvailabilityService>();
+        targetAvailability.Setup(t => t.IsEnabled(It.IsAny<RoutingTarget>())).Returns(true);
+
+        var liveness = new Mock<ITargetLivenessService>();
+        liveness.Setup(t => t.EnsureKnownAsync(RoutingTarget.Remote, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(TargetLivenessState.Offline);
+        liveness.Setup(t => t.IsOnline(It.IsAny<RoutingTarget>())).Returns(true);
+        liveness.SetupGet(t => t.ServiceStartTimeUtc).Returns(DateTimeOffset.UtcNow);
+        liveness.Setup(t => t.GetFleetTargets()).Returns(new[] { RoutingTarget.Local, RoutingTarget.Remote });
+        liveness.Setup(t => t.GetEntries())
+            .Returns(new Dictionary<RoutingTarget, TargetLivenessEntry>
+            {
+                [RoutingTarget.Local] = new(RoutingTarget.Local, TargetLivenessState.Online, null, DateTimeOffset.UtcNow),
+                [RoutingTarget.Remote] = new(RoutingTarget.Remote, TargetLivenessState.Offline, "timeout", DateTimeOffset.UtcNow)
+            });
+
+        var sut = CreateSut(_ => Task.CompletedTask, new Mock<ITokenEstimator>(), new Mock<IRoutingDecisionService>(),
+            targetAvailability: targetAvailability, targetLiveness: liveness);
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("Local", context.Request.Headers["X-Ollama-Target"]);
+        Assert.Equal("Local", context.Response.Headers["X-OllamaRouter-Target"]);
+    }
+
+    [Fact]
+    public async Task PinnedManagementRequest_DeleteMethod_PinHonored()
+    {
+        var context = new DefaultHttpContext();
+        context.Request.Method = HttpMethods.Delete;
+        context.Request.Path = "/api/delete";
+        context.Request.Body = Stream.Null;
+        context.Request.Headers["X-OllamaRouter-Target"] = "Remote";
+
+        var sut = CreateSut(_ => Task.CompletedTask, new Mock<ITokenEstimator>(), new Mock<IRoutingDecisionService>());
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("Remote", context.Request.Headers["X-Ollama-Target"]);
+        Assert.Equal("Remote", context.Response.Headers["X-OllamaRouter-Target"]);
+    }
+
+    [Fact]
+    public async Task PinnedManagementRequest_CreateAndCopy_ArePinnedClass()
+    {
+        foreach (var path in new[] { "/api/create", "/api/copy" })
+        {
+            var context = BuildContext(path, """{ "model": "llama3" }""");
+            context.Request.Headers["X-OllamaRouter-Target"] = "Remote";
+
+            var sut = CreateSut(_ => Task.CompletedTask, new Mock<ITokenEstimator>(), new Mock<IRoutingDecisionService>());
+
+            await sut.InvokeAsync(context);
+
+            Assert.Equal("Remote", context.Request.Headers["X-Ollama-Target"]);
+            Assert.Equal("Remote", context.Response.Headers["X-OllamaRouter-Target"]);
+        }
+    }
+
+    [Fact]
+    public async Task EmbeddingsRequest_RidesCompletionPipeline_DecideAsyncWithEstimatedTokens()
+    {
+        var context = BuildContext("/api/embeddings", """{ "model": "llama3", "prompt": "Bonjour" }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(100, "llama3", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Remote);
+
+        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService);
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("Remote", context.Request.Headers["X-Ollama-Target"]);
+        routingDecisionService.Verify(r => r.DecideAsync(100, "llama3", It.IsAny<CancellationToken>()), Times.Once);
+        Assert.Equal("Remote", context.Response.Headers["X-OllamaRouter-Target"]);
+        Assert.Equal("llama3", context.Response.Headers["X-OllamaRouter-Model"]);
+        Assert.Equal("100", context.Response.Headers["X-OllamaRouter-Estimated-Tokens"]);
     }
 
     [Fact]

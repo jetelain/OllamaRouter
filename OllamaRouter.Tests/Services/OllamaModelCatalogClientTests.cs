@@ -369,4 +369,66 @@ public class OllamaModelCatalogClientTests
 
         Assert.Null(show);
     }
+
+    [Fact]
+    public async Task FetchArrayBoundedAsync_ValidArray_ReturnsArrayAndSucceeded()
+    {
+        var (sut, _) = CreateSut(_ => JsonResponse("""{ "models": [ { "name": "llama3" } ] }"""));
+
+        var (array, succeeded) = await sut.FetchArrayBoundedAsync("http://127.0.0.1:11435", "/api/tags", "models", TimeSpan.FromSeconds(1));
+
+        Assert.True(succeeded);
+        Assert.NotNull(array);
+        Assert.Equal("llama3", array![0]!["name"]!.ToString());
+    }
+
+    [Fact]
+    public async Task FetchArrayBoundedAsync_EmptyArray_IsASuccessfulEmptyCatalog_NotAFailure()
+    {
+        var (sut, _) = CreateSut(_ => JsonResponse("""{ "models": [] }"""));
+
+        var (array, succeeded) = await sut.FetchArrayBoundedAsync("http://127.0.0.1:11435", "/api/tags", "models", TimeSpan.FromSeconds(1));
+
+        Assert.True(succeeded);
+        Assert.NotNull(array);
+        Assert.Empty(array!);
+    }
+
+    [Fact]
+    public async Task FetchArrayBoundedAsync_MissingArrayProperty_SurfacesFailure_NotASuccessfulNull()
+    {
+        // An error body ({"error": ...}) or any shape without the expected root property must be
+        // surfaced as a failed fetch so the aggregation falls back to the cached catalog.
+        var (sut, _) = CreateSut(_ => JsonResponse("""{ "error": "model not found" }"""));
+
+        var (array, succeeded) = await sut.FetchArrayBoundedAsync("http://127.0.0.1:11435", "/api/tags", "models", TimeSpan.FromSeconds(1));
+
+        Assert.False(succeeded);
+        Assert.Null(array);
+    }
+
+    [Fact]
+    public async Task FetchArrayBoundedAsync_BudgetExceeded_ReturnsFailure()
+    {
+        // The handler never responds; the 50 ms budget must elapse and surface a failure
+        // (never hang the caller) without cancelling the underlying request.
+        var client = new OllamaModelCatalogClient(new HttpClient(new NoRespondHandler()));
+
+        var started = Environment.TickCount64;
+        var (array, succeeded) = await client.FetchArrayBoundedAsync("http://127.0.0.1:11435", "/api/tags", "models", TimeSpan.FromMilliseconds(50));
+
+        Assert.False(succeeded);
+        Assert.Null(array);
+        Assert.InRange(Environment.TickCount64 - started, 0, 5000);
+    }
+
+    private sealed class NoRespondHandler : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var tcs = new TaskCompletionSource<HttpResponseMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+            cancellationToken.Register(() => tcs.TrySetCanceled(cancellationToken));
+            return tcs.Task;
+        }
+    }
 }

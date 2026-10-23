@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
+using System.Text.Json.Nodes;
 using OllamaRouter.Options;
 using OllamaRouter.Services;
 
@@ -408,6 +409,13 @@ public class ModelCapabilityEngineTests
         {
             RegisteredKeys.AddRange(keys);
         }
+
+        public Task<JsonArray?> GetStaleTagsAsync(string url) => Task.FromResult<JsonArray?>(null);
+        public void SetStaleTags(string url, JsonArray tags) { }
+        public Task<JsonArray?> GetStaleV1ModelsAsync(string url) => Task.FromResult<JsonArray?>(null);
+        public void SetStaleV1Models(string url, JsonArray data) { }
+        public Task<JsonArray?> GetStalePsAsync(string url) => Task.FromResult<JsonArray?>(null);
+        public void SetStalePs(string url, JsonArray models) { }
     }
 
     private static ModelCapabilityEngine CreateEngine(Mock<IOllamaModelCatalogClient>? catalogClient = null, IMemoryCache? memoryCache = null)

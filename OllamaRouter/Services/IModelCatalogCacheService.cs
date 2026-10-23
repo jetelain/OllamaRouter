@@ -1,3 +1,5 @@
+using System.Text.Json.Nodes;
+
 namespace OllamaRouter.Services;
 
 /// <summary>
@@ -59,4 +61,44 @@ public interface IModelCatalogCacheService
     /// digest different from the current one are discarded.
     /// </summary>
     void RegisterCapabilityCacheKeys(string baseUrl, IEnumerable<string> keys, string digest);
+
+    /// <summary>
+    /// Returns the last successfully fetched raw /api/tags array of the instance at
+    /// <paramref name="url"/> (full tag entries, not just names) for stale-while-revalidate
+    /// aggregation, or null when none is cached (yet). The slot expires after 60 s and is
+    /// refreshed only on a successful live fetch.
+    /// </summary>
+    Task<JsonArray?> GetStaleTagsAsync(string url);
+
+    /// <summary>
+    /// Writes the freshly fetched raw /api/tags array into the per-URL stale slot
+    /// (write-through, 60 s TTL). Only call on a successful live fetch.
+    /// </summary>
+    void SetStaleTags(string url, JsonArray tags);
+
+    /// <summary>
+    /// Returns the last successfully fetched raw /v1/models data array of the instance at
+    /// <paramref name="url"/> for stale-while-revalidate aggregation, or null when none is
+    /// cached (yet).
+    /// </summary>
+    Task<JsonArray?> GetStaleV1ModelsAsync(string url);
+
+    /// <summary>
+    /// Writes the freshly fetched raw /v1/models data array into the per-URL stale slot
+    /// (write-through, 60 s TTL). Only call on a successful live fetch.
+    /// </summary>
+    void SetStaleV1Models(string url, JsonArray data);
+
+    /// <summary>
+    /// Returns the last successfully fetched raw /api/ps models array of the instance at
+    /// <paramref name="url"/> for stale-while-revalidate aggregation, or null when none is
+    /// cached (yet).
+    /// </summary>
+    Task<JsonArray?> GetStalePsAsync(string url);
+
+    /// <summary>
+    /// Writes the freshly fetched raw /api/ps models array into the per-URL stale slot
+    /// (write-through, 60 s TTL). Only call on a successful live fetch.
+    /// </summary>
+    void SetStalePs(string url, JsonArray models);
 }
