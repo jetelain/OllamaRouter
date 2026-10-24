@@ -29,7 +29,8 @@ public sealed class OllamaRoutingMiddleware(
     ITargetLivenessService targetLiveness,
     ModelCapabilityEngine capabilityEngine,
     IOptions<OllamaRouterOptions> options,
-    ILogger<OllamaRoutingMiddleware> logger)
+    ILogger<OllamaRoutingMiddleware> logger,
+    ITargetExecutionTracker executionTracker = null!)
 {
     // During the first 10 s after the liveness prober started, an unresolved (Unknown)
     // target is treated as routable rather than offline, so a request arriving before the
@@ -461,6 +462,15 @@ public sealed class OllamaRoutingMiddleware(
         var capturingStream = new ResponseCapturingStream(originalBody);
         context.Response.Body = capturingStream;
 
+        // In-flight accounting (Cloud is a relay and is never counted): exactly one
+        // increment per real dispatch; the matching decrement lives in the finally
+        // block below, which is the single guaranteed exit path covering normal
+        // completion, forwarder errors, and client aborts alike.
+        if (target != RoutingTarget.Cloud)
+        {
+            executionTracker.IncrementInFlight(target);
+        }
+
         var requestId = activityMonitor.StartRequest(target, modelName, tokenCount);
         var stopwatch = Stopwatch.StartNew();
         var success = false;
@@ -478,6 +488,11 @@ public sealed class OllamaRoutingMiddleware(
         {
             stopwatch.Stop();
             context.Response.Body = originalBody;
+
+            if (target != RoutingTarget.Cloud)
+            {
+                executionTracker.DecrementInFlight(target);
+            }
 
             isClientAborted = isClientAborted || context.RequestAborted.IsCancellationRequested;
 

@@ -6,12 +6,14 @@ namespace OllamaRouter.Services;
 /// In-memory implementation of <see cref="IActivityMonitorService"/>. Keeps only a bounded
 /// number of recent requests, so memory usage stays negligible and no VRAM is involved.
 /// </summary>
-public sealed class ActivityMonitorService : IActivityMonitorService
+public sealed class ActivityMonitorService(
+    ITargetExecutionTracker? executionTracker = null) : IActivityMonitorService
 {
     private const int MaxHistory = 50;
 
     private readonly ConcurrentDictionary<Guid, InProgressRequest> _inProgress = new();
     private readonly ConcurrentQueue<ActivityLogEntry> _history = new();
+    private readonly ITargetExecutionTracker? _executionTracker = executionTracker;
 
     public Guid StartRequest(RoutingTarget target, string model, int estimatedPromptTokens)
     {
@@ -51,6 +53,9 @@ public sealed class ActivityMonitorService : IActivityMonitorService
     {
         return _inProgress.Values.Any(r => r.Target == target);
     }
+
+    public IReadOnlyList<TargetExecutionState> GetTargetStates() =>
+        _executionTracker?.GetAllStates() ?? [];
 
     public int GetConsecutiveFailures(RoutingTarget target, int estimatedPromptTokens, int tokenTolerance = 4000)
     {

@@ -65,6 +65,14 @@ public interface IActivityMonitorService
     bool IsBusy(RoutingTarget target);
 
     /// <summary>
+    /// Returns the per-target execution-state snapshots from the
+    /// <see cref="ITargetExecutionTracker"/> (loaded models, VRAM, in-flight request counts),
+    /// feeding the monitor UI's per-target display and the busy flags in later phases.
+    /// Returns an empty list when no tracker was injected.
+    /// </summary>
+    IReadOnlyList<TargetExecutionState> GetTargetStates();
+
+    /// <summary>
     /// Returns the number of consecutive failed adjacent requests for the specified target and estimated token count
     /// (within the specified token tolerance margin), scanning backwards from the most recent completed request
     /// until a request outside the token margin or a successful request is encountered.

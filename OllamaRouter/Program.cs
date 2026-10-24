@@ -127,6 +127,13 @@ builder.Services.AddSingleton<ITargetLivenessService>(sp => new TargetLivenessSe
     sp.GetRequiredService<ILogger<TargetLivenessService>>(),
     TimeSpan.FromSeconds(10)));
 builder.Services.AddHostedService(sp => (IHostedService)sp.GetRequiredService<ITargetLivenessService>());
+// Multi-target execution state tracker (Phase 3): caches GET /api/ps per online target with a
+// 2 s TTL and maintains per-target in-flight request counters for the routing decision
+// pipeline. HTTP access reuses the existing typed IOllamaModelCatalogClient (no new named
+// client); the refresh loop runs in its own hosted service so the tracker stays
+// unit-testable without IHostedService ceremony.
+builder.Services.AddSingleton<ITargetExecutionTracker, TargetExecutionTracker>();
+builder.Services.AddHostedService<TargetExecutionTrackerRefreshService>();
 
 var app = builder.Build();
 

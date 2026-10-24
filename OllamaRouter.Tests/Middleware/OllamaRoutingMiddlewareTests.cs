@@ -87,7 +87,8 @@ public class OllamaRoutingMiddlewareTests
             effectiveTargetLiveness.Object,
             effectiveCapabilityEngine,
             MsOptions.Create(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
-            NullLogger<OllamaRoutingMiddleware>.Instance);
+            NullLogger<OllamaRoutingMiddleware>.Instance,
+            new Mock<ITargetExecutionTracker>().Object);
     }
 
     [Fact]
@@ -971,7 +972,8 @@ public class OllamaRoutingMiddlewareTests
             liveness.Object,
             new ModelCapabilityEngine(new Mock<IOllamaModelCatalogClient>().Object, new MemoryCache(new MemoryCacheOptions()), NullLogger<ModelCapabilityEngine>.Instance),
             optionsWrapper,
-            NullLogger<OllamaRoutingMiddleware>.Instance);
+            NullLogger<OllamaRoutingMiddleware>.Instance,
+            new Mock<ITargetExecutionTracker>().Object);
 
         await sut.InvokeAsync(context);
 
@@ -1041,7 +1043,8 @@ public class OllamaRoutingMiddlewareTests
             liveness.Object,
             new ModelCapabilityEngine(new Mock<IOllamaModelCatalogClient>().Object, new MemoryCache(new MemoryCacheOptions()), NullLogger<ModelCapabilityEngine>.Instance),
             optionsWrapper,
-            NullLogger<OllamaRoutingMiddleware>.Instance);
+            NullLogger<OllamaRoutingMiddleware>.Instance,
+            new Mock<ITargetExecutionTracker>().Object);
 
         await sut.InvokeAsync(context);
 
@@ -1166,7 +1169,8 @@ public class OllamaRoutingMiddlewareTests
             liveness.Object,
             new ModelCapabilityEngine(new Mock<IOllamaModelCatalogClient>().Object, new MemoryCache(new MemoryCacheOptions()), NullLogger<ModelCapabilityEngine>.Instance),
             optionsWrapper,
-            NullLogger<OllamaRoutingMiddleware>.Instance);
+            NullLogger<OllamaRoutingMiddleware>.Instance,
+            new Mock<ITargetExecutionTracker>().Object);
 
         await sut.InvokeAsync(context);
 
@@ -1269,7 +1273,8 @@ public class OllamaRoutingMiddlewareTests
             liveness.Object,
             capabilityEngine,
             MsOptions.Create(options),
-            NullLogger<OllamaRoutingMiddleware>.Instance);
+            NullLogger<OllamaRoutingMiddleware>.Instance,
+            new Mock<ITargetExecutionTracker>().Object);
     }
 
     private static Mock<IModelCatalogCacheService> DigestCache(string digest)
@@ -1535,7 +1540,8 @@ public class OllamaRoutingMiddlewareTests
             liveness.Object,
             capabilityEngine,
             MsOptions.Create(options),
-            NullLogger<OllamaRoutingMiddleware>.Instance);
+            NullLogger<OllamaRoutingMiddleware>.Instance,
+            new Mock<ITargetExecutionTracker>().Object);
 
         await sut.InvokeAsync(context);
 
