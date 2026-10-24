@@ -42,6 +42,10 @@ public sealed class TargetExecutionTracker : ITargetExecutionTracker
     private readonly ILogger<TargetExecutionTracker> _logger;
     private readonly TimeSpan _refreshTtl;
     private readonly TimeSpan _perTargetBudget;
+    // Auto-Shrink Manager lease invalidation hook (Phase 3, item 2): invoked per evicted model
+    // name on a successful /api/ps refresh. OPTIONAL - defaults to null so existing unit tests
+    // construct the tracker unmodified; Program.cs injects the singleton via the SP factory.
+    private readonly IContextAutoShrinkManager? _contextShrinkManager;
     private readonly ConcurrentDictionary<RoutingTarget, TargetExecutionSlot> _slots = new();
 
     // When (UTC) the last fan-out completed (success or failure); MinValue = never refreshed.
@@ -68,14 +72,17 @@ public sealed class TargetExecutionTracker : ITargetExecutionTracker
         IOllamaModelCatalogClient catalogClient,
         ILogger<TargetExecutionTracker> logger,
         TimeSpan? refreshTtl = null,
-        TimeSpan? perTargetBudget = null)
-        : this(options.Value, liveness, targetAvailability, catalogClient, logger, refreshTtl, perTargetBudget)
+        TimeSpan? perTargetBudget = null,
+        IContextAutoShrinkManager? contextShrinkManager = null)
+        : this(options.Value, liveness, targetAvailability, catalogClient, logger, refreshTtl, perTargetBudget, contextShrinkManager)
     {
     }
 
     /// <summary>
     /// Test-friendly constructor accepting an already-resolved options instance (same defaults
-    /// as the <see cref="IOptions{TOptions}"/> overload).
+    /// as the <see cref="IOptions{TOptions}"/> overload). <paramref name="contextShrinkManager"/>
+    /// is the optional Auto-Shrink Manager lease-invalidation hook (null = no lease resets,
+    /// the pre-Phase-3 behavior) so existing unit tests keep compiling unmodified.
     /// </summary>
     public TargetExecutionTracker(
         OllamaRouterOptions options,
@@ -84,12 +91,14 @@ public sealed class TargetExecutionTracker : ITargetExecutionTracker
         IOllamaModelCatalogClient catalogClient,
         ILogger<TargetExecutionTracker> logger,
         TimeSpan? refreshTtl = null,
-        TimeSpan? perTargetBudget = null)
+        TimeSpan? perTargetBudget = null,
+        IContextAutoShrinkManager? contextShrinkManager = null)
     {
         _options = options;
         _liveness = liveness;
         _catalogClient = catalogClient;
         _logger = logger;
+        _contextShrinkManager = contextShrinkManager;
         _refreshTtl = refreshTtl ?? DefaultRefreshTtl;
 
         // Per-target budget: the injected override, else the configured aggregation budget,
@@ -266,13 +275,45 @@ public sealed class TargetExecutionTracker : ITargetExecutionTracker
 
         var slot = _slots.GetOrAdd(routingTarget, _ => new TargetExecutionSlot());
 
+        var evicted = new List<string>();
         lock (slot.ModelGate)
         {
             if (result.Succeeded)
             {
-                slot.Models = ParseModels(result.Array!);
+                var parsedModels = ParseModels(result.Array!);
+                slot.Models = parsedModels;
                 slot.Stale = false;
                 slot.LastRefreshedAtUtc = DateTimeOffset.UtcNow;
+
+                // Eviction diff (Phase 3, item 2): models seen on the LAST successful refresh
+                // but absent from THIS one have been evicted (or never loaded). Their KV cache
+                // is gone, so their auto-shrink leases must not survive a reload with a fresh
+                // (un-sized) context. Comparison is over normalized names (tag stripped) so a
+                // name reported with/without ":latest" still matches.
+                var currentNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var model in parsedModels)
+                {
+                    if (!string.IsNullOrWhiteSpace(model.Name))
+                    {
+                        currentNames.Add(RoutingDecisionService.NormalizeModelName(model.Name));
+                    }
+                }
+
+                var evictedNames = new List<string>();
+                if (slot.LastSeenModelNames.Count > 0)
+                {
+                    foreach (var previousName in slot.LastSeenModelNames)
+                    {
+                        if (!currentNames.Contains(previousName))
+                        {
+                            evictedNames.Add(previousName);
+                        }
+                    }
+                }
+
+                slot.LastSeenModelNames = currentNames;
+                slot.LastEvictedModelNames = evictedNames;
+                evicted = evictedNames;
             }
             else
             {
@@ -281,6 +322,38 @@ public sealed class TargetExecutionTracker : ITargetExecutionTracker
                 slot.Stale = true;
             }
         }
+
+        if (result.Succeeded && evicted.Count > 0 && _contextShrinkManager is { } shrinkManager)
+        {
+            // Outside the gate (the reset APIs are idempotent and non-blocking). The list was
+            // captured under the gate above, so it is exactly the diff of THIS refresh; a
+            // concurrent refresh replaces the slot's diff but can only evict names already
+            // covered by its own diff (its reset runs with its own captured list).
+            foreach (var name in evicted)
+            {
+                shrinkManager.ResetModelLease(routingTarget, name);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Returns the model names (normalized, tag-stripped) that were loaded on the target at the
+    /// LAST successful refresh but are absent from the CURRENT one - i.e. the models evicted by
+    /// the most recent successful refresh (empty when the target has never been successfully
+    /// refreshed or nothing was evicted). Each returned name also had its auto-shrink lease
+    /// reset by the refresh (when the <see cref="IContextAutoShrinkManager"/> was injected).
+    /// </summary>
+    public IReadOnlyList<string> GetEvictedModelNames(RoutingTarget target)
+    {
+        if (_slots.TryGetValue(target, out var slot))
+        {
+            lock (slot.ModelGate)
+            {
+                return new List<string>(slot.LastEvictedModelNames);
+            }
+        }
+
+        return Array.Empty<string>();
     }
 
     /// <summary>
@@ -374,9 +447,9 @@ public sealed class TargetExecutionTracker : ITargetExecutionTracker
 
     /// <summary>
     /// Mutable per-target execution state. <see cref="ModelGate"/> guards only the model-data
-    /// fields (list, timestamp, stale flag); the <see cref="InFlight"/> counter is manipulated
-    /// exclusively with <see cref="Interlocked"/> and is never under the gate, so counters
-    /// cannot block on (or be blocked by) snapshot/refresh work.
+    /// fields (list, timestamp, stale flag, seen/evicted name sets); the <see cref="InFlight"/>
+    /// counter is manipulated exclusively with <see cref="Interlocked"/> and is never under the
+    /// gate, so counters cannot block on (or be blocked by) snapshot/refresh work.
     /// </summary>
     private sealed class TargetExecutionSlot
     {
@@ -385,6 +458,11 @@ public sealed class TargetExecutionTracker : ITargetExecutionTracker
         public List<TargetLoadedModel> Models { get; set; } = [];
         public DateTimeOffset LastRefreshedAtUtc { get; set; } = DateTimeOffset.MinValue;
         public bool Stale { get; set; } = true;
+
+        // Normalized (tag-stripped) model names from the LAST SUCCESSFUL refresh (empty before
+        // the first success), plus the names evicted by that last successful refresh.
+        public HashSet<string> LastSeenModelNames { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+        public IReadOnlyList<string> LastEvictedModelNames { get; set; } = Array.Empty<string>();
 
         // In-flight counter, manipulated with Interlocked only (floor-at-0 on decrement).
         public int InFlight;

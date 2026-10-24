@@ -76,6 +76,13 @@ builder.Services.AddTransient<IRoutingTargetHandler, RemoteRoutingTargetHandler>
 builder.Services.AddTransient<IRoutingTargetHandler, CloudRoutingTargetHandler>();
 builder.Services.AddTransient<IRoutingDecisionService, RoutingDecisionService>();
 builder.Services.AddSingleton<IModelCatalogCacheService, ModelCatalogCacheService>();
+// Auto-Shrink Manager (Phase 3, item 2): per-(target, model) context-bucket leases with
+// KV-cache-hysteresis (cooldown turns / idle timeout / 50%-baseline drop). Singleton: the
+// middleware consumes it per request, and the execution tracker's eviction diff invalidates
+// leases. State is in-memory only and never survives a target offline/online cycle or a
+// model eviction (both components call the reset APIs).
+builder.Services.AddSingleton<IContextAutoShrinkManager>(sp => new ContextAutoShrinkManager(
+    sp.GetRequiredService<ILogger<ContextAutoShrinkManager>>()));
 // Parallel fleet aggregation (Phase 4): GET /api/tags, /v1/models, /api/ps fan out over the
 // online targets with a strict per-target budget (stale-while-revalidate fallback), and
 // POST /api/show is model-directed with a 30 s in-memory response cache.
@@ -131,8 +138,15 @@ builder.Services.AddHostedService(sp => (IHostedService)sp.GetRequiredService<IT
 // 2 s TTL and maintains per-target in-flight request counters for the routing decision
 // pipeline. HTTP access reuses the existing typed IOllamaModelCatalogClient (no new named
 // client); the refresh loop runs in its own hosted service so the tracker stays
-// unit-testable without IHostedService ceremony.
-builder.Services.AddSingleton<ITargetExecutionTracker, TargetExecutionTracker>();
+// unit-testable without IHostedService ceremony. SP factory: the tracker receives the
+// Auto-Shrink Manager so it can reset leases of models evicted between /api/ps refreshes.
+builder.Services.AddSingleton<ITargetExecutionTracker>(sp => new TargetExecutionTracker(
+    sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
+    sp.GetRequiredService<ITargetLivenessService>(),
+    sp.GetRequiredService<ITargetAvailabilityService>(),
+    sp.GetRequiredService<IOllamaModelCatalogClient>(),
+    sp.GetRequiredService<ILogger<TargetExecutionTracker>>(),
+    contextShrinkManager: sp.GetRequiredService<IContextAutoShrinkManager>()));
 builder.Services.AddHostedService<TargetExecutionTrackerRefreshService>();
 
 var app = builder.Build();

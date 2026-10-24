@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -30,12 +31,30 @@ public sealed class OllamaRoutingMiddleware(
     ModelCapabilityEngine capabilityEngine,
     IOptions<OllamaRouterOptions> options,
     ILogger<OllamaRoutingMiddleware> logger,
-    ITargetExecutionTracker executionTracker = null!)
+    ITargetExecutionTracker executionTracker = null!,
+    IContextAutoShrinkManager? contextShrinkManager = null)
 {
     // During the first 10 s after the liveness prober started, an unresolved (Unknown)
     // target is treated as routable rather than offline, so a request arriving before the
     // boot probe completes is never bounced to 503 merely because probing is slow.
     private static readonly TimeSpan StartupGracePeriod = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// The Auto-Shrink Manager (Phase 3, item 2): consulted after the stateless sizing decision
+    /// to apply the KV-cache-hysteresis lease (retain an expanded bucket across the cooldown /
+    /// idle window, inject a shrink when a trigger fires). Nullable for unit-test compatibility
+    /// with the pre-lease pipeline: when null, the middleware keeps the exact stateless sizing
+    /// behavior (no lease, no <c>X-OllamaRouter-Context-Mode</c> header, no lease resets).
+    /// Registered as a singleton in production (see <c>Program.cs</c>); the execution tracker
+    /// (model-eviction signal) and this middleware (offline/online liveness transitions) are the
+    /// two components that invalidate leases.
+    /// </summary>
+    private readonly IContextAutoShrinkManager? _contextShrinkManager = contextShrinkManager;
+
+    // Last-seen raw liveness state per target, used to detect offline/online TRANSITIONS so
+    // the Auto-Shrink Manager's leases are reset exactly when a daemon (re)loads (its KV cache
+    // is unknown at that point and no stale expanded bucket may be assigned to it).
+    private readonly ConcurrentDictionary<RoutingTarget, TargetLivenessState> _lastLivenessState = new();
 
     public async Task InvokeAsync(HttpContext context)
     {
@@ -229,6 +248,30 @@ public sealed class OllamaRoutingMiddleware(
             CloudEnabled: false);
     }
 
+    // Auto-Shrink lease invalidation on liveness TRANSITIONS: the KV cache of a daemon that
+    // went offline (or came back online and reloaded its models) is unknown, so no stale
+    // expanded bucket may be assigned to a freshly loaded model. The transition is detected
+    // against the last state this middleware observed for the target; a null first observation
+    // is NOT a transition (the prober may simply have resolved the target for the first time).
+    private void ResetLeasesOnLivenessTransition(RoutingTarget target, TargetLivenessState newState)
+    {
+        if (_contextShrinkManager is null || target == RoutingTarget.Cloud)
+        {
+            return;
+        }
+
+        if (_lastLivenessState.TryGetValue(target, out var previous) && previous != newState)
+        {
+            if (newState == TargetLivenessState.Offline || previous == TargetLivenessState.Offline)
+            {
+                logger.LogInformation("Target {Target} liveness transitioned {Previous} -> {New}; resetting its auto-shrink context leases.", target.Value, previous, newState);
+                _contextShrinkManager.ResetTargetLeases(target);
+            }
+        }
+
+        _lastLivenessState[target] = newState;
+    }
+
     private static bool IsCompletionRequest(HttpContext context)
     {
         return context.Request.Method == HttpMethods.Post &&
@@ -386,7 +429,8 @@ public sealed class OllamaRoutingMiddleware(
         // Cloud whenever Cloud is available, regardless of relay-target liveness).
         if (target != RoutingTarget.Cloud)
         {
-            await targetLiveness.EnsureKnownAsync(target, context.RequestAborted);
+            var preDispatchState = await targetLiveness.EnsureKnownAsync(target, context.RequestAborted);
+            ResetLeasesOnLivenessTransition(target, preDispatchState);
 
             if (IsFleetAllOffline())
             {
@@ -418,6 +462,9 @@ public sealed class OllamaRoutingMiddleware(
         var (injectedNumCtx, sizedBody) = target != RoutingTarget.Cloud
             ? await TryApplyDynamicContextSizingAsync(context, target, modelName, tokenCount, body)
             : (null, null);
+        var contextModeHeader = context.Response.Headers.ContainsKey("X-OllamaRouter-Context-Mode")
+            ? context.Response.Headers["X-OllamaRouter-Context-Mode"].ToString()
+            : null;
         if (sizedBody is not null)
         {
             body = sizedBody; // Record the payload actually sent to the target.
@@ -439,6 +486,10 @@ public sealed class OllamaRoutingMiddleware(
             if (injectedNumCtx.HasValue)
             {
                 context.Response.Headers["X-OllamaRouter-Context-Size"] = injectedNumCtx.Value.ToString();
+            }
+            if (contextModeHeader is not null)
+            {
+                context.Response.Headers["X-OllamaRouter-Context-Mode"] = contextModeHeader;
             }
 
             return Task.CompletedTask;
@@ -725,7 +776,31 @@ public sealed class OllamaRoutingMiddleware(
                 tokenCount,
                 clientNumCtx);
 
-            var (rewritten, injected) = DynamicContextPayloadTransformer.Apply(body, decision, dynamicOptions);
+            // Auto-Shrink Manager (Phase 3, item 2): apply the KV-cache-hysteresis lease on
+            // top of the stateless engine decision - it may RETAIN an expanded bucket (KV
+            // prefix cache preserved) or fire a shrink back to the baseline bucket. When the
+            // manager is absent (null, pre-lease test pipeline) the engine decision stands.
+            int injectedValue = decision.InjectedNumCtx;
+            LeaseBucketState? leaseState = null;
+            if (_contextShrinkManager is { } shrinkManager)
+            {
+                var leaseDecision = shrinkManager.Decide(target, normalizedName, decision, dynamicOptions, tokenCount, DateTimeOffset.UtcNow);
+                injectedValue = leaseDecision.InjectedNumCtx;
+                leaseState = leaseDecision.State;
+                if (leaseDecision.State is LeaseBucketState.FreshExpand or LeaseBucketState.ShrunkToBaseline)
+                {
+                    logger.LogInformation(
+                        "Auto-shrink lease {State}: {Model} on {Target} - injected bucket {Injected} (engine wanted {EngineBucket}; trigger: {Trigger}).",
+                        leaseDecision.State,
+                        modelName,
+                        target.Value,
+                        injectedValue,
+                        decision.InjectedNumCtx,
+                        leaseDecision.Trigger?.ToString() ?? "n/a");
+                }
+            }
+
+            var (rewritten, injected) = DynamicContextPayloadTransformer.Apply(body, injectedValue, dynamicOptions);
             if (injected is null)
             {
                 return (null, null);
@@ -735,6 +810,13 @@ public sealed class OllamaRoutingMiddleware(
             context.Request.Body = new MemoryStream(bodyBytes);
             context.Request.ContentLength = bodyBytes.Length;
             context.Request.Body.Position = 0; // Ready for the forwarder (and the recorder) to read.
+
+            // Informational response header: the lease mode of this request (retained vs
+            // fresh/shrunk vs baseline) when the Auto-Shrink Manager participates.
+            if (leaseState is { } mode)
+            {
+                context.Response.Headers["X-OllamaRouter-Context-Mode"] = mode.ToString();
+            }
 
             logger.LogInformation(
                 "Dynamic context sizing: {Model} on {Target} - {Tokens} estimated tokens, client num_ctx {ClientNumCtx}, injected bucket {Injected} (profile {Profile}, ceiling {Ceiling}, clamped {Clamped}).",

@@ -21,8 +21,9 @@ public sealed record ContextSizingDecision(
 /// Zero-Config Routing Plan): maps an architecture + target hardware pair to a bucket
 /// profile, selects the quantized elastic context bucket for a request, and evaluates the
 /// Stage-1 hardware suitability hard filter. Sizing is a pure function of (options,
-/// capability, request facts) - lease/cooldown hysteresis state arrives with the
-/// Auto-Shrink Manager (a later task).
+/// capability, request facts) - lease/cooldown hysteresis state is maintained by the
+/// Auto-Shrink Manager (<c>IContextAutoShrinkManager</c>, Phase 3 item 2), which consumes
+/// this engine's decision per request.
 /// </summary>
 public static class DynamicContextSizingEngine
 {

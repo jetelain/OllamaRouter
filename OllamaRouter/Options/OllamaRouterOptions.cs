@@ -317,9 +317,10 @@ public sealed class DynamicContextProfile
 /// <summary>
 /// Dynamic context sizing configuration (Phase 2, items 3-4 of the Multi-Target Zero-Config
 /// Routing Plan): per-request quantized elastic context bucketing with
-/// <c>options.num_ctx</c> injection. Sizing is stateless per request in this release; the
-/// Auto-Shrink hysteresis options are bound and stored here but consumed by the Auto-Shrink
-/// Manager in a later task.
+/// <c>options.num_ctx</c> injection. Base sizing is stateless per request; the Auto-Shrink
+/// hysteresis options below are bound and stored here and CONSUMED in this release by the
+/// Auto-Shrink Manager (<c>IContextAutoShrinkManager</c>, Phase 3 item 2), which retains an
+/// expanded bucket across cooldown/idle windows before injecting a shrink turn.
 /// </summary>
 public sealed class DynamicContextOptions
 {
@@ -354,16 +355,19 @@ public sealed class DynamicContextOptions
     public int BucketStepTokens { get; set; } = DefaultBucketStepTokens;
 
     /// <summary>
-    /// Cooldown (in turns) applied by the Auto-Shrink Manager after an auto-shrink event before
-    /// the context may shrink again. Stored in this release and consumed by the Auto-Shrink
-    /// Manager in a later task. Defaults to 3.
+    /// Cooldown (in turns) applied by the Auto-Shrink Manager after a context spike before the
+    /// context may shrink back to the baseline bucket: while an expanded bucket is active, up to
+    /// this many consecutive normal-size turns are RETAINED (the KV prefix cache is preserved)
+    /// before a shrink turn is injected. Consumed in this release by the Auto-Shrink Manager
+    /// (<c>IContextAutoShrinkManager</c>). Defaults to 3.
     /// </summary>
     public int AutoShrinkCooldownTurns { get; set; } = 3;
 
     /// <summary>
     /// Idle timeout (in seconds) the Auto-Shrink Manager waits before shrinking an active
-    /// session's context. Stored in this release and consumed by the Auto-Shrink Manager in a
-    /// later task. Defaults to 60.
+    /// session's context: while an expanded bucket is active, the lease is retained until this
+    /// much idle time has elapsed (detected at the next request - no background timer). Consumed
+    /// in this release by the Auto-Shrink Manager (<c>IContextAutoShrinkManager</c>). Defaults to 60.
     /// </summary>
     public int AutoShrinkIdleTimeoutSeconds { get; set; } = 60;
 

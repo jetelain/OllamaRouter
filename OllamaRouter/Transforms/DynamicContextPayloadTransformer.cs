@@ -36,7 +36,27 @@ public static class DynamicContextPayloadTransformer
         ContextSizingDecision decision,
         DynamicContextOptions dynamic)
     {
-        if (!dynamic.Enabled || decision.InjectedNumCtx <= 0)
+        return Apply(body, decision.InjectedNumCtx, dynamic);
+    }
+
+    /// <summary>
+    /// Applies an explicit <c>num_ctx</c> value to the request body: same tolerance rules as the
+    /// <see cref="Apply(string, ContextSizingDecision, DynamicContextOptions)"/> overload (unparseable
+    /// body returned unchanged; only <c>options.num_ctx</c> is touched), but the value is taken
+    /// directly from the caller instead of a <see cref="ContextSizingDecision"/>. This is the
+    /// entry point the Auto-Shrink Manager uses to inject a lease-retained (or lease-shrunk)
+    /// bucket WITHOUT re-running the stateless <see cref="DynamicContextSizingEngine.Decide"/>
+    /// path. A non-positive <paramref name="injectedNumCtx"/> is treated like a disabled dynamic
+    /// section (no rewrite).
+    /// </summary>
+    /// <returns>The (possibly rewritten) JSON body and the injected <c>num_ctx</c> value
+    /// (null when no rewrite happened).</returns>
+    public static (string NewBody, int? InjectedNumCtx) Apply(
+        string body,
+        int injectedNumCtx,
+        DynamicContextOptions dynamic)
+    {
+        if (!dynamic.Enabled || injectedNumCtx <= 0)
         {
             return (body, null);
         }
@@ -50,17 +70,17 @@ public static class DynamicContextPayloadTransformer
 
             if (root["options"] is JsonObject options)
             {
-                options["num_ctx"] = decision.InjectedNumCtx;
+                options["num_ctx"] = injectedNumCtx;
             }
             else
             {
                 root["options"] = new JsonObject
                 {
-                    ["num_ctx"] = decision.InjectedNumCtx
+                    ["num_ctx"] = injectedNumCtx
                 };
             }
 
-            return (root.ToJsonString(), decision.InjectedNumCtx);
+            return (root.ToJsonString(), injectedNumCtx);
         }
         catch (JsonException)
         {

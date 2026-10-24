@@ -122,6 +122,33 @@ public class TargetExecutionTrackerTests : IDisposable
         }
     }
 
+    // Records the reset calls made by the tracker so tests can assert which (target, model)
+    // leases were invalidated by an eviction between /api/ps refreshes.
+    private sealed class RecordingShrinkManager : IContextAutoShrinkManager
+    {
+        public readonly List<(RoutingTarget Target, string ModelName)> ResetModelCalls = [];
+        public readonly List<RoutingTarget> ResetTargetCalls = [];
+
+        public AutoShrinkLeaseDecision Decide(RoutingTarget target, string modelName, ContextSizingDecision engineDecision, DynamicContextOptions dynamic, long estimatedTokens, DateTimeOffset nowUtc)
+            => new(engineDecision.InjectedNumCtx, LeaseBucketState.Baseline, false, null);
+
+        public void ResetTargetLeases(RoutingTarget target)
+        {
+            lock (ResetTargetCalls)
+            {
+                ResetTargetCalls.Add(target);
+            }
+        }
+
+        public void ResetModelLease(RoutingTarget target, string modelName)
+        {
+            lock (ResetModelCalls)
+            {
+                ResetModelCalls.Add((target, modelName));
+            }
+        }
+    }
+
     private static OllamaRouterOptions ThreeTargetOptions() => new()
     {
         Targets =
@@ -612,6 +639,119 @@ public class TargetExecutionTrackerTests : IDisposable
         Assert.True(state.Stale);
         Assert.Equal(DateTimeOffset.MinValue, state.LastRefreshedAtUtc);
         Assert.Equal(0, state.InFlightRequests);
+    }
+
+    // ------------------------------------------------------------------
+    //  Phase 3 (item 2) — model-eviction lease invalidation
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task Refresh_ModelEvictionBetweenRefreshes_ResetsItsLeaseOnly()
+    {
+        var firstRefresh = true;
+        var catalog = new CountingCatalogClient(baseUrl =>
+        {
+            if (!string.Equals(baseUrl, AlphaUrl, StringComparison.OrdinalIgnoreCase))
+            {
+                return (new JsonArray(), true);
+            }
+
+            return firstRefresh
+                ? (Ps(("a:latest", 1000, null), ("b:latest", 2000, null)), true)
+                : (Ps(("a:latest", 1000, null)), true); // b:latest evicted.
+        });
+
+        var liveness = new Mock<ITargetLivenessService>();
+        SetupLiveness(liveness, includeCloud: false);
+
+        var shrinkManager = new RecordingShrinkManager();
+        var sut = new TargetExecutionTracker(
+            MsOptions.Create(ThreeTargetOptions()),
+            liveness.Object,
+            new Mock<ITargetAvailabilityService>().Object,
+            catalog,
+            NullLogger<TargetExecutionTracker>.Instance,
+            refreshTtl: TimeSpan.FromMilliseconds(1),
+            contextShrinkManager: shrinkManager);
+
+        await sut.RefreshAsync();
+        Assert.Empty(shrinkManager.ResetModelCalls); // First successful refresh: nothing evicted.
+
+        firstRefresh = false;
+        await Task.Delay(100); // Well past the (shortened) TTL.
+        await sut.RefreshAsync();
+
+        // The evicted model (normalized: tag stripped) had its lease reset; the retained model did not.
+        var calls = shrinkManager.ResetModelCalls.ToList();
+        Assert.Single(calls);
+        Assert.Equal(Ta, calls[0].Target);
+        Assert.Equal("b", calls[0].ModelName); // Normalized "b:latest" -> "b".
+        Assert.Empty(shrinkManager.ResetTargetCalls);
+
+        // GetEvictedModelNames exposes the same diff for observability.
+        var evicted = sut.GetEvictedModelNames(Ta);
+        Assert.Equal(["b"], evicted);
+    }
+
+    [Fact]
+    public async Task Refresh_NoEviction_ReportsNoEvictedModels()
+    {
+        var catalog = new CountingCatalogClient(_ =>
+            (Ps(("a:latest", 1000, null), ("b:latest", 2000, null)), true));
+        var liveness = new Mock<ITargetLivenessService>();
+        SetupLiveness(liveness, includeCloud: false);
+
+        var shrinkManager = new RecordingShrinkManager();
+        var sut = new TargetExecutionTracker(
+            MsOptions.Create(ThreeTargetOptions()),
+            liveness.Object,
+            new Mock<ITargetAvailabilityService>().Object,
+            catalog,
+            NullLogger<TargetExecutionTracker>.Instance,
+            refreshTtl: TimeSpan.FromMilliseconds(1),
+            contextShrinkManager: shrinkManager);
+
+        await sut.RefreshAsync();
+        Assert.Empty(sut.GetEvictedModelNames(Ta));
+
+        await Task.Delay(100);
+        await sut.RefreshAsync();
+
+        // Same model set on both refreshes: no eviction, no lease reset.
+        Assert.Empty(sut.GetEvictedModelNames(Ta));
+        Assert.Empty(shrinkManager.ResetModelCalls);
+    }
+
+    [Fact]
+    public async Task Refresh_FailedRefresh_DoesNotResetLeases()
+    {
+        var failing = false;
+        var catalog = new CountingCatalogClient(_ =>
+            failing
+                ? (null, false)
+                : (Ps(("a:latest", 1000, null)), true));
+        var liveness = new Mock<ITargetLivenessService>();
+        SetupLiveness(liveness, includeCloud: false);
+
+        var shrinkManager = new RecordingShrinkManager();
+        var sut = new TargetExecutionTracker(
+            MsOptions.Create(ThreeTargetOptions()),
+            liveness.Object,
+            new Mock<ITargetAvailabilityService>().Object,
+            catalog,
+            NullLogger<TargetExecutionTracker>.Instance,
+            refreshTtl: TimeSpan.FromMilliseconds(1),
+            contextShrinkManager: shrinkManager);
+
+        await sut.RefreshAsync();
+        // A failed refresh is stale-while-revalidate: the model set is unchanged and no leases
+        // are reset (eviction is only concluded from a SUCCESSFUL /api/ps response).
+        failing = true;
+        await Task.Delay(100);
+        await sut.RefreshAsync();
+
+        Assert.Empty(sut.GetEvictedModelNames(Ta));
+        Assert.Empty(shrinkManager.ResetModelCalls);
     }
 
     // ------------------------------------------------------------------
