@@ -1411,6 +1411,8 @@ public class OllamaRoutingMiddlewareTests
         // The routing decision is untouched: the bucket is hosted by the current (96 GB) target.
         Assert.Equal("Local", context.Request.Headers["X-Ollama-Target"]);
         Assert.Equal("221184", context.Response.Headers["X-OllamaRouter-Context-Size"]);
+        // The estimated-tokens telemetry header matches the estimator output (overhead factor 1.0).
+        Assert.Equal("200000", context.Response.Headers["X-OllamaRouter-Estimated-Tokens"]);
     }
 
     [Fact]
@@ -2220,5 +2222,298 @@ public class OllamaRoutingMiddlewareTests
         Assert.Equal(new[] { FailoverRemoteUrl, FailoverLocalUrl }, sentUrls);
         Assert.Equal(200, context.Response.StatusCode);
         Assert.Equal(1, streak.GetStreak(RoutingTarget.Remote));
+    }
+
+    // ================================================================================
+    // §2.6 header architecture (task #9): pinning capability gate, inbound sanitization,
+    // telemetry headers.
+    // ================================================================================
+
+    // Pinning (completion pipeline): an eligible (configured + enabled + online + capable)
+    // pin routes strictly to the named target and the response echoes the telemetry header.
+    [Fact]
+    public async Task Pin_EligibleOnlineTarget_RoutesStrictlyThere_EchoesTelemetryHeader()
+    {
+        var context = BuildContext("/api/chat", FailoverBody);
+        context.Request.Headers["X-OllamaRouter-Target"] = "Remote";
+        var forwardedUrls = new List<string>();
+
+        var cache = new Mock<IModelCatalogCacheService>();
+        cache.Setup(c => c.ModelExistsAsync(It.IsAny<string?>(), "llama3", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true); // capable: the model exists on the pinned target
+
+        var tokenEstimator = Estimator();
+        var decision = new Mock<IRoutingDecisionService>();
+        // Deliberately a different target than the pin: it must never be consulted.
+        decision.Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var forwarder = new Mock<IHttpForwarder>();
+        forwarder.Setup(f => f.SendAsync(
+                It.IsAny<HttpContext>(), It.IsAny<string>(), It.IsAny<HttpMessageInvoker>(),
+                It.IsAny<ForwarderRequestConfig>(), It.IsAny<HttpTransformer>(), It.IsAny<CancellationToken>()))
+            .Callback<HttpContext, string, HttpMessageInvoker, ForwarderRequestConfig, HttpTransformer, CancellationToken>(
+                (c, url, _, _, _, _) => forwardedUrls.Add(url))
+            .Returns(new ValueTask<ForwarderError>(ForwarderError.None));
+
+        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, decision,
+            modelCatalogCache: cache, forwarder: forwarder);
+        await sut.InvokeAsync(context);
+
+        // Strictly pinned: forwarded to the Remote daemon's URL, never to Local.
+        Assert.Equal(new[] { "http://remote:11434" }, forwardedUrls);
+        Assert.Equal("Remote", context.Request.Headers["X-Ollama-Target"]);
+        decision.Verify(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+        // Telemetry echoes the pinned (served) target.
+        Assert.Equal("Remote", context.Response.Headers["X-OllamaRouter-Target"]);
+    }
+
+    // Pinning: an unconfigured pin name falls back to the normal scoring pipeline.
+    [Fact]
+    public async Task Pin_UnconfiguredName_FallsBackToScoring()
+    {
+        var context = BuildContext("/api/chat", FailoverBody);
+        context.Request.Headers["X-OllamaRouter-Target"] = "ghost";
+
+        var tokenEstimator = Estimator();
+        var decision = DecisionFor(RoutingTarget.Local);
+
+        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, decision);
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("Local", context.Request.Headers["X-Ollama-Target"]);
+        Assert.Equal("Local", context.Response.Headers["X-OllamaRouter-Target"]);
+        decision.Verify(r => r.DecideAsync(100, "llama3", It.IsAny<int?>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    // Pinning capability gate: a KNOWN catalog (non-empty digest) that genuinely lacks the
+    // model disqualifies the pin → fall back to scoring.
+    [Fact]
+    public async Task Pin_ModelMissingFromKnownCatalog_FallsBackToScoring()
+    {
+        var context = BuildContext("/api/chat", FailoverBody);
+        context.Request.Headers["X-OllamaRouter-Target"] = "Remote";
+
+        var cache = new Mock<IModelCatalogCacheService>();
+        cache.Setup(c => c.ModelExistsAsync(It.IsAny<string?>(), "llama3", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+        cache.Setup(c => c.GetCurrentDigestAsync(It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync("digest-remote-1"); // non-empty: the catalog is KNOWN
+
+        var tokenEstimator = Estimator();
+        var decision = DecisionFor(RoutingTarget.Local);
+
+        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, decision, modelCatalogCache: cache);
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("Local", context.Request.Headers["X-Ollama-Target"]);
+        decision.Verify(r => r.DecideAsync(100, "llama3", It.IsAny<int?>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    // Pinning capability gate (permissive): ModelExistsAsync == false but the catalog digest
+    // is empty (unknown/never enumerated — degraded lookup) ⇒ the pin is HONORED (task #7 Q4
+    // permissive-unknown policy); scoring is never consulted.
+    [Fact]
+    public async Task Pin_CatalogUnknown_Permissive_HonorsPin()
+    {
+        var context = BuildContext("/api/chat", FailoverBody);
+        context.Request.Headers["X-OllamaRouter-Target"] = "Remote";
+
+        var cache = new Mock<IModelCatalogCacheService>();
+        cache.Setup(c => c.ModelExistsAsync(It.IsAny<string?>(), "llama3", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+        cache.Setup(c => c.GetCurrentDigestAsync(It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(""); // empty: catalog unknown ⇒ permissive
+
+        var tokenEstimator = Estimator();
+        var decision = new Mock<IRoutingDecisionService>();
+
+        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, decision, modelCatalogCache: cache);
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("Remote", context.Request.Headers["X-Ollama-Target"]);
+        Assert.Equal("Remote", context.Response.Headers["X-OllamaRouter-Target"]);
+        decision.Verify(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    // Pinning capability gate (permissive): a capability-discovery outage (ModelExistsAsync
+    // throws) never blocks a valid pin ⇒ the pin is honored.
+    [Fact]
+    public async Task Pin_CatalogLookupThrows_Permissive_HonorsPin()
+    {
+        var context = BuildContext("/api/chat", FailoverBody);
+        context.Request.Headers["X-OllamaRouter-Target"] = "Remote";
+
+        var cache = new Mock<IModelCatalogCacheService>();
+        cache.Setup(c => c.ModelExistsAsync(It.IsAny<string?>(), "llama3", It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new HttpRequestException("catalog probe down"));
+
+        var tokenEstimator = Estimator();
+        var decision = new Mock<IRoutingDecisionService>();
+
+        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, decision, modelCatalogCache: cache);
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("Remote", context.Request.Headers["X-Ollama-Target"]);
+        Assert.Equal("Remote", context.Response.Headers["X-OllamaRouter-Target"]);
+        decision.Verify(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    // Sanitization (default branch): a forged inbound X-Ollama-Target is stripped on arrival;
+    // the value visible to YARP is the router's own computed default, never the forged one.
+    [Fact]
+    public async Task InboundInternalTargetHeader_StrippedOnArrival_DefaultPath()
+    {
+        var context = new DefaultHttpContext();
+        context.Request.Method = HttpMethods.Get;
+        context.Request.Path = "/api/tags";
+        context.Request.Headers["X-Ollama-Target"] = "Spoofed";
+
+        var sut = CreateSut(_ => Task.CompletedTask, new Mock<ITokenEstimator>(), new Mock<IRoutingDecisionService>());
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("Local", context.Request.Headers["X-Ollama-Target"]);
+    }
+
+    // Sanitization (pinned-management branch, YARP-via-`next`): the forged internal header is
+    // replaced by the router's decision captured AT the YARP layer (inside the `next` delegate),
+    // so YARP route selection can never match the forged value.
+    [Fact]
+    public async Task InboundInternalTargetHeader_StrippedOnArrival_PinnedManagementPath()
+    {
+        var context = BuildContext("/api/pull", """{ "model": "llama3" }""");
+        context.Request.Headers["X-OllamaRouter-Target"] = "Remote";
+        context.Request.Headers["X-Ollama-Target"] = "Local"; // forged: opposite of the valid pin
+
+        var headerAtYarpLayer = "";
+        var sut = CreateSut(c => { headerAtYarpLayer = c.Request.Headers["X-Ollama-Target"].ToString(); return Task.CompletedTask; },
+            new Mock<ITokenEstimator>(), new Mock<IRoutingDecisionService>());
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("Remote", headerAtYarpLayer); // the valid pin, never the forged value
+    }
+
+    // Sanitization (completion branch, dispatch forwarder): the forged internal header never
+    // reaches the forwarder — the header captured at SendAsync is the router's decision.
+    [Fact]
+    public async Task InboundInternalTargetHeader_NeverReachesForwarder_CompletionPath()
+    {
+        var context = BuildContext("/api/chat", FailoverBody);
+        context.Request.Headers["X-Ollama-Target"] = "Local"; // forged
+
+        var decision = DecisionFor(RoutingTarget.Remote);
+        var headerAtForwarder = "";
+        var forwarder = new Mock<IHttpForwarder>();
+        forwarder.Setup(f => f.SendAsync(
+                It.IsAny<HttpContext>(), It.IsAny<string>(), It.IsAny<HttpMessageInvoker>(),
+                It.IsAny<ForwarderRequestConfig>(), It.IsAny<HttpTransformer>(), It.IsAny<CancellationToken>()))
+            .Callback<HttpContext, string, HttpMessageInvoker, ForwarderRequestConfig, HttpTransformer, CancellationToken>(
+                (c, _, _, _, _, _) =>
+                {
+                    headerAtForwarder = c.Request.Headers["X-Ollama-Target"].ToString();
+                    c.Response.StatusCode = 200;
+                    c.Response.WriteAsync(DoneBody).GetAwaiter().GetResult();
+                })
+            .Returns(new ValueTask<ForwarderError>(ForwarderError.None));
+
+        var (availability, liveness) = OnlineMocks();
+        var sut = BuildFailoverSut(Estimator(), decision, availability, liveness,
+            TwoTargetOptions(), forwarder, new TargetFailureStreakService());
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("Remote", headerAtForwarder); // the router's decision, never "Local"
+    }
+
+    // Telemetry: all four inference endpoints carry the three base telemetry headers with the
+    // correct values (all four ride the same completion pipeline; /api/embeddings too).
+    [Theory]
+    [InlineData("/api/chat")]
+    [InlineData("/api/generate")]
+    [InlineData("/v1/chat/completions")]
+    [InlineData("/v1/completions")]
+    public async Task Telemetry_HeadersPresent_AllFourInferenceEndpoints(string path)
+    {
+        var context = BuildContext(path, FailoverBody);
+
+        var decision = DecisionFor(RoutingTarget.Remote);
+        var sut = CreateSut(_ => Task.CompletedTask, Estimator(), decision);
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("Remote", context.Response.Headers["X-OllamaRouter-Target"]);
+        Assert.Equal("llama3", context.Response.Headers["X-OllamaRouter-Model"]);
+        Assert.Equal("100", context.Response.Headers["X-OllamaRouter-Estimated-Tokens"]);
+    }
+
+    // Telemetry (streamed): a streamed NDJSON response carries the telemetry headers — the
+    // OnStarting re-assert keeps them present when the response is committed by the stream.
+    [Fact]
+    public async Task Telemetry_StreamedNdjsonResponse_HeadersPresent()
+    {
+        var context = BuildContext("/api/chat", FailoverBody);
+        context.Response.Body = new MemoryStream();
+
+        const string ndjsonResponse =
+            """{ "model": "llama3", "message": { "role": "assistant", "content": "hi" }, "done": false }\n""" +
+            """{ "model": "llama3", "message": { "role": "assistant", "content": "!" }, "done": true, "prompt_eval_count": 7, "eval_count": 3 }\n""";
+
+        RequestDelegate next = c =>
+        {
+            c.Response.StatusCode = 200;
+            c.Response.ContentType = "application/x-ndjson";
+            c.Response.WriteAsync(ndjsonResponse).GetAwaiter().GetResult(); // commits the stream
+            return Task.CompletedTask;
+        };
+
+        var decision = DecisionFor(RoutingTarget.Remote);
+        var sut = CreateSut(next, Estimator(), decision);
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("Remote", context.Response.Headers["X-OllamaRouter-Target"]);
+        Assert.Equal("llama3", context.Response.Headers["X-OllamaRouter-Model"]);
+        Assert.Equal("100", context.Response.Headers["X-OllamaRouter-Estimated-Tokens"]);
+    }
+
+    // Telemetry failover-correctness: an UNCOMMITTED failover (the first attempt dies before
+    // the response starts) means the OnStarting closure re-asserts the FINALLY-SERVED target
+    // (Local), not the decided primary (Remote).
+    [Fact]
+    public async Task Telemetry_UncommittedFailover_ReportsServedTarget()
+    {
+        var (availability, liveness) = OnlineMocks();
+        var context = BuildContext("/api/chat", FailoverBody);
+        context.Response.Body = new MemoryStream();
+
+        var forwarder = new Mock<IHttpForwarder>();
+        // Attempt 1 (Remote, decided primary) dies uncommitted WITHOUT writing any byte.
+        // Attempt 2 (Local) succeeds (ForwarderError.None) but commits NO client bytes before
+        // returning, so the response is still uncommitted when the dispatch loop finishes and
+        // the telemetry header reports the finally-served target (Local), not the primary.
+        forwarder
+            .Setup(f => f.SendAsync(
+                It.IsAny<HttpContext>(), It.IsAny<string>(), It.IsAny<HttpMessageInvoker>(),
+                It.IsAny<ForwarderRequestConfig>(), It.IsAny<HttpTransformer>(), It.IsAny<CancellationToken>()))
+            .Returns<HttpContext, string, HttpMessageInvoker, ForwarderRequestConfig, HttpTransformer, CancellationToken>(
+                (ctx, url, _, _, _, _) =>
+                {
+                    if (url == FailoverRemoteUrl)
+                    {
+                        return new ValueTask<ForwarderError>(ForwarderError.Request); // uncommitted
+                    }
+                    ctx.Response.StatusCode = 200; // Local serves (uncommitted: no body bytes yet)
+                    return new ValueTask<ForwarderError>(ForwarderError.None);
+                });
+
+        var sut = BuildFailoverSut(Estimator(), DecisionFor(RoutingTarget.Remote), availability, liveness,
+            TwoTargetOptions(), forwarder, new TargetFailureStreakService());
+        await sut.InvokeAsync(context);
+
+        // The telemetry header reports the finally-SERVED target (Local), not the decided
+        // primary (Remote) — asserted after the response was committed by Local's body.
+        Assert.Equal("Local", context.Response.Headers["X-OllamaRouter-Target"]);
+        Assert.Equal("llama3", context.Response.Headers["X-OllamaRouter-Model"]);
+        Assert.Equal("100", context.Response.Headers["X-OllamaRouter-Estimated-Tokens"]);
     }
 }

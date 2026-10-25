@@ -2,6 +2,7 @@ using System.Text.Json.Nodes;
 using Microsoft.Extensions.Options;
 using OllamaRouter.Options;
 using OllamaRouter.Parsing;
+using OllamaRouter.ReverseProxy;
 using OllamaRouter.Services;
 
 namespace OllamaRouter.Endpoints;
@@ -67,7 +68,7 @@ public static class OllamaEndpointsExtensions
             }
 
             RoutingTarget? pinned = null;
-            if (context.Request.Headers.TryGetValue("X-OllamaRouter-Target", out var pinHeader) &&
+            if (context.Request.Headers.TryGetValue(OllamaReverseProxyConfig.PublicTargetHeader, out var pinHeader) &&
                 !string.IsNullOrWhiteSpace(pinHeader.ToString()))
             {
                 var pin = pinHeader.ToString()!;

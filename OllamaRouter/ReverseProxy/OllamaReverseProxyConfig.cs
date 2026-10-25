@@ -15,7 +15,44 @@ namespace OllamaRouter.ReverseProxy;
 /// </summary>
 public static class OllamaReverseProxyConfig
 {
+    /// <summary>
+    /// The INTERNAL YARP cluster selector header. Set by the routing middleware to steer
+    /// route selection / the dispatch forwarder, and NEVER honored from inbound clients:
+    /// <see cref="Middleware.OllamaRoutingMiddleware"/> strips any client-supplied value on
+    /// arrival so a client cannot force YARP onto a different cluster than the router's
+    /// decision.
+    /// </summary>
     public const string TargetHeader = "X-Ollama-Target";
+
+    /// <summary>
+    /// The PUBLIC client-facing header. Inbound: a request may carry it to PIN a specific
+    /// fleet target for the request (honored when the target is configured, enabled, online
+    /// and — for inference endpoints — capable of the requested model; otherwise the
+    /// middleware falls back to the normal scoring pipeline). Outbound: the middleware echoes
+    /// the finally-served target in the response as the first of the <c>X-OllamaRouter-*</c>
+    /// telemetry headers.
+    /// </summary>
+    public const string PublicTargetHeader = "X-OllamaRouter-Target";
+
+    /// <summary>Telemetry response header: the model name dispatched to the target.</summary>
+    public const string TelemetryModelHeader = "X-OllamaRouter-Model";
+
+    /// <summary>Telemetry response header: the estimated prompt token count for the request.</summary>
+    public const string TelemetryEstimatedTokensHeader = "X-OllamaRouter-Estimated-Tokens";
+
+    /// <summary>
+    /// Telemetry response header: the effective <c>num_ctx</c> the router ASSIGNED to the
+    /// request (dynamic context sizing injected/clamped a bucket, including any client-value
+    /// clamping). Absent when no sizing decision rewrote the request.
+    /// </summary>
+    public const string TelemetryContextSizeHeader = "X-OllamaRouter-Context-Size";
+
+    /// <summary>
+    /// Telemetry response header: the Auto-Shrink lease mode of the request (retained /
+    /// fresh-expanded / shrunk / baseline) when the Auto-Shrink Manager participates.
+    /// </summary>
+    public const string TelemetryContextModeHeader = "X-OllamaRouter-Context-Mode";
+
     public const string LocalTarget = "Local";
     public const string RemoteTarget = "Remote";
 

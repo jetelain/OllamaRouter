@@ -89,6 +89,17 @@ public sealed class OllamaRoutingMiddleware(
 
     public async Task InvokeAsync(HttpContext context)
     {
+        // Inbound sanitization (security rule §2.6): the X-Ollama-Target header is the
+        // INTERNAL YARP cluster selector. A client-supplied value must NEVER reach YARP
+        // route selection or the dispatch forwarder (cluster spoofing), so it is stripped on
+        // arrival; every branch below then assigns the router's own computed value.
+        if (context.Request.Headers.Remove(OllamaReverseProxyConfig.TargetHeader, out var forgedTarget))
+        {
+            logger.LogWarning(
+                "Stripped inbound {Header} header (value: '{Value}'): the internal cluster selector is set by the router and never honored from clients.",
+                OllamaReverseProxyConfig.TargetHeader, forgedTarget.ToString());
+        }
+
         if (IsCompletionRequest(context))
         {
             // The completion pipeline performs the forwarding (or a 503 short-circuit) itself.
@@ -378,7 +389,7 @@ public sealed class OllamaRoutingMiddleware(
     private async Task RoutePinnedManagementRequestAsync(HttpContext context)
     {
         RoutingTarget? pinned = null;
-        if (context.Request.Headers.TryGetValue("X-OllamaRouter-Target", out var requestedTargetHeader) &&
+        if (context.Request.Headers.TryGetValue(OllamaReverseProxyConfig.PublicTargetHeader, out var requestedTargetHeader) &&
             TryParsePinnedTarget(requestedTargetHeader.ToString(), out var requestedTarget))
         {
             if (targetAvailability.IsEnabled(requestedTarget))
@@ -409,12 +420,65 @@ public sealed class OllamaRoutingMiddleware(
         // Response telemetry header (mirrors the completion path: set eagerly so it is visible
         // before the response starts, and re-asserted in OnStarting so streamed pull progress
         // responses carry it too).
-        context.Response.Headers["X-OllamaRouter-Target"] = served.ToString();
+        context.Response.Headers[OllamaReverseProxyConfig.PublicTargetHeader] = served.ToString();
         context.Response.OnStarting(() =>
         {
-            context.Response.Headers["X-OllamaRouter-Target"] = served.ToString();
+            context.Response.Headers[OllamaReverseProxyConfig.PublicTargetHeader] = served.ToString();
             return Task.CompletedTask;
         });
+    }
+
+    // Pin capability gate (completion pipeline only): the requested model must exist in the
+    // pinned target's catalog. A KNOWN catalog (non-empty digest) that genuinely lacks the
+    // model disqualifies the pin (the caller falls back to scoring). A degraded lookup
+    // (empty/unknown digest, or the probe throwing) is PERMISSIVE: the pin is honored, so a
+    // capability-discovery outage never blocks a valid pin (task #7 Q4 permissive-unknown
+    // policy). Cloud is a relay and never probed, so it is exempt.
+    private async Task<bool> IsPinnedTargetCapableAsync(RoutingTarget pinned, string modelName, HttpContext context)
+    {
+        if (pinned == RoutingTarget.Cloud)
+        {
+            return true;
+        }
+
+        OllamaTargetOptions? pinnedOptions = null;
+        foreach (var t in options.Value.GetEffectiveTargets(logger))
+        {
+            if (string.Equals(t.Name, pinned.Value, StringComparison.OrdinalIgnoreCase))
+            {
+                pinnedOptions = t;
+                break;
+            }
+        }
+
+        var pinnedUrl = pinnedOptions?.Url
+            ?? (pinned == RoutingTarget.Local ? options.Value.LocalUrl : null)
+            ?? (pinned == RoutingTarget.Remote ? options.Value.RemoteUrl : null);
+        if (string.IsNullOrWhiteSpace(pinnedUrl) || string.Equals(modelName, "unknown", StringComparison.Ordinal))
+        {
+            return true; // nothing to check against: permissive.
+        }
+
+        try
+        {
+            var exists = await modelCatalogCache.ModelExistsAsync(pinnedUrl, modelName, context.RequestAborted);
+            if (exists)
+            {
+                return true;
+            }
+
+            var digest = await modelCatalogCache.GetCurrentDigestAsync(pinnedUrl, context.RequestAborted);
+            return string.IsNullOrEmpty(digest); // empty digest ⇒ catalog unknown ⇒ permissive.
+        }
+        catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "Pin capability probe failed for {Model} on {Target}; honoring the pin (permissive).", modelName, pinned.Value);
+            return true;
+        }
     }
 
     private async Task RouteAndTrackCompletionRequestAsync(HttpContext context)
@@ -448,7 +512,7 @@ public sealed class OllamaRoutingMiddleware(
             // dynamic context sizing rewrite below.
             var clientNumCtx = DynamicContextPayloadTransformer.ExtractClientNumCtx(body);
 
-            if (context.Request.Headers.TryGetValue("X-OllamaRouter-Target", out var requestedTargetHeader) &&
+            if (context.Request.Headers.TryGetValue(OllamaReverseProxyConfig.PublicTargetHeader, out var requestedTargetHeader) &&
                 TryParsePinnedTarget(requestedTargetHeader.ToString(), out var requestedTarget))
             {
                 if (targetAvailability.IsEnabled(requestedTarget))
@@ -462,8 +526,19 @@ public sealed class OllamaRoutingMiddleware(
 
                     if (IsPinnedTargetRoutable(pinnedState))
                     {
-                        target = requestedTarget;
-                        logger.LogInformation("Routing target explicitly pinned via request header: {Target}", target);
+                        // Pinned-target capability gate: the model must exist on the target.
+                        // A known catalog lacking the model falls back to scoring; a degraded
+                        // lookup (empty digest / probe failure) is permissive (honored).
+                        if (await IsPinnedTargetCapableAsync(requestedTarget, modelName, context))
+                        {
+                            target = requestedTarget;
+                            logger.LogInformation("Routing target explicitly pinned via request header: {Target}", target);
+                        }
+                        else
+                        {
+                            logger.LogWarning("Pinned target {Target} does not host model {Model}; falling back to dynamic routing.", requestedTarget, modelName);
+                            target = await routingDecisionService.DecideAsync(tokenCount, modelName, clientNumCtx, context.RequestAborted);
+                        }
                     }
                     else
                     {
@@ -549,34 +624,41 @@ public sealed class OllamaRoutingMiddleware(
         var (injectedNumCtx, sizedBody) = target != RoutingTarget.Cloud
             ? await TryApplyDynamicContextSizingAsync(context, target, modelName, tokenCount, body)
             : (null, null);
-        var contextModeHeader = context.Response.Headers.ContainsKey("X-OllamaRouter-Context-Mode")
-            ? context.Response.Headers["X-OllamaRouter-Context-Mode"].ToString()
+        var contextModeHeader = context.Response.Headers.ContainsKey(OllamaReverseProxyConfig.TelemetryContextModeHeader)
+            ? context.Response.Headers[OllamaReverseProxyConfig.TelemetryContextModeHeader].ToString()
             : null;
         if (sizedBody is not null)
         {
             body = sizedBody; // Record the payload actually sent to the target.
         }
 
-        context.Response.Headers["X-OllamaRouter-Target"] = target.ToString();
-        context.Response.Headers["X-OllamaRouter-Model"] = modelName;
-        context.Response.Headers["X-OllamaRouter-Estimated-Tokens"] = tokenCount.ToString();
+        // Response telemetry headers: the target header tracks the FINALLY-SERVED target —
+        // after an uncommitted failover the dispatch loop may have served a different target
+        // than the decided primary, so `telemetryTarget` is updated below when the response
+        // had not yet been committed. `telemetryTarget` (not `target`) is captured by the
+        // OnStarting closure so streamed responses (NDJSON/SSE) re-assert the served target
+        // before the first body byte.
+        var telemetryTarget = target;
+        context.Response.Headers[OllamaReverseProxyConfig.PublicTargetHeader] = telemetryTarget.ToString();
+        context.Response.Headers[OllamaReverseProxyConfig.TelemetryModelHeader] = modelName;
+        context.Response.Headers[OllamaReverseProxyConfig.TelemetryEstimatedTokensHeader] = tokenCount.ToString();
         if (injectedNumCtx.HasValue)
         {
-            context.Response.Headers["X-OllamaRouter-Context-Size"] = injectedNumCtx.Value.ToString();
+            context.Response.Headers[OllamaReverseProxyConfig.TelemetryContextSizeHeader] = injectedNumCtx.Value.ToString();
         }
 
         context.Response.OnStarting(() =>
         {
-            context.Response.Headers["X-OllamaRouter-Target"] = target.ToString();
-            context.Response.Headers["X-OllamaRouter-Model"] = modelName;
-            context.Response.Headers["X-OllamaRouter-Estimated-Tokens"] = tokenCount.ToString();
+            context.Response.Headers[OllamaReverseProxyConfig.PublicTargetHeader] = telemetryTarget.ToString();
+            context.Response.Headers[OllamaReverseProxyConfig.TelemetryModelHeader] = modelName;
+            context.Response.Headers[OllamaReverseProxyConfig.TelemetryEstimatedTokensHeader] = tokenCount.ToString();
             if (injectedNumCtx.HasValue)
             {
-                context.Response.Headers["X-OllamaRouter-Context-Size"] = injectedNumCtx.Value.ToString();
+                context.Response.Headers[OllamaReverseProxyConfig.TelemetryContextSizeHeader] = injectedNumCtx.Value.ToString();
             }
             if (contextModeHeader is not null)
             {
-                context.Response.Headers["X-OllamaRouter-Context-Mode"] = contextModeHeader;
+                context.Response.Headers[OllamaReverseProxyConfig.TelemetryContextModeHeader] = contextModeHeader;
             }
 
             return Task.CompletedTask;
@@ -613,6 +695,18 @@ public sealed class OllamaRoutingMiddleware(
             // forwarder sets the same IForwarderErrorFeature on context.Features that YARP
             // did, so the response-completeness / token-extraction logic below is unchanged.
             (servedTarget, body) = await DispatchLoopAsync(context, body, target);
+            if (servedTarget is not null && servedTarget != target && !IsResponseCommitted(context))
+            {
+                // Telemetry failover-correctness: the dispatch loop served a DIFFERENT target
+                // than the decided primary (an uncommitted failover — the first attempt died
+                // before any byte was written) and the response had not been committed yet,
+                // so the telemetry target header reports the served target. The OnStarting
+                // closure reads the updated telemetryTarget when it fires; if the response
+                // WAS committed, mid-stream failover is impossible (HTTP forbids switching
+                // targets) and the decided-target value stands (already flushed).
+                telemetryTarget = servedTarget.Value;
+                context.Response.Headers[OllamaReverseProxyConfig.PublicTargetHeader] = telemetryTarget.ToString();
+            }
             if (servedTarget is not null && servedTarget != inFlightTarget)
             {
                 // Reassign in-flight accounting to the finally-served target (binding §7):
@@ -1148,7 +1242,7 @@ public sealed class OllamaRoutingMiddleware(
             // fresh/shrunk vs baseline) when the Auto-Shrink Manager participates.
             if (leaseState is { } mode)
             {
-                context.Response.Headers["X-OllamaRouter-Context-Mode"] = mode.ToString();
+                context.Response.Headers[OllamaReverseProxyConfig.TelemetryContextModeHeader] = mode.ToString();
             }
 
             logger.LogInformation(
