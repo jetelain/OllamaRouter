@@ -55,8 +55,8 @@ public sealed record TargetLivenessSnapshot(IReadOnlyList<TargetLivenessEntry> E
 /// The service is the ONLY component that mutates liveness state: the background
 /// re-prober (an <see cref="IHostedService"/> timer probing Offline/Unknown targets
 /// every 10 s) and the middleware's on-demand
-/// <see cref="EnsureKnownAsync"/> gate. YARP forwarding,
-/// <see cref="IRoutingTargetHandler"/> and the statistics <c>finally</c> block never
+/// <see cref="EnsureKnownAsync"/> gate. YARP forwarding, routing decision
+/// handlers and the statistics <c>finally</c> block never
 /// call into it, which is what guarantees that a streaming/generation timeout mid
 /// request can never trip the breaker.
 /// </para>

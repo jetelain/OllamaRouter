@@ -558,8 +558,8 @@ public sealed class ModelThresholds
     /// Maximum number of tokens allowed in a request for this model to the local Ollama instance. Requests exceeding this limit will be routed to the remote instance.
     /// <remarks>
     /// Deprecated: superseded by the hardware suitability rules driven by the fleet targets
-    /// (OllamaTargetOptions HardwareHint/MaxVramMB); slated for removal after the transition
-    /// release. Still consumed by the local routing handler in this release.
+    /// (OllamaTargetOptions HardwareHint/MaxVramMB) and the two-stage routing pipeline;
+    /// slated for removal after the transition release.
     /// </remarks>
     /// </summary>
     public int MaxLocalTokens { get; set; } = DefaultMaxLocalTokens;
@@ -568,8 +568,8 @@ public sealed class ModelThresholds
     /// Minimum amount of free VRAM (in MB) required to route a request for this model to the local Ollama instance.
     /// <remarks>
     /// Deprecated: superseded by the hardware suitability rules driven by the fleet targets
-    /// (OllamaTargetOptions HardwareHint/MaxVramMB); slated for removal after the transition
-    /// release. Still consumed by the local routing handler in this release.
+    /// (OllamaTargetOptions HardwareHint/MaxVramMB) and the two-stage routing pipeline;
+    /// slated for removal after the transition release.
     /// </remarks>
     /// </summary>
     public int MinRequiredVramMB { get; set; } = DefaultMinRequiredVramMB;

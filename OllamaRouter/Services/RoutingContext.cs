@@ -12,6 +12,8 @@ public sealed class RoutingContext
     private readonly string _localUrl;
     private readonly string _remoteUrl;
     private readonly IReadOnlyDictionary<string, OllamaTargetOptions>? _targetByName;
+    private readonly ITargetExecutionTracker? _executionTracker;
+    private readonly Dictionary<string, Task<ModelMetadata?>> _metadataTasks = new(StringComparer.OrdinalIgnoreCase);
     private Task<bool>? _existsLocallyTask;
     private Task<bool>? _existsRemotelyTask;
     private readonly Dictionary<RoutingTarget, Task<TargetModelCapability?>> _capabilityTasks = new();
@@ -20,6 +22,12 @@ public sealed class RoutingContext
     public string ModelName { get; }
     public string NormalizedModelName { get; }
     public ModelThresholds? Thresholds { get; }
+
+    /// <summary>
+    /// The client's static <c>options.num_ctx</c> from the request body (an upper-bound
+    /// preference, never a disqualifier), used by the routing pipeline's context-fit clamp.
+    /// </summary>
+    public int? ClientRequestedNumCtx { get; }
 
     public RoutingContext(
         int tokenCount,
@@ -31,14 +39,18 @@ public sealed class RoutingContext
         string remoteUrl,
         CancellationToken cancellationToken = default,
         ModelCapabilityEngine? capabilityEngine = null,
-        IReadOnlyList<OllamaTargetOptions>? targets = null)
+        IReadOnlyList<OllamaTargetOptions>? targets = null,
+        ITargetExecutionTracker? executionTracker = null,
+        int? clientRequestedNumCtx = null)
     {
         TokenCount = tokenCount;
         ModelName = modelName;
         NormalizedModelName = normalizedModelName;
         Thresholds = thresholds;
+        ClientRequestedNumCtx = clientRequestedNumCtx;
         _modelCatalogCache = modelCatalogCache;
         _capabilityEngine = capabilityEngine;
+        _executionTracker = executionTracker;
         _localUrl = localUrl;
         _remoteUrl = remoteUrl;
         _targetByName = targets is { Count: > 0 }
@@ -51,6 +63,76 @@ public sealed class RoutingContext
         {
             _existsLocallyTask = modelCatalogCache.ModelExistsAsync(_localUrl, modelName, cancellationToken);
             _existsRemotelyTask = modelCatalogCache.ModelExistsAsync(_remoteUrl, modelName, cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Synchronous, non-blocking snapshot of the candidate target's execution state from the
+    /// execution tracker (loaded models, in-flight count, VRAM totals). Returns null for the
+    /// Cloud pseudo-target or when no tracker is wired (unit-test pipelines); the routing
+    /// pipeline treats a null snapshot as "never observed" (empty models, 0 in-flight, stale).
+    /// </summary>
+    public TargetExecutionState? GetExecutionState(RoutingTarget target)
+    {
+        if (_executionTracker is null || target == RoutingTarget.Cloud)
+        {
+            return null;
+        }
+
+        return _executionTracker.GetState(target);
+    }
+
+    /// <summary>
+    /// Returns the configured <see cref="OllamaTargetOptions"/> for the given fleet target
+    /// (case-insensitive name match), or null for unknown targets and the Cloud pseudo-target.
+    /// </summary>
+    public OllamaTargetOptions? GetTargetOptions(RoutingTarget target)
+    {
+        if (target == RoutingTarget.Cloud || _targetByName is null)
+        {
+            return null;
+        }
+
+        return _targetByName.TryGetValue(target.Value, out var resolved) ? resolved : null;
+    }
+
+    /// <summary>
+    /// Returns the cached (per-context) <see cref="ModelMetadata"/> for this request's model on
+    /// the given target URL, starting the fetch lazily (single-flight per URL). Returns null
+    /// when no capability engine is wired, the URL is blank, or no catalog digest is
+    /// discoverable — the degraded "unknown" metadata case of the permissive Stage-1 fallback.
+    /// </summary>
+    public Task<ModelMetadata?> GetModelMetadataAsync(string targetUrl, CancellationToken cancellationToken = default)
+    {
+        if (_capabilityEngine is null || string.IsNullOrEmpty(targetUrl))
+        {
+            return Task.FromResult<ModelMetadata?>(null);
+        }
+
+        if (!_metadataTasks.TryGetValue(targetUrl, out var task))
+        {
+            task = ComputeMetadataAsync(targetUrl, cancellationToken);
+            _metadataTasks[targetUrl] = task;
+        }
+
+        return task;
+    }
+
+    private async Task<ModelMetadata?> ComputeMetadataAsync(string targetUrl, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var digest = await _modelCatalogCache.GetCurrentDigestAsync(targetUrl, cancellationToken);
+            if (string.IsNullOrEmpty(digest))
+            {
+                return null;
+            }
+
+            return await _capabilityEngine!.GetMetadataAsync(targetUrl, ModelName, digest, cancellationToken);
+        }
+        catch
+        {
+            return null;
         }
     }
 

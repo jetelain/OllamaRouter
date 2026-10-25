@@ -1,61 +1,114 @@
-using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using OllamaRouter.Options;
 
 namespace OllamaRouter.Services;
 
+/// <summary>
+/// The two-stage hot-model affinity routing pipeline (Phase 3, item 3 of the Multi-Target
+/// Zero-Config Routing Plan). Replaces the legacy busy/VRAM first-fit walk: Stage 1
+/// qualifies every effective fleet target (admin enabled, liveness online with the 10 s
+/// startup grace, catalog presence, hardware capability, context fit), Stage 2 scores the
+/// qualified candidates with the calibrated formula
+/// <c>Score = AffinityBonus(+100) + HardwareBonus(+20) − EvictionPenalty(−80) − ConcurrencyPenalty</c>,
+/// and the highest score wins with equal scores resolved by declaration order in the
+/// <see cref="OllamaRouterOptions.Targets"/> list. The Cloud pseudo-target participates as a
+/// fixed score-0 candidate appended after all fleet targets (it therefore loses 0-vs-0 ties
+/// but beats every negative fleet score).
+/// </summary>
 public sealed class RoutingDecisionService : IRoutingDecisionService
 {
-    private readonly List<IRoutingTargetHandler> _targets;
+    /// <summary>Affinity bonus: the requested model is already loaded (hot) on the target.</summary>
+    private const int AffinityBonus = 100;
+
+    /// <summary>Hardware bonus: role-matching target for the request's architecture class.</summary>
+    private const int HardwareBonus = 20;
+
+    /// <summary>Eviction penalty: loading the model would evict a different loaded model.</summary>
+    private const int EvictionPenalty = 80;
+
+    /// <summary>Concurrency penalty per in-flight request.</summary>
+    private const int ConcurrencyPenaltyPerInFlight = 40;
+
+    /// <summary>Concurrency cliff penalty when the target's MaxParallel is reached.</summary>
+    private const int ConcurrencyCliffPenalty = 100;
+
+    /// <summary>Bytes per MiB for the eviction VRAM-sum comparison (mirrors ModelCapabilityEngine's weight→MB conversion).</summary>
+    private const long BytesPerMiB = 1_048_576;
+
     private readonly IOptions<OllamaRouterOptions> _options;
     private readonly IModelCatalogCacheService _modelCatalogCacheService;
-    private readonly IActivityMonitorService? _activityMonitor;
+    private readonly ITargetLivenessService _liveness;
+    private readonly ITargetAvailabilityService _availability;
+    private readonly ITargetExecutionTracker _executionTracker;
     private readonly ModelCapabilityEngine? _capabilityEngine;
+    private readonly CloudRoutingTargetHandler _cloudHandler;
     private readonly ILogger<RoutingDecisionService> _logger;
     private readonly ITargetFailureStreakService _streakTracker;
 
+    /// <summary>
+    /// Creates the routing decision pipeline over the configured fleet. The Cloud terminal
+    /// fallback handler is resolved directly (it is the sole <see cref="IRoutingTargetHandler"/>
+    /// implementation); fleet targets are taken from the options' effective target list
+    /// (including the legacy Local/Remote synthesis) and evaluated in declaration order.
+    /// </summary>
     public RoutingDecisionService(
-        IEnumerable<IRoutingTargetHandler> targets,
         IOptions<OllamaRouterOptions> options,
         IModelCatalogCacheService modelCatalogCacheService,
-        ILogger<RoutingDecisionService> logger)
-        : this(targets, options, modelCatalogCacheService, null, logger, null, null)
-    {
-    }
-
-    public RoutingDecisionService(
-        IEnumerable<IRoutingTargetHandler> targets,
-        IOptions<OllamaRouterOptions> options,
-        IModelCatalogCacheService modelCatalogCacheService,
-        IActivityMonitorService? activityMonitor,
-        ILogger<RoutingDecisionService> logger)
-        : this(targets, options, modelCatalogCacheService, activityMonitor, logger, null, null)
-    {
-    }
-
-    public RoutingDecisionService(
-        IEnumerable<IRoutingTargetHandler> targets,
-        IOptions<OllamaRouterOptions> options,
-        IModelCatalogCacheService modelCatalogCacheService,
-        IActivityMonitorService? activityMonitor,
-        ILogger<RoutingDecisionService> logger,
+        ITargetLivenessService liveness,
+        ITargetAvailabilityService availability,
+        ITargetExecutionTracker executionTracker,
         ModelCapabilityEngine? capabilityEngine,
+        CloudRoutingTargetHandler cloudHandler,
+        ILogger<RoutingDecisionService> logger,
         ITargetFailureStreakService? streakTracker = null)
     {
-        _targets = targets.ToList();
         _options = options;
         _modelCatalogCacheService = modelCatalogCacheService;
-        _activityMonitor = activityMonitor;
+        _liveness = liveness;
+        _availability = availability;
+        _executionTracker = executionTracker;
         _capabilityEngine = capabilityEngine;
+        _cloudHandler = cloudHandler;
         _logger = logger;
-        // A per-instance default keeps the delegating constructors and existing tests
-        // source-compatible; Program.cs injects the shared singleton via the factory
-        // registration so all decision requests share one streak table.
+        // A per-instance default keeps tests source-compatible; Program.cs injects the shared
+        // singleton via the factory registration so all decision requests share one streak table.
         _streakTracker = streakTracker ?? new TargetFailureStreakService();
     }
 
-    public async Task<RoutingTarget> DecideAsync(int tokenCount, string modelName, CancellationToken cancellationToken = default)
+    public Task<RoutingTarget> DecideAsync(int tokenCount, string modelName, CancellationToken cancellationToken = default)
+    {
+        return DecideAsync(tokenCount, modelName, clientRequestedNumCtx: null, cancellationToken);
+    }
+
+    public Task<RoutingTarget> DecideAsync(int tokenCount, string modelName, int? clientRequestedNumCtx, CancellationToken cancellationToken = default)
+    {
+        // Per the scoring plan §1.6, every per-candidate evaluation artifact is logged at
+        // Debug on the production path (the tests consume the same artifacts through the
+        // DecideWithEvaluationsAsync reporting callback).
+        return DecideWithEvaluationsAsync(
+            tokenCount,
+            modelName,
+            clientRequestedNumCtx,
+            evaluation => _logger.LogDebug(
+                "{Model}: Candidate {Target} qualified={Qualified} score={Score}: {Detail}",
+                NormalizeModelName(modelName), evaluation.Target, evaluation.Qualified, evaluation.Score, evaluation.Detail),
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// Runs the full two-stage pipeline and reports every per-candidate evaluation (fleet
+    /// targets in declaration order, then the Cloud pseudo-target when eligible) through
+    /// <paramref name="reportEvaluation"/> BEFORE the selection is made — so the artifacts
+    /// survive even when no candidate qualifies and <see cref="NoAvailableTargetException"/>
+    /// is thrown. Returns the selected target.
+    /// </summary>
+    public async Task<RoutingTarget> DecideWithEvaluationsAsync(
+        int tokenCount,
+        string modelName,
+        int? clientRequestedNumCtx,
+        Action<RoutingCandidateEvaluation> reportEvaluation,
+        CancellationToken cancellationToken = default)
     {
         var settings = _options.Value;
         var normalizedName = NormalizeModelName(modelName);
@@ -71,82 +124,430 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             settings.RemoteUrl.TrimEnd('/'),
             cancellationToken,
             _capabilityEngine,
-            settings.GetEffectiveTargets(_logger));
+            settings.GetEffectiveTargets(_logger),
+            _executionTracker,
+            clientRequestedNumCtx);
 
-        var primaryTarget = await TrySelectTargetAsync(context, _targets, cancellationToken);
-        if (primaryTarget is null)
+        var fleetTargets = settings.GetEffectiveTargets(_logger);
+        var evaluations = new List<RoutingCandidateEvaluation>(fleetTargets.Count + 1);
+
+        // ---- Stage 1 + Stage 2: every fleet target, in declaration order. ----
+        var offloadSlotTaken = false;
+        foreach (var targetOptions in fleetTargets)
+        {
+            var evaluation = await EvaluateFleetTargetAsync(context, targetOptions, offloadSlotTaken, cancellationToken);
+            // The MoE/SmallDense offload slot is single per decision: once the first
+            // small-class target has claimed it (when justified), later ones never get the
+            // HardwareBonus (role slot is single, per the scoring plan §1.2).
+            if (evaluation.Qualified && evaluation.HardwareBonus > 0 && IsSmallClass(targetOptions))
+            {
+                offloadSlotTaken = true;
+            }
+
+            evaluations.Add(evaluation);
+            reportEvaluation(evaluation);
+        }
+
+        // ---- Cloud pseudo-target: fixed score 0, appended after all fleet targets. ----
+        if (await _cloudHandler.CanProcessAsync(context, cancellationToken))
+        {
+            var cloudEvaluation = new RoutingCandidateEvaluation(
+                RoutingTarget.Cloud,
+                Qualified: true,
+                Score: 0,
+                DisqualifiedReason: null,
+                AffinityBonus: 0,
+                HardwareBonus: 0,
+                EvictionPenalty: 0,
+                ConcurrencyPenalty: 0,
+                Detail: "Cloud overflow: fixed score 0 (terminal fallback, sorted after all fleet targets).");
+            evaluations.Add(cloudEvaluation);
+            reportEvaluation(cloudEvaluation);
+        }
+
+        // ---- Selection: highest score; ties by declaration order (stable). ----
+        var qualified = evaluations.Where(e => e.Qualified).ToList();
+        if (qualified.Count == 0)
         {
             _logger.LogWarning("{Model}: No enabled target can handle the request.", normalizedName);
             throw new NoAvailableTargetException($"No enabled routing target is available to handle the request for model '{modelName}'.");
         }
 
+        var ranked = qualified
+            .Select((e, index) => (Evaluation: e, Index: index))
+            .OrderByDescending(x => x.Evaluation.Score!.Value)
+            .ThenBy(x => x.Index)
+            .Select(x => x.Evaluation)
+            .ToList();
+
+        var winner = ranked[0];
+        _logger.LogDebug(
+            "{Model}: Routing decision {Winner} (score {Score}; {Detail})",
+            normalizedName, winner.Target, winner.Score, winner.Detail);
+
+        // ---- Failure-streak switch over the ranked list (task #8 streak semantics). ----
+        // If the winner's uncommitted/mid-stream failure streak is ABOVE the threshold, take
+        // the next-ranked candidate (including the Cloud pseudo-target) whose streak is below
+        // the threshold; otherwise keep the winner (a forced switch to another failing target
+        // would be worse).
         var maxFailures = settings.MaxConsecutiveFailures;
-        if (maxFailures > 0 && _streakTracker.ShouldSkip(primaryTarget.Target, maxFailures))
+        if (maxFailures > 0 && _streakTracker.ShouldSkip(winner.Target, maxFailures))
         {
-            var primaryIndex = _targets.IndexOf(primaryTarget);
-            if (primaryIndex >= 0 && primaryIndex < _targets.Count - 1)
+            var nextCandidate = ranked
+                .Skip(1)
+                .FirstOrDefault(e => !_streakTracker.ShouldSkip(e.Target, maxFailures));
+
+            if (nextCandidate is not null)
             {
-                // The decided target is above the failure-streak threshold: walk the remaining
-                // handlers in configuration order (after the primary's index), skipping any that
-                // are also above threshold, and reuse the standard selection over the survivors.
-                var subsequentCandidates = _targets
-                    .Skip(primaryIndex + 1)
-                    .Where(t => !_streakTracker.ShouldSkip(t.Target, maxFailures));
-
-                var nextTarget = await TrySelectTargetAsync(context, subsequentCandidates, cancellationToken);
-                if (nextTarget is not null)
-                {
-                    _logger.LogInformation(
-                        "{Model}: Target {FailedTarget} has a failure streak of {Streak} above threshold {MaxFailures}. Switching to next target {NewTarget}.",
-                        normalizedName, primaryTarget.Target, _streakTracker.GetStreak(primaryTarget.Target), maxFailures, nextTarget.Target);
-                    return nextTarget.Target;
-                }
-
-                _logger.LogWarning(
-                    "{Model}: Target {FailedTarget} has a failure streak of {Streak} above threshold {MaxFailures}, but no subsequent target is enabled or can process the request. Keeping {FailedTarget}.",
-                    normalizedName, primaryTarget.Target, _streakTracker.GetStreak(primaryTarget.Target), maxFailures, primaryTarget.Target);
+                _logger.LogInformation(
+                    "{Model}: Target {FailedTarget} has a failure streak of {Streak} above threshold {MaxFailures}. Switching to next target {NewTarget}.",
+                    normalizedName, winner.Target, _streakTracker.GetStreak(winner.Target), maxFailures, nextCandidate.Target);
+                return nextCandidate.Target;
             }
+
+            _logger.LogWarning(
+                "{Model}: Target {FailedTarget} has a failure streak of {Streak} above threshold {MaxFailures}, but no subsequent target is enabled or can process the request. Keeping {FailedTarget}.",
+                normalizedName, winner.Target, _streakTracker.GetStreak(winner.Target), maxFailures, winner.Target);
         }
 
-        _logger.LogDebug("{Model}: Routing to target {Target}.", normalizedName, primaryTarget.Target);
-        return primaryTarget.Target;
+        return winner.Target;
     }
 
-    private static async Task<IRoutingTargetHandler?> TrySelectTargetAsync(
+    // ---- Stage 1 + Stage 2 for one fleet target. ----
+
+    private async Task<RoutingCandidateEvaluation> EvaluateFleetTargetAsync(
         RoutingContext context,
-        IEnumerable<IRoutingTargetHandler> candidates,
+        OllamaTargetOptions targetOptions,
+        bool offloadSlotTaken,
         CancellationToken cancellationToken)
     {
-        var list = candidates.ToList();
+        var target = new RoutingTarget(targetOptions.Name!);
+        var maxVramMB = targetOptions.GetEffectiveMaxVramMB();
 
-        // 1. Dispatch to the first target that is available and able to process the request.
-        foreach (var target in list)
+        // 1. Admin enabled (configuration flag AND availability state file).
+        if (!targetOptions.Enabled || !_availability.IsEnabled(target))
         {
-            if (target.IsAvailable() && await target.CanProcessAsync(context, cancellationToken))
+            return Disqualified(target, "disabled (administratively unavailable or Enabled=false)");
+        }
+
+        // 2. Online: shared routable predicate (IsOnline || within 10 s startup grace && Unknown).
+        if (!TargetRoutability.IsRoutable(targetOptions, _availability, _liveness))
+        {
+            return Disqualified(target, "offline (liveness not Online and outside the startup grace window)");
+        }
+
+        // 3. Catalog present.
+        var exists = await _modelCatalogCacheService.ModelExistsAsync(targetOptions.Url, context.ModelName, cancellationToken);
+        if (!exists)
+        {
+            return Disqualified(target, "model not present in the target catalog");
+        }
+
+        // 4. Hardware capable (capability engine + suitability rules) with the permissive
+        //    fallback for unknown/degraded metadata (the config-pinned Dense veto still applies).
+        // 5. Context fit: min(ceil(tokens × 1.25), clientNumCtx ?? ∞) ≤ CMax.
+        var capability = await context.GetTargetCapabilityAsync(target, targetOptions.Url!, cancellationToken);
+        if (capability is null)
+        {
+            // Unknown/degraded capability ⇒ permissively qualified, EXCEPT the operator-pinned
+            // Dense hard veto (unknown count ⇒ LargeDense) on a small-class target (< 12 GB):
+            // the 27B-on-8GB-laptop veto survives capability-discovery outages.
+            if (IsPinnedDenseVetoed(context, maxVramMB))
             {
-                return target;
+                return Disqualified(target, "pinned-Dense model vetoed on a small-class target (MaxVramMB < 12000) with unknown capability metadata");
+            }
+
+            return Scored(target, 0, 0, 0, 0, 0, "permissive qualification (no capability metadata discoverable)");
+        }
+
+        if (!DynamicContextSizingEngine.IsHardwareSuitable(capability))
+        {
+            var maxVramDescription = maxVramMB?.ToString() ?? "unknown";
+            return Disqualified(target, $"hardware incapable ({capability.Architecture} on target with MaxVramMB {maxVramDescription})");
+        }
+
+        if (!ModelCapabilityEngine.EvaluateClientContext(context.TokenCount, context.ClientRequestedNumCtx, capability.CMax).Qualified)
+        {
+            return Disqualified(target, $"context overflow (estimated {context.TokenCount} tokens does not fit CMax {capability.CMax})");
+        }
+
+        // ---- Stage 2 scoring for the qualified candidate. ----
+        var state = context.GetExecutionState(target);
+        var loadedModels = state?.LoadedModels ?? [];
+        var inFlight = state?.InFlightRequests ?? 0;
+
+        // Affinity: the requested model is already loaded (hot) on this target.
+        var isLoaded = loadedModels.Any(m => string.Equals(m.Name, context.ModelName, StringComparison.OrdinalIgnoreCase) ||
+                                            string.Equals(m.Name, context.NormalizedModelName, StringComparison.OrdinalIgnoreCase));
+        var affinity = isLoaded ? AffinityBonus : 0;
+
+        // Eviction penalty (VRAM-sum based, Q1 resolution; a stale snapshot is still applied —
+        // better than none for anti-thrashing). The model weight comes from the same capability
+        // metadata already fetched for Stage 1 (context-cached).
+        var metadata = await context.GetModelMetadataAsync(targetOptions.Url!, cancellationToken);
+        var eviction = WouldEvict(isLoaded, loadedModels, state?.TotalVramBytes, metadata?.WeightSizeBytes, maxVramMB) ? EvictionPenalty : 0;
+
+        // Concurrency: (InFlight × 40) + (InFlight ≥ MaxParallel ? 100 : 0).
+        var maxParallel = targetOptions.MaxParallel <= 0 ? 1 : targetOptions.MaxParallel;
+        var concurrency = inFlight * ConcurrencyPenaltyPerInFlight + (inFlight >= maxParallel ? ConcurrencyCliffPenalty : 0);
+
+        // Hardware role bonus (request architecture + fleet-wide hot/busy facts). The MoE/
+        // SmallDense offload slot is single per decision: only the FIRST small-class target in
+        // declaration order is eligible (enforced by the caller's offloadSlotTaken flag).
+        var hardware = await ComputeHardwareBonus(context, capability, maxVramMB, offloadSlotTaken, cancellationToken);
+
+        var score = affinity + hardware - eviction - concurrency;
+        return Scored(target, score, affinity, hardware, eviction, concurrency,
+            $"affinity={affinity:+#;-#;0} hardware={hardware:+#;-#;0} eviction=-{eviction} concurrency=-{concurrency} " +
+            $"(inFlight={inFlight}, maxParallel={maxParallel}, loaded={loadedModels.Count}, stale={state?.Stale ?? true})");
+    }
+
+    // Permissive-fallback veto: operator pinned Models[model].Architecture = "Dense" (unknown
+    // count ⇒ LargeDense) and the target's effective VRAM is below the small-target threshold.
+    private static bool IsPinnedDenseVetoed(RoutingContext context, int? maxVramMB)
+    {
+        if (!string.Equals(context.Thresholds?.Architecture, "Dense", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return maxVramMB is null || maxVramMB < ModelCapabilityEngine.SmallTargetVramThresholdMB;
+    }
+
+    /// <summary>
+    /// Stage-2 HardwareBonus (+20) role matching:
+    /// <list type="bullet">
+    /// <item>LargeDense: +20 to a desktop-class target when the effective requirement is ≤ the
+    /// desktop ceiling (the ≤ 48k Architect sweet spot); +20 to a server-class target when it
+    /// exceeds it. At most one target kind is role-matched per request (by its own class).</item>
+    /// <item>MoE / SmallDense: +20 to the FIRST small-class (Laptop) target only when any
+    /// desktop/server-class fleet target holds a dense model hot (per /api/ps classification)
+    /// or is busy (InFlight &gt; 0). Otherwise no bonus — an idle desktop wins a standalone
+    /// MoE request by declaration order / affinity (AC2).</item>
+    /// </list>
+    /// </summary>
+    private async Task<int> ComputeHardwareBonus(
+        RoutingContext context,
+        TargetModelCapability capability,
+        int? maxVramMB,
+        bool offloadSlotTaken,
+        CancellationToken cancellationToken)
+    {
+        var targetClass = GetTargetClass(maxVramMB);
+
+        if (capability.Architecture == ModelArchitectureKind.LargeDense)
+        {
+            var effectiveRequired = (long)Math.Ceiling((double)context.TokenCount * 1.25);
+            if (context.ClientRequestedNumCtx.HasValue)
+            {
+                effectiveRequired = Math.Min(effectiveRequired, context.ClientRequestedNumCtx.Value);
+            }
+
+            // The role slot is single per request: ≤ 48k (the Architect sweet spot) belongs to
+            // the desktop class, > 48k to the server class. Only the role-matched kind scores.
+            if (effectiveRequired <= ModelCapabilityEngine.DesktopCeiling)
+            {
+                return targetClass == TargetClass.Desktop ? HardwareBonus : 0;
+            }
+
+            return targetClass == TargetClass.Server ? HardwareBonus : 0;
+        }
+
+        // MoE / SmallDense: Laptop offload slot (single; first small-class target in declaration
+        // order) only when a desktop/server-class target holds a dense model hot or is busy.
+        if (targetClass != TargetClass.Small)
+        {
+            return 0;
+        }
+
+        if (offloadSlotTaken)
+        {
+            return 0; // A previous (earlier-declared) small-class target already claims the slot.
+        }
+
+        var offloadJustified = await HasDenseHotOrBusyLargeTargetAsync(context, cancellationToken);
+        return offloadJustified ? HardwareBonus : 0;
+    }
+
+    private static bool IsSmallClass(OllamaTargetOptions target) =>
+        GetTargetClass(target.GetEffectiveMaxVramMB()) == TargetClass.Small;
+
+    /// <summary>
+    /// Returns true when any desktop/server-class fleet target (a) holds a loaded model
+    /// classified as dense (per its /api/ps entry's capability metadata — SmallDense or
+    /// LargeDense, never MoE) or (b) is busy (InFlightRequests &gt; 0). Evaluated per decision
+    /// over the current tracker states (no caching across requests; the capability engine's
+    /// own 30 s metadata cache bounds the /api/show traffic).
+    /// </summary>
+    private async Task<bool> HasDenseHotOrBusyLargeTargetAsync(RoutingContext context, CancellationToken cancellationToken)
+    {
+        var fleetTargets = _options.Value.GetEffectiveTargets(_logger);
+        foreach (var candidate in fleetTargets)
+        {
+            var maxVram = candidate.GetEffectiveMaxVramMB();
+            var candidateClass = GetTargetClass(maxVram);
+            if (candidateClass != TargetClass.Desktop && candidateClass != TargetClass.Server)
+            {
+                continue;
+            }
+
+            var state = context.GetExecutionState(new RoutingTarget(candidate.Name!));
+            if (state is null)
+            {
+                continue;
+            }
+
+            if (state.InFlightRequests > 0)
+            {
+                return true;
+            }
+
+            foreach (var loaded in state.LoadedModels)
+            {
+                if (await IsLoadedModelDenseAsync(candidate, loaded.Name, cancellationToken))
+                {
+                    return true;
+                }
             }
         }
 
-        // 2. If no target is available, fallback to the first enabled target that is able to handle the request.
-        // Non-overflow targets are evaluated first so that busy primary instances take precedence over overflow.
-        foreach (var target in list.Where(t => t.IsEnabled && !t.IsOverflow))
+        return false;
+    }
+
+    /// <summary>
+    /// Classifies one /api/ps loaded-model entry via the capability engine's metadata
+    /// (same source of truth as Stage 1). Any discovery failure degrades to "not dense"
+    /// (permissive: no offload bonus, never a disqualification).
+    /// </summary>
+    private async Task<bool> IsLoadedModelDenseAsync(OllamaTargetOptions target, string modelName, CancellationToken cancellationToken)
+    {
+        if (_capabilityEngine is null)
         {
-            if (await target.CanProcessAsync(context, cancellationToken))
-            {
-                return target;
-            }
+            return false;
         }
 
-        foreach (var target in list.Where(t => t.IsEnabled && t.IsOverflow))
+        try
         {
-            if (await target.CanProcessAsync(context, cancellationToken))
+            var digest = await _modelCatalogCacheService.GetCurrentDigestAsync(target.Url, cancellationToken);
+            if (string.IsNullOrEmpty(digest))
             {
-                return target;
+                return false;
             }
+
+            var metadata = await _capabilityEngine.GetMetadataAsync(target.Url, modelName, digest, cancellationToken);
+            var (architecture, _) = _capabilityEngine.ClassifyArchitecture(metadata, null);
+            return architecture == ModelArchitectureKind.SmallDense || architecture == ModelArchitectureKind.LargeDense;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Stage-2 EvictionPenalty (VRAM-sum based, Q1 resolution): penalize iff
+    /// <list type="number">
+    /// <item>the requested model is NOT already loaded (Affinity applies instead), and</item>
+    /// <item>the target has ≥ 1 OTHER loaded model, and</item>
+    /// <item>the load overflows: TotalVramBytes + modelWeightMB &gt; MaxVramMB when MaxVramMB
+    /// is known; when unknown (or the weight is unknown and MaxVramMB is known), apply the
+    /// penalty only for non-server-class targets (server has enough headroom — we cannot
+    /// prove eviction). Stale snapshots still apply the rule (better than none for anti-thrash).</item>
+    /// </list>
+    /// </summary>
+    private static bool WouldEvict(
+        bool requestedModelIsLoaded,
+        IReadOnlyList<TargetLoadedModel> loadedModels,
+        long? totalVramBytes,
+        long? weightSizeBytes,
+        int? maxVramMB)
+    {
+        if (requestedModelIsLoaded)
+        {
+            return false;
         }
 
-        return null;
+        if (loadedModels.Count == 0)
+        {
+            return false;
+        }
+
+        var isServerClass = maxVramMB is not null && maxVramMB >= DynamicContextSizingEngine.ServerClassVramThresholdMB;
+
+        if (maxVramMB is null)
+        {
+            // Unknown VRAM budget: pessimistic anti-thrash for non-server-class targets only.
+            return !isServerClass;
+        }
+
+        if (weightSizeBytes is not null && weightSizeBytes > 0)
+        {
+            var total = totalVramBytes ?? 0L;
+            return total + weightSizeBytes > (long)maxVramMB.Value * BytesPerMiB;
+        }
+
+        // Known budget but unknown (degraded) weight: conservative for non-server-class targets.
+        return !isServerClass;
+    }
+
+    private enum TargetClass
+    {
+        Small,
+        Desktop,
+        Server,
+        Unknown
+    }
+
+    private static TargetClass GetTargetClass(int? maxVramMB)
+    {
+        if (maxVramMB is null)
+        {
+            return TargetClass.Unknown;
+        }
+
+        if (maxVramMB < ModelCapabilityEngine.SmallTargetVramThresholdMB)
+        {
+            return TargetClass.Small;
+        }
+
+        return maxVramMB >= DynamicContextSizingEngine.ServerClassVramThresholdMB
+            ? TargetClass.Server
+            : TargetClass.Desktop;
+    }
+
+    private static RoutingCandidateEvaluation Disqualified(RoutingTarget target, string reason)
+    {
+        return new RoutingCandidateEvaluation(
+            target,
+            Qualified: false,
+            Score: null,
+            DisqualifiedReason: reason,
+            AffinityBonus: 0,
+            HardwareBonus: 0,
+            EvictionPenalty: 0,
+            ConcurrencyPenalty: 0,
+            Detail: $"disqualified: {reason}");
+    }
+
+    private static RoutingCandidateEvaluation Scored(
+        RoutingTarget target,
+        int score,
+        int affinity,
+        int hardware,
+        int eviction,
+        int concurrency,
+        string detail)
+    {
+        return new RoutingCandidateEvaluation(
+            target,
+            Qualified: true,
+            Score: score,
+            DisqualifiedReason: null,
+            AffinityBonus: affinity,
+            HardwareBonus: hardware,
+            EvictionPenalty: eviction,
+            ConcurrencyPenalty: concurrency,
+            Detail: detail);
     }
 
     /// <summary>

@@ -1,3 +1,5 @@
+using System.Text.Json.Nodes;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -8,705 +10,681 @@ using OllamaRouter.Services;
 
 namespace OllamaRouter.Tests.Services;
 
+/// <summary>
+/// Tests for the two-stage hot-model affinity scoring pipeline (Phase 3, item 3):
+/// Stage-1 candidate qualification + Stage-2 calibrated scoring
+/// (Affinity +100, Hardware +20, Eviction -80, Concurrency (InFlight×40)+(cliff?100:0)),
+/// declaration-order tie-break, and the Cloud fixed-score-0 terminal fallback.
+/// </summary>
 public class RoutingDecisionServiceTests
 {
-    private const string ModelName = "llama3";
+    private const string DesktopUrl = "http://desktop:11434";
+    private const string LaptopUrl = "http://laptop:11434";
+    private const string ServerUrl = "http://server:11434";
 
-    // The legacy fleet: the well-known three targets, all enabled.
-    private static TargetAvailabilitySnapshot AllEnabledTargets() =>
-        new(new Dictionary<RoutingTarget, bool>
-        {
-            [RoutingTarget.Local] = true,
-            [RoutingTarget.Remote] = true,
-            [RoutingTarget.Cloud] = true
-        });
+    // Fleet fixture (declaration order matters — Desktop first, then Laptop, then Server).
+    private static readonly OllamaTargetOptions Desktop = new() { Name = "Desktop", Url = DesktopUrl, HardwareHint = "16gb", MaxParallel = 1 };
+    private static readonly OllamaTargetOptions Laptop = new() { Name = "Laptop", Url = LaptopUrl, HardwareHint = "8gb", MaxParallel = 1 };
+    private static readonly OllamaTargetOptions Server = new() { Name = "Server", Url = ServerUrl, HardwareHint = "96gb", MaxParallel = 2 };
 
-    // All legacy targets enabled except the given ones.
-    private static TargetAvailabilitySnapshot AllExcept(params RoutingTarget[] disabled) =>
-        new(new Dictionary<RoutingTarget, bool>
-        {
-            [RoutingTarget.Local] = !disabled.Contains(RoutingTarget.Local),
-            [RoutingTarget.Remote] = !disabled.Contains(RoutingTarget.Remote),
-            [RoutingTarget.Cloud] = !disabled.Contains(RoutingTarget.Cloud)
-        });
+    private static readonly RoutingTarget TDesktop = new("Desktop");
+    private static readonly RoutingTarget TLaptop = new("Laptop");
+    private static readonly RoutingTarget TServer = new("Server");
 
-    private static RoutingDecisionService CreateSut(
-        Mock<IOllamaModelCatalogClient> catalogClient,
-        Mock<IGpuVramProvider> gpuVramProvider,
-        int maxLocalTokens = 40_000,
-        int minRequiredVramMB = 13_500,
-        string modelName = ModelName,
-        string? cloudModel = null,
-        Mock<IModelCatalogCacheService>? modelCatalogCacheService = null,
-        Mock<IActivityMonitorService>? activityMonitor = null,
-        TargetAvailabilitySnapshot? targets = null,
-        int consecutiveFailuresTokenTolerance = 4000,
-        ITargetFailureStreakService? streakTracker = null)
+    // ------------------------------------------------------------------
+    // Test harness
+    // ------------------------------------------------------------------
+
+    private sealed class Harness
+    {
+        public required RoutingDecisionService SUT { get; init; }
+        public List<RoutingCandidateEvaluation> Evaluations { get; } = new();
+        /// <summary>
+        /// Mutable per-turn execution-state snapshot store (multi-turn simulations mutate
+        /// this between turns; the tracker mock reads it live on every GetState call).
+        /// </summary>
+        public required Dictionary<RoutingTarget, TargetExecutionState> States { get; init; }
+
+        public Task<RoutingTarget> Decide(int tokens, string model, int? numCtx = null)
+            => SUT.DecideWithEvaluationsAsync(tokens, model, numCtx, e => Evaluations.Add(e));
+
+        public RoutingCandidateEvaluation? Eval(RoutingTarget t) => Evaluations.LastOrDefault(e => e.Target == t);
+    }
+
+    private sealed class MetaMap
+    {
+        private readonly Dictionary<string, (JsonObject Show, long SizeBytes)> _entries = new(StringComparer.OrdinalIgnoreCase);
+
+        public void Add(string url, string model, JsonObject show, long sizeBytes)
+            => _entries[$"{url}|{model}"] = (show, sizeBytes);
+
+        public JsonArray BuildTags(string url)
         {
-        var options = Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions
-        {
-            Models = new Dictionary<string, ModelThresholds>
+            var array = new JsonArray();
+            foreach (var (key, value) in _entries)
             {
-                [modelName] = new ModelThresholds
+                var idx = key.IndexOf('|');
+                if (!key[..idx].Equals(url, StringComparison.OrdinalIgnoreCase))
                 {
-                    MaxLocalTokens = maxLocalTokens,
-                    MinRequiredVramMB = minRequiredVramMB,
-                    CloudModel = cloudModel
+                    continue;
                 }
-            },
-            LocalUrl = "http://127.0.0.1:11435",
-            RemoteUrl = "http://aiserver.local:11434",
-            ConsecutiveFailuresTokenTolerance = consecutiveFailuresTokenTolerance
-        });
 
-        var targetAvailability = new Mock<ITargetAvailabilityService>();
-        var effectiveTargets = targets ?? AllEnabledTargets();
-        targetAvailability.Setup(t => t.IsEnabled(RoutingTarget.Local)).Returns(effectiveTargets.Flags[RoutingTarget.Local]);
-        targetAvailability.Setup(t => t.IsEnabled(RoutingTarget.Remote)).Returns(effectiveTargets.Flags[RoutingTarget.Remote]);
-        targetAvailability.Setup(t => t.IsEnabled(RoutingTarget.Cloud)).Returns(effectiveTargets.Flags[RoutingTarget.Cloud]);
+                var model = key[(idx + 1)..];
+                array.Add(new JsonObject { ["name"] = model, ["size"] = (JsonNode)(value.SizeBytes) });
+            }
 
-        modelCatalogCacheService ??= CreateModelCatalogCacheServiceAvailableOnBoth();
-        activityMonitor ??= CreateActivityMonitorNotBusy();
-        var handlers = new IRoutingTargetHandler[]
-        {
-            new LocalRoutingTargetHandler(options, catalogClient.Object, gpuVramProvider.Object, activityMonitor.Object, targetAvailability.Object),
-            new RemoteRoutingTargetHandler(activityMonitor.Object, targetAvailability.Object),
-            new CloudRoutingTargetHandler(targetAvailability.Object)
-        };
-
-        // Use the master constructor so tests can drive the shared per-target failure-streak
-        // service (the token-tolerance-based logic was replaced by streak-based skipping).
-        return new RoutingDecisionService(
-            handlers,
-            options,
-            modelCatalogCacheService.Object,
-            activityMonitor.Object,
-            NullLogger<RoutingDecisionService>.Instance,
-            capabilityEngine: null,
-            streakTracker: streakTracker ?? new TargetFailureStreakService());
+            return array;
         }
 
-    private static Mock<IActivityMonitorService> CreateActivityMonitorNotBusy()
-    {
-        var activityMonitor = new Mock<IActivityMonitorService>();
-        activityMonitor.Setup(a => a.IsBusy(It.IsAny<RoutingTarget>())).Returns(false);
-        return activityMonitor;
+        public JsonObject? Show(string url, string model)
+            => _entries.TryGetValue($"{url}|{model}", out var v) ? v.Show : null;
     }
 
-    private static Mock<IActivityMonitorService> CreateActivityMonitorRemoteBusy()
+    private static (Harness Harness, MetaMap Meta) Build(
+        OllamaRouterOptions options,
+        bool withEngine,
+        HashSet<string> catalogModels,          // "url|model" entries present in the catalog
+        HashSet<string> onlineTargets,          // target names that are Online
+        Dictionary<RoutingTarget, TargetExecutionState>? states = null,
+        HashSet<RoutingTarget>? disabled = null,
+        MetaMap? meta = null,
+        Mock<ITargetLivenessService>? livenessOverride = null,
+        Func<RoutingTarget, int>? failureStreaks = null)
     {
-        var activityMonitor = new Mock<IActivityMonitorService>();
-        activityMonitor.Setup(a => a.IsBusy(RoutingTarget.Remote)).Returns(true);
-        return activityMonitor;
-    }
-
-    private static Mock<IActivityMonitorService> CreateActivityMonitorBothBusy()
-    {
-        var activityMonitor = new Mock<IActivityMonitorService>();
-        activityMonitor.Setup(a => a.IsBusy(RoutingTarget.Local)).Returns(true);
-        activityMonitor.Setup(a => a.IsBusy(RoutingTarget.Remote)).Returns(true);
-        return activityMonitor;
-    }
-
-    private static Mock<IModelCatalogCacheService> CreateModelCatalogCacheServiceAvailableOnBoth()
-    {
-        var modelCatalogCacheService = new Mock<IModelCatalogCacheService>();
-        modelCatalogCacheService
-            .Setup(c => c.ModelExistsAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(true);
-        return modelCatalogCacheService;
-    }
-
-    [Fact]
-    public async Task DecideAsync_ModelNotConfigured_ReturnsRemote_WithoutQueryingCatalogOrGpu()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        // The SUT only has "llama3" configured, so any other model name must be routed remote.
-        var sut = CreateSut(catalogClient, gpuVramProvider);
-
-        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: "unknown-model");
-
-        Assert.Equal(RoutingTarget.Remote, target);
-        catalogClient.Verify(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
-        gpuVramProvider.Verify(g => g.GetFreeVramMB(), Times.Never);
-    }
-
-    [Fact]
-    public async Task DecideAsync_TokenCountExceedsMax_ReturnsRemote_WithoutQueryingCatalogOrGpu()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        var sut = CreateSut(catalogClient, gpuVramProvider);
-
-        var target = await sut.DecideAsync(tokenCount: 50_000, modelName: ModelName);
-
-        Assert.Equal(RoutingTarget.Remote, target);
-        catalogClient.Verify(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
-        gpuVramProvider.Verify(g => g.GetFreeVramMB(), Times.Never);
-    }
-
-    [Fact]
-    public async Task DecideAsync_TokenCountExceedsMax_RemoteBusy_CloudModelConfigured_ReturnsCloud()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        var activityMonitor = CreateActivityMonitorRemoteBusy();
-        var sut = CreateSut(catalogClient, gpuVramProvider, cloudModel: "deepseek-v3.1:671b-cloud", activityMonitor: activityMonitor);
-
-        var target = await sut.DecideAsync(tokenCount: 50_000, modelName: ModelName);
-
-        Assert.Equal(RoutingTarget.Cloud, target);
-    }
-
-    [Fact]
-    public async Task DecideAsync_ModelNotLoaded_NotEnoughVram_RemoteBusy_CloudModelConfigured_ReturnsCloud()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        catalogClient.Setup(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(false);
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(5_000);
-        var activityMonitor = CreateActivityMonitorRemoteBusy();
-        var sut = CreateSut(catalogClient, gpuVramProvider, cloudModel: "deepseek-v3.1:671b-cloud", activityMonitor: activityMonitor);
-
-        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
-
-        Assert.Equal(RoutingTarget.Cloud, target);
-    }
-
-    [Fact]
-    public async Task DecideAsync_ModelNotLoaded_NotEnoughVram_RemoteNotBusy_ReturnsRemote()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        catalogClient.Setup(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(false);
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(5_000);
-        var sut = CreateSut(catalogClient, gpuVramProvider, cloudModel: "deepseek-v3.1:671b-cloud");
-
-        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
-
-        Assert.Equal(RoutingTarget.Remote, target);
-    }
-
-    [Fact]
-    public async Task DecideAsync_ModelAlreadyLoadedLocally_ReturnsLocal_WithoutQueryingGpu()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        catalogClient.Setup(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), ModelName, It.IsAny<CancellationToken>()))
-            .ReturnsAsync(true);
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        var sut = CreateSut(catalogClient, gpuVramProvider);
-
-        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
-
-        Assert.Equal(RoutingTarget.Local, target);
-        gpuVramProvider.Verify(g => g.GetFreeVramMB(), Times.Never);
-    }
-
-    [Fact]
-    public async Task DecideAsync_ModelNotLoaded_EnoughVram_ReturnsLocal()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        catalogClient.Setup(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(false);
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(15_000);
-        var sut = CreateSut(catalogClient, gpuVramProvider);
-
-        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
-
-        Assert.Equal(RoutingTarget.Local, target);
-    }
-
-    [Fact]
-    public async Task DecideAsync_ModelNotLoaded_NotEnoughVram_ReturnsRemote()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        catalogClient.Setup(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(false);
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(5_000);
-        var sut = CreateSut(catalogClient, gpuVramProvider);
-
-        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
-
-        Assert.Equal(RoutingTarget.Remote, target);
-    }
-
-    [Fact]
-    public async Task DecideAsync_TokenCountEqualsMax_IsWithinLocalLimit()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        catalogClient.Setup(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(false);
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
-        var sut = CreateSut(catalogClient, gpuVramProvider);
-
-        var target = await sut.DecideAsync(tokenCount: 40_000, modelName: ModelName);
-
-        Assert.Equal(RoutingTarget.Local, target);
-    }
-
-    [Fact]
-    public async Task DecideAsync_ModelNameWithLatestTag_ResolvesConfiguredModel()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        catalogClient.Setup(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(false);
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
-        var sut = CreateSut(catalogClient, gpuVramProvider);
-
-        // Clients frequently send the implicit ":latest" tag; the configured key has no tag.
-        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName + ":latest");
-
-        Assert.Equal(RoutingTarget.Local, target);
-    }
-
-    [Fact]
-    public async Task DecideAsync_ModelOnlyAvailableLocally_ReturnsLocal_WithoutQueryingGpu()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        var modelCatalogCacheService = new Mock<IModelCatalogCacheService>();
-        modelCatalogCacheService.Setup(c => c.ModelExistsAsync("http://127.0.0.1:11435", ModelName, It.IsAny<CancellationToken>()))
-            .ReturnsAsync(true);
-        modelCatalogCacheService.Setup(c => c.ModelExistsAsync("http://aiserver.local:11434", ModelName, It.IsAny<CancellationToken>()))
-            .ReturnsAsync(false);
-        var sut = CreateSut(catalogClient, gpuVramProvider, modelCatalogCacheService: modelCatalogCacheService);
-
-        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
-
-        Assert.Equal(RoutingTarget.Local, target);
-        gpuVramProvider.Verify(g => g.GetFreeVramMB(), Times.Never);
-    }
-
-    [Fact]
-    public async Task DecideAsync_ModelOnlyAvailableRemotely_ReturnsRemote_WithoutQueryingGpu()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        var modelCatalogCacheService = new Mock<IModelCatalogCacheService>();
-        modelCatalogCacheService.Setup(c => c.ModelExistsAsync("http://127.0.0.1:11435", ModelName, It.IsAny<CancellationToken>()))
-            .ReturnsAsync(false);
-        modelCatalogCacheService.Setup(c => c.ModelExistsAsync("http://aiserver.local:11434", ModelName, It.IsAny<CancellationToken>()))
-            .ReturnsAsync(true);
-        var sut = CreateSut(catalogClient, gpuVramProvider, modelCatalogCacheService: modelCatalogCacheService);
-
-        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
-
-        Assert.Equal(RoutingTarget.Remote, target);
-        gpuVramProvider.Verify(g => g.GetFreeVramMB(), Times.Never);
-    }
-
-    [Fact]
-    public async Task DecideAsync_ModelNotAvailableOnEitherTarget_ReturnsRemote_WithoutQueryingGpu()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        var modelCatalogCacheService = new Mock<IModelCatalogCacheService>();
-        modelCatalogCacheService
-            .Setup(c => c.ModelExistsAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(false);
-        var sut = CreateSut(catalogClient, gpuVramProvider, modelCatalogCacheService: modelCatalogCacheService);
-
-        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
-
-        Assert.Equal(RoutingTarget.Remote, target);
-        gpuVramProvider.Verify(g => g.GetFreeVramMB(), Times.Never);
-    }
-
-    [Fact]
-    public async Task DecideAsync_ChecksAvailability_WithFullModelNameAndCorrectUrls()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        catalogClient.Setup(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(false);
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
-        var modelCatalogCacheService = CreateModelCatalogCacheServiceAvailableOnBoth();
-        var sut = CreateSut(catalogClient, gpuVramProvider, modelCatalogCacheService: modelCatalogCacheService);
-
-        await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName + ":latest");
-
-        modelCatalogCacheService.Verify(c => c.ModelExistsAsync("http://127.0.0.1:11435", ModelName + ":latest", It.IsAny<CancellationToken>()), Times.Once);
-        modelCatalogCacheService.Verify(c => c.ModelExistsAsync("http://aiserver.local:11434", ModelName + ":latest", It.IsAny<CancellationToken>()), Times.Once);
-    }
-
-    [Fact]
-    public async Task DecideAsync_ModelNotAvailableOnEitherTarget_TokenCountExceedsMax_ReturnsRemote_WithoutQueryingCatalogOrGpu()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        var modelCatalogCacheService = new Mock<IModelCatalogCacheService>();
-        modelCatalogCacheService
-            .Setup(c => c.ModelExistsAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(false);
-        var sut = CreateSut(catalogClient, gpuVramProvider, modelCatalogCacheService: modelCatalogCacheService);
-
-        var target = await sut.DecideAsync(tokenCount: 50_000, modelName: ModelName);
-
-        Assert.Equal(RoutingTarget.Remote, target);
-        catalogClient.Verify(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
-        gpuVramProvider.Verify(g => g.GetFreeVramMB(), Times.Never);
-    }
-
-    [Fact]
-    public async Task DecideAsync_ModelAvailableOnBoth_ButExceedsTokenLimit_ReturnsRemote()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        var sut = CreateSut(catalogClient, gpuVramProvider);
-
-        var target = await sut.DecideAsync(tokenCount: 50_000, modelName: ModelName);
-
-        Assert.Equal(RoutingTarget.Remote, target);
-        catalogClient.Verify(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
-        gpuVramProvider.Verify(g => g.GetFreeVramMB(), Times.Never);
-    }
-
-    [Fact]
-    public async Task DecideAsync_LocalAndRemoteBothBusy_CloudModelConfigured_ReturnsCloud()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        var activityMonitor = CreateActivityMonitorBothBusy();
-        var sut = CreateSut(catalogClient, gpuVramProvider, cloudModel: "deepseek-v3.1:671b-cloud", activityMonitor: activityMonitor);
-
-        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
-
-        Assert.Equal(RoutingTarget.Cloud, target);
-        catalogClient.Verify(c => c.IsModelLoadedLocallyAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
-        gpuVramProvider.Verify(g => g.GetFreeVramMB(), Times.Never);
-    }
-
-    [Fact]
-    public async Task DecideAsync_LocalAndRemoteBothBusy_NoCloudModelConfigured_DoesNotOverflow()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
-        var activityMonitor = CreateActivityMonitorBothBusy();
-        var sut = CreateSut(catalogClient, gpuVramProvider, activityMonitor: activityMonitor);
-
-        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
-
-        Assert.NotEqual(RoutingTarget.Cloud, target);
-    }
-
-    [Theory]
-    [InlineData("llama3", "llama3")]
-    [InlineData("llama3:latest", "llama3")]
-    [InlineData("qwen3.8-27B:latest", "qwen3.8-27B")]
-    [InlineData("qwen3.8-27B:myquant", "qwen3.8-27B")]
-    [InlineData("no-tag", "no-tag")]
-    [InlineData("", "")]
-    public void NormalizeModelName_StripsTagPrefix(string input, string expected)
-    {
-        Assert.Equal(expected, RoutingDecisionService.NormalizeModelName(input));
-    }
-
-    [Fact]
-    public async Task DecideAsync_LocalDisabled_RemoteBusy_CloudModelConfigured_ReturnsCloud()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        var activityMonitor = CreateActivityMonitorRemoteBusy();
-        var sut = CreateSut(catalogClient, gpuVramProvider,
-            cloudModel: "deepseek-v3.1:671b-cloud",
-            activityMonitor: activityMonitor,
-            targets: AllExcept(RoutingTarget.Local));
-
-        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
-
-        Assert.Equal(RoutingTarget.Cloud, target);
-    }
-
-    [Fact]
-    public async Task DecideAsync_RemoteDisabled_TokenCountExceedsMax_CloudModelConfigured_ReturnsCloud()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        var sut = CreateSut(catalogClient, gpuVramProvider,
-            cloudModel: "deepseek-v3.1:671b-cloud",
-            targets: AllExcept(RoutingTarget.Remote));
-
-        var target = await sut.DecideAsync(tokenCount: 50_000, modelName: ModelName);
-
-        Assert.Equal(RoutingTarget.Cloud, target);
-    }
-
-    [Fact]
-    public async Task DecideAsync_CloudDisabled_LocalAndRemoteBothBusy_CloudModelConfigured_DoesNotOverflow()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
-        var activityMonitor = CreateActivityMonitorBothBusy();
-        var sut = CreateSut(catalogClient, gpuVramProvider,
-            cloudModel: "deepseek-v3.1:671b-cloud",
-            activityMonitor: activityMonitor,
-            targets: AllExcept(RoutingTarget.Cloud));
-
-        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
-
-        Assert.NotEqual(RoutingTarget.Cloud, target);
-    }
-
-    [Fact]
-    public async Task DecideAsync_RemoteDisabled_CloudDisabled_TokenCountExceedsMax_ThrowsNoAvailableTargetException()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        var sut = CreateSut(catalogClient, gpuVramProvider,
-            cloudModel: "deepseek-v3.1:671b-cloud",
-            targets: AllExcept(RoutingTarget.Remote, RoutingTarget.Cloud));
-
-        await Assert.ThrowsAsync<NoAvailableTargetException>(() => sut.DecideAsync(tokenCount: 50_000, modelName: ModelName));
-    }
-
-    [Fact]
-    public async Task DecideAsync_RemoteDisabled_CloudDisabled_WithinLocalLimits_ReturnsLocal()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
-        var sut = CreateSut(catalogClient, gpuVramProvider,
-            cloudModel: "deepseek-v3.1:671b-cloud",
-            targets: AllExcept(RoutingTarget.Remote, RoutingTarget.Cloud));
-
-        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
-
-        Assert.Equal(RoutingTarget.Local, target);
-    }
-
-    [Fact]
-    public async Task DecideAsync_RemoteDisabled_LocalBusy_WithinLocalLimits_FallsBackToLocal()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
-        var activityMonitor = new Mock<IActivityMonitorService>();
-        activityMonitor.Setup(a => a.IsBusy(RoutingTarget.Local)).Returns(true);
-        activityMonitor.Setup(a => a.IsBusy(RoutingTarget.Remote)).Returns(false);
-        var sut = CreateSut(catalogClient, gpuVramProvider,
-            activityMonitor: activityMonitor,
-            targets: AllExcept(RoutingTarget.Remote, RoutingTarget.Cloud));
-
-        var target = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
-
-        Assert.Equal(RoutingTarget.Local, target);
-    }
-
-    [Fact]
-    public async Task DecideAsync_AllTargetsDisabled_ThrowsNoAvailableTargetException()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
-        var sut = CreateSut(catalogClient, gpuVramProvider,
-            targets: AllExcept(RoutingTarget.Local, RoutingTarget.Remote, RoutingTarget.Cloud));
-
-        await Assert.ThrowsAsync<NoAvailableTargetException>(() => sut.DecideAsync(tokenCount: 1_000, modelName: ModelName));
-    }
-
-    [Fact]
-    public async Task DecideAsync_MultiTarget_DispatchesToFirstAvailableTarget()
-    {
-        var target1 = new Mock<IRoutingTargetHandler>();
-        target1.Setup(t => t.Target).Returns(RoutingTarget.Local);
-        target1.Setup(t => t.IsEnabled).Returns(true);
-        target1.Setup(t => t.IsAvailable()).Returns(false); // busy
-        target1.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
-
-        var target2 = new Mock<IRoutingTargetHandler>();
-        target2.Setup(t => t.Target).Returns(RoutingTarget.Remote);
-        target2.Setup(t => t.IsEnabled).Returns(true);
-        target2.Setup(t => t.IsAvailable()).Returns(true);
-        target2.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
-
-        var target3Overflow = new Mock<IRoutingTargetHandler>();
-        target3Overflow.Setup(t => t.Target).Returns(RoutingTarget.Cloud);
-        target3Overflow.Setup(t => t.IsOverflow).Returns(true);
-        target3Overflow.Setup(t => t.IsEnabled).Returns(true);
-        target3Overflow.Setup(t => t.IsAvailable()).Returns(true);
-        target3Overflow.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
-
-        var options = Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions());
-        var catalogCache = new Mock<IModelCatalogCacheService>();
+        meta ??= new MetaMap();
+        var metaMap = meta;
+        var disabledSet = disabled ?? new HashSet<RoutingTarget>();
+        var cacheService = new Mock<IModelCatalogCacheService>();
+        cacheService
+            .Setup(c => c.ModelExistsAsync(It.IsAny<string?>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns((string? url, string model, CancellationToken _) =>
+                Task.FromResult(catalogModels.Contains($"{url}|{model}")));
+        cacheService
+            .Setup(c => c.GetCurrentDigestAsync(It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(withEngine ? "digest-xyz" : "");
+
+        Mock<ITargetLivenessService> liveness;
+        if (livenessOverride is not null)
+        {
+            liveness = livenessOverride;
+        }
+        else
+        {
+            liveness = new Mock<ITargetLivenessService>();
+            liveness.Setup(l => l.IsOnline(It.IsAny<RoutingTarget>()))
+                .Returns((RoutingTarget t) => onlineTargets.Contains(t.Value));
+            liveness.Setup(l => l.ServiceStartTimeUtc).Returns(DateTimeOffset.MinValue); // no startup grace
+            liveness.Setup(l => l.GetEntries()).Returns(new Dictionary<RoutingTarget, TargetLivenessEntry>());
+        }
+
+        var availability = new Mock<ITargetAvailabilityService>();
+        availability.Setup(a => a.IsEnabled(It.IsAny<RoutingTarget>()))
+            .Returns((RoutingTarget t) => !disabledSet.Contains(t));
+
+        var statesStore = new Dictionary<RoutingTarget, TargetExecutionState>(states ?? new Dictionary<RoutingTarget, TargetExecutionState>());
+        var tracker = new Mock<ITargetExecutionTracker>();
+        tracker.Setup(t => t.GetState(It.IsAny<RoutingTarget>()))
+            .Returns((RoutingTarget t) => statesStore.TryGetValue(t, out var s) ? s : null);
+        tracker.Setup(t => t.GetAllStates()).Returns(() => statesStore.Values.ToList());
+
+        // The decision service consumes the per-target failure streak (task #8): a real
+        // streak service is minted per harness and fed from the per-target streak function.
+        var streakTracker = new TargetFailureStreakService();
+        if (failureStreaks is not null)
+        {
+            var tracked = new HashSet<RoutingTarget>();
+            tracked.UnionWith(onlineTargets.Select(n => new RoutingTarget(n)));
+            tracked.Add(RoutingTarget.Cloud);
+            foreach (var t in tracked)
+            {
+                var count = failureStreaks(t);
+                for (var i = 0; i < count; i++)
+                {
+                    streakTracker.RecordFailure(t);
+                }
+            }
+        }
+
+        ModelCapabilityEngine? engine = null;
+        if (withEngine)
+        {
+            var catalogClient = new Mock<IOllamaModelCatalogClient>();
+            catalogClient
+                .Setup(c => c.GetTagsWithDigestAsync(It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+                .Returns((string? url, CancellationToken _) =>
+                    Task.FromResult((url is null ? new JsonArray() : metaMap.BuildTags(url), "digest-xyz")));
+            catalogClient
+                .Setup(c => c.GetShowAsync(It.IsAny<string?>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Returns((string? url, string model, CancellationToken _) =>
+                {
+                    JsonObject? show = metaMap.Show(url ?? "", model) ?? new JsonObject();
+                    return Task.FromResult(show);
+                });
+
+            engine = new ModelCapabilityEngine(
+                catalogClient.Object,
+                new MemoryCache(new MemoryCacheOptions()),
+                NullLogger<ModelCapabilityEngine>.Instance,
+                cacheService.Object);
+        }
+
+        var cloudHandler = new CloudRoutingTargetHandler(availability.Object);
         var sut = new RoutingDecisionService(
-            [target1.Object, target2.Object, target3Overflow.Object],
-            options,
-            catalogCache.Object,
-            NullLogger<RoutingDecisionService>.Instance);
+            Microsoft.Extensions.Options.Options.Create(options),
+            cacheService.Object,
+            liveness.Object,
+            availability.Object,
+            tracker.Object,
+            engine,
+            cloudHandler,
+            NullLogger<RoutingDecisionService>.Instance,
+            streakTracker);
 
-        var decision = await sut.DecideAsync(100, "test-model");
+        return (new Harness { SUT = sut, States = statesStore }, meta);
+    }
 
-        Assert.Equal(RoutingTarget.Remote, decision);
-        target3Overflow.Verify(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>()), Times.Never);
+    // ---- option / metadata builders ----
+
+    private static OllamaRouterOptions FleetOptions(string model, string? architecture = null, string? cloudModel = null)
+    {
+        var options = new OllamaRouterOptions
+        {
+            Targets = new List<OllamaTargetOptions> { Desktop, Laptop, Server },
+            Models = new Dictionary<string, ModelThresholds>
+            {
+                [model] = new ModelThresholds { Architecture = architecture, CloudModel = cloudModel }
+            }
+        };
+        return options;
+    }
+
+    private static TargetExecutionState State(
+        RoutingTarget t,
+        int inFlight,
+        params (string Name, long Size)[] loaded)
+    {
+        var models = loaded.Select(m => new TargetLoadedModel(m.Name, m.Size)).ToList();
+        return new TargetExecutionState(t, inFlight, models, models.Sum(m => (long)m.SizeVramBytes), DateTimeOffset.UtcNow, false);
+    }
+
+    private static readonly long Gb = 1_073_741_824;
+
+    private static JsonObject DenseShow(long paramCount) => new()
+    {
+        ["model_info"] = new JsonObject { ["general.parameter_count"] = (JsonNode)paramCount },
+        ["details"] = new JsonObject { ["family"] = "qwen" }
+    };
+
+    private static JsonObject MoeShow(long paramCount, long expertCount) => new()
+    {
+        ["model_info"] = new JsonObject
+        {
+            ["general.parameter_count"] = (JsonNode)paramCount,
+            ["general.expert_count"] = (JsonNode)expertCount
+        },
+        ["details"] = new JsonObject { ["family"] = "moe" }
+    };
+
+    // ==================================================================
+    // AC3 — concurrency spill: busy Desktop (-20) vs idle Server (0)
+    // ==================================================================
+
+    [Fact]
+    public async Task ConcurrencySpill_BusyDesktop_SecondConcurrent27B_RoutesToServer()
+    {
+        var seedMeta = new MetaMap();
+        var (h, meta) = Build(
+            FleetOptions("qwen3.8-27B"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{LaptopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, inFlight: 1, ("qwen3.8-27B", 16 * Gb)), // hot + busy, MaxParallel 1
+                [TLaptop] = State(TLaptop, inFlight: 0),
+                [TServer] = State(TServer, inFlight: 0)
+            },
+            meta: AddDense(seedMeta, "qwen3.8-27B", 27_800_000_000));
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B");
+
+        Assert.Equal(TServer, winner);
+
+        var desktop = h.Eval(TDesktop)!;
+        Assert.True(desktop.Qualified);
+        Assert.Equal(100, desktop.AffinityBonus);  // 27B is hot on Desktop
+        Assert.Equal(20, desktop.HardwareBonus);   // desktop-class, ≤48k Architect sweet spot
+        Assert.Equal(0, desktop.EvictionPenalty);  // requested model already loaded
+        Assert.Equal(140, desktop.ConcurrencyPenalty); // 1 in-flight ×40 + cliff(1≥1)×100
+        Assert.Equal(-20, desktop.Score);          // 120 − 140 (documented AC3 example)
+
+        var server = h.Eval(TServer)!;
+        Assert.True(server.Qualified);
+        // 30k tokens (effective 37.5k) is within the 48k desktop sweet spot, so the +20 role
+        // bonus goes to the desktop class, not the server class: Server scores 0 vs
+        // Desktop's −20 (120 − 140, the documented AC3 example) ⇒ the second concurrent
+        // 27B request spills immediately to the idle Server.
+        Assert.Equal(0, server.HardwareBonus);
+        Assert.Equal(0, server.Score);
+    }
+
+    // ==================================================================
+    // AC1 — interleaved Architect(27B) / Developer(MoE), zero evictions
+    // ==================================================================
+
+    [Fact]
+    public async Task InterleavedArchitectDeveloper_ZeroEvictions_AlternatesDesktopLaptop()
+    {
+        const string dense = "qwen3.8-27B";
+        const string moe = "qwen3.6-35B-A3B";
+        var meta = new MetaMap();
+        meta = AddDense(meta, dense, 27_800_000_000);
+        meta = AddMoe(meta, moe, 35_000_000_000);
+
+        var options = new OllamaRouterOptions
+        {
+            Targets = new List<OllamaTargetOptions> { Desktop, Laptop }, // dual-agent: Desktop + Laptop only
+            Models = new Dictionary<string, ModelThresholds> { [dense] = new(), [moe] = new() }
+        };
+
+        var catalog = new HashSet<string>
+        {
+            $"{DesktopUrl}|{dense}", $"{DesktopUrl}|{moe}",
+            $"{LaptopUrl}|{dense}", $"{LaptopUrl}|{moe}"
+        };
+        var online = new HashSet<string> { "Desktop", "Laptop" };
+
+        var (h, _) = Build(options, withEngine: true, catalogModels: catalog, onlineTargets: online, meta: meta);
+
+        // Turn A: Architect 27B request. Desktop hot (27B), idle. → Desktop (+120).
+        h.States[TDesktop] = State(TDesktop, inFlight: 0, (dense, 16 * Gb));
+        h.States[TLaptop] = State(TLaptop, inFlight: 0);
+        var a = await h.Decide(30_000, dense);
+        Assert.Equal(TDesktop, a);
+        Assert.Equal(120, h.Eval(TDesktop)!.Score); // 100 affinity + 20 desktop role
+        Assert.Equal(0, h.Eval(TDesktop)!.EvictionPenalty);
+
+        // Turn B (concurrent): Developer MoE request. Desktop busy with 27B (in-flight 1);
+        // Laptop hot with MoE. → Laptop (100 affinity + 20 offload = +120).
+        h.States[TDesktop] = State(TDesktop, inFlight: 1, (dense, 16 * Gb));
+        h.States[TLaptop] = State(TLaptop, inFlight: 0, (moe, 24 * Gb));
+        var b = await h.Decide(30_000, moe);
+        Assert.Equal(TLaptop, b);
+        Assert.Equal(120, h.Eval(TLaptop)!.Score);           // 100 affinity + 20 offload
+        Assert.Equal(20, h.Eval(TLaptop)!.HardwareBonus);    // Desktop holds a dense model hot
+        Assert.Equal(0, h.Eval(TLaptop)!.EvictionPenalty);   // no eviction on the winner
+        Assert.Equal(80, h.Eval(TDesktop)!.EvictionPenalty); // MoE onto the 27B-holding Desktop WOULD evict
+
+        // Turn A2: Architect 27B again → Desktop (no eviction on the winner).
+        h.States[TDesktop] = State(TDesktop, inFlight: 0, (dense, 16 * Gb));
+        h.States[TLaptop] = State(TLaptop, inFlight: 1, (moe, 24 * Gb));
+        var a2 = await h.Decide(30_000, dense);
+        Assert.Equal(TDesktop, a2);
+        Assert.Equal(0, h.Eval(TDesktop)!.EvictionPenalty);
+
+        // Turn B2: Developer MoE again → Laptop (no eviction on the winner).
+        h.States[TDesktop] = State(TDesktop, inFlight: 1, (dense, 16 * Gb));
+        h.States[TLaptop] = State(TLaptop, inFlight: 0, (moe, 24 * Gb));
+        var b2 = await h.Decide(30_000, moe);
+        Assert.Equal(TLaptop, b2);
+        Assert.Equal(0, h.Eval(TLaptop)!.EvictionPenalty);
+
+        // Zero unloads: the eviction penalty (−80) never hit a winner in any turn.
+    }
+    // ==================================================================
+    // AC2 — standalone MoE on idle Desktop (no dense hot, all idle)
+    // ==================================================================
+
+    [Fact]
+    public async Task StandaloneMoe_IdleFleet_RoutesToIdleDesktop_ByDeclarationOrder()
+    {
+        const string moe = "qwen3.6-35B-A3B";
+        var meta = AddMoe(new MetaMap(), moe, 35_000_000_000);
+        var (h, _) = Build(
+            FleetOptions(moe),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|{moe}", $"{LaptopUrl}|{moe}", $"{ServerUrl}|{moe}" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, inFlight: 0), // idle, nothing loaded
+                [TLaptop] = State(TLaptop, inFlight: 0),
+                [TServer] = State(TServer, inFlight: 0)
+            },
+            meta: meta);
+
+        var winner = await h.Decide(30_000, moe);
+
+        // All three score 0 (no dense hot anywhere → Laptop gets NO offload bonus).
+        Assert.Equal(TDesktop, winner);           // Desktop wins the 0-0-0 tie by declaration order
+        Assert.Equal(0, h.Eval(TDesktop)!.Score);
+        Assert.Equal(0, h.Eval(TLaptop)!.HardwareBonus); // Laptop did NOT receive the offload bonus
+        Assert.Equal(0, h.Eval(TLaptop)!.Score);
+        Assert.Equal(0, h.Eval(TServer)!.Score);
+    }
+
+    // ==================================================================
+    // Stage-1 qualification: each rule individually disqualifies
+    // ==================================================================
+
+    [Fact]
+    public async Task Stage1_AdminDisabled_DisqualifiesTarget()
+    {
+        var seedMeta = new MetaMap();
+        var (h, meta) = Build(
+            FleetOptions("qwen3.8-27B"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{LaptopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            disabled: new() { TDesktop },
+            meta: AddDense(seedMeta, "qwen3.8-27B", 27_800_000_000));
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B");
+
+        Assert.False(h.Eval(TDesktop)!.Qualified);
+        Assert.Equal("disabled (administratively unavailable or Enabled=false)", h.Eval(TDesktop)!.DisqualifiedReason);
+        Assert.NotEqual(TDesktop, winner);
     }
 
     [Fact]
-    public async Task DecideAsync_MultiTarget_AllPrimaryBusy_DispatchesToLastOverflowTarget()
+    public async Task Stage1_Offline_DisqualifiesTarget()
     {
-        var target1 = new Mock<IRoutingTargetHandler>();
-        target1.Setup(t => t.Target).Returns(RoutingTarget.Local);
-        target1.Setup(t => t.IsEnabled).Returns(true);
-        target1.Setup(t => t.IsAvailable()).Returns(false); // busy
+        var seedMeta = new MetaMap();
+        var (h, meta) = Build(
+            FleetOptions("qwen3.8-27B"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{LaptopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Laptop" }, // Server offline
+            meta: AddDense(seedMeta, "qwen3.8-27B", 27_800_000_000));
 
-        var target2 = new Mock<IRoutingTargetHandler>();
-        target2.Setup(t => t.Target).Returns(RoutingTarget.Remote);
-        target2.Setup(t => t.IsEnabled).Returns(true);
-        target2.Setup(t => t.IsAvailable()).Returns(false); // busy
+        await h.Decide(30_000, "qwen3.8-27B");
 
-        var target3Overflow = new Mock<IRoutingTargetHandler>();
-        target3Overflow.Setup(t => t.Target).Returns(RoutingTarget.Cloud);
-        target3Overflow.Setup(t => t.IsOverflow).Returns(true);
-        target3Overflow.Setup(t => t.IsEnabled).Returns(true);
-        target3Overflow.Setup(t => t.IsAvailable()).Returns(true);
-        target3Overflow.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
-
-        var options = Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions());
-        var catalogCache = new Mock<IModelCatalogCacheService>();
-        var sut = new RoutingDecisionService(
-            [target1.Object, target2.Object, target3Overflow.Object],
-            options,
-            catalogCache.Object,
-            NullLogger<RoutingDecisionService>.Instance);
-
-        var decision = await sut.DecideAsync(100, "test-model");
-
-        Assert.Equal(RoutingTarget.Cloud, decision);
+        Assert.False(h.Eval(TServer)!.Qualified);
+        Assert.StartsWith("offline", h.Eval(TServer)!.DisqualifiedReason);
     }
 
     [Fact]
-    public async Task DecideAsync_MultiTarget_NoTargetAvailable_FallsBackToFirstCapableTarget()
+    public async Task Stage1_MissingFromCatalog_DisqualifiesTarget()
     {
-        var target1 = new Mock<IRoutingTargetHandler>();
-        target1.Setup(t => t.Target).Returns(RoutingTarget.Local);
-        target1.Setup(t => t.IsEnabled).Returns(true);
-        target1.Setup(t => t.IsAvailable()).Returns(false); // busy
-        target1.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
+        var seedMeta = new MetaMap();
+        var (h, meta) = Build(
+            FleetOptions("qwen3.8-27B"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" }, // not on Laptop
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            meta: AddDense(seedMeta, "qwen3.8-27B", 27_800_000_000));
 
-        var target2 = new Mock<IRoutingTargetHandler>();
-        target2.Setup(t => t.Target).Returns(RoutingTarget.Remote);
-        target2.Setup(t => t.IsEnabled).Returns(true);
-        target2.Setup(t => t.IsAvailable()).Returns(false); // busy
-        target2.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
+        await h.Decide(30_000, "qwen3.8-27B");
 
-        var target3Overflow = new Mock<IRoutingTargetHandler>();
-        target3Overflow.Setup(t => t.Target).Returns(RoutingTarget.Cloud);
-        target3Overflow.Setup(t => t.IsOverflow).Returns(true);
-        target3Overflow.Setup(t => t.IsEnabled).Returns(true);
-        target3Overflow.Setup(t => t.IsAvailable()).Returns(false); // busy
-        target3Overflow.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
-
-        var options = Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions());
-        var catalogCache = new Mock<IModelCatalogCacheService>();
-        var sut = new RoutingDecisionService(
-            [target1.Object, target2.Object, target3Overflow.Object],
-            options,
-            catalogCache.Object,
-            NullLogger<RoutingDecisionService>.Instance);
-
-        var decision = await sut.DecideAsync(100, "test-model");
-
-        // Falls back to target1 (Local) as the first capable target
-        Assert.Equal(RoutingTarget.Local, decision);
+        Assert.False(h.Eval(TLaptop)!.Qualified);
+        Assert.Equal("model not present in the target catalog", h.Eval(TLaptop)!.DisqualifiedReason);
     }
 
     [Fact]
-    public async Task DecideAsync_MultiTarget_NoTargetAvailable_FirstUnable_FallsBackToSecondCapableTarget()
+    public async Task Stage1_HardwareIncapable_LargeDenseOn8Gblaptop_DisqualifiesTarget()
     {
-        var target1 = new Mock<IRoutingTargetHandler>();
-        target1.Setup(t => t.Target).Returns(RoutingTarget.Local);
-        target1.Setup(t => t.IsEnabled).Returns(true);
-        target1.Setup(t => t.IsAvailable()).Returns(false); // busy
-        target1.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(false); // cannot handle
+        var seedMeta = new MetaMap();
+        var (h, meta) = Build(
+            FleetOptions("qwen3.8-27B"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{LaptopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            meta: AddDense(seedMeta, "qwen3.8-27B", 27_800_000_000));
 
-        var target2 = new Mock<IRoutingTargetHandler>();
-        target2.Setup(t => t.Target).Returns(RoutingTarget.Remote);
-        target2.Setup(t => t.IsEnabled).Returns(true);
-        target2.Setup(t => t.IsAvailable()).Returns(false); // busy
-        target2.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(true); // can handle
+        await h.Decide(30_000, "qwen3.8-27B");
 
-        var target3Overflow = new Mock<IRoutingTargetHandler>();
-        target3Overflow.Setup(t => t.Target).Returns(RoutingTarget.Cloud);
-        target3Overflow.Setup(t => t.IsOverflow).Returns(true);
-        target3Overflow.Setup(t => t.IsEnabled).Returns(true);
-        target3Overflow.Setup(t => t.IsAvailable()).Returns(false); // busy
-
-        var options = Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions());
-        var catalogCache = new Mock<IModelCatalogCacheService>();
-        var sut = new RoutingDecisionService(
-            [target1.Object, target2.Object, target3Overflow.Object],
-            options,
-            catalogCache.Object,
-            NullLogger<RoutingDecisionService>.Instance);
-
-        var decision = await sut.DecideAsync(100, "test-model");
-
-        // Falls back to target2 (Remote) as target1 cannot handle the request
-        Assert.Equal(RoutingTarget.Remote, decision);
+        Assert.False(h.Eval(TLaptop)!.Qualified);
+        Assert.StartsWith("hardware incapable", h.Eval(TLaptop)!.DisqualifiedReason);
     }
 
     [Fact]
-    public async Task DecideAsync_MultiTarget_DisabledTarget_NeverHandlesRequest()
+    public async Task Stage1_ContextOverflow_TokensExceedCMax_DisqualifiesTarget()
     {
-        var target1 = new Mock<IRoutingTargetHandler>();
-        target1.Setup(t => t.Target).Returns(RoutingTarget.Local);
-        target1.Setup(t => t.IsEnabled).Returns(false); // disabled!
-        target1.Setup(t => t.IsAvailable()).Returns(false);
-        target1.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(false);
+        // Modelfile num_ctx pins CMax at 4096; 30k tokens (×1.25 = 37500) does not fit.
+        var meta = new MetaMap();
+        foreach (var url in new[] { DesktopUrl, LaptopUrl, ServerUrl })
+        {
+            meta.Add(url, "m", new JsonObject
+            {
+                ["model_info"] = new JsonObject { ["general.parameter_count"] = (JsonNode)27_800_000_000L },
+                ["parameters"] = "num_ctx 4096"
+            }, 16 * Gb);
+        }
 
-        var target2 = new Mock<IRoutingTargetHandler>();
-        target2.Setup(t => t.Target).Returns(RoutingTarget.Remote);
-        target2.Setup(t => t.IsEnabled).Returns(true); // enabled but busy
-        target2.Setup(t => t.IsAvailable()).Returns(false);
-        target2.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(true);
+        var (h, _) = Build(
+            FleetOptions("m"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|m", $"{LaptopUrl}|m", $"{ServerUrl}|m" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            meta: meta);
 
-        var options = Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions());
-        var catalogCache = new Mock<IModelCatalogCacheService>();
-        var sut = new RoutingDecisionService(
-            [target1.Object, target2.Object],
-            options,
-            catalogCache.Object,
-            NullLogger<RoutingDecisionService>.Instance);
+        // Every target is disqualified (Desktop/Server context overflow, Laptop hardware
+        // incapable) and no CloudModel is configured → the whole decision throws, but the
+        // per-candidate evaluations survive the throw path via the reporting callback.
+        await Assert.ThrowsAsync<NoAvailableTargetException>(() => h.Decide(30_000, "m"));
 
-        var decision = await sut.DecideAsync(100, "test-model");
-
-        // Disabled target1 must never be selected; falls back to busy enabled target2
-        Assert.Equal(RoutingTarget.Remote, decision);
+        // Desktop (CMax 4096): 37500 > 4096 → context overflow.
+        Assert.False(h.Eval(TDesktop)!.Qualified);
+        Assert.StartsWith("context overflow", h.Eval(TDesktop)!.DisqualifiedReason);
     }
 
     [Fact]
-    public async Task DecideAsync_MultiTarget_NoTargetCapable_ThrowsInvalidOperationException()
+    public async Task Stage1_ClientNumCtx_IsClampedDown_NotADisqualifier()
     {
-        var target1 = new Mock<IRoutingTargetHandler>();
-        target1.Setup(t => t.Target).Returns(RoutingTarget.Local);
-        target1.Setup(t => t.IsEnabled).Returns(true);
-        target1.Setup(t => t.IsAvailable()).Returns(false);
-        target1.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(false);
+        // Static client num_ctx 131072 is larger than CMax 49152; it clamps the requirement
+        // down to the (small) token estimate, so the target still qualifies.
+        var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        var (h, _) = Build(
+            FleetOptions("qwen3.8-27B"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{LaptopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            meta: meta);
 
-        var target2 = new Mock<IRoutingTargetHandler>();
-        target2.Setup(t => t.Target).Returns(RoutingTarget.Remote);
-        target2.Setup(t => t.IsEnabled).Returns(true);
-        target2.Setup(t => t.IsAvailable()).Returns(false);
-        target2.Setup(t => t.CanProcessAsync(It.IsAny<RoutingContext>(), It.IsAny<CancellationToken>())).ReturnsAsync(false);
+        var winner = await h.Decide(1_000, "qwen3.8-27B", numCtx: 131_072);
 
-        var options = Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions());
-        var catalogCache = new Mock<IModelCatalogCacheService>();
-        var sut = new RoutingDecisionService(
-            [target1.Object, target2.Object],
-            options,
-            catalogCache.Object,
-            NullLogger<RoutingDecisionService>.Instance);
-
-        await Assert.ThrowsAsync<NoAvailableTargetException>(() => sut.DecideAsync(100, "test-model"));
+        // 1000 × 1.25 = 1250 ≤ min(131072) and ≤ 49152 → Desktop qualifies and wins by order.
+        Assert.True(h.Eval(TDesktop)!.Qualified);
+        Assert.Equal(TDesktop, winner);
     }
+
+    // ==================================================================
+    // Stage-1 permissive fallback + pinned-Dense-on-small veto
+    // ==================================================================
+
+    [Fact]
+    public async Task PermissiveFallback_NoCapabilityMetadata_StillQualifies()
+    {
+        // No engine ⇒ no metadata discoverable ⇒ permissively qualified (score 0).
+        var (h, _) = Build(
+            FleetOptions("mystery"),
+            withEngine: false,
+            catalogModels: new() { $"{DesktopUrl}|mystery", $"{LaptopUrl}|mystery", $"{ServerUrl}|mystery" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" });
+
+        var winner = await h.Decide(1_000, "mystery");
+
+        Assert.True(h.Eval(TDesktop)!.Qualified);
+        Assert.Equal(0, h.Eval(TDesktop)!.Score);
+        Assert.Equal(TDesktop, winner); // declaration-order tie-break at 0
+    }
+
+    [Fact]
+    public async Task PinnedDense_NoCapabilityMetadata_SmallTargetIsVetoed()
+    {
+        // Operator pinned Architecture "Dense" (unknown count ⇒ LargeDense); the 8 GB Laptop
+        // (< 12000 MB) is vetoed even with no capability metadata, while Desktop/Server pass.
+        var (h, _) = Build(
+            FleetOptions("mystery", architecture: "Dense"),
+            withEngine: false,
+            catalogModels: new() { $"{DesktopUrl}|mystery", $"{LaptopUrl}|mystery", $"{ServerUrl}|mystery" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" });
+
+        var winner = await h.Decide(1_000, "mystery");
+
+        Assert.False(h.Eval(TLaptop)!.Qualified);
+        Assert.StartsWith("pinned-Dense", h.Eval(TLaptop)!.DisqualifiedReason);
+        Assert.True(h.Eval(TDesktop)!.Qualified);
+        Assert.Equal(TDesktop, winner);
+    }
+
+    // ==================================================================
+    // Tie-breaker: equal scores resolve by declaration order
+    // ==================================================================
+
+    [Fact]
+    public async Task TieBreaker_EqualScores_EarlierDeclarationWins()
+    {
+        var seedMeta = new MetaMap();
+        var (h, meta) = Build(
+            FleetOptions("mystery"),
+            withEngine: false,
+            catalogModels: new() { $"{DesktopUrl}|mystery", $"{ServerUrl}|mystery" }, // Desktop & Server only (no Laptop)
+            onlineTargets: new() { "Desktop", "Laptop", "Server" });
+
+        var winner = await h.Decide(1_000, "mystery");
+
+        // Desktop (0) and Server (0) tie → Desktop (earlier declaration) wins.
+        Assert.Equal(0, h.Eval(TDesktop)!.Score);
+        Assert.Equal(0, h.Eval(TServer)!.Score);
+        Assert.Equal(TDesktop, winner);
+    }
+
+    // ==================================================================
+    // Cloud pseudo-target: fixed score 0, sorted after fleet targets
+    // ==================================================================
+
+    [Fact]
+    public async Task Cloud_AllFleetOffline_CloudConfigured_CloudWins()
+    {
+        var seedMeta = new MetaMap();
+        var (h, meta) = Build(
+            FleetOptions("qwen3.8-27B", cloudModel: "deepseek-v3.1:671b-cloud"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { }, // all fleet offline
+            meta: AddDense(seedMeta, "qwen3.8-27B", 27_800_000_000));
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B");
+
+        Assert.Equal(RoutingTarget.Cloud, winner);
+        Assert.Equal(0, h.Eval(RoutingTarget.Cloud)!.Score);
+        Assert.False(h.Eval(TDesktop)!.Qualified);
+        Assert.False(h.Eval(TServer)!.Qualified);
+    }
+
+    [Fact]
+    public async Task Cloud_FleetZeroScore_Tie_FleetWinsOverCloud()
+    {
+        var seedMeta = new MetaMap();
+        var (h, meta) = Build(
+            FleetOptions("qwen3.8-27B", cloudModel: "deepseek-v3.1:671b-cloud"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{LaptopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            states: new() { [TDesktop] = State(TDesktop, 0), [TLaptop] = State(TLaptop, 0), [TServer] = State(TServer, 0) },
+            meta: AddDense(seedMeta, "qwen3.8-27B", 27_800_000_000));
+
+        var winner = await h.Decide(1_000, "qwen3.8-27B");
+
+        // Desktop has affinity? No (nothing loaded) → 0. Cloud is 0. Desktop (0) beats Cloud (0).
+        Assert.Equal(TDesktop, winner);
+        Assert.NotEqual(RoutingTarget.Cloud, winner);
+    }
+
+    [Fact]
+    public async Task Cloud_NoCloudModel_NothingQualifies_ThrowsNoAvailableTarget()
+    {
+        var seedMeta = new MetaMap();
+        var (h, meta) = Build(
+            FleetOptions("qwen3.8-27B"), // no CloudModel
+            withEngine: true,
+            catalogModels: new() { }, // model absent everywhere
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            meta: AddDense(seedMeta, "qwen3.8-27B", 27_800_000_000));
+
+        await Assert.ThrowsAsync<NoAvailableTargetException>(() => h.Decide(30_000, "qwen3.8-27B"));
+    }
+
+    // ==================================================================
+    // Failure-streak switch over the ranked list
+    // ==================================================================
+
+    [Fact]
+    public async Task FailureStreak_WinnerFailing_SwitchesToNextRankedCandidate()
+    {
+        // Desktop is top-ranked (27B hot) but has failed repeatedly; Server is next.
+        var seedMeta = new MetaMap();
+        var (h, meta) = Build(
+            FleetOptions("qwen3.8-27B"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{LaptopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, 0, ("qwen3.8-27B", 16 * Gb)), // Desktop hot → top ranked (120)
+                [TLaptop] = State(TLaptop, 0),
+                [TServer] = State(TServer, 0)
+            },
+            failureStreaks: t => t == TDesktop ? 5 : 0, // Desktop failing ≥ max (3)
+            meta: AddDense(seedMeta, "qwen3.8-27B", 27_800_000_000));
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B");
+
+        // Desktop would win on score but its failure streak forces a switch to Server.
+        Assert.Equal(TServer, winner);
+    }
+
+    // ==================================================================
+    // Legacy two-tier synthesis regression
+    // ==================================================================
+
+    [Fact]
+    public async Task LegacyTwoTier_SynthesizedFleet_UnconfiguredModel_FirstDeclaredWins()
+    {
+        // No Targets configured; LocalUrl/RemoteUrl synthesize Local(16gb) + Remote(16gb).
+        var options = new OllamaRouterOptions
+        {
+            LocalUrl = "http://127.0.0.1:11435",
+            RemoteUrl = "http://aiserver.local:11434"
+            // Models empty ⇒ the requested model is unconfigured (no thresholds).
+        };
+
+        var (h, _) = Build(
+            options,
+            withEngine: false, // permissive path (no engine)
+            catalogModels: new() { "http://127.0.0.1:11435|llama3", "http://aiserver.local:11434|llama3" },
+            onlineTargets: new() { "Local", "Remote" });
+
+        var winner = await h.Decide(1_000, "llama3");
+
+        // Both synthesized targets qualify permissively at score 0 → Local (first declared).
+        Assert.Equal(new RoutingTarget("Local"), winner);
+    }
+
+    // ==================================================================
+    // DecideAsync overload without clientNumCtx still works
+    // ==================================================================
+
+    [Fact]
+    public async Task DecideAsync_TwoArgOverload_Works()
+    {
+        var seedMeta = new MetaMap();
+        var (h, meta) = Build(
+            FleetOptions("qwen3.8-27B"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{LaptopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            meta: AddDense(seedMeta, "qwen3.8-27B", 27_800_000_000));
+
+        var winner = await h.SUT.DecideAsync(1_000, "qwen3.8-27B");
+
+        Assert.Equal(TDesktop, winner);
+    }
+
+    // ==================================================================
+    // DI: single canonical constructor resolves without ambiguity
+    // ==================================================================
 
     [Fact]
     public void ServiceCollection_CanResolveRoutingDecisionService_WithoutAmbiguousConstructors()
@@ -719,23 +697,26 @@ public class RoutingDecisionServiceTests
         services.Configure<OllamaRouterOptions>(o => o.CloudOverflow.Enabled = false);
         services.AddSingleton(new Mock<IOllamaModelCatalogClient>().Object);
         services.AddSingleton(new Mock<IModelCatalogCacheService>().Object);
-        services.AddSingleton(new Mock<IGpuVramProvider>().Object);
-        services.AddSingleton(new Mock<IActivityMonitorService>().Object);
+        services.AddSingleton(new Mock<ITargetLivenessService>().Object);
         // Everything enabled, so the Cloud handler's IsAvailable() outcome below is decided
         // SOLELY by the CloudOverflow.Enabled options switch (true with no options, false with them).
         var availability = new Mock<ITargetAvailabilityService>();
         availability.Setup(t => t.IsEnabled(It.IsAny<RoutingTarget>())).Returns(true);
         services.AddSingleton(availability.Object);
+        services.AddSingleton(new Mock<ITargetExecutionTracker>().Object);
+        services.AddSingleton(new ModelCapabilityEngine(
+            new Mock<IOllamaModelCatalogClient>().Object,
+            new MemoryCache(new MemoryCacheOptions()),
+            NullLogger<ModelCapabilityEngine>.Instance));
         services.AddSingleton<ITargetFailureStreakService, TargetFailureStreakService>();
 
-        services.AddTransient<IRoutingTargetHandler, LocalRoutingTargetHandler>();
-        services.AddTransient<IRoutingTargetHandler, RemoteRoutingTargetHandler>();
         // Mirrors Program.cs: the Cloud handler must be constructed with its options or the
         // CloudOverflow.Enabled switch / DefaultModel precedence would be silently ignored.
-        services.AddTransient<IRoutingTargetHandler>(sp => new CloudRoutingTargetHandler(
+        services.AddTransient<CloudRoutingTargetHandler>(sp => new CloudRoutingTargetHandler(
             sp.GetRequiredService<ITargetAvailabilityService>(),
             sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
             sp.GetRequiredService<ILogger<CloudRoutingTargetHandler>>()));
+        services.AddTransient<IRoutingTargetHandler>(sp => sp.GetRequiredService<CloudRoutingTargetHandler>());
         services.AddTransient<IRoutingDecisionService, RoutingDecisionService>();
 
         var serviceProvider = services.BuildServiceProvider(new ServiceProviderOptions
@@ -754,287 +735,635 @@ public class RoutingDecisionServiceTests
         Assert.False(cloudHandler.IsAvailable());
     }
 
-    [Fact]
-    public async Task DecideAsync_WhenRemoteFailsAboveThreshold_AndCloudEnabled_SwitchesToCloud()
+    // ==================================================================
+    // Pipeline branch coverage: startup grace, offload conditions, eviction
+    // VRAM-sum branches, role bonuses, failure streaks, tag normalization
+    // ==================================================================
+
+    private static Dictionary<RoutingTarget, TargetLivenessEntry> Entries(
+        RoutingTarget target, TargetLivenessState state)
+        => new() { [target] = new TargetLivenessEntry(target, state, null, DateTimeOffset.UtcNow) };
+
+    private static JsonObject MoeShow(long paramCount) => new()
     {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        var activityMonitor = CreateActivityMonitorNotBusy();
-
-        // Remote's failure streak is ABOVE the threshold (MaxConsecutiveFailures = 3 ⇒ 4 is skipped),
-        // so the decided primary (Remote, since Local can't hold 91.3k tokens) is skipped and the
-        // decision falls through to Cloud.
-        var streakTracker = new TargetFailureStreakService();
-        streakTracker.RecordFailure(RoutingTarget.Remote);
-        streakTracker.RecordFailure(RoutingTarget.Remote);
-        streakTracker.RecordFailure(RoutingTarget.Remote);
-        streakTracker.RecordFailure(RoutingTarget.Remote);
-
-        var sut = CreateSut(
-            catalogClient,
-            gpuVramProvider,
-            maxLocalTokens: 36_864, // 91.3k > 36.8k so Local cannot process
-            modelName: "Qwen3.8-27B",
-            cloudModel: "glm-5.3-flash:cloud",
-            activityMonitor: activityMonitor,
-            streakTracker: streakTracker);
-
-        var decision = await sut.DecideAsync(tokenCount: 91_300, modelName: "Qwen3.8-27B:latest");
-
-        Assert.Equal(RoutingTarget.Cloud, decision);
-    }
-
-    [Fact]
-    public async Task DecideAsync_FailureStreak_IsConsultedWithMaxConsecutiveFailuresThreshold()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        var activityMonitor = CreateActivityMonitorNotBusy();
-
-        // Repurposed from the old token-tolerance test: the decision service now consults the
-        // per-target failure streak via ShouldSkip(target, options.MaxConsecutiveFailures) and no
-        // longer reads the activity monitor's consecutive-failure count for routing. We use a
-        // mocked streak tracker to assert the threshold (3) is the value passed in.
-        var streakTracker = new Mock<ITargetFailureStreakService>();
-        streakTracker.Setup(s => s.ShouldSkip(RoutingTarget.Remote, 3)).Returns(true);
-        streakTracker.Setup(s => s.GetStreak(RoutingTarget.Remote)).Returns(4);
-
-        var sut = CreateSut(
-            catalogClient,
-            gpuVramProvider,
-            maxLocalTokens: 36_864,
-            modelName: "Qwen3.8-27B",
-            cloudModel: "glm-5.3-flash:cloud",
-            activityMonitor: activityMonitor,
-            streakTracker: streakTracker.Object);
-
-        var decision = await sut.DecideAsync(tokenCount: 92_500, modelName: "Qwen3.8-27B:latest");
-
-        Assert.Equal(RoutingTarget.Cloud, decision);
-        // The threshold passed to ShouldSkip is options.MaxConsecutiveFailures (default 3).
-        streakTracker.Verify(s => s.ShouldSkip(RoutingTarget.Remote, 3), Times.AtLeastOnce);
-        // The legacy token-tolerance count is no longer consulted for routing.
-        activityMonitor.Verify(
-            a => a.GetConsecutiveFailures(It.IsAny<RoutingTarget>(), It.IsAny<int>(), It.IsAny<int>()),
-            Times.Never);
-    }
-
-    [Fact]
-    public async Task DecideAsync_WhenRemoteFailsAboveThreshold_AndCloudDisabled_KeepsRemote()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        var activityMonitor = CreateActivityMonitorNotBusy();
-
-        // Remote's streak is above threshold, but with Cloud disabled (and Local unable to hold
-        // the tokens) there is no subsequent candidate → the decision keeps Remote.
-        var streakTracker = new TargetFailureStreakService();
-        for (var i = 0; i < 4; i++)
+        ["model_info"] = new JsonObject
         {
-            streakTracker.RecordFailure(RoutingTarget.Remote);
+            ["general.parameter_count"] = (JsonNode)paramCount,
+            ["general.expert_count"] = (JsonNode)64L
+        },
+        ["details"] = new JsonObject { ["family"] = "moe" }
+    };
+
+    [Fact]
+    public async Task Stage1_StartupGrace_UnknownStateWithinGraceWindow_RemainsRoutable()
+    {
+        // Liveness prober started 1 s ago (within the 10 s grace) and the Desktop's raw state
+        // is still Unknown: the pipeline must NOT disqualify it (boot-probe latency tolerance).
+        var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { Desktop } };
+        options.Models["mystery"] = new ModelThresholds();
+
+        var liveness = new Mock<ITargetLivenessService>();
+        liveness.Setup(l => l.IsOnline(It.IsAny<RoutingTarget>())).Returns(false);
+        liveness.Setup(l => l.ServiceStartTimeUtc).Returns(DateTimeOffset.UtcNow.AddSeconds(-1));
+        liveness.Setup(l => l.GetEntries()).Returns(Entries(TDesktop, TargetLivenessState.Unknown));
+
+        var (h, _) = Build(options, withEngine: false, catalogModels: new() { $"{DesktopUrl}|mystery" }, onlineTargets: new(), livenessOverride: liveness);
+
+        var winner = await h.Decide(1_000, "mystery");
+
+        Assert.True(h.Eval(TDesktop)!.Qualified);
+        Assert.Equal(TDesktop, winner);
+    }
+
+    [Fact]
+    public async Task Stage1_WithinStartupGrace_ButStateOffline_DisqualifiesTarget()
+    {
+        // Same grace window, but the raw state is already Offline (not Unknown): the grace
+        // predicate must NOT rescue it.
+        var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { Desktop } };
+        options.Models["mystery"] = new ModelThresholds();
+
+        var liveness = new Mock<ITargetLivenessService>();
+        liveness.Setup(l => l.IsOnline(It.IsAny<RoutingTarget>())).Returns(false);
+        liveness.Setup(l => l.ServiceStartTimeUtc).Returns(DateTimeOffset.UtcNow.AddSeconds(-1));
+        liveness.Setup(l => l.GetEntries()).Returns(Entries(TDesktop, TargetLivenessState.Offline));
+
+        var (h, _) = Build(options, withEngine: false, catalogModels: new() { $"{DesktopUrl}|mystery" }, onlineTargets: new(), livenessOverride: liveness);
+
+        await Assert.ThrowsAsync<NoAvailableTargetException>(() => h.Decide(1_000, "mystery"));
+        Assert.False(h.Eval(TDesktop)!.Qualified);
+        Assert.StartsWith("offline", h.Eval(TDesktop)!.DisqualifiedReason);
+    }
+
+    [Fact]
+    public async Task Stage1_ConfigEnabledFalse_DisqualifiesTarget()
+    {
+        // The fleet entry's Enabled flag is false (not the availability state file): the
+        // candidate is admin-disabled before any liveness/catalog check runs.
+        var off = new OllamaTargetOptions { Name = "Desktop", Url = DesktopUrl, HardwareHint = "16gb", MaxParallel = 1, Enabled = false };
+        var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { off } };
+        options.Models["mystery"] = new ModelThresholds();
+
+        var (h, _) = Build(options, withEngine: false, catalogModels: new() { $"{DesktopUrl}|mystery" }, onlineTargets: new() { "Desktop" });
+
+        await Assert.ThrowsAsync<NoAvailableTargetException>(() => h.Decide(1_000, "mystery"));
+        Assert.False(h.Eval(TDesktop)!.Qualified);
+        Assert.StartsWith("disabled", h.Eval(TDesktop)!.DisqualifiedReason);
+    }
+
+    private static JsonObject PinnedDenseShow(long paramCount, int? modelfileNumCtx = null) => new()
+    {
+        ["model_info"] = new JsonObject { ["general.parameter_count"] = (JsonNode)paramCount },
+        ["details"] = new JsonObject { ["family"] = "qwen" },
+        ["parameters"] = modelfileNumCtx is { } n ? $"num_ctx {n}" : ""
+    };
+
+    [Fact]
+    public async Task Stage1_ClientNumCtxSmallerThanRequired_StillDisqualifiesOnOverflow()
+    {
+        // The client's num_ctx is an upper-bound preference, never a disqualifier — but when
+        // BOTH the token×1.25 estimate and the client num_ctx exceed CMax, the target is still
+        // disqualified: the clamp can only LOWER the requirement, never raise it.
+        var meta = new MetaMap();
+        foreach (var url in new[] { DesktopUrl, LaptopUrl, ServerUrl })
+        {
+            // Modelfile pins CMax at 4096 on every target.
+            meta.Add(url, "m", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 4096), 16 * Gb);
         }
 
-        // Cloud target is disabled
-        var targets = AllExcept(RoutingTarget.Cloud);
+        var (h, _) = Build(
+            FleetOptions("m"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|m", $"{LaptopUrl}|m", $"{ServerUrl}|m" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            meta: meta);
 
-        var sut = CreateSut(
-            catalogClient,
-            gpuVramProvider,
-            maxLocalTokens: 36_864,
-            modelName: "Qwen3.8-27B",
-            cloudModel: "glm-5.3-flash:cloud",
-            activityMonitor: activityMonitor,
-            targets: targets,
-            streakTracker: streakTracker);
-
-        var decision = await sut.DecideAsync(tokenCount: 91_300, modelName: "Qwen3.8-27B:latest");
-
-        Assert.Equal(RoutingTarget.Remote, decision);
+        // 5000 tokens × 1.25 = 6250; client num_ctx 8192 → clamped requirement min(6250, 8192) =
+        // 6250 > CMax 4096 → context overflow on the Desktop (the Laptop is hardware-incapable
+        // for the 27B metadata as well) ⇒ nothing qualifies and no CloudModel is configured.
+        await Assert.ThrowsAsync<NoAvailableTargetException>(() => h.Decide(5_000, "m", numCtx: 8_192));
+        Assert.False(h.Eval(TDesktop)!.Qualified);
+        Assert.StartsWith("context overflow", h.Eval(TDesktop)!.DisqualifiedReason);
     }
 
     [Fact]
-    public async Task DecideAsync_WhenRemoteFailsAboveThreshold_AndNoCloudModelConfigured_KeepsRemote()
+    public async Task Stage1_LargeDenseAboveDesktopCeiling_QualifiesOnServerClass()
     {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        var activityMonitor = CreateActivityMonitorNotBusy();
+        // 60k tokens → effective 75k > 49152 desktop ceiling: the Desktop (CMax 49152) overflows
+        // and is disqualified, while the Server-class target (CMax 262144) qualifies and wins.
+        var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        var (h, _) = Build(
+            FleetOptions("qwen3.8-27B"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{LaptopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            meta: meta);
 
-        // Remote's streak is above threshold, but with no CloudModel configured the Cloud
-        // handler cannot process → the decision keeps Remote.
-        var streakTracker = new TargetFailureStreakService();
-        for (var i = 0; i < 4; i++)
+        var winner = await h.Decide(60_000, "qwen3.8-27B");
+
+        Assert.False(h.Eval(TDesktop)!.Qualified);
+        Assert.StartsWith("context overflow", h.Eval(TDesktop)!.DisqualifiedReason);
+        Assert.True(h.Eval(TServer)!.Qualified);
+        Assert.Equal(20, h.Eval(TServer)!.HardwareBonus); // >48k ⇒ server-class role match
+        Assert.Equal(TServer, winner);
+    }
+
+    [Fact]
+    public async Task HardwareBonus_BusyDesktop_JustifiesMoeOffloadToLaptop()
+    {
+        // The Desktop holds NO dense model hot but HAS 1 in-flight request (busy per the Q2
+        // resolution InFlight > 0) → the MoE offload bonus kicks in on the Laptop (+20), which
+        // beats the busy Desktop's −140 concurrency penalty and the Server's 0.
+        var meta = AddMoe(new MetaMap(), "moe1", 35_000_000_000);
+        var (h, _) = Build(
+            FleetOptions("moe1"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|moe1", $"{LaptopUrl}|moe1", $"{ServerUrl}|moe1" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, inFlight: 1), // busy, nothing loaded
+                [TLaptop] = State(TLaptop, inFlight: 0),
+                [TServer] = State(TServer, inFlight: 0)
+            },
+            meta: meta);
+
+        var winner = await h.Decide(30_000, "moe1");
+
+        Assert.Equal(20, h.Eval(TLaptop)!.HardwareBonus); // offload justified by busy desktop
+        Assert.Equal(140, h.Eval(TDesktop)!.ConcurrencyPenalty);
+        Assert.Equal(-140, h.Eval(TDesktop)!.Score);
+        Assert.Equal(TLaptop, winner);
+    }
+
+    [Fact]
+    public async Task HardwareBonus_MultipleSmallClassTargets_OnlyFirstClaimsOffloadSlot()
+    {
+        // Two small-class targets with a busy Desktop: only the FIRST declared small-class
+        // target receives the +20 offload bonus (the role slot is single per decision).
+        var s1 = new OllamaTargetOptions { Name = "S1", Url = "http://s1:11434", HardwareHint = "8gb", MaxParallel = 1 };
+        var s2 = new OllamaTargetOptions { Name = "S2", Url = "http://s2:11434", HardwareHint = "8gb", MaxParallel = 1 };
+        var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { Desktop, s1, s2 } };
+        options.Models["moe1"] = new ModelThresholds();
+
+        var ts1 = new RoutingTarget("S1");
+        var ts2 = new RoutingTarget("S2");
+        var meta = new MetaMap();
+        foreach (var url in new[] { DesktopUrl, "http://s1:11434", "http://s2:11434" })
         {
-            streakTracker.RecordFailure(RoutingTarget.Remote);
+            meta.Add(url, "moe1", MoeShow(35_000_000_000), 24 * Gb);
         }
 
-        // cloudModel is null
-        var sut = CreateSut(
-            catalogClient,
-            gpuVramProvider,
-            maxLocalTokens: 36_864,
-            modelName: "Qwen3.8-27B",
-            cloudModel: null,
-            activityMonitor: activityMonitor,
-            streakTracker: streakTracker);
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|moe1", "http://s1:11434|moe1", "http://s2:11434|moe1" },
+            onlineTargets: new() { "Desktop", "S1", "S2" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, inFlight: 1),
+                [ts1] = State(ts1, inFlight: 0),
+                [ts2] = State(ts2, inFlight: 0)
+            },
+            meta: meta);
 
-        var decision = await sut.DecideAsync(tokenCount: 91_300, modelName: "Qwen3.8-27B:latest");
+        var winner = await h.Decide(30_000, "moe1");
 
-        Assert.Equal(RoutingTarget.Remote, decision);
+        Assert.Equal(20, h.Eval(ts1)!.HardwareBonus);
+        Assert.Equal(0, h.Eval(ts2)!.HardwareBonus); // slot already claimed by S1
+        Assert.Equal(0, h.Eval(TDesktop)!.HardwareBonus); // offload bonus never lands on the desktop class
+        Assert.Equal(ts1, winner);
     }
 
     [Fact]
-    public async Task DecideAsync_WhenLocalFailsAboveThreshold_SwitchesToRemote()
+    public async Task HardwareBonus_SmallDenseRequest_UsesOffloadSlotLikeMoe()
     {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
-        var activityMonitor = CreateActivityMonitorNotBusy();
+        // A SmallDense request follows the same Laptop-offload rule as MoE: the +20 goes to
+        // the first small-class target only when a desktop/server-class target is busy.
+        var meta = AddDense(new MetaMap(), "small1", 4_000_000_000); // 4B ⇒ SmallDense
+        var (h, _) = Build(
+            FleetOptions("small1"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|small1", $"{LaptopUrl}|small1", $"{ServerUrl}|small1" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, inFlight: 1), // busy → offload justified
+                [TLaptop] = State(TLaptop, inFlight: 0),
+                [TServer] = State(TServer, inFlight: 0)
+            },
+            meta: meta);
 
-        // Local's failure streak is above threshold → skipped; the decision walks the remaining
-        // handlers and lands on Remote (which can hold 2,000 tokens).
-        var streakTracker = new TargetFailureStreakService();
-        for (var i = 0; i < 4; i++)
+        var winner = await h.Decide(30_000, "small1");
+
+        Assert.Equal(20, h.Eval(TLaptop)!.HardwareBonus);
+        Assert.Equal(TLaptop, winner);
+    }
+
+    [Fact]
+    public async Task HardwareBonus_PinnedMoe_ArchitectureTreatedAsMoeForOffload()
+    {
+        // Operator pin "Moe" wins over auto-detection (4B dense metadata): the request is
+        // handled as an MoE/SmallDense offload candidate.
+        var meta = AddDense(new MetaMap(), "pinned1", 4_000_000_000);
+        var (h, _) = Build(
+            FleetOptions("pinned1", architecture: "Moe"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|pinned1", $"{LaptopUrl}|pinned1", $"{ServerUrl}|pinned1" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, inFlight: 1),
+                [TLaptop] = State(TLaptop, inFlight: 0),
+                [TServer] = State(TServer, inFlight: 0)
+            },
+            meta: meta);
+
+        var winner = await h.Decide(30_000, "pinned1");
+
+        Assert.Equal(20, h.Eval(TLaptop)!.HardwareBonus);
+        Assert.Equal(TLaptop, winner);
+    }
+
+    [Fact]
+    public async Task Eviction_StaleSnapshot_StillAppliesVramSumRule()
+    {
+        // A STALE tracker snapshot (refresh missed its budget) is still used for the eviction
+        // rule — a stale snapshot is better than none for anti-thrashing: Desktop holds 10 GB,
+        // loading the 16 GB model would overflow 16 GB ⇒ −80; the idle Server (0) wins.
+        var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        var staleDesktop = new TargetExecutionState(TDesktop, 0, [new TargetLoadedModel("other", 10 * Gb)], 10 * Gb, DateTimeOffset.UtcNow, Stale: true);
+
+        var (h, _) = Build(
+            FleetOptions("qwen3.8-27B"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{LaptopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            states: new()
+            {
+                [TDesktop] = staleDesktop,
+                [TLaptop] = State(TLaptop, 0),
+                [TServer] = State(TServer, 0)
+            },
+            meta: meta);
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B");
+
+        Assert.Equal(80, h.Eval(TDesktop)!.EvictionPenalty); // 10GB + 16GB > 16GB even though stale
+        Assert.Equal(-60, h.Eval(TDesktop)!.Score); // 0 affinity + 20 role - 80 eviction
+        Assert.Equal(0, h.Eval(TServer)!.EvictionPenalty);
+        Assert.Equal(TServer, winner);
+    }
+
+    [Fact]
+    public async Task Eviction_UnknownVramBudget_PessimisticOnNonServerClass()
+    {
+        // The Desktop has NO hardware hint (unknown VRAM budget) but holds a different model:
+        // we cannot prove overflow, so the pessimistic anti-thrash fallback penalizes the
+        // non-server-class candidate only. The Server (server-class, no penalty) wins.
+        var desktopNoHint = new OllamaTargetOptions { Name = "Desktop", Url = DesktopUrl, MaxParallel = 1 }; // no hint ⇒ unknown
+        var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { desktopNoHint, Server } };
+        options.Models["mystery"] = new ModelThresholds();
+
+        var meta = new MetaMap();
+        foreach (var url in new[] { DesktopUrl, ServerUrl })
         {
-            streakTracker.RecordFailure(RoutingTarget.Local);
+            meta.Add(url, "mystery", MoeShow(35_000_000_000), 24 * Gb);
         }
 
-        var sut = CreateSut(
-            catalogClient,
-            gpuVramProvider,
-            maxLocalTokens: 40_000,
-            modelName: "llama3",
-            cloudModel: "glm-5.3-flash:cloud",
-            activityMonitor: activityMonitor,
-            streakTracker: streakTracker);
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|mystery", $"{ServerUrl}|mystery" },
+            onlineTargets: new() { "Desktop", "Server" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, inFlight: 0, ("other", 10 * Gb)),
+                [TServer] = State(TServer, inFlight: 0)
+            },
+            meta: meta);
 
-        var decision = await sut.DecideAsync(tokenCount: 2_000, modelName: "llama3");
+        var winner = await h.Decide(1_000, "mystery");
 
-        Assert.Equal(RoutingTarget.Remote, decision);
+        Assert.Equal(80, h.Eval(TDesktop)!.EvictionPenalty); // unknown budget + non-server ⇒ penalize
+        Assert.Equal(0, h.Eval(TServer)!.EvictionPenalty);  // server-class: cannot prove eviction
+        Assert.Equal(TServer, winner);
     }
 
     [Fact]
-    public async Task DecideAsync_WhenLocalAndRemoteBothFailAboveThreshold_SwitchesToCloud()
+    public async Task Eviction_UnknownWeight_WithKnownVram_PessimisticOnNonServerClass()
     {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
-        var activityMonitor = CreateActivityMonitorNotBusy();
-
-        // Both Local and Remote are above the failure-streak threshold: the primary (Local) is
-        // skipped and the subsequent walk skips Remote too, landing on Cloud.
-        var streakTracker = new TargetFailureStreakService();
-        for (var i = 0; i < 4; i++)
+        // Known VRAM budget but a degraded /api/tags entry (weight size 0): the conservative
+        // fallback penalizes the non-server-class target holding a different model.
+        var meta = new MetaMap();
+        foreach (var url in new[] { DesktopUrl, LaptopUrl, ServerUrl })
         {
-            streakTracker.RecordFailure(RoutingTarget.Local);
-            streakTracker.RecordFailure(RoutingTarget.Remote);
+            meta.Add(url, "mystery", DenseShow(27_800_000_000), sizeBytes: 0); // catalog present, weight unknown
         }
 
-        var sut = CreateSut(
-            catalogClient,
-            gpuVramProvider,
-            maxLocalTokens: 40_000,
-            modelName: "llama3",
-            cloudModel: "glm-5.3-flash:cloud",
-            activityMonitor: activityMonitor,
-            streakTracker: streakTracker);
+        var (h, _) = Build(
+            FleetOptions("mystery"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|mystery", $"{LaptopUrl}|mystery", $"{ServerUrl}|mystery" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, inFlight: 0, ("other", 10 * Gb)),
+                [TLaptop] = State(TLaptop, inFlight: 0),
+                [TServer] = State(TServer, inFlight: 0)
+            },
+            meta: meta);
 
-        var decision = await sut.DecideAsync(tokenCount: 2_000, modelName: "llama3");
+        var winner = await h.Decide(1_000, "mystery");
 
-        Assert.Equal(RoutingTarget.Cloud, decision);
+        Assert.Equal(80, h.Eval(TDesktop)!.EvictionPenalty);
+        Assert.Equal(0, h.Eval(TServer)!.EvictionPenalty);
+        Assert.Equal(TServer, winner);
     }
 
     [Fact]
-    public async Task DecideAsync_WhenFailureStreakBelowThreshold_KeepsOriginalTarget()
+    public async Task Cloud_AllFleetNegativeScores_CloudBeatsNegativeFleet()
     {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        var activityMonitor = CreateActivityMonitorNotBusy();
+        // Desktop saturated (1 in-flight, MaxParallel 1 ⇒ −140), Laptop/Server offline, Cloud
+        // configured: the fixed score-0 Cloud candidate beats the negative fleet score.
+        var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        var (h, _) = Build(
+            FleetOptions("qwen3.8-27B", cloudModel: "deepseek-v3.1:671b-cloud"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop" },
+            states: new() { [TDesktop] = State(TDesktop, inFlight: 1) },
+            meta: meta);
 
-        // 3 failures is NOT above the threshold (MaxConsecutiveFailures = 3), so the primary
-        // (Remote, since Local can't hold the tokens) is kept.
-        var streakTracker = new TargetFailureStreakService();
-        for (var i = 0; i < 3; i++)
+        var winner = await h.Decide(30_000, "qwen3.8-27B");
+
+        // Desktop: 0 affinity + 20 role - 0 eviction - 140 concurrency = -120; Cloud's fixed
+        // score 0 beats the negative fleet score.
+        Assert.Equal(-120, h.Eval(TDesktop)!.Score);
+        Assert.Equal(0, h.Eval(RoutingTarget.Cloud)!.Score);
+        Assert.Equal(RoutingTarget.Cloud, winner);
+    }
+
+    [Fact]
+    public async Task FailureStreak_AllCandidatesFailing_KeepsWinnerAndLogs()
+    {
+        // The winner's streak is ≥ max, but EVERY other ranked candidate is also failing: the
+        // pipeline keeps the winner (existing behavior — a forced switch to another failing
+        // target would be worse).
+        var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        var (h, _) = Build(
+            FleetOptions("qwen3.8-27B"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{LaptopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, 0, ("qwen3.8-27B", 16 * Gb)), // top-ranked (120)
+                [TLaptop] = State(TLaptop, 0),
+                [TServer] = State(TServer, 0)
+            },
+            failureStreaks: _ => 5,
+            meta: meta);
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B");
+
+        Assert.Equal(TDesktop, winner);
+    }
+
+    [Fact]
+    public async Task FailureStreak_WinnerFailing_SwitchesToNextRankedFleetTarget()
+    {
+        // Desktop (top-ranked, SmallDense hot: 100 affinity) is failing; the next-ranked
+        // candidate is the Laptop (+20 offload — the Desktop holds a dense model hot, and
+        // the offload bonus lands on the small-class target). A 27B-class LargeDense would be
+        // hardware-incapable on the 8 GB Laptop, so this scenario uses a 4B SmallDense model.
+        var meta = AddDense(new MetaMap(), "small1", 4_000_000_000); // 4B ⇒ SmallDense
+        var (h, _) = Build(
+            FleetOptions("small1"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|small1", $"{LaptopUrl}|small1", $"{ServerUrl}|small1" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, 0, ("small1", 4 * Gb)), // top-ranked: 100 affinity
+                [TLaptop] = State(TLaptop, 0),                      // +20 offload (desktop holds dense hot)
+                [TServer] = State(TServer, 0)
+            },
+            failureStreaks: t => t == TDesktop ? 5 : 0,
+            meta: meta);
+
+        var winner = await h.Decide(30_000, "small1");
+
+        // Desktop would win on score (100) but its failure streak forces a switch to the
+        // next-ranked candidate (Laptop, 20).
+        Assert.Equal(100, h.Eval(TDesktop)!.Score);
+        Assert.Equal(20, h.Eval(TLaptop)!.Score);
+        Assert.Equal(TLaptop, winner);
+    }
+
+    [Fact]
+    public async Task FailureStreak_WinnerFailing_AllFleetFailing_SwitchesToCloud()
+    {
+        // Every fleet candidate is failing (the Desktop top-ranked winner's streak exceeds
+        // the threshold), but the Cloud pseudo-target sorts last in the ranked list with no
+        // failure streak of its own: the switch lands on Cloud.
+        var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+
+        var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { Desktop } };
+        options.Models["qwen3.8-27B"] = new ModelThresholds { CloudModel = "glm-5.3-flash:cloud" };
+
+        var (h, _) = Build(options, withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop" },
+            states: new() { [TDesktop] = State(TDesktop, 0, ("qwen3.8-27B", 16 * Gb)) },
+            failureStreaks: t => t == RoutingTarget.Cloud ? 0 : 5, // Desktop failing, Cloud clean
+            meta: meta);
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B");
+
+        Assert.Equal(RoutingTarget.Cloud, winner);
+    }
+
+    [Fact]
+    public async Task Affinity_TaggedModelName_MatchesHotModelByNormalizedName()
+    {
+        // The request carries a tag ("qwen3.8-27B:latest") while /api/ps reports the model
+        // WITHOUT a tag ("qwen3.8-27B"): the normalized-name comparison must still recognize
+        // the model as hot (affinity +100). The /api/show for the tagged name degrades to the
+        // permissive MoE classification, so no role bonus — only the affinity is asserted.
+        var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        var (h, _) = Build(
+            FleetOptions("qwen3.8-27B"),
+            withEngine: true,
+            catalogModels: new()
+            {
+                $"{DesktopUrl}|qwen3.8-27B:latest", $"{LaptopUrl}|qwen3.8-27B:latest", $"{ServerUrl}|qwen3.8-27B:latest"
+            },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            states: new() { [TDesktop] = State(TDesktop, 0, ("qwen3.8-27B", 16 * Gb)) }, // ps: no tag
+            meta: meta);
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B:latest");
+
+        Assert.Equal(100, h.Eval(TDesktop)!.AffinityBonus);
+        Assert.Equal(0, h.Eval(TDesktop)!.EvictionPenalty);
+        Assert.Equal(TDesktop, winner);
+    }
+
+    [Theory]
+    [InlineData("Dense")]       // pinned Dense, unknown count ⇒ LargeDense ⇒ small-class veto
+    [InlineData("dense")]       // case-insensitive pin
+    [InlineData(null)]          // no pin + no metadata ⇒ permissively qualified (LargeDense-by-unknown-count is NOT inferred without metadata)
+    [InlineData("Moe")]         // pinned Moe ⇒ permissive small-class (MoE never VRAM-vetoed)
+    public async Task PinnedArchitecture_UnknownMetadata_VetoAppliesOnlyToDensePin(string? architecture)
+    {
+        // With no capability metadata discoverable, ONLY a Dense pin vetoes the 8 GB small-class
+        // target; everything else stays permissively qualified (Q4 resolution).
+        var expectLaptopQualified = architecture is null || string.Equals(architecture, "Moe", StringComparison.OrdinalIgnoreCase);
+
+        var (h, _) = Build(
+            FleetOptions("mystery", architecture: architecture),
+            withEngine: false,
+            catalogModels: new() { $"{DesktopUrl}|mystery", $"{LaptopUrl}|mystery", $"{ServerUrl}|mystery" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" });
+
+        var winner = await h.Decide(1_000, "mystery");
+
+        Assert.Equal(expectLaptopQualified, h.Eval(TLaptop)!.Qualified);
+        Assert.True(h.Eval(TDesktop)!.Qualified);
+        Assert.Equal(TDesktop, winner); // Desktop first in declaration order at the 0 tie
+    }
+
+    [Theory]
+    [InlineData(2, 2, 180)]  // MaxParallel 2, 2 in-flight: 2×40 + cliff(2≥2)×100 = 180
+    [InlineData(1, 2, 40)]   // MaxParallel 2, 1 in-flight: 1×40, no cliff = 40
+    [InlineData(1, 1, 140)]  // MaxParallel 1, 1 in-flight: 1×40 + cliff = 140 (AC3)
+    [InlineData(3, 2, 220)]  // MaxParallel 2, 3 in-flight: 3×40 + cliff = 220
+    public async Task ConcurrencyPenalty_ScalesWithInFlightAndCliff(int inFlight, int maxParallel, int expectedPenalty)
+    {
+        // The concurrency penalty is (InFlight × 40) + (InFlight ≥ MaxParallel ? 100 : 0). A
+        // single-target fleet isolates the term under test (nothing else scores).
+        var single = new OllamaTargetOptions { Name = "S", Url = "http://s:11434", HardwareHint = "96gb", MaxParallel = maxParallel };
+        var ts = new RoutingTarget("S");
+        var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { single } };
+        options.Models["mystery"] = new ModelThresholds();
+
+        var (h, _) = Build(
+            options,
+            withEngine: true, // Stage 2 scoring runs (the permissive fixed-0 path skips it)
+            catalogModels: new() { "http://s:11434|mystery" },
+            onlineTargets: new() { "S" },
+            states: new() { [ts] = State(ts, inFlight) });
+
+        await h.Decide(1_000, "mystery");
+
+        Assert.Equal(expectedPenalty, h.Eval(ts)!.ConcurrencyPenalty);
+    }
+
+    [Fact]
+    public async Task Eviction_NoOtherModelLoaded_NoPenalty()
+    {
+        // The target has an empty /api/ps (nothing loaded): even though it is not
+        // server-class and the model is not loaded, there is no OTHER model to evict, so
+        // no penalty applies.
+        var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        var (h, _) = Build(
+            FleetOptions("qwen3.8-27B"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{LaptopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, inFlight: 0), // empty /api/ps
+                [TLaptop] = State(TLaptop, 0),
+                [TServer] = State(TServer, 0)
+            },
+            meta: meta);
+
+        await h.Decide(30_000, "qwen3.8-27B");
+
+        Assert.Equal(0, h.Eval(TDesktop)!.EvictionPenalty);
+    }
+
+    [Fact]
+    public async Task Eviction_ServerClass_ProvableOverflow_StillPenalized()
+    {
+        // Per the Q1 VRAM-sum resolution: when the overflow is PROVABLE
+        // (TotalVramBytes + weight > MaxVramMB, both known), the penalty applies to a
+        // server-class target too — the server headroom exemption only kicks in when the
+        // budget or the weight is UNKNOWN (we cannot prove eviction). The Server holds a
+        // 90 GB model; loading the 16 GB request model overflows 96 GB (106 > 96) ⇒ −80.
+        var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        var (h, _) = Build(
+            FleetOptions("qwen3.8-27B"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{LaptopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, 0),
+                [TLaptop] = State(TLaptop, 0),
+                [TServer] = State(TServer, inFlight: 0, ("other", 90 * Gb)) // server holds a big model
+            },
+            meta: meta);
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B");
+
+        Assert.Equal(80, h.Eval(TServer)!.EvictionPenalty); // provable overflow ⇒ penalized even server-class
+        Assert.Equal(-80, h.Eval(TServer)!.Score);          // 0 + 0 role (≤48k ⇒ desktop-class) - 80 eviction
+        Assert.Equal(0, h.Eval(TDesktop)!.EvictionPenalty);
+        Assert.Equal(20, h.Eval(TDesktop)!.Score);
+        Assert.Equal(TDesktop, winner);
+    }
+
+    [Fact]
+    public async Task Stage1_StartupGraceExpired_NotYetOnline_DisqualifiesTarget()
+    {
+        // The liveness prober started 20 s ago (OUTSIDE the 10 s grace) and the Desktop's raw
+        // state is still Unknown: the grace window has closed, so the target is offline and
+        // disqualified.
+        var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { Desktop } };
+        options.Models["mystery"] = new ModelThresholds();
+
+        var liveness = new Mock<ITargetLivenessService>();
+        liveness.Setup(l => l.IsOnline(It.IsAny<RoutingTarget>())).Returns(false);
+        liveness.Setup(l => l.ServiceStartTimeUtc).Returns(DateTimeOffset.UtcNow.AddSeconds(-20));
+        liveness.Setup(l => l.GetEntries()).Returns(Entries(TDesktop, TargetLivenessState.Unknown));
+
+        var (h, _) = Build(options, withEngine: false, catalogModels: new() { $"{DesktopUrl}|mystery" }, onlineTargets: new(), livenessOverride: liveness);
+
+        await Assert.ThrowsAsync<NoAvailableTargetException>(() => h.Decide(1_000, "mystery"));
+        Assert.False(h.Eval(TDesktop)!.Qualified);
+        Assert.StartsWith("offline", h.Eval(TDesktop)!.DisqualifiedReason);
+    }
+
+    // ---- helpers ----
+
+    [Fact]
+    public void NormalizeModelName_StripsTagSuffix()
+    {
+        Assert.Equal("llama3", RoutingDecisionService.NormalizeModelName("llama3:8b"));
+        Assert.Equal("Qwen3.8-27B", RoutingDecisionService.NormalizeModelName("Qwen3.8-27B:latest"));
+        Assert.Equal("plain", RoutingDecisionService.NormalizeModelName("plain"));
+    }
+
+    private static MetaMap AddDense(MetaMap meta, string model, long paramCount)
+    {
+        foreach (var url in new[] { DesktopUrl, LaptopUrl, ServerUrl })
         {
-            streakTracker.RecordFailure(RoutingTarget.Remote);
+            meta.Add(url, model, DenseShow(paramCount), 16 * Gb);
         }
 
-        var sut = CreateSut(
-            catalogClient,
-            gpuVramProvider,
-            maxLocalTokens: 36_864,
-            modelName: "Qwen3.8-27B",
-            cloudModel: "glm-5.3-flash:cloud",
-            activityMonitor: activityMonitor,
-            streakTracker: streakTracker);
-
-        var decision = await sut.DecideAsync(tokenCount: 91_300, modelName: "Qwen3.8-27B:latest");
-
-        Assert.Equal(RoutingTarget.Remote, decision);
+        return meta;
     }
 
-    [Fact]
-    public async Task DecideAsync_ConcurrentRequests_WhenLocalAndRemoteBusyAndCloudBusy_RoutesAllSubsequentRequestsToCloud()
+    private static MetaMap AddMoe(MetaMap meta, string model, long paramCount)
     {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        var activityMonitor = new Mock<IActivityMonitorService>();
+        foreach (var url in new[] { DesktopUrl, LaptopUrl, ServerUrl })
+        {
+            meta.Add(url, model, MoeShow(paramCount, expertCount: 64), 24 * Gb);
+        }
 
-        // Local, Remote and Cloud are ALL busy
-        activityMonitor.Setup(a => a.IsBusy(RoutingTarget.Local)).Returns(true);
-        activityMonitor.Setup(a => a.IsBusy(RoutingTarget.Remote)).Returns(true);
-        activityMonitor.Setup(a => a.IsBusy(RoutingTarget.Cloud)).Returns(true);
-
-        var sut = CreateSut(catalogClient, gpuVramProvider, cloudModel: "deepseek-v3.1:671b-cloud", activityMonitor: activityMonitor);
-
-        // Multiple concurrent requests should ALL route to Cloud despite Cloud already being busy
-        var decision1 = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
-        var decision2 = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
-        var decision3 = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
-
-        Assert.Equal(RoutingTarget.Cloud, decision1);
-        Assert.Equal(RoutingTarget.Cloud, decision2);
-        Assert.Equal(RoutingTarget.Cloud, decision3);
-    }
-
-    [Fact]
-    public async Task DecideAsync_ProgressiveLoad_FirstToLocal_SecondToRemote_SubsequentAllToCloud()
-    {
-        var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        var gpuVramProvider = new Mock<IGpuVramProvider>();
-        gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
-
-        var localBusy = false;
-        var remoteBusy = false;
-        var cloudBusy = false;
-
-        var activityMonitor = new Mock<IActivityMonitorService>();
-        activityMonitor.Setup(a => a.IsBusy(RoutingTarget.Local)).Returns(() => localBusy);
-        activityMonitor.Setup(a => a.IsBusy(RoutingTarget.Remote)).Returns(() => remoteBusy);
-        activityMonitor.Setup(a => a.IsBusy(RoutingTarget.Cloud)).Returns(() => cloudBusy);
-
-        var sut = CreateSut(catalogClient, gpuVramProvider, cloudModel: "deepseek-v3.1:671b-cloud", activityMonitor: activityMonitor);
-
-        // Request 1: Local is idle -> routes to Local
-        var r1 = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
-        Assert.Equal(RoutingTarget.Local, r1);
-        localBusy = true; // Request 1 is now in progress on Local
-
-        // Request 2: Local is busy, Remote is idle -> routes to Remote
-        var r2 = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
-        Assert.Equal(RoutingTarget.Remote, r2);
-        remoteBusy = true; // Request 2 is now in progress on Remote
-
-        // Request 3: Local and Remote are busy -> routes to Cloud
-        var r3 = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
-        Assert.Equal(RoutingTarget.Cloud, r3);
-        cloudBusy = true; // Request 3 is now in progress on Cloud
-
-        // Request 4: Local, Remote, and Cloud have requests in progress -> still routes to Cloud!
-        var r4 = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
-        Assert.Equal(RoutingTarget.Cloud, r4);
-
-        // Request 5: Still all busy -> still routes to Cloud!
-        var r5 = await sut.DecideAsync(tokenCount: 1_000, modelName: ModelName);
-        Assert.Equal(RoutingTarget.Cloud, r5);
+        return meta;
     }
 }

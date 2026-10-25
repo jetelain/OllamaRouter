@@ -141,7 +141,7 @@ public class OllamaRoutingMiddlewareTests
         Assert.Equal("Local", context.Request.Headers["X-Ollama-Target"]);
         Assert.True(nextCalled);
         tokenEstimator.Verify(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>()), Times.Never);
-        routingDecisionService.Verify(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        routingDecisionService.Verify(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     [Fact]
@@ -154,7 +154,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(100, "llama3", It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(100, "llama3", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Remote);
 
         var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService);
@@ -162,7 +162,31 @@ public class OllamaRoutingMiddlewareTests
         await sut.InvokeAsync(context);
 
         Assert.Equal("Remote", context.Request.Headers["X-Ollama-Target"]);
-        routingDecisionService.Verify(r => r.DecideAsync(100, "llama3", It.IsAny<CancellationToken>()), Times.Once);
+        routingDecisionService.Verify(r => r.DecideAsync(100, "llama3", It.IsAny<int?>(), It.IsAny<CancellationToken>()), Times.Once);
+        // No options.num_ctx in the body ⇒ the client value is passed as null.
+        routingDecisionService.Verify(r => r.DecideAsync(100, "llama3", (int?)null, It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_InterceptedPath_WithClientNumCtx_PassesItToRoutingDecisionService()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Bonjour" , "options": { "num_ctx": 131072 } }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Remote);
+
+        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService);
+
+        await sut.InvokeAsync(context);
+
+        // The client's static options.num_ctx is extracted from the body and fed to the
+        // pipeline's context-fit clamp (upper-bound preference, never a disqualifier).
+        routingDecisionService.Verify(r => r.DecideAsync(100, "llama3", 131_072, It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
@@ -175,7 +199,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(50, "llama3", It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(50, "llama3", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Local);
 
         var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService);
@@ -212,7 +236,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new NoAvailableTargetException("No enabled routing target is available."));
 
         var nextCalled = false;
@@ -276,7 +300,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(105, "llama3", It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(105, "llama3", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Remote);
 
         var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService);
@@ -284,7 +308,7 @@ public class OllamaRoutingMiddlewareTests
         await sut.InvokeAsync(context);
 
         Assert.Equal("Remote", context.Request.Headers["X-Ollama-Target"]);
-        routingDecisionService.Verify(r => r.DecideAsync(105, "llama3", It.IsAny<CancellationToken>()), Times.Once);
+        routingDecisionService.Verify(r => r.DecideAsync(105, "llama3", It.IsAny<int?>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
@@ -306,7 +330,7 @@ public class OllamaRoutingMiddlewareTests
         Assert.True(nextCalled);
         Assert.Equal("Local", context.Request.Headers["X-Ollama-Target"]);
         tokenEstimator.Verify(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>()), Times.Never);
-        routingDecisionService.Verify(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        routingDecisionService.Verify(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     [Fact]
@@ -441,7 +465,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(100, "llama3", It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(100, "llama3", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Remote);
 
         var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService);
@@ -449,7 +473,7 @@ public class OllamaRoutingMiddlewareTests
         await sut.InvokeAsync(context);
 
         Assert.Equal("Remote", context.Request.Headers["X-Ollama-Target"]);
-        routingDecisionService.Verify(r => r.DecideAsync(100, "llama3", It.IsAny<CancellationToken>()), Times.Once);
+        routingDecisionService.Verify(r => r.DecideAsync(100, "llama3", It.IsAny<int?>(), It.IsAny<CancellationToken>()), Times.Once);
         Assert.Equal("Remote", context.Response.Headers["X-OllamaRouter-Target"]);
         Assert.Equal("llama3", context.Response.Headers["X-OllamaRouter-Model"]);
         Assert.Equal("100", context.Response.Headers["X-OllamaRouter-Estimated-Tokens"]);
@@ -467,7 +491,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Remote);
 
         var requestId = Guid.NewGuid();
@@ -514,7 +538,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(100, "llama3", It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(100, "llama3", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Local);
 
         var requestId = Guid.NewGuid();
@@ -543,7 +567,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(100, "qwen", It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(100, "qwen", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Local);
 
         var inferenceRequestRecorder = new Mock<IInferenceRequestRecorder>();
@@ -572,7 +596,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Remote);
 
         var requestId = Guid.NewGuid();
@@ -614,7 +638,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Remote);
 
         var requestId = Guid.NewGuid();
@@ -660,7 +684,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Remote);
 
         var requestId = Guid.NewGuid();
@@ -699,7 +723,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Remote);
 
         var requestId = Guid.NewGuid();
@@ -740,7 +764,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Remote);
 
         var requestId = Guid.NewGuid();
@@ -782,7 +806,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Remote);
 
         var requestId = Guid.NewGuid();
@@ -824,7 +848,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Remote);
 
         var requestId = Guid.NewGuid();
@@ -867,7 +891,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(1420, "qwen2.5-coder:32b", It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(1420, "qwen2.5-coder:32b", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Local);
 
         var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService);
@@ -898,7 +922,7 @@ public class OllamaRoutingMiddlewareTests
 
         Assert.Equal("Cloud", context.Response.Headers["X-OllamaRouter-Target"]);
         // When pinned and enabled, DecideAsync must not be called
-        routingDecisionService.Verify(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        routingDecisionService.Verify(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     [Fact]
@@ -912,7 +936,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(50, "llama3", It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(50, "llama3", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Local);
 
         var targetAvailability = new Mock<ITargetAvailabilityService>();
@@ -925,7 +949,7 @@ public class OllamaRoutingMiddlewareTests
 
         Assert.Equal("Local", context.Response.Headers["X-OllamaRouter-Target"]);
         // Because Remote was disabled, it fell back to dynamic routing
-        routingDecisionService.Verify(r => r.DecideAsync(50, "llama3", It.IsAny<CancellationToken>()), Times.Once);
+        routingDecisionService.Verify(r => r.DecideAsync(50, "llama3", It.IsAny<int?>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
     // Build a liveness mock where every target is Offline: EnsureKnownAsync returns Offline,
@@ -977,7 +1001,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Local);
 
         var targetAvailability = new Mock<ITargetAvailabilityService>();
@@ -1045,7 +1069,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Local);
 
         var targetAvailability = new Mock<ITargetAvailabilityService>();
@@ -1106,7 +1130,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Local);
 
         // Local is online, Remote is offline → the fleet is NOT all offline.
@@ -1140,7 +1164,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(50, "llama3", It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(50, "llama3", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Local);
 
         var targetAvailability = new Mock<ITargetAvailabilityService>();
@@ -1163,7 +1187,7 @@ public class OllamaRoutingMiddlewareTests
         await sut.InvokeAsync(context);
 
         Assert.Equal("Local", context.Request.Headers["X-Ollama-Target"]);
-        routingDecisionService.Verify(r => r.DecideAsync(50, "llama3", It.IsAny<CancellationToken>()), Times.Once);
+        routingDecisionService.Verify(r => r.DecideAsync(50, "llama3", It.IsAny<int?>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
@@ -1176,7 +1200,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Local);
 
         var targetAvailability = new Mock<ITargetAvailabilityService>();
@@ -1235,7 +1259,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Remote);
 
         var liveness = new Mock<ITargetLivenessService>();
@@ -1353,7 +1377,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(200_000, "qwen3.6-35b-a3b", It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(200_000, "qwen3.6-35b-a3b", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Local);
 
         var capabilityEngine = CreateCapabilityEngine(out var catalogClient);
@@ -1399,7 +1423,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(2_000, "qwen3.8-27b", It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(2_000, "qwen3.8-27b", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Local);
 
         var capabilityEngine = CreateCapabilityEngine(out var catalogClient);
@@ -1449,7 +1473,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(100_000, "qwen3.6-35b-a3b", It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(100_000, "qwen3.6-35b-a3b", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Local);
 
         var capabilityEngine = CreateCapabilityEngine(out var catalogClient);
@@ -1487,7 +1511,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(100, "m", It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(100, "m", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Local);
 
         var capabilityEngine = CreateCapabilityEngine(out var catalogClient);
@@ -1561,7 +1585,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Local);
 
         var capabilityEngine = CreateCapabilityEngine(out var catalogClient);
@@ -1616,7 +1640,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(100, "m", It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(100, "m", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Local);
 
         var capabilityEngine = CreateCapabilityEngine(out var catalogClient);
@@ -1652,7 +1676,7 @@ public class OllamaRoutingMiddlewareTests
 
         var routingDecisionService = new Mock<IRoutingDecisionService>();
         routingDecisionService
-            .Setup(r => r.DecideAsync(3_000, "pinned", It.IsAny<CancellationToken>()))
+            .Setup(r => r.DecideAsync(3_000, "pinned", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(RoutingTarget.Local);
 
         var capabilityEngine = CreateCapabilityEngine(out var catalogClient);
@@ -1734,6 +1758,10 @@ public class OllamaRoutingMiddlewareTests
     private static Mock<IRoutingDecisionService> DecisionFor(RoutingTarget target)
     {
         var d = new Mock<IRoutingDecisionService>();
+        // The middleware dispatch loop calls the 4-arg overload (clientRequestedNumCtx aware);
+        // the 3-arg overload is kept for the legacy call paths.
+        d.Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(target);
         d.Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(target);
         return d;

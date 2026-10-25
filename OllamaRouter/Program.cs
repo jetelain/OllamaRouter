@@ -84,24 +84,27 @@ else
     builder.Services.AddSingleton<ITokenEstimator, HeuristicTokenEstimator>();
 }
 builder.Services.AddGpuVramProviders();
-builder.Services.AddTransient<IRoutingTargetHandler, LocalRoutingTargetHandler>();
-builder.Services.AddTransient<IRoutingTargetHandler, RemoteRoutingTargetHandler>();
 // Explicit factory so the Cloud handler resolves IOptions<OllamaRouterOptions>: without it the
 // optional ctor parameter stays null and the CloudOverflow.Enabled switch / DefaultModel
 // precedence would be silently ignored at runtime.
-builder.Services.AddTransient<IRoutingTargetHandler>(sp => new CloudRoutingTargetHandler(
+builder.Services.AddTransient<CloudRoutingTargetHandler>(sp => new CloudRoutingTargetHandler(
     sp.GetRequiredService<ITargetAvailabilityService>(),
     sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
     sp.GetRequiredService<ILogger<CloudRoutingTargetHandler>>()));
-// Explicit factory so the decision service resolves the SHARED ITargetFailureStreakService
-// singleton (the constructor's optional default would otherwise mint a per-instance table).
+builder.Services.AddTransient<IRoutingTargetHandler>(sp => sp.GetRequiredService<CloudRoutingTargetHandler>());
+// Explicit factory so the decision service resolves the shared singletons (capability engine,
+// execution tracker, liveness/availability, and the SHARED ITargetFailureStreakService table).
+// The two-stage pipeline (task #7) evaluates every effective fleet target; the Cloud handler
+// remains the sole IRoutingTargetHandler (terminal fallback candidate, fixed score 0).
 builder.Services.AddTransient<IRoutingDecisionService>(sp => new RoutingDecisionService(
-    sp.GetServices<IRoutingTargetHandler>(),
     sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
     sp.GetRequiredService<IModelCatalogCacheService>(),
-    sp.GetRequiredService<IActivityMonitorService>(),
-    sp.GetRequiredService<ILogger<RoutingDecisionService>>(),
+    sp.GetRequiredService<ITargetLivenessService>(),
+    sp.GetRequiredService<ITargetAvailabilityService>(),
+    sp.GetRequiredService<ITargetExecutionTracker>(),
     sp.GetRequiredService<ModelCapabilityEngine>(),
+    sp.GetRequiredService<CloudRoutingTargetHandler>(),
+    sp.GetRequiredService<ILogger<RoutingDecisionService>>(),
     sp.GetRequiredService<ITargetFailureStreakService>()));
 builder.Services.AddSingleton<IModelCatalogCacheService, ModelCatalogCacheService>();
 // Auto-Shrink Manager (Phase 3, item 2): per-(target, model) context-bucket leases with
@@ -203,8 +206,8 @@ static IReadOnlyList<RoutingTarget> BuildFleetTargets(OllamaRouterOptions option
 
     if (ollamaOptions.Targets.Count > 0)
     {
-        startupLogger.LogWarning(
-            "OllamaRouter:Targets is configured: routing decisions currently still operate on the legacy LocalUrl/RemoteUrl two-tier logic (full fleet decision logic is planned for a follow-up release). LocalUrl/RemoteUrl remain the instances used by the routing handlers.");
+        startupLogger.LogInformation(
+            "OllamaRouter:Targets is configured with {Count} fleet target(s); routing decisions use the two-stage hot-model affinity pipeline over the configured fleet (catalog presence + hardware suitability + calibrated scoring).", ollamaOptions.Targets.Count);
     }
 
     var nonDefaultModels = ollamaOptions.Models

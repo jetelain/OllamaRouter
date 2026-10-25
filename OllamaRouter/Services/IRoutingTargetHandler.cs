@@ -1,7 +1,14 @@
 namespace OllamaRouter.Services;
 
 /// <summary>
-/// Defines a target that can participate in request routing decisions.
+/// Defines a routing target that can participate in request routing decisions.
+/// <para>
+/// Reserved for terminal fallback targets only: since the fleet-wide two-stage scoring
+/// pipeline (Phase 3, item 3), fleet targets are evaluated directly by the
+/// <see cref="RoutingDecisionService"/> over the configured <c>Targets</c> list, and the only
+/// remaining implementation is the Cloud pseudo-target (<c>CloudRoutingTargetHandler</c>),
+/// which the pipeline treats as a fixed score-0 candidate appended after all fleet targets.
+/// </para>
 /// </summary>
 public interface IRoutingTargetHandler
 {
@@ -21,7 +28,7 @@ public interface IRoutingTargetHandler
     bool IsEnabled { get; }
 
     /// <summary>
-    /// Determines whether the target is currently available (enabled and not busy).
+    /// Determines whether the target is currently available (enabled).
     /// </summary>
     bool IsAvailable();
 
@@ -31,4 +38,3 @@ public interface IRoutingTargetHandler
     /// </summary>
     Task<bool> CanProcessAsync(RoutingContext context, CancellationToken cancellationToken = default);
 }
-

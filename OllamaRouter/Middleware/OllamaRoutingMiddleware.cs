@@ -443,6 +443,10 @@ public sealed class OllamaRoutingMiddleware(
             rawTokenCount = tokenEstimator.EstimateTokens(requestInfo.ContextParts)
                 + requestInfo.PriorContextTokenCount;
             tokenCount = (int)Math.Ceiling(rawTokenCount * options.Value.TokenEstimationOverheadFactor);
+            // The client's static options.num_ctx (upper-bound preference, never a disqualifier):
+            // fed to the routing pipeline's context-fit clamp (plan §2.2) and reused by the
+            // dynamic context sizing rewrite below.
+            var clientNumCtx = DynamicContextPayloadTransformer.ExtractClientNumCtx(body);
 
             if (context.Request.Headers.TryGetValue("X-OllamaRouter-Target", out var requestedTargetHeader) &&
                 TryParsePinnedTarget(requestedTargetHeader.ToString(), out var requestedTarget))
@@ -464,18 +468,18 @@ public sealed class OllamaRoutingMiddleware(
                     else
                     {
                         logger.LogWarning("Requested target {Target} is offline (liveness {State}). Falling back to dynamic routing.", requestedTarget, pinnedState);
-                        target = await routingDecisionService.DecideAsync(tokenCount, modelName, context.RequestAborted);
+                        target = await routingDecisionService.DecideAsync(tokenCount, modelName, clientNumCtx, context.RequestAborted);
                     }
                 }
                 else
                 {
                     logger.LogWarning("Requested target {Target} is disabled. Falling back to dynamic routing.", requestedTarget);
-                    target = await routingDecisionService.DecideAsync(tokenCount, modelName, context.RequestAborted);
+                    target = await routingDecisionService.DecideAsync(tokenCount, modelName, clientNumCtx, context.RequestAborted);
                 }
             }
             else
             {
-                target = await routingDecisionService.DecideAsync(tokenCount, modelName, context.RequestAborted);
+                target = await routingDecisionService.DecideAsync(tokenCount, modelName, clientNumCtx, context.RequestAborted);
             }
 
             logger.LogInformation("{ModelName} - Tokens: {TokenCount} => {Target}", modelName, tokenCount, target);
