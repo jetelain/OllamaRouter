@@ -1,3 +1,4 @@
+using System.Net.Http;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -34,8 +35,10 @@ public class OllamaRoutingMiddlewareTests
         Mock<IInferenceRequestRecorder>? inferenceRequestRecorder = null,
         Mock<ITargetAvailabilityService>? targetAvailability = null,
         Mock<ITargetLivenessService>? targetLiveness = null,
-        ModelCapabilityEngine? capabilityEngine = null)
-    {
+        ModelCapabilityEngine? capabilityEngine = null,
+        Mock<IHttpForwarder>? forwarder = null,
+        ITargetFailureStreakService? streakTracker = null)
+        {
         var effectiveTargetAvailability = targetAvailability ?? new Mock<ITargetAvailabilityService>();
         if (targetAvailability is null)
         {
@@ -88,8 +91,37 @@ public class OllamaRoutingMiddlewareTests
             effectiveCapabilityEngine,
             MsOptions.Create(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
             NullLogger<OllamaRoutingMiddleware>.Instance,
+            CreateForwarder(next, forwarder).Object,
+            streakTracker ?? new TargetFailureStreakService(),
             new Mock<ITargetExecutionTracker>().Object);
-    }
+            }
+
+            // Builds the forwarder used by the middleware. When the caller does not supply an explicit
+            // mock (most pre-existing completion-path tests), a transparent proxy is returned whose
+            // SendAsync simply invokes the test's `next` delegate and reports ForwarderError.None —
+            // this preserves the historical YARP-via-`next` behavior for those tests. Callers that
+            // need to inspect or steer failover pass their own Mock<IHttpForwarder>.
+            internal static Mock<IHttpForwarder> CreateForwarder(RequestDelegate next, Mock<IHttpForwarder>? forwarder = null)
+            {
+            var effectiveForwarder = forwarder ?? new Mock<IHttpForwarder>();
+            if (forwarder is null)
+            {
+            effectiveForwarder
+                .Setup(f => f.SendAsync(
+                    It.IsAny<HttpContext>(), It.IsAny<string>(), It.IsAny<HttpMessageInvoker>(),
+                    It.IsAny<ForwarderRequestConfig>(), It.IsAny<HttpTransformer>(), It.IsAny<CancellationToken>()))
+                .Callback<HttpContext, string, HttpMessageInvoker, ForwarderRequestConfig, HttpTransformer, CancellationToken>(
+                    (c, _, _, _, _, _) =>
+                    {
+                        // The transparent proxy forwards to the test's `next` delegate.
+                        // In-memory request/response streams complete synchronously, so the
+                        // delegate's task is already done by the time we join it.
+                        next(c).GetAwaiter().GetResult();
+                    })
+                .Returns(new ValueTask<ForwarderError>(ForwarderError.None));
+            }
+            return effectiveForwarder;
+            }
 
     [Fact]
     public async Task InvokeAsync_NonInterceptedPath_SetsHeaderToLocal_WithoutInspection()
@@ -959,6 +991,7 @@ public class OllamaRoutingMiddlewareTests
         var liveness = AllOfflineLiveness();
 
         var nextCalled = false;
+        var forwarder = new Mock<IHttpForwarder>();
         // Manually wire the middleware so we can override the options instance.
         var sut = new OllamaRoutingMiddleware(
             _ => { nextCalled = true; return Task.CompletedTask; },
@@ -973,6 +1006,8 @@ public class OllamaRoutingMiddlewareTests
             new ModelCapabilityEngine(new Mock<IOllamaModelCatalogClient>().Object, new MemoryCache(new MemoryCacheOptions()), NullLogger<ModelCapabilityEngine>.Instance),
             optionsWrapper,
             NullLogger<OllamaRoutingMiddleware>.Instance,
+            forwarder.Object,
+            new TargetFailureStreakService(),
             new Mock<ITargetExecutionTracker>().Object);
 
         await sut.InvokeAsync(context);
@@ -981,6 +1016,8 @@ public class OllamaRoutingMiddlewareTests
         Assert.False(nextCalled);
         Assert.False(context.Request.Headers.ContainsKey("X-Ollama-Target"));
         activityMonitor.Verify(m => m.StartRequest(It.IsAny<RoutingTarget>(), It.IsAny<string>(), It.IsAny<int>()), Times.Never);
+        // The all-offline short-circuit returns before any SendAsync is issued.
+        forwarder.Verify(f => f.SendAsync(It.IsAny<HttpContext>(), It.IsAny<string>(), It.IsAny<HttpMessageInvoker>(), It.IsAny<ForwarderRequestConfig>(), It.IsAny<HttpTransformer>(), It.IsAny<CancellationToken>()), Times.Never);
 
         responseBody.Seek(0, SeekOrigin.Begin);
         using var bodyReader = new StreamReader(responseBody);
@@ -1022,17 +1059,19 @@ public class OllamaRoutingMiddlewareTests
         string? capturedModel = null;
         string? capturedTargetHeader = null;
         bool nextCalled = false;
+        RequestDelegate next = c =>
+        {
+            nextCalled = true;
+            capturedTargetHeader = c.Request.Headers["X-Ollama-Target"].ToString();
+            c.Request.Body.Position = 0;
+            using var reader = new StreamReader(c.Request.Body);
+            var body = reader.ReadToEnd();
+            using var doc = JsonDocument.Parse(body);
+            capturedModel = doc.RootElement.GetProperty("model").GetString();
+            return Task.CompletedTask;
+        };
         var sut = new OllamaRoutingMiddleware(
-            c =>
-            {
-                nextCalled = true;
-                capturedTargetHeader = c.Request.Headers["X-Ollama-Target"].ToString();
-                using var reader = new StreamReader(c.Request.Body);
-                var body = reader.ReadToEnd();
-                using var doc = JsonDocument.Parse(body);
-                capturedModel = doc.RootElement.GetProperty("model").GetString();
-                return Task.CompletedTask;
-            },
+            next,
             tokenEstimator.Object,
             routingDecisionService.Object,
             new Mock<IModelCatalogCacheService>().Object,
@@ -1044,6 +1083,8 @@ public class OllamaRoutingMiddlewareTests
             new ModelCapabilityEngine(new Mock<IOllamaModelCatalogClient>().Object, new MemoryCache(new MemoryCacheOptions()), NullLogger<ModelCapabilityEngine>.Instance),
             optionsWrapper,
             NullLogger<OllamaRoutingMiddleware>.Instance,
+            CreateForwarder(next).Object,
+            new TargetFailureStreakService(),
             new Mock<ITargetExecutionTracker>().Object);
 
         await sut.InvokeAsync(context);
@@ -1157,8 +1198,9 @@ public class OllamaRoutingMiddlewareTests
 
         var (options, optionsWrapper) = OptionsWithCloud(cloudModel: null);
         var nextCalled = false;
+        RequestDelegate graceNext = c => { nextCalled = true; return Task.CompletedTask; };
         var sut = new OllamaRoutingMiddleware(
-            _ => { nextCalled = true; return Task.CompletedTask; },
+            graceNext,
             tokenEstimator.Object,
             routingDecisionService.Object,
             new Mock<IModelCatalogCacheService>().Object,
@@ -1170,6 +1212,8 @@ public class OllamaRoutingMiddlewareTests
             new ModelCapabilityEngine(new Mock<IOllamaModelCatalogClient>().Object, new MemoryCache(new MemoryCacheOptions()), NullLogger<ModelCapabilityEngine>.Instance),
             optionsWrapper,
             NullLogger<OllamaRoutingMiddleware>.Instance,
+            CreateForwarder(graceNext).Object,
+            new TargetFailureStreakService(),
             new Mock<ITargetExecutionTracker>().Object);
 
         await sut.InvokeAsync(context);
@@ -1218,10 +1262,12 @@ public class OllamaRoutingMiddlewareTests
 
         await sut.InvokeAsync(context);
 
-        // The liveness service is consulted only up front (for the pinned/chosen gate),
-        // never after the streamed failure — the breaker is inference-isolated.
+        // The liveness service is consulted only up front (for the pinned/chosen gate) and as
+        // read-only probes while the dispatch loop ranks candidates — it is NEVER mutated after
+        // the streamed failure (the breaker is inference-isolated). Mid-stream drops never
+        // apply a liveness strike (that is the streak counter's job, a separate invariant).
         liveness.Verify(t => t.EnsureKnownAsync(It.IsAny<RoutingTarget>(), It.IsAny<CancellationToken>()), Times.Exactly(1));
-        liveness.Verify(t => t.IsOnline(It.IsAny<RoutingTarget>()), Times.Once);
+        liveness.Verify(t => t.MarkHardFailureAsync(It.IsAny<RoutingTarget>()), Times.Never);
     }
 
     // ================================================================================
@@ -1274,8 +1320,10 @@ public class OllamaRoutingMiddlewareTests
             capabilityEngine,
             MsOptions.Create(options),
             NullLogger<OllamaRoutingMiddleware>.Instance,
+            CreateForwarder(next).Object,
+            new TargetFailureStreakService(),
             new Mock<ITargetExecutionTracker>().Object);
-    }
+            }
 
     private static Mock<IModelCatalogCacheService> DigestCache(string digest)
     {
@@ -1528,8 +1576,9 @@ public class OllamaRoutingMiddlewareTests
         var liveness = AllOfflineLiveness();
         var availability = new Mock<ITargetAvailabilityService>();
         availability.Setup(t => t.IsEnabled(It.IsAny<RoutingTarget>())).Returns(true);
+        RequestDelegate cloudCaptureNext = CaptureBodyDelegate(captured);
         var sut = new OllamaRoutingMiddleware(
-            CaptureBodyDelegate(captured),
+            cloudCaptureNext,
             tokenEstimator.Object,
             routingDecisionService.Object,
             cache.Object,
@@ -1541,6 +1590,8 @@ public class OllamaRoutingMiddlewareTests
             capabilityEngine,
             MsOptions.Create(options),
             NullLogger<OllamaRoutingMiddleware>.Instance,
+            CreateForwarder(cloudCaptureNext).Object,
+            new TargetFailureStreakService(),
             new Mock<ITargetExecutionTracker>().Object);
 
         await sut.InvokeAsync(context);
@@ -1630,5 +1681,516 @@ public class OllamaRoutingMiddlewareTests
         Assert.NotNull(captured[0]);
         using var doc = JsonDocument.Parse(captured[0]!);
         Assert.Equal(24_576, doc.RootElement.GetProperty("options").GetProperty("num_ctx").GetInt32());
+        }
+
+    // ================================================================================
+    // Per-target failover, streak tracking, and the uncommitted retry loop (Phase 3, task 8).
+    // These drive a fully-instrumented Mock<IHttpForwarder> that returns a scripted, per-attempt
+    // ForwarderError, so candidate URL ordering, body rewind, commit guards, streak increments,
+    // client-abort handling, and the Cloud relay terminal step can be inspected end to end.
+    // ================================================================================
+
+    private const string FailoverLocalUrl = "http://localhost:11435";
+    private const string FailoverRemoteUrl = "http://remote:11434";
+
+    private const string FailoverBody = """{ "model": "llama3", "prompt": "Bonjour" }""";
+    private const string DoneBody = """{ "model": "llama3", "done": true }""";
+
+    private static OllamaRoutingMiddleware BuildFailoverSut(
+        Mock<ITokenEstimator> tokenEstimator,
+        Mock<IRoutingDecisionService> decision,
+        Mock<ITargetAvailabilityService> availability,
+        Mock<ITargetLivenessService> liveness,
+        OllamaRouterOptions options,
+        Mock<IHttpForwarder> forwarder,
+        ITargetFailureStreakService streak,
+        Mock<IActivityMonitorService>? activityMonitor = null)
+    {
+        return new OllamaRoutingMiddleware(
+            _ => Task.CompletedTask,
+            tokenEstimator.Object,
+            decision.Object,
+            new Mock<IModelCatalogCacheService>().Object,
+            (activityMonitor ?? new Mock<IActivityMonitorService>()).Object,
+            new Mock<IActivityStatisticsService>().Object,
+            new Mock<IInferenceRequestRecorder>().Object,
+            availability.Object,
+            liveness.Object,
+            new ModelCapabilityEngine(new Mock<IOllamaModelCatalogClient>().Object, new MemoryCache(new MemoryCacheOptions()), NullLogger<ModelCapabilityEngine>.Instance),
+            MsOptions.Create(options),
+            NullLogger<OllamaRoutingMiddleware>.Instance,
+            forwarder.Object,
+            streak,
+            new Mock<ITargetExecutionTracker>().Object);
+    }
+
+    private static Mock<ITokenEstimator> Estimator()
+    {
+        var e = new Mock<ITokenEstimator>();
+        e.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+        return e;
+    }
+
+    private static Mock<IRoutingDecisionService> DecisionFor(RoutingTarget target)
+    {
+        var d = new Mock<IRoutingDecisionService>();
+        d.Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(target);
+        return d;
+    }
+
+    // Online availability + liveness (everything Online, outside the grace window).
+    private static (Mock<ITargetAvailabilityService> Availability, Mock<ITargetLivenessService> Liveness) OnlineMocks()
+    {
+        var availability = new Mock<ITargetAvailabilityService>();
+        availability.Setup(t => t.IsEnabled(It.IsAny<RoutingTarget>())).Returns(true);
+        var liveness = new Mock<ITargetLivenessService>();
+        liveness.Setup(t => t.EnsureKnownAsync(It.IsAny<RoutingTarget>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(TargetLivenessState.Online);
+        liveness.Setup(t => t.IsOnline(It.IsAny<RoutingTarget>())).Returns(true);
+        liveness.SetupGet(t => t.ServiceStartTimeUtc).Returns(DateTimeOffset.UtcNow.AddHours(1));
+        liveness.Setup(t => t.GetFleetTargets()).Returns(new[] { RoutingTarget.Local, RoutingTarget.Remote });
+        liveness.Setup(t => t.GetEntries()).Returns(new Dictionary<RoutingTarget, TargetLivenessEntry>());
+        return (availability, liveness);
+    }
+
+    private static IForwarderErrorFeature ErrorFeature(ForwarderError error)
+    {
+        var feature = new Mock<IForwarderErrorFeature>();
+        feature.SetupGet(f => f.Error).Returns(error);
+        return feature.Object;
+    }
+
+    // Wires the forwarder so SendAsync consumes a positional script: entry i handles attempt i
+    // (the last entry is reused for any attempts beyond the list). Each entry writes the response
+    // side effects and returns the ForwarderError the loop should observe. A non-None error is
+    // also published on context.Features (the same IForwarderErrorFeature YARP/the real forwarder
+    // sets) so the middleware's finally-block classification is exercised.
+    private static void WireForwarder(
+        Mock<IHttpForwarder> forwarder,
+        List<Func<HttpContext, string, ForwarderError>> script,
+        List<string> sentUrls)
+    {
+        var idx = 0;
+        forwarder
+            .Setup(f => f.SendAsync(
+                It.IsAny<HttpContext>(), It.IsAny<string>(), It.IsAny<HttpMessageInvoker>(),
+                It.IsAny<ForwarderRequestConfig>(), It.IsAny<HttpTransformer>(), It.IsAny<CancellationToken>()))
+            .Returns<HttpContext, string, HttpMessageInvoker, ForwarderRequestConfig, HttpTransformer, CancellationToken>(
+                (ctx, url, _, _, _, _) =>
+                {
+                    sentUrls.Add(url);
+                    var i = idx < script.Count ? idx : script.Count - 1;
+                    var result = script[i](ctx, url);
+                    idx++;
+                    if (result != ForwarderError.None)
+                    {
+                        ctx.Features.Set<IForwarderErrorFeature>(ErrorFeature(result));
+                    }
+                    return new ValueTask<ForwarderError>(result);
+                });
+    }
+
+    // Helpers that build the common attempt scripts.
+    private static ForwarderError Uncommitted(HttpContext ctx, string url) => ForwarderError.Request;
+    private static ForwarderError Ok(HttpContext ctx, string url)
+    {
+        ctx.Response.StatusCode = 200;
+        ctx.Response.WriteAsync(DoneBody).GetAwaiter().GetResult();
+        return ForwarderError.None;
+    }
+    private static ForwarderError OkCloud(HttpContext ctx, string url)
+    {
+        ctx.Response.StatusCode = 200;
+        ctx.Response.WriteAsync(DoneBody).GetAwaiter().GetResult();
+        return ForwarderError.None;
+    }
+    private static ForwarderError CloudRead(HttpContext ctx, string url, List<string> bodies)
+    {
+        ctx.Request.Body.Position = 0;
+        using var reader = new StreamReader(ctx.Request.Body);
+        bodies.Add(reader.ReadToEnd());
+        ctx.Response.StatusCode = 200;
+        ctx.Response.WriteAsync(DoneBody).GetAwaiter().GetResult();
+        return ForwarderError.None;
+    }
+
+    private static OllamaRouterOptions TwoTargetOptions() =>
+        new() { LocalUrl = FailoverLocalUrl, RemoteUrl = FailoverRemoteUrl };
+
+    // 1. Uncommitted failover: first attempt fails before commit → body rewound → second attempt 200.
+    [Fact]
+    public async Task Failover_FirstAttemptUncommittedFailure_RewindsBody_FailsOverToNextTarget()
+    {
+        var (availability, liveness) = OnlineMocks();
+        var context = BuildContext("/api/chat", FailoverBody);
+        context.Response.Body = new MemoryStream();
+        var streak = new TargetFailureStreakService();
+        var sentUrls = new List<string>();
+        var secondBodyPosition = -1;
+
+        var forwarder = new Mock<IHttpForwarder>();
+        WireForwarder(forwarder, new List<Func<HttpContext, string, ForwarderError>>
+        {
+            (ctx, url) => Uncommitted(ctx, url), // attempt 1: Remote (primary) fails uncommitted
+            (ctx, url) =>
+            {
+                var stream = (MemoryStream)ctx.Request.Body;
+                secondBodyPosition = (int)stream.Position; // rewind must have been applied
+                return Ok(ctx, url); // attempt 2: Local serves 200
+            }
+        }, sentUrls);
+
+        var sut = BuildFailoverSut(Estimator(), DecisionFor(RoutingTarget.Remote), availability, liveness,
+            TwoTargetOptions(), forwarder, streak);
+        await sut.InvokeAsync(context);
+
+        Assert.Equal(new[] { FailoverRemoteUrl, FailoverLocalUrl }, sentUrls);
+        Assert.Equal(0, secondBodyPosition); // body rewound to 0 before the second attempt
+        Assert.Equal(1, streak.GetStreak(RoutingTarget.Remote));
+        liveness.Verify(t => t.MarkHardFailureAsync(RoutingTarget.Remote), Times.Once);
+        Assert.Equal(200, context.Response.StatusCode);
+    }
+
+    // 2. No retry after commit: committed response ending in a non-client mid-stream error →
+    //    exactly one SendAsync, streak incremented, no liveness strike.
+    [Fact]
+    public async Task MidStreamFailure_CommittedResponse_NoRetry_StreakIncrements_NoLivenessStrike()
+    {
+        var (availability, liveness) = OnlineMocks();
+        var context = BuildContext("/api/chat", FailoverBody);
+        context.Response.Body = new MemoryStream();
+        var streak = new TargetFailureStreakService();
+        var sentUrls = new List<string>();
+
+        var forwarder = new Mock<IHttpForwarder>();
+        WireForwarder(forwarder, new List<Func<HttpContext, string, ForwarderError>>
+        {
+            (ctx, url) =>
+            {
+                // Commit bytes, then end in a non-client mid-stream error.
+                ctx.Response.StatusCode = 200;
+                ctx.Response.ContentType = "application/x-ndjson";
+                ctx.Response.WriteAsync("""{ "model": "llama3", "done": false }\n""").GetAwaiter().GetResult();
+                return ForwarderError.RequestTimedOut; // non-client error
+            }
+        }, sentUrls);
+
+        var sut = BuildFailoverSut(Estimator(), DecisionFor(RoutingTarget.Remote), availability, liveness,
+            TwoTargetOptions(), forwarder, streak);
+        await sut.InvokeAsync(context);
+
+        // Committed ⇒ no loop: exactly one attempt; streak on the served target; no liveness strike.
+        Assert.Single(sentUrls);
+        Assert.Equal(1, streak.GetStreak(RoutingTarget.Remote));
+        liveness.Verify(t => t.MarkHardFailureAsync(It.IsAny<RoutingTarget>()), Times.Never);
+    }
+
+    // 3. Streak skip on next request: a target whose streak exceeds the threshold is excluded from
+    //    the candidate list; after a success resets it, the target is offered again.
+    [Fact]
+    public async Task StreakExceedingThreshold_ExcludesFailedTarget_UntilSuccessResets()
+    {
+        var (availability, liveness) = OnlineMocks();
+        var options = TwoTargetOptions();
+
+        // Remote already above threshold (MaxConsecutiveFailures = 3 ⇒ 4).
+        var streak = new TargetFailureStreakService();
+        for (var i = 0; i < 4; i++)
+        {
+            streak.RecordFailure(RoutingTarget.Remote);
+        }
+
+        var forwarder = new Mock<IHttpForwarder>();
+        var sentUrls = new List<string>();
+        WireForwarder(forwarder, new List<Func<HttpContext, string, ForwarderError>> { (ctx, url) => Ok(ctx, url) }, sentUrls);
+
+        // DecideAsync → Local. The candidate list must be [Local] only: Remote is streak-skipped.
+        var sut = BuildFailoverSut(Estimator(), DecisionFor(RoutingTarget.Local), availability, liveness, options, forwarder, streak);
+        var context = BuildContext("/api/chat", FailoverBody);
+        context.Response.Body = new MemoryStream();
+        await sut.InvokeAsync(context);
+
+        Assert.DoesNotContain(FailoverRemoteUrl, sentUrls);
+        Assert.Contains(FailoverLocalUrl, sentUrls);
+
+        // After a success resets the streak, Remote is offered again on a fresh request.
+        streak.RecordSuccess(RoutingTarget.Remote);
+        var forwarder2 = new Mock<IHttpForwarder>();
+        var sentUrls2 = new List<string>();
+        WireForwarder(forwarder2, new List<Func<HttpContext, string, ForwarderError>> { (ctx, url) => Ok(ctx, url) }, sentUrls2);
+        var sut2 = BuildFailoverSut(Estimator(), DecisionFor(RoutingTarget.Remote), availability, liveness, options, forwarder2, streak);
+        var context2 = BuildContext("/api/chat", FailoverBody);
+        context2.Response.Body = new MemoryStream();
+        await sut2.InvokeAsync(context2);
+
+        Assert.Contains(FailoverRemoteUrl, sentUrls2);
+    }
+
+    // 4. All-fleet-fail → Cloud relay: every fleet candidate fails uncommitted; the terminal
+    //    Cloud step rewrites the model and forwards through the preferred relay.
+    [Fact]
+    public async Task AllFleetFail_CloudRelayUsed_WithModelRewrite_ViaPreferredRelay()
+    {
+        var (availability, liveness) = OnlineMocks();
+        var options = TwoTargetOptions();
+        options.Models["llama3"] = new ModelThresholds { CloudModel = "llama3-cloud" };
+        options.CloudOverflow.PreferredRelayTarget = "Local";
+
+        var context = BuildContext("/api/chat", FailoverBody);
+        context.Response.Body = new MemoryStream();
+        var streak = new TargetFailureStreakService();
+        var sentUrls = new List<string>();
+        var bodies = new List<string>();
+
+        var forwarder = new Mock<IHttpForwarder>();
+        WireForwarder(forwarder, new List<Func<HttpContext, string, ForwarderError>>
+        {
+            (ctx, url) => Uncommitted(ctx, url), // attempt 1: Remote (primary) fails uncommitted
+            (ctx, url) => Uncommitted(ctx, url), // attempt 2: Local (fleet fallback) fails uncommitted
+            (ctx, url) => CloudRead(ctx, url, bodies) // attempt 3: terminal Cloud relay via Local → 200
+        }, sentUrls);
+
+        var sut = BuildFailoverSut(Estimator(), DecisionFor(RoutingTarget.Remote), availability, liveness, options, forwarder, streak);
+        await sut.InvokeAsync(context);
+
+        Assert.Equal(3, sentUrls.Count);
+        Assert.Equal(FailoverLocalUrl, sentUrls[^1]); // the cloud relay is the preferred (Local) node
+        Assert.Contains("llama3-cloud", bodies[^1]); // the cloud-rewritten body carries the cloud model
+    }
+
+    // 5. Preferred relay offline → fallback node: an explicitly-configured offline preferred relay
+    //    fails and the next online+enabled fleet target relays the cloud request.
+    [Fact]
+    public async Task PreferredRelayOffline_FallsBackToNextOnlineFleetTarget()
+    {
+        var (availability, liveness) = OnlineMocks();
+        // The preferred relay (Local) is offline; Remote stays online.
+        liveness.Setup(t => t.IsOnline(RoutingTarget.Local)).Returns(false);
+        liveness.Setup(t => t.IsOnline(RoutingTarget.Remote)).Returns(true);
+        var options = TwoTargetOptions();
+        options.Models["llama3"] = new ModelThresholds { CloudModel = "llama3-cloud" };
+        options.CloudOverflow.PreferredRelayTarget = "Local";
+
+        var context = BuildContext("/api/chat", FailoverBody);
+        context.Response.Body = new MemoryStream();
+        var streak = new TargetFailureStreakService();
+        var sentUrls = new List<string>();
+        var bodies = new List<string>();
+
+        var forwarder = new Mock<IHttpForwarder>();
+        var remoteAttempts = 0;
+        WireForwarder(forwarder, new List<Func<HttpContext, string, ForwarderError>>
+        {
+            // Local (offline preferred relay, and the offline fleet fallback) always fails uncommitted.
+            (ctx, url) =>
+            {
+                if (url == FailoverLocalUrl)
+                {
+                    return Uncommitted(ctx, url);
+                }
+                remoteAttempts++;
+                // First Remote attempt = fleet primary (fails uncommitted); a later Remote attempt
+                // = the online cloud fallback (serves the cloud-rewritten body).
+                return remoteAttempts == 1 ? Uncommitted(ctx, url) : CloudRead(ctx, url, bodies);
+            }
+        }, sentUrls);
+
+        var sut = BuildFailoverSut(Estimator(), DecisionFor(RoutingTarget.Remote), availability, liveness, options, forwarder, streak);
+        await sut.InvokeAsync(context);
+
+        // The offline preferred relay (Local) does NOT serve; the online fallback (Remote) does.
+        Assert.Equal(FailoverRemoteUrl, sentUrls[^1]);
+        Assert.Contains("llama3-cloud", bodies[^1]);
+    }
+
+    // 5b. Regression lock: the default PreferredRelayTarget = "Local" relays through the
+    //     Local-named target (byte-identical to the legacy MapTargetToHeader(Cloud)).
+    [Fact]
+    public async Task DefaultPreferredRelayLocal_RelaysThroughLocalTarget()
+    {
+        var (availability, liveness) = OnlineMocks();
+        var options = TwoTargetOptions();
+        options.Models["llama3"] = new ModelThresholds { CloudModel = "llama3-cloud" };
+        // PreferredRelayTarget is left at its default ("Local").
+
+        var context = BuildContext("/api/chat", FailoverBody);
+        context.Response.Body = new MemoryStream();
+        var streak = new TargetFailureStreakService();
+        var sentUrls = new List<string>();
+        var bodies = new List<string>();
+
+        var forwarder = new Mock<IHttpForwarder>();
+        WireForwarder(forwarder, new List<Func<HttpContext, string, ForwarderError>>
+        {
+            (ctx, url) => Uncommitted(ctx, url), // Remote (primary) fails
+            (ctx, url) => Uncommitted(ctx, url), // Local (fleet fallback) fails
+            (ctx, url) => CloudRead(ctx, url, bodies) // terminal Cloud relay via default "Local"
+        }, sentUrls);
+
+        var sut = BuildFailoverSut(Estimator(), DecisionFor(RoutingTarget.Remote), availability, liveness, options, forwarder, streak);
+        await sut.InvokeAsync(context);
+
+        Assert.Equal(FailoverLocalUrl, sentUrls[^1]); // cloud relayed through the Local-named target
+        Assert.Contains("llama3-cloud", bodies[^1]);
+    }
+
+    // 6. Model precedence: per-model CloudModel wins over DefaultModel in the cloud-rewritten body.
+    [Fact]
+    public async Task ModelPrecedence_PerModelCloudModel_WinsOverDefaultModel()
+    {
+        var (availability, liveness) = OnlineMocks();
+        var options = TwoTargetOptions();
+        options.Models["llama3"] = new ModelThresholds { CloudModel = "per-model-cloud" };
+        options.CloudOverflow.DefaultModel = "default-cloud";
+        options.CloudOverflow.PreferredRelayTarget = "Local";
+
+        var context = BuildContext("/api/chat", FailoverBody);
+        context.Response.Body = new MemoryStream();
+        var streak = new TargetFailureStreakService();
+        var sentUrls = new List<string>();
+        var bodies = new List<string>();
+
+        var forwarder = new Mock<IHttpForwarder>();
+        WireForwarder(forwarder, new List<Func<HttpContext, string, ForwarderError>>
+        {
+            (ctx, url) => Uncommitted(ctx, url), // Remote fails
+            (ctx, url) => Uncommitted(ctx, url), // Local (fleet) fails
+            (ctx, url) => CloudRead(ctx, url, bodies) // terminal Cloud relay
+        }, sentUrls);
+
+        var sut = BuildFailoverSut(Estimator(), DecisionFor(RoutingTarget.Remote), availability, liveness, options, forwarder, streak);
+        await sut.InvokeAsync(context);
+
+        Assert.Contains("per-model-cloud", bodies[^1]);
+        Assert.DoesNotContain("default-cloud", bodies[^1]);
+    }
+
+    // 7. CloudOverflow.Enabled == false disables the terminal Cloud step even when a per-model
+    //    CloudModel is configured: every fleet failure ends at the terminal 503 (cloud_enabled=false).
+    [Fact]
+    public async Task CloudDisabled_TerminalCloudStepSkipped_Returns503()
+    {
+        var (availability, liveness) = OnlineMocks();
+        var options = TwoTargetOptions();
+        options.Models["llama3"] = new ModelThresholds { CloudModel = "llama3-cloud" };
+        options.CloudOverflow.Enabled = false;
+
+        var context = BuildContext("/api/chat", FailoverBody);
+        context.Response.Body = new MemoryStream();
+        var streak = new TargetFailureStreakService();
+        var sentUrls = new List<string>();
+
+        var forwarder = new Mock<IHttpForwarder>();
+        WireForwarder(forwarder, new List<Func<HttpContext, string, ForwarderError>>
+        {
+            (ctx, url) => Uncommitted(ctx, url), // Remote (primary) fails
+            (ctx, url) => Uncommitted(ctx, url), // Local (fallback) fails; no cloud relay → terminal 503
+        }, sentUrls);
+
+        var sut = BuildFailoverSut(Estimator(), DecisionFor(RoutingTarget.Remote), availability, liveness, options, forwarder, streak);
+        await sut.InvokeAsync(context);
+
+        Assert.Equal(2, sentUrls.Count);
+        Assert.Equal(StatusCodes.Status503ServiceUnavailable, context.Response.StatusCode);
+        context.Response.Body.Position = 0;
+        var bodyText = new StreamReader(context.Response.Body).ReadToEnd();
+        using var doc = JsonDocument.Parse(bodyText);
+        Assert.False(doc.RootElement.GetProperty("cloud_enabled").GetBoolean());
+    }
+
+    // 7b. Relay also fails: every fleet AND the cloud relay candidate fail uncommitted → the
+    //     terminal 503 reports cloud_enabled: true (the Cloud step WAS attempted/available).
+    [Fact]
+    public async Task CloudRelayAlsoFails_Returns503WithCloudEnabledTrue()
+    {
+        var (availability, liveness) = OnlineMocks();
+        var options = TwoTargetOptions();
+        options.Models["llama3"] = new ModelThresholds { CloudModel = "llama3-cloud" };
+
+        var context = BuildContext("/api/chat", FailoverBody);
+        context.Response.Body = new MemoryStream();
+        var streak = new TargetFailureStreakService();
+        var sentUrls = new List<string>();
+
+        var forwarder = new Mock<IHttpForwarder>();
+        WireForwarder(forwarder, new List<Func<HttpContext, string, ForwarderError>>
+        {
+            (ctx, url) => Uncommitted(ctx, url), // Remote (primary) fails
+            (ctx, url) => Uncommitted(ctx, url), // Local (fleet fallback) fails
+            (ctx, url) => Uncommitted(ctx, url)  // cloud relay (preferred Local) fails too
+        }, sentUrls);
+
+        var sut = BuildFailoverSut(Estimator(), DecisionFor(RoutingTarget.Remote), availability, liveness, options, forwarder, streak);
+        await sut.InvokeAsync(context);
+
+        // The Cloud step offered both the preferred relay (Local) AND the next online node
+        // (Remote) before exhausting: fleet [Remote, Local] + relay [Local, Remote].
+        Assert.Equal(4, sentUrls.Count);
+        Assert.Equal(FailoverLocalUrl, sentUrls[2]);
+        Assert.Equal(FailoverRemoteUrl, sentUrls[3]);
+        Assert.Equal(StatusCodes.Status503ServiceUnavailable, context.Response.StatusCode);
+        context.Response.Body.Position = 0;
+        var bodyText = new StreamReader(context.Response.Body).ReadToEnd();
+        using var doc = JsonDocument.Parse(bodyText);
+        Assert.True(doc.RootElement.GetProperty("cloud_enabled").GetBoolean());
+    }
+
+    // 8. Client abort: a client-side cancellation neither retries nor increments streaks.
+    [Fact]
+    public async Task ClientAbort_NeitherRetries_NorIncrementsStreaks()
+    {
+        var (availability, liveness) = OnlineMocks();
+        var context = BuildContext("/api/chat", FailoverBody);
+        context.Response.Body = new MemoryStream();
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        context.RequestAborted = cts.Token;
+
+        var streak = new TargetFailureStreakService();
+        var sentUrls = new List<string>();
+
+        var forwarder = new Mock<IHttpForwarder>();
+        WireForwarder(forwarder, new List<Func<HttpContext, string, ForwarderError>>
+        {
+            (ctx, url) => ForwarderError.RequestCanceled // client abort → terminal, no retry
+        }, sentUrls);
+
+        var sut = BuildFailoverSut(Estimator(), DecisionFor(RoutingTarget.Remote), availability, liveness,
+            TwoTargetOptions(), forwarder, streak);
+        await sut.InvokeAsync(context);
+
+        Assert.Single(sentUrls); // no retry
+        Assert.Equal(0, streak.GetStreak(RoutingTarget.Remote)); // no streak
+        liveness.Verify(t => t.MarkHardFailureAsync(It.IsAny<RoutingTarget>()), Times.Never); // no liveness strike
+    }
+
+    // 9. Pinned-failover (Q1): a pinned Remote that fails uncommitted falls through to the next
+    //    online candidate; the pin is a preference, never fatal.
+    [Fact]
+    public async Task PinnedTarget_UncommittedFailure_FallsThroughToNextOnlineCandidate()
+    {
+        var (availability, liveness) = OnlineMocks();
+        var context = BuildContext("/api/chat", FailoverBody);
+        context.Request.Headers["X-OllamaRouter-Target"] = "Remote";
+        context.Response.Body = new MemoryStream();
+
+        var streak = new TargetFailureStreakService();
+        var sentUrls = new List<string>();
+
+        var forwarder = new Mock<IHttpForwarder>();
+        WireForwarder(forwarder, new List<Func<HttpContext, string, ForwarderError>>
+        {
+            (ctx, url) => Uncommitted(ctx, url), // pinned Remote fails uncommitted
+            (ctx, url) => Ok(ctx, url) // next online candidate (Local) serves 200
+        }, sentUrls);
+
+        var sut = BuildFailoverSut(Estimator(), DecisionFor(RoutingTarget.Remote), availability, liveness,
+            TwoTargetOptions(), forwarder, streak);
+        await sut.InvokeAsync(context);
+
+        Assert.Equal(new[] { FailoverRemoteUrl, FailoverLocalUrl }, sentUrls);
+        Assert.Equal(200, context.Response.StatusCode);
+        Assert.Equal(1, streak.GetStreak(RoutingTarget.Remote));
     }
 }

@@ -82,6 +82,18 @@ public interface ITargetLivenessService
     Task<TargetLivenessState> EnsureKnownAsync(RoutingTarget target, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Applies exactly ONE best-effort liveness strike to <paramref name="target"/> after an
+    /// UNCOMMITTED transport failure observed by the dispatch loop (the request could not even
+    /// reach response headers, e.g. connection refused / socket error). The strike flows
+    /// through the same hysteresis code path as a hard-transport probe failure
+    /// (<c>ApplyProbeResult(..., ProbeOutcome.HardError)</c>), so the target trips to
+    /// <see cref="TargetLivenessState.Offline"/> immediately and the 10 s background re-prober
+    /// remains the recovery path. Mid-stream failures NEVER call this (inference isolation).
+    /// Never triggers a catalog refresh. Never throws.
+    /// </summary>
+    Task MarkHardFailureAsync(RoutingTarget target);
+
+    /// <summary>
     /// Per-target raw state-machine state (no TTL applied) plus the most recent
     /// probe error, for diagnostics payloads and the future monitor UI.
     /// </summary>

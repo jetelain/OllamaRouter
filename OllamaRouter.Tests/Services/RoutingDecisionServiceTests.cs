@@ -1,4 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Moq;
@@ -39,8 +40,9 @@ public class RoutingDecisionServiceTests
         Mock<IModelCatalogCacheService>? modelCatalogCacheService = null,
         Mock<IActivityMonitorService>? activityMonitor = null,
         TargetAvailabilitySnapshot? targets = null,
-        int consecutiveFailuresTokenTolerance = 4000)
-    {
+        int consecutiveFailuresTokenTolerance = 4000,
+        ITargetFailureStreakService? streakTracker = null)
+        {
         var options = Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions
         {
             Models = new Dictionary<string, ModelThresholds>
@@ -72,8 +74,17 @@ public class RoutingDecisionServiceTests
             new CloudRoutingTargetHandler(targetAvailability.Object)
         };
 
-        return new RoutingDecisionService(handlers, options, modelCatalogCacheService.Object, activityMonitor.Object, NullLogger<RoutingDecisionService>.Instance);
-    }
+        // Use the master constructor so tests can drive the shared per-target failure-streak
+        // service (the token-tolerance-based logic was replaced by streak-based skipping).
+        return new RoutingDecisionService(
+            handlers,
+            options,
+            modelCatalogCacheService.Object,
+            activityMonitor.Object,
+            NullLogger<RoutingDecisionService>.Instance,
+            capabilityEngine: null,
+            streakTracker: streakTracker ?? new TargetFailureStreakService());
+        }
 
     private static Mock<IActivityMonitorService> CreateActivityMonitorNotBusy()
     {
@@ -703,16 +714,28 @@ public class RoutingDecisionServiceTests
         var services = new ServiceCollection();
         services.AddLogging();
         services.AddOptions();
-        services.Configure<OllamaRouterOptions>(_ => { });
+        // CloudOverflow disabled: used below to prove the Cloud handler actually receives the
+        // options instance (a handler without options would report itself available).
+        services.Configure<OllamaRouterOptions>(o => o.CloudOverflow.Enabled = false);
         services.AddSingleton(new Mock<IOllamaModelCatalogClient>().Object);
         services.AddSingleton(new Mock<IModelCatalogCacheService>().Object);
         services.AddSingleton(new Mock<IGpuVramProvider>().Object);
         services.AddSingleton(new Mock<IActivityMonitorService>().Object);
-        services.AddSingleton(new Mock<ITargetAvailabilityService>().Object);
+        // Everything enabled, so the Cloud handler's IsAvailable() outcome below is decided
+        // SOLELY by the CloudOverflow.Enabled options switch (true with no options, false with them).
+        var availability = new Mock<ITargetAvailabilityService>();
+        availability.Setup(t => t.IsEnabled(It.IsAny<RoutingTarget>())).Returns(true);
+        services.AddSingleton(availability.Object);
+        services.AddSingleton<ITargetFailureStreakService, TargetFailureStreakService>();
 
         services.AddTransient<IRoutingTargetHandler, LocalRoutingTargetHandler>();
         services.AddTransient<IRoutingTargetHandler, RemoteRoutingTargetHandler>();
-        services.AddTransient<IRoutingTargetHandler, CloudRoutingTargetHandler>();
+        // Mirrors Program.cs: the Cloud handler must be constructed with its options or the
+        // CloudOverflow.Enabled switch / DefaultModel precedence would be silently ignored.
+        services.AddTransient<IRoutingTargetHandler>(sp => new CloudRoutingTargetHandler(
+            sp.GetRequiredService<ITargetAvailabilityService>(),
+            sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
+            sp.GetRequiredService<ILogger<CloudRoutingTargetHandler>>()));
         services.AddTransient<IRoutingDecisionService, RoutingDecisionService>();
 
         var serviceProvider = services.BuildServiceProvider(new ServiceProviderOptions
@@ -723,19 +746,29 @@ public class RoutingDecisionServiceTests
 
         var instance = serviceProvider.GetRequiredService<IRoutingDecisionService>();
         Assert.NotNull(instance);
+
+        // The resolved Cloud handler must have received its options: with CloudOverflow.Enabled
+        // = false (configured above) and the Cloud toggle on, it must report itself unavailable.
+        var cloudHandler = serviceProvider.GetServices<IRoutingTargetHandler>()
+            .Single(h => h.Target == RoutingTarget.Cloud);
+        Assert.False(cloudHandler.IsAvailable());
     }
 
     [Fact]
-    public async Task DecideAsync_WhenRemoteFails3Times_AndCloudEnabled_SwitchesToCloud()
+    public async Task DecideAsync_WhenRemoteFailsAboveThreshold_AndCloudEnabled_SwitchesToCloud()
     {
         var catalogClient = new Mock<IOllamaModelCatalogClient>();
         var gpuVramProvider = new Mock<IGpuVramProvider>();
         var activityMonitor = CreateActivityMonitorNotBusy();
 
-        // Remote has failed 3 times for 91,300 tokens
-        activityMonitor
-            .Setup(a => a.GetConsecutiveFailures(RoutingTarget.Remote, 91_300))
-            .Returns(3);
+        // Remote's failure streak is ABOVE the threshold (MaxConsecutiveFailures = 3 ⇒ 4 is skipped),
+        // so the decided primary (Remote, since Local can't hold 91.3k tokens) is skipped and the
+        // decision falls through to Cloud.
+        var streakTracker = new TargetFailureStreakService();
+        streakTracker.RecordFailure(RoutingTarget.Remote);
+        streakTracker.RecordFailure(RoutingTarget.Remote);
+        streakTracker.RecordFailure(RoutingTarget.Remote);
+        streakTracker.RecordFailure(RoutingTarget.Remote);
 
         var sut = CreateSut(
             catalogClient,
@@ -743,7 +776,8 @@ public class RoutingDecisionServiceTests
             maxLocalTokens: 36_864, // 91.3k > 36.8k so Local cannot process
             modelName: "Qwen3.8-27B",
             cloudModel: "glm-5.3-flash:cloud",
-            activityMonitor: activityMonitor);
+            activityMonitor: activityMonitor,
+            streakTracker: streakTracker);
 
         var decision = await sut.DecideAsync(tokenCount: 91_300, modelName: "Qwen3.8-27B:latest");
 
@@ -751,15 +785,19 @@ public class RoutingDecisionServiceTests
     }
 
     [Fact]
-    public async Task DecideAsync_WhenRemoteFails3Times_PassesConfiguredTokenTolerance()
+    public async Task DecideAsync_FailureStreak_IsConsultedWithMaxConsecutiveFailuresThreshold()
     {
         var catalogClient = new Mock<IOllamaModelCatalogClient>();
         var gpuVramProvider = new Mock<IGpuVramProvider>();
         var activityMonitor = CreateActivityMonitorNotBusy();
 
-        activityMonitor
-            .Setup(a => a.GetConsecutiveFailures(RoutingTarget.Remote, 92_500, 5_000))
-            .Returns(3);
+        // Repurposed from the old token-tolerance test: the decision service now consults the
+        // per-target failure streak via ShouldSkip(target, options.MaxConsecutiveFailures) and no
+        // longer reads the activity monitor's consecutive-failure count for routing. We use a
+        // mocked streak tracker to assert the threshold (3) is the value passed in.
+        var streakTracker = new Mock<ITargetFailureStreakService>();
+        streakTracker.Setup(s => s.ShouldSkip(RoutingTarget.Remote, 3)).Returns(true);
+        streakTracker.Setup(s => s.GetStreak(RoutingTarget.Remote)).Returns(4);
 
         var sut = CreateSut(
             catalogClient,
@@ -768,24 +806,33 @@ public class RoutingDecisionServiceTests
             modelName: "Qwen3.8-27B",
             cloudModel: "glm-5.3-flash:cloud",
             activityMonitor: activityMonitor,
-            consecutiveFailuresTokenTolerance: 5_000);
+            streakTracker: streakTracker.Object);
 
         var decision = await sut.DecideAsync(tokenCount: 92_500, modelName: "Qwen3.8-27B:latest");
 
         Assert.Equal(RoutingTarget.Cloud, decision);
-        activityMonitor.Verify(a => a.GetConsecutiveFailures(RoutingTarget.Remote, 92_500, 5_000), Times.AtLeastOnce);
+        // The threshold passed to ShouldSkip is options.MaxConsecutiveFailures (default 3).
+        streakTracker.Verify(s => s.ShouldSkip(RoutingTarget.Remote, 3), Times.AtLeastOnce);
+        // The legacy token-tolerance count is no longer consulted for routing.
+        activityMonitor.Verify(
+            a => a.GetConsecutiveFailures(It.IsAny<RoutingTarget>(), It.IsAny<int>(), It.IsAny<int>()),
+            Times.Never);
     }
 
     [Fact]
-    public async Task DecideAsync_WhenRemoteFails3Times_AndCloudDisabled_KeepsRemote()
+    public async Task DecideAsync_WhenRemoteFailsAboveThreshold_AndCloudDisabled_KeepsRemote()
     {
         var catalogClient = new Mock<IOllamaModelCatalogClient>();
         var gpuVramProvider = new Mock<IGpuVramProvider>();
         var activityMonitor = CreateActivityMonitorNotBusy();
 
-        activityMonitor
-            .Setup(a => a.GetConsecutiveFailures(RoutingTarget.Remote, 91_300))
-            .Returns(3);
+        // Remote's streak is above threshold, but with Cloud disabled (and Local unable to hold
+        // the tokens) there is no subsequent candidate → the decision keeps Remote.
+        var streakTracker = new TargetFailureStreakService();
+        for (var i = 0; i < 4; i++)
+        {
+            streakTracker.RecordFailure(RoutingTarget.Remote);
+        }
 
         // Cloud target is disabled
         var targets = AllExcept(RoutingTarget.Cloud);
@@ -797,7 +844,8 @@ public class RoutingDecisionServiceTests
             modelName: "Qwen3.8-27B",
             cloudModel: "glm-5.3-flash:cloud",
             activityMonitor: activityMonitor,
-            targets: targets);
+            targets: targets,
+            streakTracker: streakTracker);
 
         var decision = await sut.DecideAsync(tokenCount: 91_300, modelName: "Qwen3.8-27B:latest");
 
@@ -805,15 +853,19 @@ public class RoutingDecisionServiceTests
     }
 
     [Fact]
-    public async Task DecideAsync_WhenRemoteFails3Times_AndNoCloudModelConfigured_KeepsRemote()
+    public async Task DecideAsync_WhenRemoteFailsAboveThreshold_AndNoCloudModelConfigured_KeepsRemote()
     {
         var catalogClient = new Mock<IOllamaModelCatalogClient>();
         var gpuVramProvider = new Mock<IGpuVramProvider>();
         var activityMonitor = CreateActivityMonitorNotBusy();
 
-        activityMonitor
-            .Setup(a => a.GetConsecutiveFailures(RoutingTarget.Remote, 91_300))
-            .Returns(3);
+        // Remote's streak is above threshold, but with no CloudModel configured the Cloud
+        // handler cannot process → the decision keeps Remote.
+        var streakTracker = new TargetFailureStreakService();
+        for (var i = 0; i < 4; i++)
+        {
+            streakTracker.RecordFailure(RoutingTarget.Remote);
+        }
 
         // cloudModel is null
         var sut = CreateSut(
@@ -822,7 +874,8 @@ public class RoutingDecisionServiceTests
             maxLocalTokens: 36_864,
             modelName: "Qwen3.8-27B",
             cloudModel: null,
-            activityMonitor: activityMonitor);
+            activityMonitor: activityMonitor,
+            streakTracker: streakTracker);
 
         var decision = await sut.DecideAsync(tokenCount: 91_300, modelName: "Qwen3.8-27B:latest");
 
@@ -830,17 +883,20 @@ public class RoutingDecisionServiceTests
     }
 
     [Fact]
-    public async Task DecideAsync_WhenLocalFails3Times_SwitchesToRemote()
+    public async Task DecideAsync_WhenLocalFailsAboveThreshold_SwitchesToRemote()
     {
         var catalogClient = new Mock<IOllamaModelCatalogClient>();
         var gpuVramProvider = new Mock<IGpuVramProvider>();
         gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
         var activityMonitor = CreateActivityMonitorNotBusy();
 
-        // Local has failed 3 times for 2,000 tokens
-        activityMonitor
-            .Setup(a => a.GetConsecutiveFailures(RoutingTarget.Local, 2_000))
-            .Returns(3);
+        // Local's failure streak is above threshold → skipped; the decision walks the remaining
+        // handlers and lands on Remote (which can hold 2,000 tokens).
+        var streakTracker = new TargetFailureStreakService();
+        for (var i = 0; i < 4; i++)
+        {
+            streakTracker.RecordFailure(RoutingTarget.Local);
+        }
 
         var sut = CreateSut(
             catalogClient,
@@ -848,7 +904,8 @@ public class RoutingDecisionServiceTests
             maxLocalTokens: 40_000,
             modelName: "llama3",
             cloudModel: "glm-5.3-flash:cloud",
-            activityMonitor: activityMonitor);
+            activityMonitor: activityMonitor,
+            streakTracker: streakTracker);
 
         var decision = await sut.DecideAsync(tokenCount: 2_000, modelName: "llama3");
 
@@ -856,20 +913,21 @@ public class RoutingDecisionServiceTests
     }
 
     [Fact]
-    public async Task DecideAsync_WhenLocalAndRemoteBothFail3Times_SwitchesToCloud()
+    public async Task DecideAsync_WhenLocalAndRemoteBothFailAboveThreshold_SwitchesToCloud()
     {
         var catalogClient = new Mock<IOllamaModelCatalogClient>();
         var gpuVramProvider = new Mock<IGpuVramProvider>();
         gpuVramProvider.Setup(g => g.GetFreeVramMB()).Returns(20_000);
         var activityMonitor = CreateActivityMonitorNotBusy();
 
-        // Both Local and Remote have failed 3 times
-        activityMonitor
-            .Setup(a => a.GetConsecutiveFailures(RoutingTarget.Local, 2_000))
-            .Returns(3);
-        activityMonitor
-            .Setup(a => a.GetConsecutiveFailures(RoutingTarget.Remote, 2_000))
-            .Returns(3);
+        // Both Local and Remote are above the failure-streak threshold: the primary (Local) is
+        // skipped and the subsequent walk skips Remote too, landing on Cloud.
+        var streakTracker = new TargetFailureStreakService();
+        for (var i = 0; i < 4; i++)
+        {
+            streakTracker.RecordFailure(RoutingTarget.Local);
+            streakTracker.RecordFailure(RoutingTarget.Remote);
+        }
 
         var sut = CreateSut(
             catalogClient,
@@ -877,7 +935,8 @@ public class RoutingDecisionServiceTests
             maxLocalTokens: 40_000,
             modelName: "llama3",
             cloudModel: "glm-5.3-flash:cloud",
-            activityMonitor: activityMonitor);
+            activityMonitor: activityMonitor,
+            streakTracker: streakTracker);
 
         var decision = await sut.DecideAsync(tokenCount: 2_000, modelName: "llama3");
 
@@ -885,16 +944,19 @@ public class RoutingDecisionServiceTests
     }
 
     [Fact]
-    public async Task DecideAsync_WhenFailuresBelowThreshold_KeepsOriginalTarget()
+    public async Task DecideAsync_WhenFailureStreakBelowThreshold_KeepsOriginalTarget()
     {
         var catalogClient = new Mock<IOllamaModelCatalogClient>();
         var gpuVramProvider = new Mock<IGpuVramProvider>();
         var activityMonitor = CreateActivityMonitorNotBusy();
 
-        // Only 2 failures (below threshold of 3)
-        activityMonitor
-            .Setup(a => a.GetConsecutiveFailures(RoutingTarget.Remote, 91_300))
-            .Returns(2);
+        // 3 failures is NOT above the threshold (MaxConsecutiveFailures = 3), so the primary
+        // (Remote, since Local can't hold the tokens) is kept.
+        var streakTracker = new TargetFailureStreakService();
+        for (var i = 0; i < 3; i++)
+        {
+            streakTracker.RecordFailure(RoutingTarget.Remote);
+        }
 
         var sut = CreateSut(
             catalogClient,
@@ -902,7 +964,8 @@ public class RoutingDecisionServiceTests
             maxLocalTokens: 36_864,
             modelName: "Qwen3.8-27B",
             cloudModel: "glm-5.3-flash:cloud",
-            activityMonitor: activityMonitor);
+            activityMonitor: activityMonitor,
+            streakTracker: streakTracker);
 
         var decision = await sut.DecideAsync(tokenCount: 91_300, modelName: "Qwen3.8-27B:latest");
 

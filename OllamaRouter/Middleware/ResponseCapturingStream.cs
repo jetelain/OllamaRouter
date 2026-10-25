@@ -14,6 +14,18 @@ internal sealed class ResponseCapturingStream(Stream inner) : Stream
     private readonly byte[] _buffer = new byte[MaxTailLength];
     private int _head = 0;
     private int _count = 0;
+    private bool _hasWritten;
+
+    /// <summary>
+    /// True once at least one byte has been written through the stream. The middleware uses
+    /// this as its commit guard for the uncommitted-retry failover loop: once the response has
+    /// started being written, the request can no longer be safely re-dispatched to another
+    /// target. It complements <see cref="Microsoft.AspNetCore.Http.HttpResponse.HasStarted"/>
+    /// (which is not observable in the <c>DefaultHttpContext</c> test host) and also tracks
+    /// streaming writes on the production path, where YARP's <c>DisableBuffering()</c> swaps
+    /// the response body after this stream is installed.
+    /// </summary>
+    public bool HasWritten => _hasWritten;
 
     public string CapturedTail
     {
@@ -53,6 +65,7 @@ internal sealed class ResponseCapturingStream(Stream inner) : Stream
 
         lock (_gate)
         {
+            _hasWritten = true;
             if (buffer.Length >= MaxTailLength)
             {
                 buffer.Slice(buffer.Length - MaxTailLength).CopyTo(_buffer);

@@ -8,6 +8,7 @@ using OllamaRouter.Options;
 using OllamaRouter.ReverseProxy;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services;
+using Yarp.ReverseProxy;
 
 Console.OutputEncoding = Encoding.UTF8;
 Console.Title = "Ollama Router";
@@ -34,6 +35,18 @@ var ollamaOptions = builder.Configuration.GetSection(OllamaRouterOptions.Section
 var (routes, clusters) = OllamaReverseProxyConfig.Build(ollamaOptions);
 builder.Services.AddReverseProxy()
     .LoadFromMemory(routes, clusters);
+
+// Middleware-owned dispatch loop (Phase 3): the completion pipeline forwards via
+// IHttpForwarder.SendAsync (uncommitted-failure failover) instead of relying on the YARP
+// endpoint. AddHttpForwarder registers the single HttpForwarder instance (YARP 2.3.0 has no
+// DI-friendly constructor); the dedicated proxy HttpClient + 15 min per-request
+// ForwarderRequestConfig live on the middleware (see OllamaRoutingMiddleware.ProxyClient).
+builder.Services.AddHttpForwarder();
+
+// Per-target failure streak tracker (Phase 3): singleton, thread-safe in-memory counter that
+// the routing decision service and the middleware's dispatch loop share. A target above the
+// MaxConsecutiveFailures threshold is skipped as a candidate until a success resets it.
+builder.Services.AddSingleton<ITargetFailureStreakService, TargetFailureStreakService>();
 
 // Effective fleet targets plus the Cloud pseudo-target (always present); used by the
 // availability and statistics services so state is keyed per target.
@@ -73,8 +86,23 @@ else
 builder.Services.AddGpuVramProviders();
 builder.Services.AddTransient<IRoutingTargetHandler, LocalRoutingTargetHandler>();
 builder.Services.AddTransient<IRoutingTargetHandler, RemoteRoutingTargetHandler>();
-builder.Services.AddTransient<IRoutingTargetHandler, CloudRoutingTargetHandler>();
-builder.Services.AddTransient<IRoutingDecisionService, RoutingDecisionService>();
+// Explicit factory so the Cloud handler resolves IOptions<OllamaRouterOptions>: without it the
+// optional ctor parameter stays null and the CloudOverflow.Enabled switch / DefaultModel
+// precedence would be silently ignored at runtime.
+builder.Services.AddTransient<IRoutingTargetHandler>(sp => new CloudRoutingTargetHandler(
+    sp.GetRequiredService<ITargetAvailabilityService>(),
+    sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
+    sp.GetRequiredService<ILogger<CloudRoutingTargetHandler>>()));
+// Explicit factory so the decision service resolves the SHARED ITargetFailureStreakService
+// singleton (the constructor's optional default would otherwise mint a per-instance table).
+builder.Services.AddTransient<IRoutingDecisionService>(sp => new RoutingDecisionService(
+    sp.GetServices<IRoutingTargetHandler>(),
+    sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
+    sp.GetRequiredService<IModelCatalogCacheService>(),
+    sp.GetRequiredService<IActivityMonitorService>(),
+    sp.GetRequiredService<ILogger<RoutingDecisionService>>(),
+    sp.GetRequiredService<ModelCapabilityEngine>(),
+    sp.GetRequiredService<ITargetFailureStreakService>()));
 builder.Services.AddSingleton<IModelCatalogCacheService, ModelCatalogCacheService>();
 // Auto-Shrink Manager (Phase 3, item 2): per-(target, model) context-bucket leases with
 // KV-cache-hysteresis (cooldown turns / idle timeout / 50%-baseline drop). Singleton: the

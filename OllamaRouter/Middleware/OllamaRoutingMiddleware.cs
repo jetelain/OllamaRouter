@@ -1,5 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Net.Http;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Options;
@@ -31,6 +33,8 @@ public sealed class OllamaRoutingMiddleware(
     ModelCapabilityEngine capabilityEngine,
     IOptions<OllamaRouterOptions> options,
     ILogger<OllamaRoutingMiddleware> logger,
+    IHttpForwarder forwarder,
+    ITargetFailureStreakService streakTracker,
     ITargetExecutionTracker executionTracker = null!,
     IContextAutoShrinkManager? contextShrinkManager = null)
 {
@@ -38,6 +42,33 @@ public sealed class OllamaRoutingMiddleware(
     // target is treated as routable rather than offline, so a request arriving before the
     // boot probe completes is never bounced to 503 merely because probing is slow.
     private static readonly TimeSpan StartupGracePeriod = TimeSpan.FromSeconds(10);
+
+    // Pass-through transformer for the middleware-owned dispatch loop. HttpTransformer.Default
+    // (the public YARP 2.3.0 instance) is pure pass-through (headers/body flow untouched), so
+    // the already-set request headers (incl. X-Ollama-Target) reach the destination unchanged.
+    private static readonly HttpTransformer PassThroughTransformer = HttpTransformer.Default;
+
+    // Per-request forwarding config: a 15 min activity timeout matching the existing YARP
+    // cluster config (OllamaReverseProxyConfig.ActivityTimeout). The dedicated proxy client
+    // below disables its client-level timeout so long generations survive this window rather
+    // than being killed by SocketsHttpHandler's default 100 s.
+    private static readonly ForwarderRequestConfig ForwarderRequestConfig = new() { ActivityTimeout = TimeSpan.FromMinutes(15) };
+
+    // Dedicated proxy client for the dispatch loop: a SocketsHttpHandler with a 10 s
+    // pooled-connection lifetime (mirrors the LivenessProbe client so sleeping-then-woken
+    // machines with a changed IP do not keep hitting dead pooled sockets). No client-level
+    // timeout is imposed — an HttpMessageInvoker has none (the 100 s default is an HttpClient
+    // concept) — so long generations survive until the per-request 15 min
+    // ForwarderRequestConfig.ActivityTimeout above. Shared (thread-safe) across requests; the
+    // middleware is instantiated once.
+    private static readonly HttpMessageInvoker ProxyClient = new(
+        new SocketsHttpHandler { PooledConnectionLifetime = TimeSpan.FromSeconds(10) });
+
+    // HttpContext.Items key under which the response capturing stream is stored so the
+    // dispatch loop can reach its commit guard (HasWritten) even after the response body has
+    // been re-assigned (YARP's DisableBuffering swaps it) or in the test host, where the
+    // capturing stream IS the response body.
+    internal const string CapturingStreamKey = "OllamaRouter.CapturingStream";
 
     /// <summary>
     /// The Auto-Shrink Manager (Phase 3, item 2): consulted after the stateless sizing decision
@@ -209,25 +240,68 @@ public sealed class OllamaRoutingMiddleware(
                DateTimeOffset.UtcNow - start < StartupGracePeriod;
     }
 
-    // Cloud Overflow availability for this request (mirrors CloudRoutingTargetHandler's
-    // predicate): the model has a configured CloudModel AND the Cloud target is enabled.
+    // Cloud Overflow availability for this request (shared with CloudRoutingTargetHandler
+    // via CloudRelayResolver): the targets.json Cloud toggle AND the static
+    // CloudOverflow.Enabled switch AND a resolvable cloud model (per-model CloudModel wins
+    // over CloudOverflow.DefaultModel).
     private bool IsCloudOverflowAvailable(string modelName)
     {
-        if (!targetAvailability.IsEnabled(RoutingTarget.Cloud))
+        return CloudRelayResolver.IsCloudOverflowAvailable(targetAvailability, options.Value, modelName);
+    }
+
+    // Whether the given fleet target can receive a request right now: enabled in
+    // targets.json AND (online, or still Unknown within the 10 s startup grace window).
+    // Mirrors IsPinnedTargetRoutable / IsFleetAllOffline; does NOT force a new probe (the
+    // dispatch loop itself is the probe).
+    private bool IsRoutableNow(RoutingTarget target)
+    {
+        if (!targetAvailability.IsEnabled(target))
         {
             return false;
         }
 
-        var normalizedName = RoutingDecisionService.NormalizeModelName(modelName);
-        return options.Value.Models.TryGetValue(normalizedName, out var thresholds) &&
-               !string.IsNullOrEmpty(thresholds.CloudModel);
+        if (targetLiveness.IsOnline(target))
+        {
+            return true;
+        }
+
+        var entries = targetLiveness.GetEntries();
+        return IsWithinStartupGrace() &&
+               entries is not null &&
+               entries.TryGetValue(target, out var entry) &&
+               entry.State == TargetLivenessState.Unknown;
     }
+
+    // Whether any response bytes have already been committed to the client: the real
+    // HttpResponse.HasStarted flag, OR (in the DefaultHttpContext test host, where HasStarted
+    // never flips after a write) the first-write marker on the capturing stream installed by
+    // this middleware.
+    private static bool IsResponseCommitted(HttpContext context)
+    {
+        if (context.Response.HasStarted)
+        {
+            return true;
+        }
+
+        return context.Items[CapturingStreamKey] is ResponseCapturingStream { HasWritten: true };
+    }
+
+    // The client-abort classification (binding): the five client-side ForwarderError values (or a
+    // canceled request token) mean the client went away. Client aborts never retry, never feed the
+    // failure streak, and never apply a liveness strike.
+    private static bool IsClientAbort(ForwarderError error)
+        => error is ForwarderError.RequestCanceled
+            or ForwarderError.ResponseBodyCanceled
+            or ForwarderError.ResponseBodyClient
+            or ForwarderError.RequestBodyCanceled
+            or ForwarderError.RequestBodyClient;
 
     // Diagnostics payload for the all-offline 503: enumerates the ENABLED fleet targets
     // in fleet order with their raw (non-TTL) state lowercased and the last probe error.
-    // cloud_enabled is false by construction (the 503 path is only taken when Cloud is NOT
-    // available). The request is never forwarded and no activity statistics are recorded.
-    private AllOfflineDiagnostics BuildAllOfflineDiagnostics()
+    // <paramref name="cloudEnabled"/> is false on the pre-dispatch gate (Cloud was NOT
+    // available) and true on the dispatch-loop terminal path (every candidate died at
+    // runtime AFTER the Cloud relay step was attempted/available).
+    private AllOfflineDiagnostics BuildAllOfflineDiagnostics(bool cloudEnabled)
     {
         var entries = targetLiveness.GetEntries();
         var targets = targetLiveness.GetFleetTargets()
@@ -245,7 +319,7 @@ public sealed class OllamaRoutingMiddleware(
         return new AllOfflineDiagnostics(
             "All fleet targets are offline or disabled.",
             targets,
-            CloudEnabled: false);
+            CloudEnabled: cloudEnabled);
     }
 
     // Auto-Shrink lease invalidation on liveness TRANSITIONS: the KV cache of a daemon that
@@ -348,6 +422,15 @@ public sealed class OllamaRoutingMiddleware(
         var body = await ReadBodyAsync(context.Request);
         var endpoint = context.Request.Path.Value ?? "/";
 
+        // The target that actually produced the response (may differ from the decided primary
+        // after an uncommitted failover), or the last attempted one on terminal failure.
+        RoutingTarget? servedTarget = null;
+
+        // The target currently holding an in-flight accounting slot (the decided primary);
+        // reassigned to the finally-served target after the dispatch loop so a request that
+        // fails over Remote→Local is counted against Local, never against an exhausted candidate.
+        RoutingTarget? inFlightTarget = null;
+
         var modelName = "unknown";
         var tokenCount = 0;
         var rawTokenCount = 0;
@@ -445,7 +528,7 @@ public sealed class OllamaRoutingMiddleware(
                     context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
                     context.Response.ContentType = "application/json";
                     await context.Response.WriteAsync(JsonSerializer.Serialize(
-                        BuildAllOfflineDiagnostics(),
+                        BuildAllOfflineDiagnostics(cloudEnabled: false),
                         OllamaRouterJsonSerializerContext.Default.AllOfflineDiagnostics));
                     return;
                 }
@@ -495,30 +578,20 @@ public sealed class OllamaRoutingMiddleware(
             return Task.CompletedTask;
         });
 
-        if (target == RoutingTarget.Cloud)
-        {
-            var normalizedName = RoutingDecisionService.NormalizeModelName(modelName);
-            if (options.Value.Models.TryGetValue(normalizedName, out var cloudThresholds) &&
-                !string.IsNullOrEmpty(cloudThresholds.CloudModel))
-            {
-                var rewrittenBody = OllamaRequestParser.ReplaceModelName(body, cloudThresholds.CloudModel);
-                var bodyBytes = System.Text.Encoding.UTF8.GetBytes(rewrittenBody);
-                context.Request.Body = new MemoryStream(bodyBytes);
-                context.Request.ContentLength = bodyBytes.Length;
-                body = rewrittenBody; // Record the payload actually sent to the cloud target.
-            }
-        }
-
         var originalBody = context.Response.Body;
         var capturingStream = new ResponseCapturingStream(originalBody);
         context.Response.Body = capturingStream;
+        // Expose the capturing stream so IsResponseCommitted can read its commit guard even
+        // after the response body has been re-assigned (YARP's DisableBuffering) or in the
+        // test host, where the capturing stream is the response body.
+        context.Items[CapturingStreamKey] = capturingStream;
 
         // In-flight accounting (Cloud is a relay and is never counted): exactly one
-        // increment per real dispatch; the matching decrement lives in the finally
-        // block below, which is the single guaranteed exit path covering normal
-        // completion, forwarder errors, and client aborts alike.
+        // increment per real dispatch; the matching decrement lives in the finally block
+        // below, keyed on the finally-served target.
         if (target != RoutingTarget.Cloud)
         {
+            inFlightTarget = target;
             executionTracker.IncrementInFlight(target);
         }
 
@@ -529,30 +602,54 @@ public sealed class OllamaRoutingMiddleware(
 
         try
         {
-            await next(context);
+            // Middleware-owned dispatch loop (Phase 3): forward the buffered body to the
+            // decided primary and, on uncommitted failure, rewind the body and fail over to
+            // the next eligible candidate (then the terminal Cloud relay step). Replaces the
+            // previous `await next(context)` YARP hand-off for completion requests; the
+            // forwarder sets the same IForwarderErrorFeature on context.Features that YARP
+            // did, so the response-completeness / token-extraction logic below is unchanged.
+            (servedTarget, body) = await DispatchLoopAsync(context, body, target);
+            if (servedTarget is not null && servedTarget != inFlightTarget)
+            {
+                // Reassign in-flight accounting to the finally-served target (binding §7):
+                // a failover Remote→Local is counted against Local, never against the
+                // exhausted candidate that produced the uncommitted failure.
+                if (inFlightTarget is { } inFlight)
+                {
+                    executionTracker.DecrementInFlight(inFlight);
+                }
+                if (servedTarget != RoutingTarget.Cloud)
+                {
+                    executionTracker.IncrementInFlight(servedTarget.Value);
+                    inFlightTarget = servedTarget;
+                }
+                else
+                {
+                    inFlightTarget = null; // Cloud is a relay; never counted in-flight.
+                }
+            }
         }
         catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
         {
             isClientAborted = true;
+            servedTarget ??= target;
         }
         finally
         {
             stopwatch.Stop();
             context.Response.Body = originalBody;
 
-            if (target != RoutingTarget.Cloud)
+            // In-flight accounting is keyed on the finally-served target (or null if the
+            // request was served through the Cloud relay, which is never counted).
+            if (inFlightTarget is { } inFlightDecrement)
             {
-                executionTracker.DecrementInFlight(target);
+                executionTracker.DecrementInFlight(inFlightDecrement);
             }
 
             isClientAborted = isClientAborted || context.RequestAborted.IsCancellationRequested;
 
             var forwarderError = context.Features.Get<IForwarderErrorFeature>();
-            if (forwarderError is not null && forwarderError.Error is ForwarderError.RequestCanceled
-                                                                   or ForwarderError.ResponseBodyCanceled
-                                                                   or ForwarderError.ResponseBodyClient
-                                                                   or ForwarderError.RequestBodyCanceled
-                                                                   or ForwarderError.RequestBodyClient)
+            if (forwarderError is not null && IsClientAbort(forwarderError.Error))
             {
                 isClientAborted = true;
             }
@@ -563,6 +660,22 @@ public sealed class OllamaRoutingMiddleware(
             var isInterrupted = !isStreamCompleted;
             success = context.Response.StatusCode < 400 && !isInterrupted;
 
+            // Mid-stream failure (§7): the response had already started (bytes committed) and
+            // then ended in a forwarder error. Do NOT loop — increment the served target's
+            // failure streak so the next request avoids a flapping target. Client aborts
+            // (isClientAborted) never feed streaks, and a complete HTTP error response from an
+            // alive daemon (headers flushed, stream intact) never does either (Q4: streaks
+            // track transport reliability only — only a transport-level uncommitted failure or
+            // a mid-stream drop counts).
+            if (servedTarget is { } midStreamTarget
+                && !isClientAborted
+                && forwarderError is not null
+                && forwarderError.Error != ForwarderError.None
+                && IsResponseCommitted(context))
+            {
+                streakTracker.RecordFailure(midStreamTarget);
+            }
+
             var recordedStatusCode = context.Response.StatusCode;
             if (context.Response.StatusCode < 400 && isInterrupted)
             {
@@ -571,7 +684,7 @@ public sealed class OllamaRoutingMiddleware(
 
             var entry = new ActivityLogEntry(
                 DateTimeOffset.UtcNow,
-                target,
+                servedTarget ?? target,
                 modelName,
                 tokenCount,
                 actualPromptTokens,
@@ -581,11 +694,227 @@ public sealed class OllamaRoutingMiddleware(
                 success,
                 rawTokenCount);
 
+
             activityMonitor.CompleteRequest(requestId, entry);
             activityStatistics.Add(entry);
             inferenceRequestRecorder.Record(entry, endpoint, body);
         }
     }
+
+    // The middleware-owned uncommitted-retry dispatch loop (§1–§3, §6–§8).
+    //
+    // Builds the ranked candidate list — the decided primary, then the remaining
+    // enabled + routable + streak-ok fleet targets in configuration order, then (when Cloud
+    // Overflow is available) the terminal Cloud relay step — buffers the request body as a
+    // seekable stream, and forwards to each candidate in order. An uncommitted failure
+    // (ForwarderError != None and no response bytes committed) rewinds the body, records the
+    // failure streak, applies one best-effort liveness strike, and fails over. A committed
+    // failure (response already started) is terminal: no loop. Exhausting every candidate
+    // uncommitted produces the terminal 503 all-offline diagnostics (cloud_enabled reports
+    // whether the Cloud relay step was available).
+    private async Task<(RoutingTarget? Served, string Body)> DispatchLoopAsync(HttpContext context, string body, RoutingTarget target)
+    {
+        var effectiveTargets = options.Value.GetEffectiveTargets(logger);
+        var targetsByName = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        foreach (var t in effectiveTargets)
+        {
+            if (!string.IsNullOrWhiteSpace(t.Name))
+            {
+                targetsByName[t.Name] = t.Url;
+            }
+        }
+
+        var isCloud = target == RoutingTarget.Cloud;
+        var cloudAvailable = isCloud || IsCloudOverflowAvailable(
+            OllamaRequestParser.ParseCompletionRequest(body).ModelName ?? string.Empty);
+
+        // Ranked candidate list: (routing target, destination URL).
+        var candidates = new List<(RoutingTarget Target, string Url)>();
+        if (isCloud)
+        {
+            // All-offline gate handoff (or pinned Cloud): the fleet nodes are the relays
+            // carrying the cloud-rewritten body (preferred relay first, then online fallbacks).
+            AddCloudRelayCandidates(effectiveTargets, targetsByName, candidates);
+        }
+        else
+        {
+            // Decided primary first (always attempted, even if liveness says offline — the
+            // loop itself is the probe). A resolved-but-nameless decision degrades gracefully
+            // to the remaining ranked fleet candidates (no candidate ⇒ terminal 503 below).
+            var primaryName = target.ToString();
+            if (!string.IsNullOrWhiteSpace(primaryName)
+                && targetsByName.TryGetValue(primaryName, out var primaryUrl)
+                && !string.IsNullOrWhiteSpace(primaryUrl))
+            {
+                candidates.Add((target, primaryUrl!));
+            }
+            // Remaining eligible fleet targets in configuration order (streak-skipped and
+            // offline/disabled targets are excluded).
+            foreach (var t in effectiveTargets)
+            {
+                if (string.IsNullOrWhiteSpace(t.Name))
+                {
+                    continue;
+                }
+                var candidate = (RoutingTarget)t.Name!;
+                if (candidate == target)
+                {
+                    continue;
+                }
+                if (!IsRoutableNow(candidate)
+                    || streakTracker.ShouldSkip(candidate, options.Value.MaxConsecutiveFailures))
+                {
+                    continue;
+                }
+                if (targetsByName.TryGetValue(candidate.ToString(), out var url) && !string.IsNullOrWhiteSpace(url))
+                {
+                    candidates.Add((candidate, url!));
+                }
+            }
+            // Terminal Cloud relay step (Q1: a pinned/decided fleet target that fails
+            // uncommitted falls through to Cloud before the terminal 503).
+            if (cloudAvailable)
+            {
+                AddCloudRelayCandidates(effectiveTargets, targetsByName, candidates);
+            }
+        }
+
+        // Buffer the (possibly dynamically-sized) body as a seekable stream; it is rewound to
+        // position 0 before each attempt. The cloud-rewritten bytes replace it only when the
+        // terminal Cloud step begins (binding §6).
+        var bodyBytes = Encoding.UTF8.GetBytes(body);
+        var bodyStream = new MemoryStream(bodyBytes);
+        context.Request.Body = bodyStream;
+        context.Request.ContentLength = bodyStream.Length;
+        bodyStream.Position = 0;
+
+        var lastAttempted = target;
+        var cloudBodySwapped = false;
+        foreach (var (candidate, url) in candidates)
+        {
+            if (candidate == RoutingTarget.Cloud && !cloudBodySwapped)
+            {
+                // Cloud terminal step: swap in the cloud-rewritten body (per-model CloudModel
+                // precedence over CloudOverflow.DefaultModel) and never restore it afterwards.
+                var requestedModel = OllamaRequestParser.ParseCompletionRequest(body).ModelName ?? string.Empty;
+                var cloudModel = CloudRelayResolver.ResolveCloudModel(options.Value, requestedModel);
+                if (!string.IsNullOrEmpty(cloudModel))
+                {
+                    body = OllamaRequestParser.ReplaceModelName(body, cloudModel);
+                    bodyBytes = Encoding.UTF8.GetBytes(body);
+                    bodyStream = new MemoryStream(bodyBytes);
+                    context.Request.Body = bodyStream;
+                    context.Request.ContentLength = bodyBytes.Length;
+                }
+                cloudBodySwapped = true;
+            }
+
+            if (bodyStream.CanSeek)
+            {
+                bodyStream.Position = 0; // rewind before every attempt (acceptance criterion).
+            }
+            lastAttempted = candidate;
+            var error = await forwarder
+                .SendAsync(context, url, ProxyClient, ForwarderRequestConfig, PassThroughTransformer, context.RequestAborted)
+                .AsTask();
+
+            if (error == ForwarderError.None || IsResponseCommitted(context))
+            {
+                // Committed (or error-free): this candidate produced the response. A completed
+                // success resets the target's failure streak; a complete HTTP error response from
+                // an ALIVE daemon (4xx — headers flushed, transport reliable) does NOT, per Q4.
+                if (error == ForwarderError.None && context.Response.StatusCode is >= 200 and < 400)
+                {
+                    streakTracker.RecordSuccess(candidate);
+                }
+                return (candidate, body);
+            }
+
+            // Client abort (client disconnected / request canceled): terminal, never retry,
+            // never strike the streak, never feed liveness (§7 / client-abort binding).
+            if (IsClientAbort(error) || context.RequestAborted.IsCancellationRequested)
+            {
+                logger.LogWarning(
+                    "Target {Target} aborted by the client ({Error}); not failing over.", candidate.ToString(), error);
+                return (candidate, body);
+            }
+
+            // Uncommitted failure: rewind (next iteration), strike the failure streak, and
+            // apply one best-effort liveness strike through the existing hysteresis (Q2).
+            streakTracker.RecordFailure(candidate);
+            try
+            {
+                await targetLiveness.MarkHardFailureAsync(candidate);
+            }
+            catch
+            {
+                // Best-effort: never block failover on liveness bookkeeping.
+            }
+            logger.LogWarning(
+                "Target {Target} failed uncommitted ({Error}); failing over.", candidate.ToString(), error);
+        }
+
+            // Every candidate failed uncommitted (dead at runtime): terminal 503 with diagnostics.
+            context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+            context.Response.ContentType = "application/json";
+            var diagnostics = BuildAllOfflineDiagnostics(cloudEnabled: cloudAvailable);
+            await context.Response.WriteAsync(JsonSerializer.Serialize(
+                diagnostics,
+                OllamaRouterJsonSerializerContext.Default.AllOfflineDiagnostics));
+            return (lastAttempted, body);
+        }
+
+        // Appends the Cloud relay candidates (§6): the preferred relay (when it names an existing,
+        // enabled effective target — tried first even when offline, per the Q3 regression lock), then
+        // the remaining enabled + routable fleet nodes in configuration order. All candidates carry
+        // the logical Cloud routing target (telemetry and in-flight accounting treat them as the
+        // relay); the destination URL is the fleet node's URL.
+        private void AddCloudRelayCandidates(
+            IReadOnlyList<OllamaTargetOptions> effectiveTargets,
+            Dictionary<string, string?> targetsByName,
+            List<(RoutingTarget Target, string Url)> candidates)
+        {
+            var preferred = options.Value.CloudOverflow.PreferredRelayTarget;
+            var preferredEntry = effectiveTargets
+                .FirstOrDefault(t => !string.IsNullOrWhiteSpace(t.Name) &&
+                                      string.Equals(t.Name, preferred, StringComparison.OrdinalIgnoreCase));
+            var preferredName = preferredEntry is not null
+                && targetAvailability.IsEnabled((RoutingTarget)preferredEntry.Name!)
+                ? preferredEntry.Name!
+                : null;
+            if (preferredName is not null && targetsByName.TryGetValue(preferredName, out var preferredUrl)
+                && !string.IsNullOrWhiteSpace(preferredUrl))
+            {
+                candidates.Add((RoutingTarget.Cloud, preferredUrl!));
+                logger.LogDebug("Cloud relay resolved to preferred target {Target}.", preferredName);
+            }
+            else if (preferredEntry is not null)
+            {
+                logger.LogWarning(
+                    "Preferred cloud relay {Target} is disabled; falling back to online fleet nodes.", preferred);
+            }
+
+            foreach (var t in effectiveTargets)
+            {
+                if (string.IsNullOrWhiteSpace(t.Name))
+                {
+                    continue;
+                }
+                if (preferredName is not null && string.Equals(t.Name, preferredName, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue; // already added as the preferred relay.
+                }
+                var candidate = (RoutingTarget)t.Name!;
+                if (!targetAvailability.IsEnabled(candidate) || !IsRoutableNow(candidate))
+                {
+                    continue;
+                }
+                if (targetsByName.TryGetValue(candidate.ToString(), out var url) && !string.IsNullOrWhiteSpace(url))
+                {
+                    candidates.Add((RoutingTarget.Cloud, url!));
+                }
+            }
+        }
 
     private static bool IsResponseComplete(HttpContext context, string capturedTail, int? actualResponseTokens)
     {

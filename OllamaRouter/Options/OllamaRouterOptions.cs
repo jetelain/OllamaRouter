@@ -81,9 +81,10 @@ public sealed class OllamaRouterOptions
     public PricingOptions? Pricing { get; set; }
 
     /// <summary>
-    /// Number of consecutive failures on a target for adjacent requests within
-    /// <see cref="ConsecutiveFailuresTokenTolerance"/> before switching to the next target.
-    /// Defaults to 3. Set to 0 to disable automatic target switching.
+    /// Per-target failure streak threshold: a target whose uncommitted-transport and
+    /// mid-stream failure streak exceeds this value is skipped as a routing candidate
+    /// (by <see cref="Services.ITargetFailureStreakService"/>) until a success resets its
+    /// streak. Defaults to 3. Set to 0 (or negative) to disable streak-based skipping.
     /// </summary>
     public int MaxConsecutiveFailures { get; set; } = 3;
 
@@ -92,7 +93,18 @@ public sealed class OllamaRouterOptions
     /// to consider them part of the same retry streak. Defaults to 4000.
     /// Set to 0 to require an exact match.
     /// </summary>
+    /// <remarks>
+    /// Deprecated: the streak-based failover (<see cref="Services.ITargetFailureStreakService"/>)
+    /// no longer consults this value; it is kept for configuration binding only.
+    /// </remarks>
     public int ConsecutiveFailuresTokenTolerance { get; set; } = 4000;
+
+    /// <summary>
+    /// Cloud Overflow (ollama.com relay) configuration: the static half of the cloud
+    /// switch, the default cloud model name, and the preferred relay target used when
+    /// the cloud-rewritten request must traverse a fleet node.
+    /// </summary>
+    public CloudOverflowOptions CloudOverflow { get; set; } = new();
 
     /// <summary>
     /// Optional recording mode, to investigate the difference between the estimated token count
@@ -449,6 +461,40 @@ public sealed class DynamicContextOptions
             [DenseServer96gbProfileName] = GetDefaultProfile(DenseServer96gbProfileName),
             [SmallDenseProfileName] = GetDefaultProfile(SmallDenseProfileName)
         };
+}
+
+/// <summary>
+/// Cloud Overflow (ollama.com relay) configuration. Runtime availability is the AND of
+/// <see cref="Enabled"/> here and the per-target Cloud toggle in targets.json
+/// (<see cref="Services.ITargetAvailabilityService"/>); the model to rewrite to is taken from
+/// the per-model <see cref="ModelThresholds.CloudModel"/> when set, falling back to
+/// <see cref="DefaultModel"/>.
+/// </summary>
+public sealed class CloudOverflowOptions
+{
+    /// <summary>
+    /// Enables the Cloud Overflow terminal fallback (the static half of the switch; the
+    /// targets.json Cloud toggle must also be on). Defaults to true so existing deployments
+    /// keep today's behavior.
+    /// </summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    /// Default cloud model name used when the requested model has no per-model
+    /// <see cref="ModelThresholds.CloudModel"/> configured. Null/empty means "no default":
+    /// cloud overflow is only available for models with an explicit CloudModel.
+    /// </summary>
+    public string? DefaultModel { get; set; }
+
+    /// <summary>
+    /// Name of the fleet target preferred to relay the cloud-rewritten request to
+    /// ollama.com (case-insensitive). The resolver's fallback chain (first online+enabled
+    /// target, first enabled target, last-resort "Local") applies when the preferred relay is
+    /// unknown, disabled, or offline. Defaults to "Local" (human-approved deviation from the
+    /// plan's "desktop" default) so existing deployments keep today's relay selection
+    /// byte-for-byte.
+    /// </summary>
+    public string PreferredRelayTarget { get; set; } = "Local";
 }
 
 /// <summary>

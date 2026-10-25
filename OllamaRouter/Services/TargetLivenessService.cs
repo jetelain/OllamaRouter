@@ -106,6 +106,17 @@ public sealed class TargetLivenessService(
         return await probeTask;
     }
 
+    // One best-effort strike after an uncommitted transport failure from the dispatch loop.
+    // Applies a single HardError through the shared hysteresis path (immediate Offline in any
+    // state) and deliberately does NOT trigger the rejoin catalog refresh (a hard failure is
+    // never a rejoin) and never throws.
+    public Task MarkHardFailureAsync(RoutingTarget target)
+    {
+        var slot = _slots.GetOrAdd(target, _ => new TargetSlot(target));
+        ApplyProbeResult(target, slot, ProbeOutcome.HardError, source: "uncommitted-transport-failure");
+        return Task.CompletedTask;
+    }
+
     public TargetLivenessSnapshot GetSnapshot() => new(GetEntries().Values.ToList());
 
     public IReadOnlyDictionary<RoutingTarget, TargetLivenessEntry> GetEntries()

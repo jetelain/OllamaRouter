@@ -240,7 +240,37 @@ public class TargetLivenessServiceTests : IDisposable
 
         Assert.Equal(TargetLivenessState.Offline, state);
         Assert.False(sut.IsOnline(RoutingTarget.Local));
-    }
+        }
+
+        [Fact]
+        public async Task MarkHardFailure_OnlineTarget_TripsOfflineWithOneStrike()
+        {
+        var (sut, handler, _) = CreateSut(_ => Ok());
+
+        await sut.EnsureKnownAsync(RoutingTarget.Local); // establish Online
+        await sut.MarkHardFailureAsync(RoutingTarget.Local);
+
+        // A hard transport failure applies a single HardError strike through the shared
+        // hysteresis path, which trips an Online target to Offline immediately.
+        Assert.False(sut.IsOnline(RoutingTarget.Local));
+        Assert.Equal(TargetLivenessState.Offline, sut.GetEntries()[RoutingTarget.Local].State);
+        // Exactly the one up-front probe; the hard-failure strike itself performs no probe.
+        Assert.Equal(1, handler.RequestCount);
+        }
+
+        [Fact]
+        public async Task MarkHardFailure_PerformsNoProbeAndNoCatalogRefresh()
+        {
+        var (sut, handler, catalog) = CreateSut(_ => Ok());
+
+        // The target has never been probed (Unknown). MarkHardFailureAsync must apply the
+        // strike synchronously without issuing a probe or a rejoin catalog refresh.
+        await sut.MarkHardFailureAsync(RoutingTarget.Local);
+
+        Assert.Equal(0, handler.RequestCount); // no probe fired by the hard-failure strike
+        Assert.Equal(0, catalog.RefreshCount); // a hard failure is never a rejoin
+        Assert.Equal(TargetLivenessState.Offline, sut.GetEntries()[RoutingTarget.Local].State);
+        }
 
     [Fact]
     public async Task EnsureKnown_HealthyTargetIsNotReProbedWithinTtl()

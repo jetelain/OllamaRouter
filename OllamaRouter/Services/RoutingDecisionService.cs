@@ -13,13 +13,14 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
     private readonly IActivityMonitorService? _activityMonitor;
     private readonly ModelCapabilityEngine? _capabilityEngine;
     private readonly ILogger<RoutingDecisionService> _logger;
+    private readonly ITargetFailureStreakService _streakTracker;
 
     public RoutingDecisionService(
         IEnumerable<IRoutingTargetHandler> targets,
         IOptions<OllamaRouterOptions> options,
         IModelCatalogCacheService modelCatalogCacheService,
         ILogger<RoutingDecisionService> logger)
-        : this(targets, options, modelCatalogCacheService, null, logger, null)
+        : this(targets, options, modelCatalogCacheService, null, logger, null, null)
     {
     }
 
@@ -29,7 +30,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         IModelCatalogCacheService modelCatalogCacheService,
         IActivityMonitorService? activityMonitor,
         ILogger<RoutingDecisionService> logger)
-        : this(targets, options, modelCatalogCacheService, activityMonitor, logger, null)
+        : this(targets, options, modelCatalogCacheService, activityMonitor, logger, null, null)
     {
     }
 
@@ -39,7 +40,8 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         IModelCatalogCacheService modelCatalogCacheService,
         IActivityMonitorService? activityMonitor,
         ILogger<RoutingDecisionService> logger,
-        ModelCapabilityEngine? capabilityEngine)
+        ModelCapabilityEngine? capabilityEngine,
+        ITargetFailureStreakService? streakTracker = null)
     {
         _targets = targets.ToList();
         _options = options;
@@ -47,6 +49,10 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         _activityMonitor = activityMonitor;
         _capabilityEngine = capabilityEngine;
         _logger = logger;
+        // A per-instance default keeps the delegating constructors and existing tests
+        // source-compatible; Program.cs injects the shared singleton via the factory
+        // registration so all decision requests share one streak table.
+        _streakTracker = streakTracker ?? new TargetFailureStreakService();
     }
 
     public async Task<RoutingTarget> DecideAsync(int tokenCount, string modelName, CancellationToken cancellationToken = default)
@@ -75,32 +81,30 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         }
 
         var maxFailures = settings.MaxConsecutiveFailures;
-        if (maxFailures > 0 && _activityMonitor is not null)
+        if (maxFailures > 0 && _streakTracker.ShouldSkip(primaryTarget.Target, maxFailures))
         {
-            var tokenTolerance = settings.ConsecutiveFailuresTokenTolerance;
-            var consecutiveFailures = _activityMonitor.GetConsecutiveFailures(primaryTarget.Target, tokenCount, tokenTolerance);
-            if (consecutiveFailures >= maxFailures)
+            var primaryIndex = _targets.IndexOf(primaryTarget);
+            if (primaryIndex >= 0 && primaryIndex < _targets.Count - 1)
             {
-                var primaryIndex = _targets.IndexOf(primaryTarget);
-                if (primaryIndex >= 0 && primaryIndex < _targets.Count - 1)
+                // The decided target is above the failure-streak threshold: walk the remaining
+                // handlers in configuration order (after the primary's index), skipping any that
+                // are also above threshold, and reuse the standard selection over the survivors.
+                var subsequentCandidates = _targets
+                    .Skip(primaryIndex + 1)
+                    .Where(t => !_streakTracker.ShouldSkip(t.Target, maxFailures));
+
+                var nextTarget = await TrySelectTargetAsync(context, subsequentCandidates, cancellationToken);
+                if (nextTarget is not null)
                 {
-                    var subsequentCandidates = _targets
-                        .Skip(primaryIndex + 1)
-                        .Where(t => _activityMonitor.GetConsecutiveFailures(t.Target, tokenCount, tokenTolerance) < maxFailures);
-
-                    var nextTarget = await TrySelectTargetAsync(context, subsequentCandidates, cancellationToken);
-                    if (nextTarget is not null)
-                    {
-                        _logger.LogInformation(
-                            "{Model}: Target {FailedTarget} failed {Failures} times for adjacent request with {TokenCount} tokens (tolerance {Tolerance}). Switching to next target {NewTarget}.",
-                            normalizedName, primaryTarget.Target, consecutiveFailures, tokenCount, tokenTolerance, nextTarget.Target);
-                        return nextTarget.Target;
-                    }
-
-                    _logger.LogWarning(
-                        "{Model}: Target {FailedTarget} failed {Failures} times for adjacent request with {TokenCount} tokens (tolerance {Tolerance}), but no subsequent target is enabled or can process the request. Keeping {FailedTarget}.",
-                        normalizedName, primaryTarget.Target, consecutiveFailures, tokenCount, tokenTolerance, primaryTarget.Target);
+                    _logger.LogInformation(
+                        "{Model}: Target {FailedTarget} has a failure streak of {Streak} above threshold {MaxFailures}. Switching to next target {NewTarget}.",
+                        normalizedName, primaryTarget.Target, _streakTracker.GetStreak(primaryTarget.Target), maxFailures, nextTarget.Target);
+                    return nextTarget.Target;
                 }
+
+                _logger.LogWarning(
+                    "{Model}: Target {FailedTarget} has a failure streak of {Streak} above threshold {MaxFailures}, but no subsequent target is enabled or can process the request. Keeping {FailedTarget}.",
+                    normalizedName, primaryTarget.Target, _streakTracker.GetStreak(primaryTarget.Target), maxFailures, primaryTarget.Target);
             }
         }
 
