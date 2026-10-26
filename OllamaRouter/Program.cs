@@ -40,7 +40,16 @@ else
 {
     builder.Services.AddSingleton<ITokenEstimator, HeuristicTokenEstimator>();
 }
-builder.Services.AddSingleton<IGpuVramProvider, NvidiaSmiVramProvider>();
+
+if (OperatingSystem.IsMacOS())
+{
+    builder.Services.AddSingleton<IGpuVramProvider, AppleUnifiedMemoryVramProvider>();
+}
+else
+{
+    builder.Services.AddSingleton<IGpuVramProvider, NvidiaSmiVramProvider>();
+}
+
 builder.Services.AddTransient<IRoutingTargetHandler, LocalRoutingTargetHandler>();
 builder.Services.AddTransient<IRoutingTargetHandler, RemoteRoutingTargetHandler>();
 builder.Services.AddTransient<IRoutingTargetHandler, CloudRoutingTargetHandler>();
@@ -77,7 +86,7 @@ builder.Services.AddHostedService<TerminalMonitoringHostedService>();
 
 var app = builder.Build();
 
-// Ensure local Ollama is running (Windows only).
+// Ensure local Ollama is running (Windows and macOS only).
 app.Services.GetRequiredService<IOllamaProcessLauncher>().EnsureRunning();
 
 // 1. INSPECTION MIDDLEWARE (dynamic routing)

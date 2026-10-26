@@ -2,7 +2,7 @@
 
 OllamaRouter is a lightweight reverse proxy that sits in front of two [Ollama](https://ollama.com) instances and transparently routes each request to the most appropriate one:
 
-- A **local** Ollama instance, running on a machine with a powerful GPU but **limited VRAM** (assumed to be a nVidia card).
+- A **local** Ollama instance, running on a machine with a powerful GPU but **limited VRAM** (an NVIDIA card, or an Apple Silicon Mac with unified memory).
 - A **remote** Ollama instance (e.g. a server), with a lot of **unified RAM or VRAM** but a **less powerful GPU**.
 
 The goal is to get the best of both worlds: use the fast local GPU whenever the request can fit in its available VRAM, and fall back to the remote server for everything else (larger contexts, models that don't fit locally, etc.).
@@ -55,7 +55,7 @@ Requests to the following endpoints are inspected to extract the prompt and the 
 For these requests, the routing decision is orchestrated by `RoutingDecisionService` using a priority-ordered chain of target handlers (`IRoutingTargetHandler`: **Local** → **Remote** → **Cloud**):
 
 1. **Available target dispatch:** The router evaluates targets in order and dispatches the request to the first target that is **available** (enabled and not busy) and **capable** of handling it (`CanProcessAsync`):
-   - **Local (`LocalRoutingTargetHandler`)**: Eligible if the model is configured under `OllamaRouter:Models`, exists in the local catalog, the estimated token count fits within `MaxLocalTokens`, and the model is either already loaded in memory (checked via `/api/ps`) or sufficient free GPU VRAM is available (checked via `nvidia-smi` against `MinRequiredVramMB`). If a model is only available locally, Local handles it exclusively.
+   - **Local (`LocalRoutingTargetHandler`)**: Eligible if the model is configured under `OllamaRouter:Models`, exists in the local catalog, the estimated token count fits within `MaxLocalTokens`, and the model is either already loaded in memory (checked via `/api/ps`) or sufficient free GPU VRAM is available (checked against `MinRequiredVramMB` via `nvidia-smi`, or on macOS via an estimate of the unified memory usable by the GPU, see [GPU memory on macOS](#gpu-memory-on-macos)). If a model is only available locally, Local handles it exclusively.
    - **Remote (`RemoteRoutingTargetHandler`)**: Accepts requests for models that are available remotely (unconfigured models, models exceeding local token limits, or models that don't fit local VRAM naturally fall through to Remote).
    - **Cloud (`CloudRoutingTargetHandler`, overflow)**: Acts as an overflow target. If Local and Remote are unavailable or cannot handle the request, Cloud accepts it if enabled and a `CloudModel` is configured for the requested model (see [Cloud overflow](#cloud-overflow)).
 2. **Busy fallback:** If all eligible targets are currently busy:
@@ -152,6 +152,10 @@ Set the following environment variables:
 
 Then install (or restart) Ollama for the changes to take effect.
 
+> **macOS.** The Ollama app does not read your shell environment. Set the variables with `launchctl setenv` (e.g. `launchctl setenv OLLAMA_HOST 127.0.0.1:11435`), then quit and restart Ollama from the menu bar. These values are lost on reboot: either set them again (or from a LaunchAgent), or prevent Ollama from starting at login and let OllamaRouter start it (see [Running](#running)), as it passes `OLLAMA_HOST` itself.
+>
+> If Ollama is left on its default port, it keeps listening on `127.0.0.1:11434` alongside the router, which listens on all interfaces on the same port: macOS allows both without any error, so local clients would bypass the router and the router would fail to reach the local instance on `11435`.
+
 Pull the model you want to use locally, e.g.:
 ```powershell
 ollama pull jetelain/Qwen3.8-27B:iq3
@@ -237,7 +241,7 @@ Configuration is provided through the `OllamaRouter` section of `appsettings.jso
 | `MaxConsecutiveFailures` | Number of consecutive failures on a target for adjacent requests within `ConsecutiveFailuresTokenTolerance` before switching to the next target in the chain (`Local` → `Remote` → `Cloud`). Defaults to `3`. Set to `0` to disable automatic target switching. |
 | `ConsecutiveFailuresTokenTolerance` | Maximum difference in estimated prompt tokens between adjacent requests to consider them part of the same retry streak. Defaults to `4000`. Set to `0` to require an exact match. |
 | `Recording:Enabled` | Enables the optional [inference request recording](#inference-request-recording-optional), saving each request's metadata and full request body for investigation of estimated vs actual token counts. Defaults to `false`. |
-| `Recording:OutputDirectory` | Directory where the records are stored: a `requests.jsonl` manifest plus one pretty-printed payload file per request. Defaults to the `inference-requests` folder in the local application data folder (`%LOCALAPPDATA%\OllamaRouter\inference-requests` on Windows). |
+| `Recording:OutputDirectory` | Directory where the records are stored: a `requests.jsonl` manifest plus one pretty-printed payload file per request. Defaults to the `inference-requests` folder in the local application data folder (`%LOCALAPPDATA%\OllamaRouter\inference-requests` on Windows, `~/Library/Application Support/OllamaRouter/inference-requests` on macOS). |
 | `Recording:MaxFiles` | Maximum number of payload files to keep in the output directory; the oldest records are deleted once this count is exceeded (and the manifest is trimmed to match). Defaults to `500`. Set to `0` to keep all files. |
 | `Pricing:PromptPricePerMillion` | Optional price per 1,000,000 prompt / input tokens. Used to calculate 7-day estimated savings and cloud overflow cost. Alias: `InputPricePerMillion`. |
 | `Pricing:CompletionPricePerMillion` | Optional price per 1,000,000 completion / output tokens. Used to calculate 7-day estimated savings and cloud overflow cost. Alias: `OutputPricePerMillion`. |
@@ -258,6 +262,15 @@ OllamaRouter estimates prompt token count prior to routing so it can check again
 >
 > If your prompts are predominantly non-English (e.g. French, German, Chinese) or contain heavy code indentation, add an extra `+0.05` margin to the overhead factor to prevent unexpected overflows.
 
+### GPU memory on macOS
+
+On macOS, there is no `nvidia-smi`: the free VRAM is estimated from the Apple Silicon unified memory (`AppleUnifiedMemoryVramProvider`), using `sysctl` and `vm_stat`:
+
+- The GPU can only wire part of the RAM: `iogpu.wired_limit_mb` when it has been set (`sudo sysctl iogpu.wired_limit_mb=<MB>`), otherwise the macOS default, about 2/3 of the RAM up to 36 GB and 3/4 above.
+- The reported value is the smallest of the remaining GPU budget (that limit minus the memory already wired, including models already loaded) and the memory the OS can hand out without swapping (free, inactive and speculative pages).
+
+This value varies with the memory used by the other applications, so `MinRequiredVramMB` should be set according to the Mac: on a 24 GB Mac, about 12 to 14 GB is reported.
+
 ### Inference request recording (optional)
 
 Because the optimal overhead factor depends on your exact models and prompt mix, OllamaRouter can record every inference request so the difference between the **estimated** token count (used for routing) and the **actual** token count (reported by Ollama) can be investigated per request. This recording mode is **disabled by default**.
@@ -270,7 +283,7 @@ Enable it in `appsettings.json`:
 }
 ```
 
-Each recorded request then produces, in the output directory (default `%LOCALAPPDATA%\OllamaRouter\inference-requests\` on Windows):
+Each recorded request then produces, in the output directory (default `%LOCALAPPDATA%\OllamaRouter\inference-requests\` on Windows, `~/Library/Application Support/OllamaRouter/inference-requests/` on macOS):
 
 - one line in `requests.jsonl` with the routing metadata: `timestamp`, `target`, `model`, `endpoint`, `estimatedPromptTokens` (after applying `TokenEstimationOverheadFactor`), `rawPromptTokens` (before the factor), `actualPromptTokens` / `actualResponseTokens` as reported by the Ollama instance, `elapsedMilliseconds`, `statusCode`, `success`, and the name of the payload `file`;
 - a payload file named `&lt;utc-timestamp&gt;_&lt;sequence&gt;_&lt;model&gt;.json` (e.g. `20260925-153012-123_000042_Qwen3.8-27B.json`) containing the **full request body**, pretty-printed and ready to open in an editor. File names begin with a sortable UTC timestamp followed by a per-process sequence, so files list in chronological order and remain unique even for rapid successive requests.
@@ -284,6 +297,14 @@ The output directory is capped at `Recording:MaxFiles` payload files (default `5
 ### Manual (Windows)
 
 Download the latest [`OllamaRouter-win-x64.zip`](../../releases) from the [releases page](../../releases), extract it into a folder of your choice and run `OllamaRouter.exe`. The executable is self-contained: no .NET installation is required.
+
+### macOS
+
+No macOS release is published yet: run it from source, or publish a self-contained native executable (requires the Xcode Command Line Tools, `xcode-select --install`):
+
+```bash
+dotnet publish OllamaRouter/OllamaRouter.csproj -c Release -r osx-arm64 -o OllamaRouter-osx-arm64
+```
 
 ### From source
 
@@ -301,6 +322,12 @@ dotnet run --project OllamaRouter\OllamaRouter.csproj
 
 By default, the router listens on `http://localhost:11434`, the standard Ollama port, so it can be used as a drop-in replacement for a direct Ollama endpoint in your existing tools and clients. On startup, a link to the [monitoring UI](#monitoring) is printed to the console.
 
+On startup, the router also makes sure the local Ollama is running, and starts it from its default location if it is not:
+
+- **Windows:** `%LOCALAPPDATA%\Programs\Ollama\ollama app.exe`.
+- **macOS:** `/Applications/Ollama.app` (or `~/Applications/Ollama.app`), started in the background with `OLLAMA_HOST` set to the host and port of `LocalUrl`. If Ollama is already running, it is left as is: make sure it already listens on `LocalUrl` (see [Local Ollama](#local-ollama)).
+- On other platforms, Ollama is expected to be managed by the OS (e.g. systemd) or started manually.
+
 ## Monitoring
 
 OllamaRouter exposes a very lightweight, dependency-free monitoring page at `/monitor` (e.g. `http://localhost:11434/monitor`), backed by a JSON endpoint at `/monitor/api`. 
@@ -308,10 +335,10 @@ OllamaRouter exposes a very lightweight, dependency-free monitoring page at `/mo
 The page shows:
 
 - Whether each instance (**Local**/**Remote**, and **Cloud** when at least one model has a `CloudModel` configured, see [Cloud overflow](#cloud-overflow)) is currently **busy** processing a chat/generate request.
-- An **Enabled** checkbox per instance, to enable/disable each target at runtime. Toggling it immediately changes the routing behavior: a disabled target is completely excluded from routing and will never receive requests (unlike a busy target, which can still queue requests if all eligible targets are busy). The new state is persisted to a dedicated JSON file (`%LOCALAPPDATA%\OllamaRouter\targets.json` on Windows), so it is restored on the next startup. The state file is written on a best-effort ("failsafe") basis: if it cannot be written, the change still takes effect in memory and a warning is logged — `appsettings.json` is never modified at runtime.
+- An **Enabled** checkbox per instance, to enable/disable each target at runtime. Toggling it immediately changes the routing behavior: a disabled target is completely excluded from routing and will never receive requests (unlike a busy target, which can still queue requests if all eligible targets are busy). The new state is persisted to a dedicated JSON file (`%LOCALAPPDATA%\OllamaRouter\targets.json` on Windows, `~/Library/Application Support/OllamaRouter/targets.json` on macOS), so it is restored on the next startup. The state file is written on a best-effort ("failsafe") basis: if it cannot be written, the change still takes effect in memory and a warning is logged — `appsettings.json` is never modified at runtime.
 - The requests currently **in progress**, with target instance, model, estimated input tokens and running time.
 - A history of the most recent completed requests (last 50), with model, estimated vs. actual input tokens, actual output tokens, elapsed time and HTTP status. Failed requests are highlighted.
-- Aggregated **token statistics** per target (and overall total): number of requests, actual input tokens and actual output tokens, both for the **current day** and for the **last 7 days**. Only successful requests with actual token counts are counted. These statistics are persisted to a dedicated JSON file (`%LOCALAPPDATA%\OllamaRouter\activity-statistics.json` on Windows) so they survive restarts, and are written on a best-effort basis (throttled to at most one write per 30 seconds, on day rollover, and on application shutdown).
+- Aggregated **token statistics** per target (and overall total): number of requests, actual input tokens and actual output tokens, both for the **current day** and for the **last 7 days**. Only successful requests with actual token counts are counted. These statistics are persisted to a dedicated JSON file (`%LOCALAPPDATA%\OllamaRouter\activity-statistics.json` on Windows, `~/Library/Application Support/OllamaRouter/activity-statistics.json` on macOS) so they survive restarts, and are written on a best-effort basis (throttled to at most one write per 30 seconds, on day rollover, and on application shutdown).
 - A **target usage ratio progress bar** visually breaking down the share of tokens processed by each target (**Local**, **Remote**, and **Cloud**) over the **last 7 days**.
 - **Estimated savings and cloud overflow cost** based on the **last 7 days**, displayed whenever `Pricing` is configured in the settings. It calculates the money saved by serving requests locally and remotely instead of paying cloud API rates, as well as the cost incurred from cloud overflow. If pricing is not configured, this section is completely hidden.
 - A **live token estimation overhead recommendation** card at the bottom of the page, computed from recent requests by comparing raw estimator token counts against the actual prompt tokens reported by Ollama. It displays the overall observed factor, per-model factors, and the exact recommended value to put in `appsettings.json`.
@@ -340,11 +367,15 @@ It starts automatically when running interactively. If standard output is redire
 OllamaRouter.exe --no-tui
 ```
 
+> Put `--no-tui` last when combining it with configuration overrides (e.g. `--OllamaRouter:BindAddress=http://127.0.0.1:18999/ --no-tui`): otherwise the next argument is read as its value and ignored.
+
 ## Requirements
 
 - .NET 9 / .NET 10 SDK
 - Two reachable Ollama instances (local and remote)
-- `nvidia-smi` available on the local machine to report free VRAM (returns 0 if not available, which effectively disables local routing based on VRAM)
+- To report the free VRAM of the local machine:
+  - Windows / Linux: `nvidia-smi` (returns 0 if not available, which effectively disables local routing based on VRAM)
+  - macOS (Apple Silicon): nothing to install, `sysctl` and `vm_stat` are used (see [GPU memory on macOS](#gpu-memory-on-macos))
 
 ## Project structure
 
@@ -353,6 +384,8 @@ OllamaRouter.exe --no-tui
 - `Services/IRoutingTargetHandler.cs` – abstraction for routing destinations (`Local`, `Remote`, `Cloud`) defining availability, overflow status, and request capability.
 - `Services/LocalRoutingTargetHandler.cs` – target handler for the local Ollama instance (model configuration, token limits, loaded models, GPU VRAM).
 - `Services/RemoteRoutingTargetHandler.cs` – target handler for the remote server.
+- `Services/NvidiaSmiVramProvider.cs` / `Services/AppleUnifiedMemoryVramProvider.cs` – free VRAM of the local GPU, via `nvidia-smi` (Windows / Linux) or estimated from the unified memory (macOS).
+- `Services/OllamaProcessLauncher.cs` – starts the local Ollama on startup if it is not running (Windows and macOS).
 - `Services/CloudRoutingTargetHandler.cs` – overflow target handler relaying to ollama.com cloud models when primary instances are busy.
 - `Services/RoutingContext.cs` – encapsulates request parameters, token estimates, thresholds, and shared catalog checks for a routing decision.
 - `Services/OllamaModelCatalogClient.cs` – fetches and merges model catalogs (`/api/tags`, `/v1/models`, `/api/ps`) from both instances.
@@ -361,9 +394,9 @@ OllamaRouter.exe --no-tui
 - `Endpoints/OllamaEndpointsExtensions.cs` – hybrid endpoints (`/api/tags`, `/api/ps`, `/v1/models`) that short-circuit YARP to return merged results including configured cloud models.
 - `Endpoints/MonitorEndpointsExtensions.cs` – lightweight monitoring UI (`/monitor`, `/monitor/api`), target toggles (`POST /targets`), and non-destructive VRAM reclaim (`POST /api/models/unload`, `POST /monitor/reclaim-vram`).
 - `Services/ActivityMonitorService.cs` – in-memory bookkeeping of busy state, in-progress requests and recent request history used by the monitoring UI.
-- `Services/ActivityStatisticsService.cs` – per-target counters (requests, actual input/output tokens) with current-day and last-7-days aggregation, persisted on a best-effort basis to a dedicated JSON file in the application data folder (`%LOCALAPPDATA%\OllamaRouter\activity-statistics.json` on Windows) and exposed via `/monitor/api`.
-- `Services/TargetAvailabilityService.cs` – in-memory state of the Local/Remote/Cloud enable/disable flags, loaded at startup from and persisted on a best-effort basis to a dedicated JSON state file in the application data folder (`%LOCALAPPDATA%\OllamaRouter\targets.json` on Windows), toggled via `POST /targets`.
-- `Services/InferenceRequestRecorder.cs` – optional, best-effort recorder of inference requests (a `requests.jsonl` metadata manifest plus one pretty-printed payload file per request with the full request body) used to investigate estimated vs actual token counts; disabled by default, records are stored in the application data folder (`%LOCALAPPDATA%\OllamaRouter\inference-requests\` on Windows).
+- `Services/ActivityStatisticsService.cs` – per-target counters (requests, actual input/output tokens) with current-day and last-7-days aggregation, persisted on a best-effort basis to a dedicated JSON file in the application data folder (`%LOCALAPPDATA%\OllamaRouter\activity-statistics.json` on Windows, `~/Library/Application Support/OllamaRouter/activity-statistics.json` on macOS) and exposed via `/monitor/api`.
+- `Services/TargetAvailabilityService.cs` – in-memory state of the Local/Remote/Cloud enable/disable flags, loaded at startup from and persisted on a best-effort basis to a dedicated JSON state file in the application data folder (`%LOCALAPPDATA%\OllamaRouter\targets.json` on Windows, `~/Library/Application Support/OllamaRouter/targets.json` on macOS), toggled via `POST /targets`.
+- `Services/InferenceRequestRecorder.cs` – optional, best-effort recorder of inference requests (a `requests.jsonl` metadata manifest plus one pretty-printed payload file per request with the full request body) used to investigate estimated vs actual token counts; disabled by default, records are stored in the application data folder (`%LOCALAPPDATA%\OllamaRouter\inference-requests\` on Windows, `~/Library/Application Support/OllamaRouter/inference-requests/` on macOS).
 
 ## Tests
 
