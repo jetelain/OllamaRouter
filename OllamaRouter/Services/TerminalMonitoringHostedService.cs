@@ -15,6 +15,9 @@ public sealed class TerminalMonitoringHostedService : BackgroundService
     private readonly IActivityStatisticsService _activityStatistics;
     private readonly ITargetAvailabilityService _targetAvailability;
     private readonly IModelCatalogCacheService _modelCatalogCache;
+    private readonly ITargetLivenessService _targetLiveness;
+    private readonly ITargetExecutionTracker _targetExecutionTracker;
+    private readonly IContextAutoShrinkManager _contextAutoShrinkManager;
     private readonly IOptions<OllamaRouterOptions> _options;
     private readonly IHostApplicationLifetime _lifetime;
 
@@ -23,6 +26,9 @@ public sealed class TerminalMonitoringHostedService : BackgroundService
         IActivityStatisticsService activityStatistics,
         ITargetAvailabilityService targetAvailability,
         IModelCatalogCacheService modelCatalogCache,
+        ITargetLivenessService targetLiveness,
+        ITargetExecutionTracker targetExecutionTracker,
+        IContextAutoShrinkManager contextAutoShrinkManager,
         IOptions<OllamaRouterOptions> options,
         IHostApplicationLifetime lifetime)
     {
@@ -30,6 +36,9 @@ public sealed class TerminalMonitoringHostedService : BackgroundService
         _activityStatistics = activityStatistics;
         _targetAvailability = targetAvailability;
         _modelCatalogCache = modelCatalogCache;
+        _targetLiveness = targetLiveness;
+        _targetExecutionTracker = targetExecutionTracker;
+        _contextAutoShrinkManager = contextAutoShrinkManager;
         _options = options;
         _lifetime = lifetime;
     }
@@ -112,7 +121,10 @@ public sealed class TerminalMonitoringHostedService : BackgroundService
                         _targetAvailability,
                         _modelCatalogCache,
                         stoppingToken,
-                        includeOverhead: false).ConfigureAwait(false);
+                        includeOverhead: false,
+                        liveness: _targetLiveness,
+                        executionTracker: _targetExecutionTracker,
+                        contextShrinkManager: _contextAutoShrinkManager).ConfigureAwait(false);
 
                     var monitorUrl = _options.Value.BindAddress.TrimEnd('/').Replace("+", "localhost") + "/monitor";
 

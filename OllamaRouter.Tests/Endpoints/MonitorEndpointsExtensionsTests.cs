@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using OllamaRouter.Endpoints;
 using OllamaRouter.Options;
@@ -18,13 +19,17 @@ public class MonitorEndpointsExtensionsTests
     private static async Task<(WebApplication App, HttpClient Client, Mocks Bag)> CreateTestAppAsync(
         string localUrl = "http://127.0.0.1:11435",
         PricingOptions? pricing = null,
-        ActivityStatisticsSnapshot? statisticsSnapshot = null)
+        ActivityStatisticsSnapshot? statisticsSnapshot = null,
+        OllamaRouterOptions? options = null,
+        ITargetLivenessService? liveness = null,
+        ITargetExecutionTracker? executionTracker = null,
+        IContextAutoShrinkManager? contextShrinkManager = null)
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseUrls("http://127.0.0.1:0");
-        builder.Services.ConfigureHttpJsonOptions(options =>
+        builder.Services.ConfigureHttpJsonOptions(opt =>
         {
-            options.SerializerOptions.TypeInfoResolverChain.Insert(0, OllamaRouterJsonSerializerContext.Default);
+            opt.SerializerOptions.TypeInfoResolverChain.Insert(0, OllamaRouterJsonSerializerContext.Default);
         });
 
         var mocks = new Mocks(
@@ -69,11 +74,25 @@ public class MonitorEndpointsExtensionsTests
         builder.Services.AddSingleton(mocks.TargetAvailability.Object);
         builder.Services.AddSingleton(mocks.CatalogClient.Object);
         builder.Services.AddSingleton(mocks.ModelCatalogCache.Object);
-        builder.Services.AddSingleton(Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions
+        builder.Services.AddSingleton(Microsoft.Extensions.Options.Options.Create(options ?? new OllamaRouterOptions
         {
             LocalUrl = localUrl,
             Pricing = pricing
         }));
+
+        // Optional fleet-enrichment services (null = not registered: minimal test app).
+        if (liveness != null)
+        {
+            builder.Services.AddSingleton(liveness);
+        }
+        if (executionTracker != null)
+        {
+            builder.Services.AddSingleton(executionTracker);
+        }
+        if (contextShrinkManager != null)
+        {
+            builder.Services.AddSingleton(contextShrinkManager);
+        }
 
         var app = builder.Build();
         app.MapOllamaMonitorEndpoints();
@@ -174,7 +193,58 @@ public class MonitorEndpointsExtensionsTests
     }
 
     [Fact]
-    public async Task GetMonitorApi_TargetsOnlineBusyAreNameKeyedObjectsContainingCloud()
+    public async Task PostTargets_WithFleetName_UpdatesTargetAvailability()
+    {
+        var (app, client, mocks) = await CreateTestAppAsync();
+        try
+        {
+            var content = new StringContent("""{"desktop": false}""", System.Text.Encoding.UTF8, "application/json");
+            var response = await client.PostAsync("/targets", content);
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+            // The web toggle for a fleet name flows into the availability service under that key.
+            mocks.TargetAvailability.Verify(t => t.Update(It.Is<IReadOnlyDictionary<string, bool>>(f =>
+                    f.ContainsKey("desktop") && !f["desktop"] && f.Count == 1)), Times.Once);
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public void TogglePersistence_RoundTrip_PersistsDisabledFleetTargetAcrossInstances()
+    {
+        var tempDir = Directory.CreateTempSubdirectory("OllamaRouterTests");
+        var stateFilePath = Path.Combine(tempDir.FullName, "targets.json");
+        try
+        {
+            var fleet = new[] { new RoutingTarget("desktop"), new RoutingTarget("laptop"), new RoutingTarget("server1"), RoutingTarget.Cloud };
+
+            var first = new TargetAvailabilityService(stateFilePath, fleet, NullLogger<TargetAvailabilityService>.Instance);
+            first.Update(new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["desktop"] = false
+            });
+
+            // A fresh instance constructed from the same persisted file sees the disabled target;
+            // all other targets remain enabled.
+            var second = new TargetAvailabilityService(stateFilePath, fleet, NullLogger<TargetAvailabilityService>.Instance);
+            Assert.False(second.IsEnabled(new RoutingTarget("desktop")));
+            Assert.True(second.IsEnabled(new RoutingTarget("laptop")));
+            Assert.True(second.IsEnabled(new RoutingTarget("server1")));
+            Assert.True(second.IsEnabled(RoutingTarget.Cloud));
+        }
+        finally
+        {
+            tempDir.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task GetMonitorApi_FleetIsOrderedArray_WithCloudLast_AndLegacyDictionariesRemoved()
     {
         var (app, client, _) = await CreateTestAppAsync();
         try
@@ -185,18 +255,32 @@ public class MonitorEndpointsExtensionsTests
             var json = await response.Content.ReadFromJsonAsync<JsonObject>();
 
             Assert.NotNull(json);
-            var targets = json["targets"]!;
-            var online = json["online"]!;
-            var busy = json["busy"]!;
 
-            // Legacy configuration synthesizes exactly "Local" (no RemoteUrl in this test app).
-            Assert.True(targets["Local"]?.GetValue<bool>() is true);
-            Assert.False(online["Local"]?.GetValue<bool>() is true); // no models in the cache mock
-            Assert.False(busy["Local"]?.GetValue<bool>() is true);
-            // Cloud is always present.
-            Assert.NotNull(targets["Cloud"]);
-            Assert.NotNull(online["Cloud"]);
-            Assert.NotNull(busy["Cloud"]);
+            // The legacy name-keyed dictionaries are gone.
+            Assert.True(json["targets"] == null);
+            Assert.True(json["online"] == null);
+            Assert.True(json["busy"] == null);
+
+            // The new ordered fleet array: "Local" (no RemoteUrl in this test app), Cloud last.
+            var fleet = json["fleet"]!.AsArray();
+            Assert.Equal(2, fleet.Count);
+
+            var local = fleet[0]!;
+            Assert.Equal("Local", local["name"]?.GetValue<string>());
+            Assert.Equal("http://127.0.0.1:11435", local["url"]?.GetValue<string>());
+            Assert.True(local["enabled"]?.GetValue<bool>());
+            Assert.Equal("Offline", local["liveness"]?.GetValue<string>()); // no models in the cache mock
+            Assert.Equal(0, local["inFlightRequests"]?.GetValue<int>());
+            Assert.Equal("16gb", local["hardwareProfile"]?.GetValue<string>()); // legacy synthesized hint
+            Assert.Equal("-", local["contextAllocation"]?.GetValue<string>()); // no leases
+
+            var cloud = fleet[1]!;
+            Assert.Equal("Cloud", cloud["name"]?.GetValue<string>());
+            Assert.True(cloud["url"] == null);
+            Assert.False(cloud["enabled"]?.GetValue<bool>()); // availability flag false; cloud not configured
+            Assert.Equal("Offline", cloud["liveness"]?.GetValue<string>()); // cloud models not configured
+            Assert.Equal(0, cloud["inFlightRequests"]?.GetValue<int>());
+            Assert.Equal("baseline", cloud["contextAllocation"]?.GetValue<string>());
 
             // statistics periods contain one entry per target plus the reserved "total" key.
             var today = json["statistics"]?["today"]!;
@@ -207,6 +291,151 @@ public class MonitorEndpointsExtensionsTests
             Assert.NotNull(last7["Local"]);
             Assert.NotNull(last7["Cloud"]);
             Assert.NotNull(last7["total"]);
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task GetMonitorApi_WithLivenessService_MapsRawStatesToProbingAndOffline()
+    {
+        var liveness = new Mock<ITargetLivenessService>();
+        liveness.Setup(l => l.GetEntries()).Returns(new Dictionary<RoutingTarget, TargetLivenessEntry>
+        {
+            [RoutingTarget.Local] = new(RoutingTarget.Local, TargetLivenessState.Unknown, null, DateTimeOffset.UtcNow),
+            [new RoutingTarget("desktop")] = new(new RoutingTarget("desktop"), TargetLivenessState.Offline, "boom", DateTimeOffset.UtcNow)
+        });
+
+        var (app, client, _) = await CreateTestAppAsync(
+            options: new OllamaRouterOptions
+            {
+                Targets =
+                [
+                    new OllamaTargetOptions { Name = "Local", Url = "http://127.0.0.1:11435", HardwareHint = "16gb" },
+                    new OllamaTargetOptions { Name = "desktop", Url = "http://127.0.0.1:11436", HardwareHint = "16gb" }
+                ]
+            },
+            liveness: liveness.Object);
+        try
+        {
+            var response = await client.GetAsync("/monitor/api");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var json = await response.Content.ReadFromJsonAsync<JsonObject>();
+            var fleet = json!["fleet"]!.AsArray();
+
+            // Unknown state maps to "Probing"; Offline stays "Offline".
+            Assert.Equal("Probing", fleet[0]!["liveness"]?.GetValue<string>());
+            Assert.Equal("Offline", fleet[1]!["liveness"]?.GetValue<string>());
+
+            // Cloud remains driven by cloudEnabled (not configured here).
+            Assert.Equal("Offline", fleet[2]!["liveness"]?.GetValue<string>());
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task GetMonitorApi_WithoutLivenessService_FallsBackToCatalogCheck()
+    {
+        var (app, client, mocks) = await CreateTestAppAsync("http://127.0.0.1:11435");
+        try
+        {
+            // No liveness service registered: catalog check drives the liveness.
+            mocks.ModelCatalogCache.Setup(c => c.HasAnyModelsAsync("http://127.0.0.1:11435", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(true);
+
+            var response = await client.GetAsync("/monitor/api");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var json = await response.Content.ReadFromJsonAsync<JsonObject>();
+            var fleet = json!["fleet"]!.AsArray();
+
+            Assert.Equal("Online", fleet[0]!["liveness"]?.GetValue<string>()); // HasAnyModelsAsync == true
+            Assert.Equal("Offline", fleet[1]!["liveness"]?.GetValue<string>()); // cloud not configured
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task GetMonitorApi_WithExecutionTracker_ExposesActiveModelAndInFlightPerTarget()
+    {
+        var tracker = new Mock<ITargetExecutionTracker>();
+        tracker.Setup(t => t.GetState(RoutingTarget.Local)).Returns(new TargetExecutionState(
+            RoutingTarget.Local,
+            InFlightRequests: 2,
+            LoadedModels: [new TargetLoadedModel("llama3.2:latest", 4_000_000_000)],
+            TotalVramBytes: 4_000_000_000,
+            LastRefreshedAtUtc: DateTimeOffset.UtcNow,
+            Stale: false));
+
+        var (app, client, _) = await CreateTestAppAsync(executionTracker: tracker.Object);
+        try
+        {
+            var response = await client.GetAsync("/monitor/api");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var json = await response.Content.ReadFromJsonAsync<JsonObject>();
+            var fleet = json!["fleet"]!.AsArray();
+
+            Assert.Equal("llama3.2:latest", fleet[0]!["activeModel"]?.GetValue<string>());
+            Assert.Equal(2, fleet[0]!["inFlightRequests"]?.GetValue<int>());
+
+            // Cloud never has an active model or in-flight requests.
+            Assert.True(fleet[1]!["activeModel"] == null);
+            Assert.Equal(0, fleet[1]!["inFlightRequests"]?.GetValue<int>());
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task GetMonitorApi_WithContextLeases_ShowsExpandedAndBaselineAllocations()
+    {
+        var shrinkManager = new ContextAutoShrinkManager();
+        var now = DateTimeOffset.UtcNow;
+        var dynamic = new DynamicContextOptions();
+
+        // "Local" has an expanded lease (SmallDense profile: 32,768 baseline / 65,536 /
+        // 131,072 max; a 60,000-token prompt selects the 65,536 expanded bucket).
+        shrinkManager.Decide(
+            RoutingTarget.Local,
+            "llama3.2:latest",
+            DynamicContextSizingEngine.Decide(dynamic, ModelArchitectureKind.SmallDense, 16_384, 131_072, 60_000, null),
+            dynamic,
+            60_000,
+            now);
+
+        var (app, client, _) = await CreateTestAppAsync(contextShrinkManager: shrinkManager);
+        try
+        {
+            var response = await client.GetAsync("/monitor/api");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var json = await response.Content.ReadFromJsonAsync<JsonObject>();
+            var fleet = json!["fleet"]!.AsArray();
+
+            // Expanded lease: "<bucket>k (expanded)".
+            var localContext = fleet[0]!["contextAllocation"]?.GetValue<string>()!;
+            Assert.EndsWith(" (expanded)", localContext);
+            Assert.StartsWith("65.5k", localContext);
+
+            // No leases: baseline implied ("-"). Cloud: always "baseline".
+            // (The legacy synthesized fleet only has Local in this test app.)
+            Assert.Equal("baseline", fleet[1]!["contextAllocation"]?.GetValue<string>());
         }
         finally
         {
@@ -340,7 +569,7 @@ public class MonitorEndpointsExtensionsTests
     }
 
     [Fact]
-    public async Task GetMonitor_ReturnsHtmlWithOfflineStylesAndScript()
+    public async Task GetMonitor_ReturnsHtmlWithFleetTableStylesAndScript()
     {
         var (app, client, _) = await CreateTestAppAsync();
         try
@@ -349,9 +578,14 @@ public class MonitorEndpointsExtensionsTests
 
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
             var html = await response.Content.ReadAsStringAsync();
-            Assert.Contains(".card.offline", html);
-            Assert.Contains(".offline .dot", html);
+            Assert.Contains("fleetTable", html);
+            Assert.Contains("fleetRows", html);
+            Assert.Contains("lv-offline", html);
+            Assert.Contains("lv-probing", html);
+            Assert.Contains("lv-disabled", html);
             Assert.Contains("statusText = 'Offline'", html);
+            Assert.Contains("statusText = 'Probing'", html);
+            Assert.Contains("renderFleet", html);
         }
         finally
         {
@@ -375,10 +609,9 @@ public class MonitorEndpointsExtensionsTests
             var json = await response.Content.ReadFromJsonAsync<JsonObject>();
 
             Assert.NotNull(json);
-            var online = json["online"];
-            Assert.NotNull(online);
-            Assert.True(online["Local"]?.GetValue<bool>());
-            Assert.False(online["Cloud"]?.GetValue<bool>()); // cloud models not configured
+            var fleet = json["fleet"]!.AsArray();
+            Assert.Equal("Online", fleet[0]!["liveness"]?.GetValue<string>());
+            Assert.Equal("Offline", fleet[1]!["liveness"]?.GetValue<string>()); // cloud models not configured
         }
         finally
         {
@@ -492,6 +725,61 @@ public class MonitorEndpointsExtensionsTests
     }
 
     [Fact]
+    public async Task GetMonitorApi_WithPricing_ReturnsPerTargetSavings()
+    {
+        var stats = new ActivityStatisticsSnapshot(
+            Today: new Dictionary<RoutingTarget, ActivityStatisticsTotals>
+            {
+                [RoutingTarget.Local] = new(0, 0, 0),
+                [RoutingTarget.Remote] = new(0, 0, 0),
+                [RoutingTarget.Cloud] = new(0, 0, 0)
+            },
+            TodayTotal: new(0, 0, 0),
+            Last7Days: new Dictionary<RoutingTarget, ActivityStatisticsTotals>
+            {
+                [RoutingTarget.Local] = new(Requests: 10, InputTokens: 200_000, OutputTokens: 50_000),
+                [RoutingTarget.Remote] = new(Requests: 5, InputTokens: 800_000, OutputTokens: 150_000),
+                [RoutingTarget.Cloud] = new(Requests: 2, InputTokens: 100_000, OutputTokens: 20_000)
+            },
+            Last7DaysTotal: new(17, 1_100_000, 220_000));
+
+        var pricing = new PricingOptions
+        {
+            PromptPricePerMillion = 0.20,
+            CompletionPricePerMillion = 0.80,
+            Currency = "$"
+        };
+
+        var (app, client, _) = await CreateTestAppAsync(pricing: pricing, statisticsSnapshot: stats);
+        try
+        {
+            var response = await client.GetAsync("/monitor/api");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var json = await response.Content.ReadFromJsonAsync<JsonObject>();
+
+            var cost = json!["cost"]!;
+            var perTarget = cost["perTargetSavings"]!.AsObject();
+
+            // Local: (0.2 * 0.20) + (0.05 * 0.80) = 0.04 + 0.04 = 0.08
+            Assert.Equal(0.08, perTarget["Local"]!.GetValue<double>());
+            // Remote: (0.8 * 0.20) + (0.15 * 0.80) = 0.16 + 0.12 = 0.28
+            Assert.Equal(0.28, perTarget["Remote"]!.GetValue<double>());
+            // Cloud is excluded from the savings (it is an overflow cost).
+            Assert.True(perTarget.ContainsKey("Cloud") == false);
+
+            // Per-target values sum to the estimated savings total.
+            var perTargetSum = perTarget.Select(pair => pair.Value!.GetValue<double>()).Sum();
+            Assert.Equal(cost["estimatedSavings"]!.GetValue<double>(), perTargetSum, 4);
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    [Fact]
     public void CalculateCostStatus_NullPricing_ReturnsNull()
     {
         var last7Days = new Dictionary<RoutingTarget, ActivityStatisticsTotals>
@@ -542,6 +830,11 @@ public class MonitorEndpointsExtensionsTests
         // Cloud total tokens = 300,000 -> 0.3 * 1.0 = 0.3
         Assert.Equal(0.3, result.CloudOverflowCost);
         Assert.Equal("€", result.Currency);
+        // Per-target: Local 1,000,000 -> 1.0; Remote 1,000,000 -> 1.0; sum == total, Cloud excluded.
+        Assert.Equal(1.0, result.PerTargetSavings["Local"]);
+        Assert.Equal(1.0, result.PerTargetSavings["Remote"]);
+        Assert.DoesNotContain("Cloud", result.PerTargetSavings.Keys, StringComparer.OrdinalIgnoreCase);
+        Assert.Equal(result.EstimatedSavings, result.PerTargetSavings.Values.Sum(), 4);
     }
 
     [Fact]

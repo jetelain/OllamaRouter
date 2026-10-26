@@ -147,6 +147,9 @@ public class TargetExecutionTrackerTests : IDisposable
                 ResetModelCalls.Add((target, modelName));
             }
         }
+
+        public IReadOnlyDictionary<RoutingTarget, IReadOnlyList<ContextLeaseView>> GetLeaseSnapshot()
+            => new Dictionary<RoutingTarget, IReadOnlyList<ContextLeaseView>>();
     }
 
     private static OllamaRouterOptions ThreeTargetOptions() => new()

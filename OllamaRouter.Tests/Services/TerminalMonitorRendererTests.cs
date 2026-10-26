@@ -5,17 +5,33 @@ namespace OllamaRouter.Tests.Services;
 
 public class TerminalMonitorRendererTests
 {
+    private static MonitorFleetTargetItem FleetItem(
+        string name,
+        string? url = null,
+        bool enabled = true,
+        string liveness = "Online",
+        string? activeModel = null,
+        int inFlightRequests = 0,
+        string? hardwareProfile = null,
+        string contextAllocation = "-")
+    {
+        return new MonitorFleetTargetItem(name, enabled, liveness, inFlightRequests, contextAllocation, url, activeModel, hardwareProfile);
+    }
+
     private static MonitorStateResponse CreateSampleState(
         bool cloudEnabled = false,
-        bool localBusy = false,
-        bool remoteBusy = false,
-        bool cloudBusy = false,
         bool localEnabled = true,
         bool remoteEnabled = true,
         bool cloudEnabledTarget = true,
-        bool localOnline = true,
-        bool remoteOnline = true,
-        bool cloudOnline = true,
+        string localLiveness = "Online",
+        string remoteLiveness = "Online",
+        int localInFlight = 0,
+        int remoteInFlight = 0,
+        string? localActiveModel = null,
+        string? remoteActiveModel = null,
+        string localContext = "-",
+        string remoteContext = "-",
+        string cloudContext = "baseline",
         ActivityStatisticsTotals? todayLocal = null,
         ActivityStatisticsTotals? todayRemote = null,
         ActivityStatisticsTotals? todayCloud = null,
@@ -43,26 +59,17 @@ public class TerminalMonitorRendererTests
             l7l.InputTokens + l7r.InputTokens + (cloudEnabled ? l7c.InputTokens : 0),
             l7l.OutputTokens + l7r.OutputTokens + (cloudEnabled ? l7c.OutputTokens : 0));
 
+        var fleet = new List<MonitorFleetTargetItem>
+        {
+            FleetItem("Local", "http://localhost:11434", localEnabled, localLiveness, localActiveModel, localInFlight, "16gb", localContext),
+            FleetItem("Remote", "http://192.168.1.2:11434", remoteEnabled, remoteLiveness, remoteActiveModel, remoteInFlight, "16gb", remoteContext)
+        };
+        // The Cloud pseudo-target is always present and always last.
+        fleet.Add(FleetItem("Cloud", null, cloudEnabledTarget, cloudEnabled ? "Online" : "Offline", null, 0, null, cloudContext));
+
         return new MonitorStateResponse(
             cloudEnabled,
-            Targets: new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["Local"] = localEnabled,
-                ["Remote"] = remoteEnabled,
-                ["Cloud"] = cloudEnabledTarget
-            },
-            Online: new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["Local"] = localOnline,
-                ["Remote"] = remoteOnline,
-                ["Cloud"] = cloudOnline
-            },
-            Busy: new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["Local"] = localBusy,
-                ["Remote"] = remoteBusy,
-                ["Cloud"] = cloudBusy
-            },
+            fleet,
             new MonitorStatisticsStatus(
                 new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase)
                 {
@@ -84,6 +91,15 @@ public class TerminalMonitorRendererTests
             overhead);
     }
 
+    private static MonitorCostStatus Cost(double savings, double cloudCost, params (string Name, double Savings)[] perTarget)
+    {
+        return new MonitorCostStatus(
+            "$",
+            savings,
+            cloudCost,
+            perTarget.ToDictionary(pair => pair.Name, pair => pair.Savings, StringComparer.OrdinalIgnoreCase));
+    }
+
     [Fact]
     public void Render_IdleState_ContainsTitleAndMonitorLinkAndTargetStatuses()
     {
@@ -94,9 +110,8 @@ public class TerminalMonitorRendererTests
 
         Assert.Contains("Ollama Router - Activity Monitor", output);
         Assert.Contains("Full monitor: http://localhost:11434/monitor", output);
-        Assert.Contains("Local: ● Idle", output);
-        Assert.Contains("Remote: ● Idle", output);
-        Assert.Contains("Cloud: ● Idle", output); // the Cloud pseudo-target is always present
+        Assert.Contains("FLEET", output);
+        Assert.Contains("\u25CF Online", output);
         Assert.Contains("No request in progress", output);
         Assert.Contains("No recent requests", output);
         Assert.Contains("No token activity in the last 7 days", output);
@@ -112,26 +127,110 @@ public class TerminalMonitorRendererTests
     }
 
     [Fact]
-    public void Render_TargetStatuses_RendersDisabledOfflineAndBusy()
+    public void Render_FleetTable_RendersDisabledOfflineAndLivenessStates()
     {
         var state = CreateSampleState(
             cloudEnabled: true,
-            localEnabled: false,
+            localEnabled: true,
             remoteEnabled: true,
-            remoteOnline: false,
-            cloudEnabledTarget: true,
-            cloudOnline: true,
-            cloudBusy: true);
+            remoteLiveness: "Offline",
+            localLiveness: "Probing",
+            cloudEnabledTarget: false);
 
         var output = TerminalMonitorRenderer.Render(state, "http://localhost:11434/monitor", enableAnsi: false);
 
-        Assert.Contains("Local: ● Disabled", output);
-        Assert.Contains("Remote: ● Offline", output);
-        Assert.Contains("Cloud: ● Busy", output);
+        Assert.Contains("FLEET", output);
+        Assert.Contains("\u25CF Disabled", output); // Cloud row is disabled
+        Assert.Contains("\u25CF Offline", output);
+        Assert.Contains("\u25CF Probing", output);
     }
 
     [Fact]
-    public void Render_WithStatisticsAndUsageRatio_RendersTableAndBar()
+    public void Render_ThreeTargetFleet_WithOneOffline_ShowsAllRowsWithLivenessAndInFlight()
+    {
+        var fleet = new List<MonitorFleetTargetItem>
+        {
+            FleetItem("desktop", "http://192.168.1.10:11434", true, "Online", "llama3.2:latest", 2, "16gb", "65.5k (expanded)"),
+            FleetItem("laptop", "http://192.168.1.11:11434", true, "Offline", null, 0, null, "-"),
+            FleetItem("server1", "http://192.168.1.12:11434", true, "Probing", "qwen3:8b", 1, "96gb", "32.8k (baseline)"),
+            FleetItem("Cloud", null, true, "Offline", null, 0, null, "baseline")
+        };
+
+        var state = new MonitorStateResponse(
+            CloudEnabled: false,
+            Fleet: fleet,
+            Statistics: new MonitorStatisticsStatus(
+                new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["desktop"] = new ActivityStatisticsTotals(0, 0, 0),
+                    ["laptop"] = new ActivityStatisticsTotals(0, 0, 0),
+                    ["server1"] = new ActivityStatisticsTotals(0, 0, 0),
+                    ["Cloud"] = new ActivityStatisticsTotals(0, 0, 0),
+                    ["total"] = new ActivityStatisticsTotals(0, 0, 0)
+                },
+                new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["desktop"] = new ActivityStatisticsTotals(0, 0, 0),
+                    ["laptop"] = new ActivityStatisticsTotals(0, 0, 0),
+                    ["server1"] = new ActivityStatisticsTotals(0, 0, 0),
+                    ["Cloud"] = new ActivityStatisticsTotals(0, 0, 0),
+                    ["total"] = new ActivityStatisticsTotals(0, 0, 0)
+                }),
+            InProgress: [],
+            Requests: [],
+            Cost: null,
+            Overhead: null);
+
+        var output = TerminalMonitorRenderer.Render(state, "http://localhost:11434/monitor", enableAnsi: false);
+
+        // All three configured targets plus the Cloud row are rendered.
+        Assert.Contains("desktop", output);
+        Assert.Contains("laptop", output);
+        Assert.Contains("server1", output);
+        Assert.Contains("Cloud", output);
+
+        // Liveness badges per row.
+        Assert.Contains("\u25CF Online", output);
+        Assert.Contains("\u25CF Offline", output);
+        Assert.Contains("\u25CF Probing", output);
+
+        // In-flight counts, hardware profiles, models and context allocations.
+        Assert.Contains("llama3.2:latest", output);
+        Assert.Contains("qwen3:8b", output);
+        Assert.Contains("16gb", output);
+        Assert.Contains("96gb", output);
+        Assert.Contains("65.5k (expanded)", output);
+        Assert.Contains("32.8k (baseline)", output);
+
+        var lines = output.Split(["\r\n", "\n"], StringSplitOptions.None);
+        var desktopRow = lines.Single(l => l.Contains("desktop"));
+        var laptopRow = lines.Single(l => l.Contains("laptop"));
+        var server1Row = lines.Single(l => l.Contains("server1"));
+        var cloudRow = lines.Single(l => l.Contains("Cloud") && !l.Contains("Cloud:"));
+
+        // desktop: online, 2 in-flight, 16gb, expanded context.
+        Assert.Contains("\u25CF Online", desktopRow);
+        Assert.Contains(" 2 ", " " + desktopRow.TrimEnd() + " ");
+        Assert.Contains("16gb", desktopRow);
+        Assert.Contains("65.5k (expanded)", desktopRow);
+
+        // laptop: offline, 0 in-flight, no hardware profile, no lease.
+        Assert.Contains("\u25CF Offline", laptopRow);
+        Assert.EndsWith("0 -", laptopRow.TrimEnd());
+        Assert.DoesNotContain("●", laptopRow.Replace("\u25CF Offline", ""));
+
+        // server1: probing, 1 in-flight, 96gb, baseline lease.
+        Assert.Contains("\u25CF Probing", server1Row);
+        Assert.Contains("96gb", server1Row);
+        Assert.Contains("32.8k (baseline)", server1Row);
+
+        // Cloud row: offline (cloud disabled), no models, "baseline" context.
+        Assert.Contains("\u25CF Offline", cloudRow);
+        Assert.Contains("baseline", cloudRow);
+    }
+
+    [Fact]
+    public void Render_StatisticsTotals_SumOfPerTargetRowsMatchesTotalRow()
     {
         var state = CreateSampleState(
             cloudEnabled: true,
@@ -145,6 +244,18 @@ public class TerminalMonitorRendererTests
         var output = TerminalMonitorRenderer.Render(state, "http://localhost:11434/monitor", consoleHeight: 35, enableAnsi: false);
 
         Assert.Contains("STATISTICS", output);
+        Assert.Contains("Total", output);
+
+        // The "total" row values equal the sums of the per-target rows.
+        var todayTotals = new ActivityStatisticsTotals(8, 157500, 23200);
+        var last7Totals = new ActivityStatisticsTotals(75, 6250000, 1920000);
+        Assert.Contains(TerminalMonitorRenderer.FormatNumber(todayTotals.Requests), output);
+        Assert.Contains(TerminalMonitorRenderer.FormatTokens(todayTotals.InputTokens), output);
+        Assert.Contains(TerminalMonitorRenderer.FormatTokens(todayTotals.OutputTokens), output);
+        Assert.Contains(TerminalMonitorRenderer.FormatNumber(last7Totals.Requests), output);
+        Assert.Contains(TerminalMonitorRenderer.FormatTokens(last7Totals.InputTokens), output);
+        Assert.Contains(TerminalMonitorRenderer.FormatTokens(last7Totals.OutputTokens), output);
+
         Assert.Contains("USAGE RATIO (last 7 days)", output);
         Assert.Contains("Total tokens:", output);
         Assert.Contains("Local:", output);
@@ -153,9 +264,13 @@ public class TerminalMonitorRendererTests
     }
 
     [Fact]
-    public void Render_WithCostAndSavings_RendersCostSection()
+    public void Render_WithCost_RendersPerTargetSavingsLinesThatSumToTotal()
     {
-        var cost = new MonitorCostStatus("$", 15.75, 0.45);
+        var cost = Cost(
+            15.75,
+            0.45,
+            ("Local", 12.30),
+            ("Remote", 3.45));
         var state = CreateSampleState(cloudEnabled: true, cost: cost);
 
         var output = TerminalMonitorRenderer.Render(state, "http://localhost:11434/monitor", enableAnsi: false);
@@ -163,6 +278,14 @@ public class TerminalMonitorRendererTests
         Assert.Contains("COST & SAVINGS (last 7 days)", output);
         Assert.Contains("Savings: ~$15.75", output);
         Assert.Contains("Cloud: ~$0.45", output);
+
+        // Per-target savings lines render for each non-Cloud target.
+        Assert.Contains("Local: ~$12.30", output);
+        Assert.Contains("Remote: ~$3.45", output);
+
+        // The per-target values sum to the rendered total.
+        var perTargetSum = cost.PerTargetSavings.Values.Sum();
+        Assert.Equal(cost.EstimatedSavings, perTargetSum, 4);
     }
 
     [Fact]
@@ -242,16 +365,16 @@ public class TerminalMonitorRendererTests
     [Fact]
     public void PadRightDisplay_WithEmojisAndAscii_AlignsToSameDisplayWidth()
     {
-        Assert.Equal(2, TerminalMonitorRenderer.GetDisplayWidth("🖥️"));
-        Assert.Equal(2, TerminalMonitorRenderer.GetDisplayWidth("📡"));
+        Assert.Equal(2, TerminalMonitorRenderer.GetDisplayWidth("\uD83D\uDDA5️"));
+        Assert.Equal(2, TerminalMonitorRenderer.GetDisplayWidth("\uD83D\uDCE1"));
         Assert.Equal(2, TerminalMonitorRenderer.GetDisplayWidth("☁️"));
 
-        Assert.Equal(8, TerminalMonitorRenderer.GetDisplayWidth("🖥️ Local"));
-        Assert.Equal(9, TerminalMonitorRenderer.GetDisplayWidth("📡 Remote"));
+        Assert.Equal(8, TerminalMonitorRenderer.GetDisplayWidth("\uD83D\uDDA5️ Local"));
+        Assert.Equal(9, TerminalMonitorRenderer.GetDisplayWidth("\uD83D\uDCE1 Remote"));
         Assert.Equal(8, TerminalMonitorRenderer.GetDisplayWidth("☁️ Cloud"));
 
-        var local = TerminalMonitorRenderer.PadRightDisplay("🖥️ Local", 13);
-        var remote = TerminalMonitorRenderer.PadRightDisplay("📡 Remote", 13);
+        var local = TerminalMonitorRenderer.PadRightDisplay("\uD83D\uDDA5️ Local", 13);
+        var remote = TerminalMonitorRenderer.PadRightDisplay("\uD83D\uDCE1 Remote", 13);
         var cloud = TerminalMonitorRenderer.PadRightDisplay("☁️ Cloud", 13);
         var total = TerminalMonitorRenderer.PadRightDisplay("Total", 13);
 
@@ -281,12 +404,22 @@ public class TerminalMonitorRendererTests
             new(now.AddSeconds(-30), "Cloud", "gpt-4o-mini", 500, 520, 80, 750.0, 500, false)
         };
 
-        var cost = new MonitorCostStatus("$", 123.45, 12.34);
+        var cost = Cost(
+            123.45,
+            12.34,
+            ("Local", 89.01),
+            ("Remote", 34.44));
+
         var state = CreateSampleState(
             cloudEnabled: true,
-            localBusy: true,
-            remoteBusy: false,
-            cloudBusy: false,
+            localEnabled: true,
+            remoteEnabled: false,
+            remoteLiveness: "Offline",
+            localInFlight: 2,
+            remoteInFlight: 0,
+            localActiveModel: "qwen2.5-coder:32b-instruct-q4_K_M",
+            localContext: "262.1k (expanded)",
+            remoteContext: "32.8k (baseline)",
             todayLocal: new ActivityStatisticsTotals(120, 450000, 120000),
             todayRemote: new ActivityStatisticsTotals(80, 890000, 340000),
             todayCloud: new ActivityStatisticsTotals(15, 230000, 45000),
@@ -309,6 +442,56 @@ public class TerminalMonitorRendererTests
         }
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Render_LargeFleet_WithLongNames_NeverExceeds79Columns(bool enableAnsi)
+    {
+        // 5 configured targets (with long names and long models) + Cloud; long values truncate.
+        var fleet = new List<MonitorFleetTargetItem>
+        {
+            FleetItem("workstation-primary", "http://192.168.1.10:11434", true, "Online", "llama-3.2-70b-instruct-fp8-tensorrt", 3, "16gb", "262.1k (expanded)"),
+            FleetItem("laptop", "http://192.168.1.11:11434", false, "Probing", null, 0, null, "-"),
+            FleetItem("server-rack-one", "http://192.168.1.12:11434", true, "Online", "qwen3:8b", 1, "96gb", "184.3k (expanded)"),
+            FleetItem("mac-mini-studio", "http://192.168.1.13:11434", true, "Offline", null, 0, "16384 MB", "-"),
+            FleetIndexItem(5),
+            FleetItem("Cloud", null, true, "Online", null, 0, null, "baseline")
+        };
+
+        var state = new MonitorStateResponse(
+            CloudEnabled: true,
+            Fleet: fleet,
+            Statistics: new MonitorStatisticsStatus(
+                new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["total"] = new ActivityStatisticsTotals(0, 0, 0)
+                },
+                new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["total"] = new ActivityStatisticsTotals(0, 0, 0)
+                }),
+            InProgress: [],
+            Requests: [],
+            Cost: Cost(1.5, 0.25, ("workstation-primary", 1.25), ("server-rack-one", 0.25)),
+            Overhead: null);
+
+        var rendered = TerminalMonitorRenderer.Render(state, "http://localhost:11434/monitor", consoleWidth: 80, consoleHeight: 30, enableAnsi: enableAnsi);
+
+        var lines = rendered.Split(["\r\n", "\n"], StringSplitOptions.None);
+        foreach (var line in lines)
+        {
+            if (string.IsNullOrEmpty(line)) continue;
+            var width = TerminalMonitorRenderer.GetDisplayWidth(line);
+            Assert.True(width <= 79, $"Line exceeded 79 columns ({width} cols): '{line}'");
+        }
+    }
+
+    private static MonitorFleetTargetItem FleetIndexItem(int index)
+    {
+        // A sixth-ish oddball name beyond the truncation budget.
+        return FleetItem($"extra-target-node-{index}-very-long-name", "http://192.168.1.14:11434", true, "Online", null, 0, null, "-");
+    }
+
     [Fact]
     public void Render_FleetNamedTarget_DisplaysNameWithoutWellKnownIcon()
     {
@@ -326,31 +509,28 @@ public class TerminalMonitorRendererTests
                 ["total"] = new ActivityStatisticsTotals(1, 100, 50)
             });
 
+        var fleet = new List<MonitorFleetTargetItem>
+        {
+            FleetItem("desktop", "http://192.168.1.5:11434", true, "Online"),
+            FleetItem("Cloud", null, true, "Online", null, 0, null, "baseline")
+        };
+
         var state = new MonitorStateResponse(
-            CloudEnabled: false,
-            Targets: new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["desktop"] = true,
-                ["Cloud"] = true
-            },
-            Online: new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["desktop"] = true,
-                ["Cloud"] = false
-            },
-            Busy: new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["desktop"] = false,
-                ["Cloud"] = false
-            },
-            stats,
-            [], [], null, null);
+            CloudEnabled: true,
+            Fleet: fleet,
+            Statistics: stats,
+            InProgress: [],
+            Requests: [],
+            Cost: null,
+            Overhead: null);
 
         var output = TerminalMonitorRenderer.Render(state, "http://localhost:11434/monitor", enableAnsi: false);
 
-        // Fleet names are displayed as plain names (no well-known icon prefix) and keep a neutral style.
-        Assert.Contains("desktop: \u25CF Idle", output);
-        Assert.DoesNotContain("\uD83D\uDDA5\uFE0F desktop", output, StringComparison.Ordinal);
+        // Fleet names are displayed as plain names (no well-known icon prefix) in the Target column.
+        var desktopRow = output.Split(['\n'], StringSplitOptions.None).Single(l => l.Contains("desktop") && l.Contains("\u25CF"));
+        Assert.Contains("\u25CF Online", desktopRow);
+        // No icon prefixed onto the plain fleet name in the row.
+        Assert.DoesNotContain("\uD83D\uDDA5\uFE0F desktop", desktopRow, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -414,7 +594,7 @@ public class TerminalMonitorRendererTests
 
         var fullState = CreateSampleState(
             cloudEnabled: true,
-            cost: new MonitorCostStatus("€", 999.99, 123.45),
+            cost: Cost(999.99, 123.45, ("Local", 876.54), ("Remote", 123.45)),
             todayLocal: new ActivityStatisticsTotals(100, 1000000, 500000),
             last7Local: new ActivityStatisticsTotals(1000, 10000000, 5000000));
         var fullRendered = TerminalMonitorRenderer.Render(fullState, monitorUrl, enableAnsi: true);

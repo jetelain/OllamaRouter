@@ -379,4 +379,80 @@ public class ContextAutoShrinkManagerTests
         Assert.Equal(MoEBaseline, alpha.InjectedNumCtx);
         Assert.Equal(LeaseBucketState.Baseline, alpha.State);
     }
+
+    [Fact]
+    public void GetLeaseSnapshot_Empty_ManagerReturnsEmptySnapshot()
+    {
+        var snapshot = _sut.GetLeaseSnapshot();
+        Assert.Empty(snapshot);
+    }
+
+    [Fact]
+    public void GetLeaseSnapshot_ExpandedLease_ExposesModelBucketAndExpandedFlag()
+    {
+        DecideAt(195_000); // Fresh expansion to the 221,184 intermediate bucket.
+
+        var snapshot = _sut.GetLeaseSnapshot();
+
+        var leases = snapshot.Single().Value;
+        var lease = leases.Single();
+        Assert.Equal("qwen3", lease.Model);
+        Assert.Equal(MoEIntermediate, lease.ActiveBucket);
+        Assert.True(lease.IsExpanded);
+    }
+
+    [Fact]
+    public void GetLeaseSnapshot_BaselineTurn_ExposesBaselineLeaseWithoutExpansion()
+    {
+        DecideAt(100_000); // Baseline bucket (184,320), no expansion.
+
+        var snapshot = _sut.GetLeaseSnapshot();
+
+        var lease = snapshot.Single().Value.Single();
+        Assert.Equal("qwen3", lease.Model);
+        Assert.Equal(MoEBaseline, lease.ActiveBucket);
+        Assert.False(lease.IsExpanded);
+    }
+
+    [Fact]
+    public void GetLeaseSnapshot_AfterShrink_LeaseIsNoLongerExpanded()
+    {
+        DecideAt(195_000); // Expand.
+        Advance(5);
+        Advance(5);
+        DecideAt(30_000); // Drop below 50% of baseline: immediate shrink.
+
+        var snapshot = _sut.GetLeaseSnapshot();
+
+        var lease = snapshot.Single().Value.Single();
+        Assert.Equal(MoEBaseline, lease.ActiveBucket);
+        Assert.False(lease.IsExpanded);
+    }
+
+    [Fact]
+    public void GetLeaseSnapshot_CloudNeverCarriesALease()
+    {
+        var engine = DynamicContextSizingEngine.Decide(_options, ModelArchitectureKind.Moe, 98_304, MoEMax, 195_000, null);
+        _sut.Decide(RoutingTarget.Cloud, "gpt-4o", engine, _options, 195_000, _now);
+
+        var snapshot = _sut.GetLeaseSnapshot();
+
+        Assert.DoesNotContain(RoutingTarget.Cloud, snapshot.Keys);
+    }
+
+    [Fact]
+    public void GetLeaseSnapshot_MultipleModels_ExposesOneLeasePerModel()
+    {
+        DecideAt(195_000, model: "model-a");
+        var engine = DynamicContextSizingEngine.Decide(_options, ModelArchitectureKind.Moe, 98_304, MoEMax, 240_000, null);
+        _sut.Decide(Target, "model-b", engine, _options, 240_000, _now); // 240k -> max bucket.
+
+        var snapshot = _sut.GetLeaseSnapshot();
+
+        var leases = snapshot.Single().Value;
+        Assert.Equal(2, leases.Count);
+        Assert.Equal(MoEIntermediate, leases.Single(l => l.Model == "model-a").ActiveBucket);
+        Assert.Equal(MoEMax, leases.Single(l => l.Model == "model-b").ActiveBucket);
+        Assert.All(leases, l => Assert.True(l.IsExpanded));
+    }
 }

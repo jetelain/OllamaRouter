@@ -41,8 +41,8 @@ public static class TerminalMonitorRenderer
         // Header Banner (link is in footer to avoid duplicate)
         AppendHeader(lines, width, enableAnsi);
 
-        // Instances Status
-        AppendInstances(lines, state, enableAnsi);
+        // Fleet Table (data-driven multi-target view; Cloud always last)
+        AppendFleet(lines, state, enableAnsi);
 
         // Statistics Table
         if (height > 30)
@@ -119,26 +119,70 @@ public static class TerminalMonitorRenderer
         lines.Add($" ╚{bar}╝");
     }
 
-    private static void AppendInstances(List<string> lines, MonitorStateResponse state, bool enableAnsi)
+    private static void AppendFleet(List<string> lines, MonitorStateResponse state, bool enableAnsi)
     {
         var sb = new StringBuilder();
         sb.Append(" ");
         if (enableAnsi) sb.Append(Bold);
-        sb.Append("INSTANCES: ");
+        sb.Append("FLEET");
         if (enableAnsi) sb.Append(Reset);
+        lines.Add(sb.ToString());
 
-        var first = true;
-        foreach (var (name, enabled) in state.Targets)
+        lines.Add("   Target       Liveness  HW    Active Model               In  Ctx");
+        lines.Add("   ─────────── ───────── ───── ──────────────────────── ── ────────────────");
+
+        foreach (var item in state.Fleet)
         {
-            if (!first)
-            {
-                sb.Append("   ");
-            }
-            first = false;
-            AppendInstanceStatus(sb, name, TargetLabel(name), enabled, state.Online.GetValueOrDefault(name, true), state.Busy.GetValueOrDefault(name), enableAnsi);
+            var row = new StringBuilder();
+            row.Append("   ");
+            var color = TargetColor(item.Name);
+            if (enableAnsi) row.Append(color);
+            row.Append(PadRightDisplay(Truncate(TargetLabel(item.Name), 13), 13));
+            if (enableAnsi) row.Append(Reset);
+            row.Append(' ');
+            AppendLivenessBadge(row, item, enableAnsi);
+            row.Append(' ');
+            row.Append(PadRightDisplay(Truncate(item.HardwareProfile ?? "-", 5), 5));
+            row.Append(' ');
+            row.Append(PadRightDisplay(Truncate(item.ActiveModel ?? "-", 20), 20));
+            row.Append(' ');
+            row.Append(item.InFlightRequests.ToString("0", CultureInfo.InvariantCulture).PadLeft(2));
+            row.Append(' ');
+            row.Append(Truncate(item.ContextAllocation ?? "-", 16));
+            lines.Add(row.ToString());
+        }
+    }
+
+    // Liveness badge: Disabled (red) takes precedence, then Offline (orange), Probing
+    // (yellow), Online (green). The in-flight count column conveys busy/idle.
+    private static void AppendLivenessBadge(StringBuilder sb, MonitorFleetTargetItem item, bool enableAnsi)
+    {
+        string text;
+        string badgeColor;
+        if (!item.Enabled)
+        {
+            text = "● Disabled";
+            badgeColor = BrightRed;
+        }
+        else if (string.Equals(item.Liveness, "Offline", StringComparison.OrdinalIgnoreCase))
+        {
+            text = "● Offline";
+            badgeColor = Orange;
+        }
+        else if (string.Equals(item.Liveness, "Probing", StringComparison.OrdinalIgnoreCase))
+        {
+            text = "● Probing";
+            badgeColor = BrightYellow;
+        }
+        else
+        {
+            text = "● Online";
+            badgeColor = BrightGreen;
         }
 
-        lines.Add(sb.ToString());
+        if (enableAnsi) sb.Append(badgeColor);
+        sb.Append(PadRightDisplay(text, 10));
+        if (enableAnsi) sb.Append(Reset);
     }
 
     // Display label (icon + name) with Local/Remote/Cloud icons and a plain-name fallback for
@@ -163,45 +207,6 @@ public static class TerminalMonitorRenderer
             "cloud" => BrightMagenta,
             _ => ""
         };
-    }
-
-    private static void AppendInstanceStatus(
-        StringBuilder sb,
-        string targetKey,
-        string displayName,
-        bool enabled,
-        bool online,
-        bool busy,
-        bool enableAnsi)
-    {
-        var targetColor = TargetColor(targetKey);
-
-        if (enableAnsi) sb.Append(Bold).Append(targetColor);
-        sb.Append(displayName).Append(": ");
-        if (enableAnsi) sb.Append(Reset);
-
-        if (!enabled)
-        {
-            if (enableAnsi) sb.Append(BrightRed);
-            sb.Append("● Disabled");
-        }
-        else if (!online)
-        {
-            if (enableAnsi) sb.Append(Orange);
-            sb.Append("● Offline");
-        }
-        else if (busy)
-        {
-            if (enableAnsi) sb.Append(BrightYellow);
-            sb.Append("● Busy");
-        }
-        else
-        {
-            if (enableAnsi) sb.Append(BrightGreen);
-            sb.Append("● Idle");
-        }
-
-        if (enableAnsi) sb.Append(Reset);
     }
 
     private static void AppendStatistics(List<string> lines, MonitorStateResponse state, bool enableAnsi)
@@ -377,6 +382,19 @@ public static class TerminalMonitorRenderer
         }
 
         lines.Add(sb.ToString());
+
+        // Per-target savings breakdown (Cloud is excluded from PerTargetSavings).
+        var perTarget = new List<string>();
+        foreach (var (name, amount) in state.Cost.PerTargetSavings)
+        {
+            perTarget.Add(Truncate($"{name}: ~{FormatCost(amount, state.Cost.Currency)}", 30));
+        }
+
+        for (int i = 0; i < perTarget.Count; i += 3)
+        {
+            var chunk = string.Join("  •  ", perTarget.Skip(i).Take(3));
+            lines.Add("   " + (enableAnsi ? Gray : "") + chunk + (enableAnsi ? Reset : ""));
+        }
     }
 
     private static void AppendInProgress(List<string> lines, MonitorStateResponse state, bool enableAnsi)

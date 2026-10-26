@@ -1,5 +1,6 @@
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using OllamaRouter.Options;
 using OllamaRouter.Serialization;
@@ -8,9 +9,10 @@ using OllamaRouter.Services;
 namespace OllamaRouter.Endpoints;
 
 /// <summary>
-/// Lightweight, dependency-free monitoring UI: shows which instance (Local/Remote) is currently
-/// busy, requests currently in progress, and the recent request history with model, estimated
-/// and actual tokens, and elapsed time. It reads in-memory state from
+/// Lightweight, dependency-free monitoring UI: shows the multi-target fleet (per-target
+/// liveness, active model, in-flight requests, hardware profile, and context allocation) plus
+/// requests currently in progress and the recent request history with model, estimated and
+/// actual tokens, and elapsed time. It reads in-memory state from
 /// <see cref="IActivityMonitorService"/> and aggregated token statistics (persisted, current day
 /// and last 7 days) from <see cref="IActivityStatisticsService"/>, so it has no impact on VRAM.
 /// </summary>
@@ -24,8 +26,11 @@ public static class MonitorEndpointsExtensions
             IOptions<OllamaRouterOptions> options,
             ITargetAvailabilityService targetAvailability,
             IModelCatalogCacheService modelCatalogCache,
+            IServiceProvider serviceProvider,
             CancellationToken cancellationToken) =>
         {
+            // Optional enrichment services: null-tolerant so minimal (test) apps that do not
+            // register them keep working with the reduced (catalog-only) liveness view.
             var monitorResponse = await BuildMonitorStateResponseAsync(
                 activityMonitor,
                 activityStatistics,
@@ -33,7 +38,10 @@ public static class MonitorEndpointsExtensions
                 targetAvailability,
                 modelCatalogCache,
                 cancellationToken,
-                includeOverhead: true);
+                includeOverhead: true,
+                liveness: serviceProvider.GetService<ITargetLivenessService>(),
+                executionTracker: serviceProvider.GetService<ITargetExecutionTracker>(),
+                contextShrinkManager: serviceProvider.GetService<IContextAutoShrinkManager>());
 
             return Results.Json(monitorResponse, OllamaRouterJsonSerializerContext.Default.MonitorStateResponse);
         });
@@ -139,24 +147,20 @@ public static class MonitorEndpointsExtensions
   body { font-family: Segoe UI, Arial, sans-serif; margin: 1.5rem; background: #1e1e1e; color: #ddd; }
   h1 { font-size: 1.3rem; }
   h2 { font-size: 1.05rem; color: #bbb; margin-top: 1.75rem; }
-  .instances { display: flex; gap: 1rem; margin-bottom: 1.5rem; align-items: flex-start; }
-  .instance-col { display: flex; flex-direction: column; gap: 0.4rem; }
-  .card { padding: 0.75rem 1.25rem; border-radius: 8px; min-width: 140px; background: #2b2b2b; }
-  .card.busy { background: #5a3d00; border: 1px solid #ffb300; }
-  .card.idle { background: #1f3d24; border: 1px solid #3ba55c; }
-  .card.disabled { background: #3a1f1f; border: 1px solid #b33333; }
-  .card.offline { background: #4a2800; border: 1px solid #e67e22; }
-  .card .toggle { display: flex; align-items: center; margin-top: 0.4rem; font-size: 0.8rem; color: #bbb; }
-  .card .toggle input { margin-right: 6px; }
-  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
-  .busy .dot { background: #ffb300; }
-  .idle .dot { background: #3ba55c; }
-  .disabled .dot { background: #b33333; }
-  .offline .dot { background: #e67e22; }
-  .btn-reclaim { display: block; padding: 0.4rem 0.6rem; font-size: 0.78rem; font-weight: 500; color: #eee; background: #333; border: 1px solid #555; border-radius: 6px; cursor: pointer; width: 100%; box-sizing: border-box; text-align: center; }
+  .fleet-table { width: 100%; margin-bottom: 0.5rem; }
+  .lv-badge { display: inline-flex; align-items: center; gap: 6px; font-size: 0.85rem; }
+  .lv-badge .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; }
+  .lv-online .dot { background: #3ba55c; }
+  .lv-offline .dot { background: #e67e22; }
+  .lv-probing .dot { background: #ffb300; }
+  .lv-disabled .dot { background: #b33333; }
+  .reclaim-row { display: flex; align-items: center; gap: 1rem; margin: 0.25rem 0 1.25rem; }
+  .reclaim-row .btn-reclaim { width: auto; }
+  .per-target-savings { font-size: 0.78rem; color: #9cdcfe; margin-top: 0.45rem; display: flex; flex-wrap: wrap; gap: 0.15rem 0.9rem; }
+  .btn-reclaim { display: inline-block; padding: 0.4rem 0.6rem; font-size: 0.78rem; font-weight: 500; color: #eee; background: #333; border: 1px solid #555; border-radius: 6px; cursor: pointer; text-align: center; }
   .btn-reclaim:hover:not(:disabled) { background: #444; border-color: #888; color: #fff; }
   .btn-reclaim:disabled { opacity: 0.6; cursor: not-allowed; }
-  .reclaim-status { font-size: 0.75rem; color: #9cdcfe; line-height: 1.2; word-break: break-word; text-align: center; }
+  .reclaim-status { font-size: 0.75rem; color: #9cdcfe; line-height: 1.2; word-break: break-word; }
   table { border-collapse: collapse; width: 100%; }
   th, td { text-align: left; padding: 0.35rem 0.75rem; border-bottom: 1px solid #333; font-size: 0.9rem; }
   th { color: #999; font-weight: 600; }
@@ -198,7 +202,17 @@ public static class MonitorEndpointsExtensions
 </head>
 <body>
 <h1>OllamaRouter - Activity Monitor</h1>
-<div class="instances" id="instances"></div>
+<table class="fleet-table" id="fleetTable">
+  <thead>
+    <tr><th>Target</th><th>URL</th><th>HW</th><th>Liveness</th><th>Active Model</th><th>In-Flight</th><th>Context</th><th>Enabled</th></tr>
+  </thead>
+  <tbody id="fleetRows"></tbody>
+</table>
+
+<div class="reclaim-row">
+  <button id="reclaimBtn" class="btn-reclaim" title="Unload all running models in local Ollama instance and disable local target (e.g. to play video games)">\uD83C\uDFAE Reclaim local VRAM</button>
+  <div id="reclaimStatus" class="reclaim-status"></div>
+</div>
 
 <h2>Statistics</h2>
 <table class="stats">
@@ -223,7 +237,8 @@ public static class MonitorEndpointsExtensions
     <div class="cost-card savings">
       <div class="cost-title">💰 Estimated savings (last 7 days)</div>
       <div class="cost-value" id="estimatedSavingsValue">-</div>
-      <div class="cost-desc">Saved thanks to local & remote routing</div>
+      <div class="cost-desc">Saved thanks to local &amp; remote routing</div>
+      <div class="per-target-savings" id="perTargetSavingsList"></div>
     </div>
     <div class="cost-card overflow" id="cloudCostCard">
       <div class="cost-title">☁️ Cloud overflow cost (last 7 days)</div>
@@ -433,9 +448,18 @@ function renderCost(cost, cloudEnabled) {
   const savingsEl = document.getElementById('estimatedSavingsValue');
   const cloudCostEl = document.getElementById('cloudCostValue');
   const cloudCard = document.getElementById('cloudCostCard');
+  const perTargetList = document.getElementById('perTargetSavingsList');
 
   savingsEl.textContent = formatCost(cost.estimatedSavings, cost.currency);
   cloudCostEl.textContent = formatCost(cost.cloudOverflowCost, cost.currency);
+
+  clear(perTargetList);
+  const perTarget = cost.perTargetSavings || {};
+  for (const [name, amount] of Object.entries(perTarget)) {
+    const span = document.createElement('span');
+    span.textContent = targetLabel(name) + ': ~' + formatCost(amount, cost.currency);
+    perTargetList.appendChild(span);
+  }
 
   if (cloudEnabled) {
     container.classList.add('has-cloud');
@@ -499,73 +523,72 @@ async function reclaimLocalVram() {
   }
 }
 
+function livenessBadge(liveness, enabled) {
+  const badge = document.createElement('span');
+  let className;
+  let statusText;
+  if (!enabled) {
+    className = 'lv-disabled';
+    statusText = 'Disabled';
+  } else if (liveness === 'Offline') {
+    className = 'lv-offline';
+    statusText = 'Offline';
+  } else if (liveness === 'Probing') {
+    className = 'lv-probing';
+    statusText = 'Probing';
+  } else {
+    className = 'lv-online';
+    statusText = 'Online';
+  }
+  badge.className = 'lv-badge ' + className;
+  const dot = document.createElement('span');
+  dot.className = 'dot';
+  badge.appendChild(dot);
+  badge.appendChild(document.createTextNode(statusText));
+  return badge;
+}
+
+function renderFleet(fleet) {
+  const tbody = document.getElementById('fleetRows');
+  clear(tbody);
+  for (const t of fleet) {
+    const tr = document.createElement('tr');
+
+    tr.appendChild(targetCell(t.name));
+
+    const urlCell = document.createElement('td');
+    urlCell.textContent = t.url || '-';
+    tr.appendChild(urlCell);
+
+    tr.appendChild(td(t.hardwareProfile || '-'));
+
+    const livenessCell = document.createElement('td');
+    livenessCell.appendChild(livenessBadge(t.liveness, t.enabled));
+    tr.appendChild(livenessCell);
+
+    tr.appendChild(td(t.activeModel || '-'));
+    tr.appendChild(td(String(t.inFlightRequests), 'num'));
+    tr.appendChild(td(t.contextAllocation || '-'));
+
+    const toggleCell = document.createElement('td');
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = t.enabled;
+    checkbox.addEventListener('change', () => toggleTarget(t.name, checkbox.checked, fleet));
+    toggleCell.appendChild(checkbox);
+    tr.appendChild(toggleCell);
+
+    tbody.appendChild(tr);
+  }
+}
+
 async function refresh() {
   try {
     const res = await fetch('/monitor/api');
     const data = await res.json();
 
-    const instances = document.getElementById('instances');
-    clear(instances);
-    for (const [name, enabled] of Object.entries(data.targets)) {
-      const busy = data.busy[name] || false;
-      const online = data.online ? (data.online[name] !== undefined ? data.online[name] : true) : true;
-
-      let statusClass = 'idle';
-      let statusText = 'Idle';
-      if (!enabled) {
-        statusClass = 'disabled';
-        statusText = 'Disabled';
-      } else if (!online) {
-        statusClass = 'offline';
-        statusText = 'Offline';
-      } else if (busy) {
-        statusClass = 'busy';
-        statusText = 'Busy';
-      }
-
-      const div = document.createElement('div');
-      div.className = 'card ' + statusClass;
-      const dot = document.createElement('span');
-      dot.className = 'dot';
-      div.appendChild(dot);
-      const label = targetLabel(name) + ': ' + statusText;
-      div.appendChild(document.createTextNode(label));
-
-      const toggle = document.createElement('label');
-      toggle.className = 'toggle';
-      const checkbox = document.createElement('input');
-      checkbox.type = 'checkbox';
-      checkbox.checked = enabled;
-      checkbox.addEventListener('change', () => toggleTarget(name, checkbox.checked, data.targets));
-      toggle.appendChild(checkbox);
-      toggle.appendChild(document.createTextNode('Enabled'));
-      div.appendChild(toggle);
-
-      if (name.toLowerCase() === 'local') {
-        const col = document.createElement('div');
-        col.className = 'instance-col';
-        col.appendChild(div);
-
-        const btn = document.createElement('button');
-        btn.id = 'reclaimBtn';
-        btn.className = 'btn-reclaim';
-        btn.title = 'Unload all running models in local Ollama instance and disable local target (e.g. to play video games)';
-        btn.disabled = isReclaiming;
-        btn.textContent = isReclaiming ? '⏳ Reclaiming...' : '🎮 Reclaim local VRAM';
-        btn.addEventListener('click', reclaimLocalVram);
-        col.appendChild(btn);
-
-        const statusDiv = document.createElement('div');
-        statusDiv.id = 'reclaimStatus';
-        statusDiv.className = 'reclaim-status';
-        statusDiv.textContent = reclaimStatusText;
-        col.appendChild(statusDiv);
-
-        instances.appendChild(col);
-      } else {
-        instances.appendChild(div);
-      }
-    }
+    renderFleet(data.fleet);
+    renderReclaimButtonState();
 
     renderStatistics('statsRows', data.statistics.today, data.statistics.last7Days);
     renderUsageRatio(data.statistics.last7Days);
@@ -645,9 +668,12 @@ function renderOverhead(overhead) {
   container.innerHTML = html;
 }
 
-async function toggleTarget(name, checked, currentTargets) {
-  // Post the full targets object with the toggled key updated.
-  const updated = { ...currentTargets };
+async function toggleTarget(name, checked, fleet) {
+  // Post the full fleet enabled-state object with the toggled key updated.
+  const updated = {};
+  for (const t of fleet) {
+    updated[t.name] = t.enabled;
+  }
   updated[name] = checked;
   try {
     await fetch('/targets', {
@@ -661,6 +687,8 @@ async function toggleTarget(name, checked, currentTargets) {
     refresh();
   }
 }
+
+document.getElementById('reclaimBtn').addEventListener('click', reclaimLocalVram);
 
 refresh();
 setInterval(refresh, 2000);
@@ -676,7 +704,10 @@ setInterval(refresh, 2000);
         ITargetAvailabilityService targetAvailability,
         IModelCatalogCacheService modelCatalogCache,
         CancellationToken cancellationToken = default,
-        bool includeOverhead = true)
+        bool includeOverhead = true,
+        ITargetLivenessService? liveness = null,
+        ITargetExecutionTracker? executionTracker = null,
+        IContextAutoShrinkManager? contextShrinkManager = null)
     {
         var snapshot = activityMonitor.GetSnapshot();
         var statistics = activityStatistics.GetSnapshot();
@@ -685,28 +716,73 @@ setInterval(refresh, 2000);
         var targets = targetAvailability.GetSnapshot();
 
         var effectiveTargets = options.Value.GetEffectiveTargets();
+        var livenessEntries = liveness?.GetEntries();
+        var leaseSnapshot = contextShrinkManager?.GetLeaseSnapshot();
 
-        // Name-keyed status objects, in fleet order, with the Cloud pseudo-target always last.
+        // Ordered fleet list: configured targets first (configuration order), Cloud always last.
         // (Invalid Targets entries were already warned about at startup; this read-only path
         // uses the default no-logger overload to avoid repeated warnings on every request.)
-        var targetsByName = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
-        var onlineByName = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
-        var busyByName = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        var fleet = new List<MonitorFleetTargetItem>(effectiveTargets.Count + 1);
         var periodByName = new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var target in effectiveTargets)
         {
             var name = target.Name!;
-            targetsByName[name] = targets.Flags.TryGetValue((RoutingTarget)name, out var enabled) ? enabled : true;
-            onlineByName[name] = !string.IsNullOrWhiteSpace(target.Url) &&
-                                 await modelCatalogCache.HasAnyModelsAsync(target.Url, cancellationToken);
-            busyByName[name] = snapshot.Busy.GetValueOrDefault((RoutingTarget)name);
+            var enabled = targets.Flags.TryGetValue((RoutingTarget)name, out var targetEnabled) ? targetEnabled : true;
+
+            // Liveness: prefer the raw (non-TTL) liveness state machine; fall back to the
+            // catalog-based check when the liveness service is not registered.
+            string livenessText;
+            if (livenessEntries is { } entries && entries.TryGetValue((RoutingTarget)name, out var entry))
+            {
+                livenessText = entry.State switch
+                {
+                    TargetLivenessState.Online => "Online",
+                    TargetLivenessState.Offline => "Offline",
+                    _ => "Probing"
+                };
+            }
+            else
+            {
+                livenessText = !string.IsNullOrWhiteSpace(target.Url) &&
+                               await modelCatalogCache.HasAnyModelsAsync(target.Url, cancellationToken)
+                    ? "Online"
+                    : "Offline";
+            }
+
+            var executionState = executionTracker?.GetState((RoutingTarget)name);
+            var activeModel = executionState?.LoadedModels.FirstOrDefault()?.Name;
+            var inFlight = executionState?.InFlightRequests ?? 0;
+
+            var hardwareProfile = target.MaxVramMB.HasValue
+                ? $"{target.MaxVramMB.Value} MB"
+                : target.HardwareHint;
+
+            fleet.Add(new MonitorFleetTargetItem(
+                Name: name,
+                Url: target.Url,
+                Enabled: enabled,
+                Liveness: livenessText,
+                ActiveModel: activeModel,
+                InFlightRequests: inFlight,
+                HardwareProfile: hardwareProfile,
+                ContextAllocation: FormatContextAllocation((RoutingTarget)name, leaseSnapshot)));
+
             periodByName[name] = statistics.Last7Days.GetValueOrDefault((RoutingTarget)name) ?? new ActivityStatisticsTotals(0, 0, 0);
         }
 
-        targetsByName[RoutingTarget.Cloud.Value] = targets.Flags.TryGetValue(RoutingTarget.Cloud, out var cloudFlag) ? cloudFlag : cloudEnabled;
-        onlineByName[RoutingTarget.Cloud.Value] = cloudEnabled;
-        busyByName[RoutingTarget.Cloud.Value] = snapshot.Busy.GetValueOrDefault(RoutingTarget.Cloud);
+        // The Cloud pseudo-target is never probed/tracked: it is "Online" iff cloud is enabled,
+        // never has a loaded model or in-flight requests, and never carries a context lease.
+        var cloudFlag = targets.Flags.TryGetValue(RoutingTarget.Cloud, out var cloudEnabledFlag) ? cloudEnabledFlag : cloudEnabled;
+        fleet.Add(new MonitorFleetTargetItem(
+            Name: RoutingTarget.Cloud.Value,
+            Url: null,
+            Enabled: cloudFlag,
+            Liveness: cloudEnabled ? "Online" : "Offline",
+            ActiveModel: null,
+            InFlightRequests: 0,
+            HardwareProfile: null,
+            ContextAllocation: "baseline"));
         periodByName[RoutingTarget.Cloud.Value] = statistics.Last7Days.GetValueOrDefault(RoutingTarget.Cloud) ?? new ActivityStatisticsTotals(0, 0, 0);
 
         var todayByName = new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase);
@@ -719,9 +795,7 @@ setInterval(refresh, 2000);
 
         return new MonitorStateResponse(
             cloudEnabled,
-            targetsByName,
-            onlineByName,
-            busyByName,
+            fleet,
             new MonitorStatisticsStatus(todayByName, periodByName),
             snapshot.InProgressRequests.Select(r => new MonitorInProgressItem(
                 r.Target.ToString(),
@@ -745,6 +819,38 @@ setInterval(refresh, 2000);
                 : null);
     }
 
+    // Renders the current context allocation for one fleet target from the lease snapshot:
+    // any expanded lease -> "<maxBucket>k (expanded)"; a single lease at baseline ->
+    // "<bucket>k (baseline)"; no leases at all -> "-" (baseline implied). Cloud is "baseline".
+    private static string FormatContextAllocation(
+        RoutingTarget target,
+        IReadOnlyDictionary<RoutingTarget, IReadOnlyList<ContextLeaseView>>? leaseSnapshot)
+    {
+        if (target == RoutingTarget.Cloud || leaseSnapshot is null ||
+            !leaseSnapshot.TryGetValue(target, out var leases) || leases.Count == 0)
+        {
+            return target == RoutingTarget.Cloud ? "baseline" : "-";
+        }
+
+        if (leases.Any(lease => lease.IsExpanded))
+        {
+            return $"{FormatBucketTokens(leases.Max(lease => lease.ActiveBucket))} (expanded)";
+        }
+
+        return $"{FormatBucketTokens(leases[0].ActiveBucket)} (baseline)";
+    }
+
+    private static string FormatBucketTokens(int tokens)
+    {
+        if (tokens >= 1_000_000)
+        {
+            return (tokens / 1_000_000.0).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + "M";
+        }
+        return tokens >= 1_000
+            ? (tokens / 1_000.0).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + "k"
+            : tokens.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    }
+
     public static MonitorCostStatus? CalculateCostStatus(
         IReadOnlyDictionary<RoutingTarget, ActivityStatisticsTotals> last7Days,
         PricingOptions? pricing)
@@ -757,23 +863,34 @@ setInterval(refresh, 2000);
         var effectiveInputPrice = pricing.PromptPricePerMillion ?? pricing.PricePerMillion ?? 0.0;
         var effectiveOutputPrice = pricing.CompletionPricePerMillion ?? pricing.PricePerMillion ?? 0.0;
 
-        var localStats = last7Days.GetValueOrDefault(RoutingTarget.Local) ?? new ActivityStatisticsTotals(0, 0, 0);
-        var remoteStats = last7Days.GetValueOrDefault(RoutingTarget.Remote) ?? new ActivityStatisticsTotals(0, 0, 0);
+        // Per-target savings: every NON-Cloud target's tokens valued at the effective cloud
+        // prices (the same 4-decimal rounding as the totals); the Cloud overflow is excluded
+        // (it is a cost, not a saving).
+        var perTargetSavings = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        var estimatedSavings = 0.0;
+        foreach (var (target, stats) in last7Days)
+        {
+            if (target == RoutingTarget.Cloud)
+            {
+                continue;
+            }
+
+            var targetSavings = (stats.InputTokens / 1_000_000.0 * effectiveInputPrice) +
+                                (stats.OutputTokens / 1_000_000.0 * effectiveOutputPrice);
+            targetSavings = Math.Round(targetSavings, 4);
+            perTargetSavings[target.Value] = targetSavings;
+            estimatedSavings += targetSavings;
+        }
+
         var cloudStats = last7Days.GetValueOrDefault(RoutingTarget.Cloud) ?? new ActivityStatisticsTotals(0, 0, 0);
-
-        long localRemoteInputTokens = (long)localStats.InputTokens + remoteStats.InputTokens;
-        long localRemoteOutputTokens = (long)localStats.OutputTokens + remoteStats.OutputTokens;
-
-        var estimatedSavings = (localRemoteInputTokens / 1_000_000.0 * effectiveInputPrice) +
-                               (localRemoteOutputTokens / 1_000_000.0 * effectiveOutputPrice);
-
         var cloudOverflowCost = (cloudStats.InputTokens / 1_000_000.0 * effectiveInputPrice) +
                                 (cloudStats.OutputTokens / 1_000_000.0 * effectiveOutputPrice);
 
         return new MonitorCostStatus(
             pricing.Currency,
             Math.Round(estimatedSavings, 4),
-            Math.Round(cloudOverflowCost, 4));
+            Math.Round(cloudOverflowCost, 4),
+            perTargetSavings);
     }
 
     public static MonitorOverheadStatus CalculateOverheadStatus(
@@ -873,13 +990,28 @@ public sealed record ReclaimVramResponse(
 public sealed record MonitorCostStatus(
     [property: JsonPropertyName("currency")] string Currency,
     [property: JsonPropertyName("estimatedSavings")] double EstimatedSavings,
-    [property: JsonPropertyName("cloudOverflowCost")] double CloudOverflowCost);
+    [property: JsonPropertyName("cloudOverflowCost")] double CloudOverflowCost,
+    [property: JsonPropertyName("perTargetSavings")] IReadOnlyDictionary<string, double> PerTargetSavings);
+
+/// <summary>
+/// One row of the ordered multi-target fleet view (configured targets first, Cloud last):
+/// identity, enablement, liveness (Online/Offline/Probing), the currently loaded model and
+/// in-flight request count (execution tracker; Cloud always null/0), the hardware profile,
+/// and the current context bucket allocation (auto-shrink lease; Cloud always "baseline").
+/// </summary>
+public sealed record MonitorFleetTargetItem(
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("enabled")] bool Enabled,
+    [property: JsonPropertyName("liveness")] string Liveness,
+    [property: JsonPropertyName("inFlightRequests")] int InFlightRequests,
+    [property: JsonPropertyName("contextAllocation")] string ContextAllocation,
+    [property: JsonPropertyName("url")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Url = null,
+    [property: JsonPropertyName("activeModel")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? ActiveModel = null,
+    [property: JsonPropertyName("hardwareProfile")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? HardwareProfile = null);
 
 public sealed record MonitorStateResponse(
     [property: JsonPropertyName("cloudEnabled")] bool CloudEnabled,
-    [property: JsonPropertyName("targets")] IReadOnlyDictionary<string, bool> Targets,
-    [property: JsonPropertyName("online")] IReadOnlyDictionary<string, bool> Online,
-    [property: JsonPropertyName("busy")] IReadOnlyDictionary<string, bool> Busy,
+    [property: JsonPropertyName("fleet")] IReadOnlyList<MonitorFleetTargetItem> Fleet,
     [property: JsonPropertyName("statistics")] MonitorStatisticsStatus Statistics,
     [property: JsonPropertyName("inProgress")] IReadOnlyList<MonitorInProgressItem> InProgress,
     [property: JsonPropertyName("requests")] IReadOnlyList<MonitorRecentRequestItem> Requests,

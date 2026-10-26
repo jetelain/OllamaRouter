@@ -62,7 +62,7 @@ internal static class MonitorScenarios
             return "Failed to parse JSON response from /monitor/api.";
         }
 
-        string[] requiredProperties = ["cloudEnabled", "targets", "online", "busy", "statistics", "inProgress", "requests"];
+        string[] requiredProperties = ["cloudEnabled", "fleet", "statistics", "inProgress", "requests"];
         foreach (var prop in requiredProperties)
         {
             if (node[prop] is null)
@@ -71,12 +71,20 @@ internal static class MonitorScenarios
             }
         }
 
-        var targets = node["targets"];
-        // Target names are exposed as configured ("Local"/"Remote"/"Cloud" for the legacy
-        // synthesized fleet); look up case-insensitively.
-        if (FindTargetFlag(targets, "local") is null || FindTargetFlag(targets, "remote") is null || FindTargetFlag(targets, "cloud") is null)
+        var fleet = node["fleet"];
+        // The fleet is an ordered array (configured targets first, Cloud last); look up the
+        // legacy fleet entries case-insensitively.
+        if (FindFleetEntry(fleet, "local") is null || FindFleetEntry(fleet, "remote") is null || FindFleetEntry(fleet, "cloud") is null)
         {
-            return "Missing target status flags (local, remote, cloud) in /monitor/api response.";
+            return "Missing fleet entries (local, remote, cloud) in /monitor/api response.";
+        }
+
+        // Cloud must always be the last fleet entry.
+        var fleetArray = fleet as JsonArray;
+        if (fleetArray is null || fleetArray.Count == 0 ||
+            !string.Equals(fleetArray[^1]?["name"]?.GetValue<string>(), "Cloud", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Expected the 'Cloud' pseudo-target to be the last entry of the fleet array.";
         }
 
         var stats = node["statistics"];
@@ -233,33 +241,32 @@ internal static class MonitorScenarios
         response.EnsureSuccessStatusCode();
 
         var json = JsonNode.Parse(await response.Content.ReadAsStringAsync());
-        var targets = json?["targets"];
+        var fleet = json?["fleet"];
 
-        // Case-insensitive key lookup: the legacy fleet exposes "Local"/"Remote"/"Cloud".
+        // Case-insensitive lookup of the fleet entries: the legacy fleet exposes
+        // "Local"/"Remote"/"Cloud".
         return (
-            FindTargetFlag(targets, "local") ?? true,
-            FindTargetFlag(targets, "remote") ?? true,
-            FindTargetFlag(targets, "cloud") ?? false
+            FindFleetEnabled(fleet, "local") ?? true,
+            FindFleetEnabled(fleet, "remote") ?? true,
+            FindFleetEnabled(fleet, "cloud") ?? false
         );
     }
 
-    private static bool? FindTargetFlag(JsonNode? targets, string key)
+    private static JsonNode? FindFleetEntry(JsonNode? fleet, string name)
     {
-        if (targets is not JsonObject targetObject)
-        {
-            return null;
-        }
-
-        foreach (var (name, value) in targetObject)
-        {
-            if (string.Equals(name, key, StringComparison.OrdinalIgnoreCase))
-            {
-                return value?.GetValue<bool>();
-            }
-        }
-
-        return null;
+        return FleetEntries(fleet)
+            .FirstOrDefault(entry => string.Equals(entry?["name"]?.GetValue<string>(), name, StringComparison.OrdinalIgnoreCase));
     }
+
+    private static bool? FindFleetEnabled(JsonNode? fleet, string name)
+    {
+        return FindFleetEntry(fleet, name)?["enabled"]?.GetValue<bool>();
+    }
+
+    private static IEnumerable<JsonNode?> FleetEntries(JsonNode? fleet) =>
+        fleet is JsonArray array
+            ? array
+            : Enumerable.Empty<JsonNode?>();
 
     private static async Task SetTargetsAsync(HttpClient http, bool local, bool remote, bool cloud)
     {

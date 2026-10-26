@@ -13,6 +13,7 @@ namespace OllamaRouter.Serialization;
 [JsonSerializable(typeof(AllOfflineDiagnostics))]
 [JsonSerializable(typeof(OfflineTargetInfo))]
 [JsonSerializable(typeof(MonitorStateResponse))]
+[JsonSerializable(typeof(MonitorFleetTargetItem))]
 [JsonSerializable(typeof(MonitorCostStatus))]
 [JsonSerializable(typeof(TargetsUpdateRequest))]
 [JsonSerializable(typeof(TargetsUpdateResponse))]

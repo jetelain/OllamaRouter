@@ -125,6 +125,9 @@ public sealed class ContextAutoShrinkManager : IContextAutoShrinkManager
                 if (!slot.IsExpanded)
                 {
                     // Baseline turn without an expanded lease: stateless engine decision.
+                    // Record the injected bucket so the read-only lease snapshot can report
+                    // the active (baseline) bucket for monitoring.
+                    slot.ActiveBucket = required;
                     slot.LastActivityUtc = nowUtc;
                     return new AutoShrinkLeaseDecision(required, LeaseBucketState.Baseline, false, null);
                 }
@@ -212,6 +215,21 @@ public sealed class ContextAutoShrinkManager : IContextAutoShrinkManager
             {
                 _logger?.LogDebug("Auto-shrink lease for ({Target}, {Model}) was reset (model eviction/reload).", target.Value, normalizedName);
             }
+        }
+    }
+
+    public IReadOnlyDictionary<RoutingTarget, IReadOnlyList<ContextLeaseView>> GetLeaseSnapshot()
+    {
+        lock (_gate)
+        {
+            var snapshot = new Dictionary<RoutingTarget, IReadOnlyList<ContextLeaseView>>();
+            foreach (var (target, byModel) in _leasesByTarget)
+            {
+                snapshot[target] = byModel
+                    .Select(pair => new ContextLeaseView(pair.Key, pair.Value.ActiveBucket, pair.Value.IsExpanded))
+                    .ToList();
+            }
+            return snapshot;
         }
     }
 
