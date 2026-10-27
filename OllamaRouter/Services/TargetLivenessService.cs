@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net.Sockets;
 using Microsoft.Extensions.Options;
 using OllamaRouter.Options;
@@ -93,7 +94,7 @@ public sealed class TargetLivenessService(
             try
             {
                 var outcome = await ProbeOnceAsync(target, CancellationToken.None);
-                ApplyProbeResult(target, slot, outcome, source: "on-demand");
+                ApplyProbeResult(target, slot, outcome.Outcome, outcome.LatencyMs, source: "on-demand");
                 return slot.ReadState();
             }
             finally
@@ -113,7 +114,7 @@ public sealed class TargetLivenessService(
     public Task MarkHardFailureAsync(RoutingTarget target)
     {
         var slot = _slots.GetOrAdd(target, _ => new TargetSlot(target));
-        ApplyProbeResult(target, slot, ProbeOutcome.HardError, source: "uncommitted-transport-failure");
+        ApplyProbeResult(target, slot, ProbeOutcome.HardError, null, source: "uncommitted-transport-failure");
         return Task.CompletedTask;
     }
 
@@ -130,7 +131,7 @@ public sealed class TargetLivenessService(
         // Ensure fleet targets that were never probed still show up as Unknown.
         foreach (var target in GetFleetTargets())
         {
-            result.TryAdd(target, new TargetLivenessEntry(target, TargetLivenessState.Unknown, null, DateTimeOffset.MinValue));
+            result.TryAdd(target, new TargetLivenessEntry(target, TargetLivenessState.Unknown, null, DateTimeOffset.MinValue, null));
         }
 
         return result;
@@ -253,7 +254,7 @@ public sealed class TargetLivenessService(
     {
         var slot = _slots.GetOrAdd(target, _ => new TargetSlot(target));
         var outcome = await ProbeOnceAsync(target, link);
-        var previous = ApplyProbeResult(target, slot, outcome, source);
+        var previous = ApplyProbeResult(target, slot, outcome.Outcome, outcome.LatencyMs, source);
         if (previous != TargetLivenessState.Online && slot.ReadState() == TargetLivenessState.Online)
         {
             // Rejoin: an Offline/Unknown target just became Online → refresh its catalog.
@@ -265,15 +266,16 @@ public sealed class TargetLivenessService(
     /// Performs one <c>GET {Url}/</c> probe and classifies the outcome into a
     /// <see cref="ProbeOutcome"/>. Bounded by the injected <see cref="HttpClient"/>
     /// timeout (1.5 s in production); never throws — every failure maps to an
-    /// outcome so the probe loop and the middleware gate can rely on it.
+    /// outcome so the probe loop and the middleware gate can rely on it. On success
+    /// the elapsed probe duration (milliseconds) is reported for latency reporting.
     /// </summary>
-    private async Task<ProbeOutcome> ProbeOnceAsync(RoutingTarget target, CancellationToken cancellationToken)
+    private async Task<(ProbeOutcome Outcome, long? LatencyMs)> ProbeOnceAsync(RoutingTarget target, CancellationToken cancellationToken)
     {
         var url = GetTargetUrl(target);
         if (url is null)
         {
             // Unconfigured URL: treat as a connection failure (Offline), never an error.
-            return ProbeOutcome.HardError;
+            return (ProbeOutcome.HardError, null);
         }
 
         try
@@ -281,16 +283,18 @@ public sealed class TargetLivenessService(
             using var request = new HttpRequestMessage(HttpMethod.Get, new Uri(url, UriKind.RelativeOrAbsolute).AbsoluteUri);
             // ResponseHeadersRead: only the connection/headers matter for liveness;
             // the body is never buffered.
+            var stopwatch = Stopwatch.StartNew();
             using var response = await probeHttpClient
                 .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
                 .ConfigureAwait(false);
             response.EnsureSuccessStatusCode();
-            return ProbeOutcome.Success;
+            stopwatch.Stop();
+            return (ProbeOutcome.Success, (long)stopwatch.ElapsedMilliseconds);
         }
         catch (Exception ex) when (ex is OperationCanceledException or HttpRequestException or
                                    SocketException)
         {
-            return Classify(ex, cancellationToken);
+            return (Classify(ex, cancellationToken), null);
         }
     }
 
@@ -304,9 +308,10 @@ public sealed class TargetLivenessService(
     /// state. Single code path for on-demand probes and the background re-prober:
     /// Success → Online (resets the timeout counter, refreshes the TTL);
     /// Timeout → 2-strike hysteresis; HardError → immediate Offline;
-    /// Canceled → state unchanged.
+    /// Canceled → state unchanged. <paramref name="latencyMs"/> is stored on the slot
+    /// only for a successful probe (null clears it on any other outcome).
     /// </summary>
-    private TargetLivenessState ApplyProbeResult(RoutingTarget target, TargetSlot slot, ProbeOutcome outcome, string source)
+    private TargetLivenessState ApplyProbeResult(RoutingTarget target, TargetSlot slot, ProbeOutcome outcome, long? latencyMs, string source)
     {
         if (outcome == ProbeOutcome.Canceled)
         {
@@ -329,11 +334,13 @@ public sealed class TargetLivenessService(
                     slot.ConsecutiveTimeouts = 0;
                     slot.CachedAt = DateTimeOffset.UtcNow;
                     slot.LastError = null;
+                    slot.LastProbeLatencyMs = latencyMs;
                     break;
 
                 case ProbeOutcome.Timeout:
                     slot.ConsecutiveTimeouts++;
                     slot.LastError = "timeout";
+                    slot.LastProbeLatencyMs = null;
                     // Hysteresis: an Online/Unknown target trips only after 2
                     // consecutive timeouts; an already-Offline target stays Offline.
                     next = slot.ConsecutiveTimeouts >= TimeoutStrikesToTrip
@@ -348,6 +355,7 @@ public sealed class TargetLivenessService(
                     next = TargetLivenessState.Offline;
                     slot.ConsecutiveTimeouts = 0;
                     slot.LastError = "connection error";
+                    slot.LastProbeLatencyMs = null;
                     break;
             }
 
@@ -444,6 +452,7 @@ public sealed class TargetLivenessService(
         public string? LastError { get; set; }
         public DateTimeOffset CachedAt { get; set; } = DateTimeOffset.MinValue;
         public DateTimeOffset LastProbeAt { get; set; } = DateTimeOffset.MinValue;
+        public long? LastProbeLatencyMs { get; set; }
         public DateTimeOffset LastStateChange { get; set; } = DateTimeOffset.MinValue;
 
         public bool IsOnlineWithinTtl(DateTimeOffset now, TimeSpan ttl) =>
@@ -451,6 +460,6 @@ public sealed class TargetLivenessService(
 
         public TargetLivenessState ReadState() => State;
 
-        public TargetLivenessEntry ToEntry() => new(Target, State, LastError, LastProbeAt);
+        public TargetLivenessEntry ToEntry() => new(Target, State, LastError, LastProbeAt, LastProbeLatencyMs);
     }
 }

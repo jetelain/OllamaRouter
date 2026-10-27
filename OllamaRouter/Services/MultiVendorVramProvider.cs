@@ -33,4 +33,30 @@ public sealed class MultiVendorVramProvider : IGpuVramProvider
 
         return 0;
     }
+
+    public async Task<LocalGpuSnapshot> GetLocalGpuSnapshotAsync(CancellationToken cancellationToken = default)
+    {
+        foreach (var provider in _providers)
+        {
+            LocalGpuSnapshot snapshot;
+            try
+            {
+                snapshot = await provider.GetLocalGpuSnapshotAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                // A vendor probe must never break the fleet view; treat as unknown and move on.
+                continue;
+            }
+
+            _logger?.LogTrace("GPU snapshot probe {Provider}: {Vendor}, {Total}MB",
+                provider.GetType().Name, snapshot.Vendor, snapshot.TotalVramMB);
+            if (snapshot.TotalVramMB > 0)
+            {
+                return snapshot;
+            }
+        }
+
+        return LocalGpuSnapshot.Unknown;
+    }
 }

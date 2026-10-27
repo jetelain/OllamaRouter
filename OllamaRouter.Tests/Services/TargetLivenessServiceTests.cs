@@ -385,6 +385,54 @@ public class TargetLivenessServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task Probe_Success_CapturesLatencyMs_OnEntry()
+    {
+        var (sut, _, _) = CreateSut(request =>
+        {
+            Thread.Sleep(25); // make the probe measurably non-zero
+            return Ok();
+        });
+
+        await sut.EnsureKnownAsync(RoutingTarget.Local);
+
+        var entry = sut.GetEntries()[RoutingTarget.Local];
+        Assert.Equal(TargetLivenessState.Online, entry.State);
+        Assert.NotNull(entry.LastProbeLatencyMs);
+        Assert.True(entry.LastProbeLatencyMs >= 1, $"Expected a positive latency, got {entry.LastProbeLatencyMs}.");
+    }
+
+    [Fact]
+    public async Task Probe_Failure_ClearsLatencyMs()
+    {
+        var flips = 0;
+        var (sut, _, _) = CreateSut(_ =>
+        {
+            flips++;
+            return flips == 1 ? Ok() : throw Refused();
+        }, onlineCacheTtl: TimeSpan.Zero);
+
+        await sut.EnsureKnownAsync(RoutingTarget.Local); // Online, latency captured
+        Assert.NotNull(sut.GetEntries()[RoutingTarget.Local].LastProbeLatencyMs);
+
+        await sut.EnsureKnownAsync(RoutingTarget.Local); // hard error → Offline, latency cleared
+
+        var entry = sut.GetEntries()[RoutingTarget.Local];
+        Assert.Equal(TargetLivenessState.Offline, entry.State);
+        Assert.Null(entry.LastProbeLatencyMs);
+    }
+
+    [Fact]
+    public void GetEntries_NeverProbedTargets_HaveNullLatency()
+    {
+        var (sut, _, _) = CreateSut(_ => Ok());
+
+        var entry = sut.GetEntries()[RoutingTarget.Local];
+
+        Assert.Equal(TargetLivenessState.Unknown, entry.State);
+        Assert.Null(entry.LastProbeLatencyMs);
+    }
+
+    [Fact]
     public async Task RealSocket_ListeningButSilentDaemon_TwoProbeTimeoutsTripOffline_SingleTimeoutDoesNot()
     {
         // A real loopback listener that is never accepted from: the kernel accept

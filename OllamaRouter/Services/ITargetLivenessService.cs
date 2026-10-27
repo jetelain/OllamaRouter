@@ -30,7 +30,8 @@ public sealed record TargetLivenessEntry(
     RoutingTarget Target,
     TargetLivenessState State,
     string? LastError,
-    DateTimeOffset LastProbeAt);
+    DateTimeOffset LastProbeAt,
+    long? LastProbeLatencyMs = null);
 
 /// <summary>
 /// Immutable snapshot of the liveness state of the entire fleet, for diagnostics

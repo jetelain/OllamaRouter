@@ -63,4 +63,70 @@ public class NvidiaSmiVramProviderTests
 
         Assert.Equal(0, provider.GetFreeVramMB());
     }
+
+    [Fact]
+    public async Task GetLocalGpuSnapshot_ReturnsDevicePerLine_WithSummedVram_WhenNvidiaSmiSucceeds()
+    {
+        var runner = new FakeProcessRunner().Succeeds(
+            "nvidia-smi",
+            "--query-gpu=name,memory.total --format=csv,noheader",
+            "GeForce RTX 4080, 16384 MiB\nGeForce RTX 4080, 16384 MiB\n");
+
+        var provider = new NvidiaSmiVramProvider(runner);
+
+        var snapshot = await provider.GetLocalGpuSnapshotAsync();
+
+        Assert.Equal("Nvidia", snapshot.Vendor);
+        Assert.Equal(
+            [
+                "NVIDIA GeForce RTX 4080 (16384 MB)",
+                "NVIDIA GeForce RTX 4080 (16384 MB)"
+            ],
+            snapshot.Devices);
+        Assert.Equal(32768, snapshot.TotalVramMB);
+    }
+
+    [Fact]
+    public async Task GetLocalGpuSnapshot_ReturnsUnknown_WhenFailedToStart()
+    {
+        var runner = new FakeProcessRunner().FailsToStart("nvidia-smi", "--query-gpu=name,memory.total --format=csv,noheader");
+
+        var provider = new NvidiaSmiVramProvider(runner);
+
+        var snapshot = await provider.GetLocalGpuSnapshotAsync();
+
+        Assert.Equal(LocalGpuSnapshot.Unknown, snapshot);
+    }
+
+    [Fact]
+    public async Task GetLocalGpuSnapshot_ReturnsUnknown_WhenNonZeroExit()
+    {
+        var runner = new FakeProcessRunner().Fails("nvidia-smi", "--query-gpu=name,memory.total --format=csv,noheader", 1, "GPU 0, 16384 MiB\n");
+
+        var provider = new NvidiaSmiVramProvider(runner);
+
+        var snapshot = await provider.GetLocalGpuSnapshotAsync();
+
+        Assert.Equal(LocalGpuSnapshot.Unknown, snapshot);
+    }
+
+    [Fact]
+    public async Task GetLocalGpuSnapshot_ReturnsUnknown_WhenStdoutEmptyOrUnparseable()
+    {
+        var empty = new FakeProcessRunner().Succeeds("nvidia-smi", "--query-gpu=name,memory.total --format=csv,noheader", "");
+        Assert.Equal(LocalGpuSnapshot.Unknown, await new NvidiaSmiVramProvider(empty).GetLocalGpuSnapshotAsync());
+
+        var unparseable = new FakeProcessRunner().Succeeds("nvidia-smi", "--query-gpu=name,memory.total --format=csv,noheader", "[N/A], [N/A]\n");
+        Assert.Equal(LocalGpuSnapshot.Unknown, await new NvidiaSmiVramProvider(unparseable).GetLocalGpuSnapshotAsync());
+    }
+
+    [Fact]
+    public async Task GetLocalGpuSnapshot_ReturnsUnknown_WhenTimedOut()
+    {
+        var runner = new FakeProcessRunner().TimesOut("nvidia-smi", "--query-gpu=name,memory.total --format=csv,noheader", "GeForce RTX 4080, 16384");
+
+        var provider = new NvidiaSmiVramProvider(runner);
+
+        Assert.Equal(LocalGpuSnapshot.Unknown, await provider.GetLocalGpuSnapshotAsync());
+    }
 }

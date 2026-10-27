@@ -742,7 +742,7 @@ public class RoutingDecisionServiceTests
 
     private static Dictionary<RoutingTarget, TargetLivenessEntry> Entries(
         RoutingTarget target, TargetLivenessState state)
-        => new() { [target] = new TargetLivenessEntry(target, state, null, DateTimeOffset.UtcNow) };
+        => new() { [target] = new TargetLivenessEntry(target, state, null, DateTimeOffset.UtcNow, null) };
 
     private static JsonObject MoeShow(long paramCount) => new()
     {

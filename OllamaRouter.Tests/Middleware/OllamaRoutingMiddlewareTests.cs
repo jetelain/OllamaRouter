@@ -62,8 +62,8 @@ public class OllamaRoutingMiddlewareTests
                 .Setup(t => t.GetEntries())
                 .Returns(new Dictionary<RoutingTarget, TargetLivenessEntry>
                 {
-                    [RoutingTarget.Local] = new TargetLivenessEntry(RoutingTarget.Local, TargetLivenessState.Online, null, DateTimeOffset.UtcNow),
-                    [RoutingTarget.Remote] = new TargetLivenessEntry(RoutingTarget.Remote, TargetLivenessState.Online, null, DateTimeOffset.UtcNow)
+                    [RoutingTarget.Local] = new TargetLivenessEntry(RoutingTarget.Local, TargetLivenessState.Online, null, DateTimeOffset.UtcNow, null),
+                    [RoutingTarget.Remote] = new TargetLivenessEntry(RoutingTarget.Remote, TargetLivenessState.Online, null, DateTimeOffset.UtcNow, null)
                 });
             effectiveTargetLiveness
                 .Setup(t => t.GetSnapshot())

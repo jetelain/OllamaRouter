@@ -15,6 +15,60 @@ public sealed class NvidiaSmiVramProvider : IGpuVramProvider
         _processRunner = processRunner ?? throw new ArgumentNullException(nameof(processRunner));
     }
 
+    public Task<LocalGpuSnapshot> GetLocalGpuSnapshotAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var result = _processRunner.Run(
+                "nvidia-smi",
+                "--query-gpu=name,memory.total --format=csv,noheader",
+                TimeoutMs);
+            if (!result.Succeeded)
+            {
+                return Task.FromResult(LocalGpuSnapshot.Unknown);
+            }
+
+            var devices = new List<string>();
+            var totalVramMB = 0;
+            foreach (var rawLine in result.StdOut.Split('\n'))
+            {
+                var line = rawLine.Trim();
+                if (line.Length == 0)
+                {
+                    continue;
+                }
+
+                var separatorIndex = line.IndexOf(',');
+                if (separatorIndex <= 0 || separatorIndex == line.Length - 1)
+                {
+                    continue;
+                }
+
+                var name = line[..separatorIndex].Trim();
+                var totalPart = line[(separatorIndex + 1)..].Trim();
+                // nvidia-smi reports totals as e.g. "16384 MiB"; parse the leading number.
+                var numberEnd = 0;
+                while (numberEnd < totalPart.Length && char.IsDigit(totalPart[numberEnd]))
+                {
+                    numberEnd++;
+                }
+                if (numberEnd > 0 && int.TryParse(totalPart[..numberEnd], out var totalMB))
+                {
+                    devices.Add($"NVIDIA {name} ({totalMB} MB)");
+                    totalVramMB += totalMB;
+                }
+            }
+
+            return Task.FromResult(devices.Count > 0
+                ? new LocalGpuSnapshot("Nvidia", devices, totalVramMB)
+                : LocalGpuSnapshot.Unknown);
+        }
+        catch
+        {
+            return Task.FromResult(LocalGpuSnapshot.Unknown);
+        }
+    }
+
     public int GetFreeVramMB()
     {
         try

@@ -204,6 +204,10 @@ public static class OllamaRouterServiceCollectionExtensions
         // 2. HYBRID ENDPOINTS /api/tags, /api/ps and /v1/models (short-circuit YARP).
         app.MapOllamaRouterEndpoints();
 
+        // 2b. PROGRAMMATIC ROUTER API /api/router/info + /api/router/fleet (lightweight
+        //     identity / fleet hardware topology endpoints for external tooling).
+        app.MapOllamaRouterApiEndpoints();
+
         // Lightweight activity monitoring UI (no VRAM impact, in-memory state only).
         app.MapOllamaMonitorEndpoints();
 
