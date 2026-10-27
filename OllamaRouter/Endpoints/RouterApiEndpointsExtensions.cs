@@ -1,6 +1,7 @@
 using System.Reflection;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using OllamaRouter.Middleware;
@@ -25,6 +26,11 @@ namespace OllamaRouter.Endpoints;
 /// parameter count, native Modelfile num_ctx and the router-calculated hardware-safe context
 /// ceiling (recommendedContextWindow = max CMax over the hardware-capable fleet targets;
 /// cloud overflow is never a ceiling contributor, only the cloudOverflowAvailable hint).</item>
+/// <item><c>POST /api/router/vram/reclaim</c> and <c>POST /api/router/fleet/unload</c> (exact
+/// alias, identical contract) — fleet VRAM reclaim: unloads the running models on one named
+/// target (case-insensitive; unknown name → 404) or on ALL effective configured targets
+/// (fail-soft per target) and optionally administratively disables the processed target(s);
+/// KV-cache leases of every processed target are reset to the baseline bucket.</item>
 /// <item><c>POST /api/router/context/evaluate</c> — stateless routing + dynamic context sizing
 /// preview: which target would service a request for the given prompt size and which
 /// num_ctx bucket would be injected (no LLM inference; only catalog /api/tags + /api/show
@@ -90,6 +96,13 @@ public static class RouterApiEndpointsExtensions
             return Results.Json(detail, OllamaRouterJsonSerializerContext.Default.RouterModelDetailResponse);
         });
 
+        // Canonical fleet VRAM reclaim + exact alias (identical handler, parameters and
+        // response shape). Both paths unload the running models on the selected effective
+        // target(s) — or ALL effective targets when no target is specified (fail-soft per
+        // target; the Cloud pseudo-target is never part of the effective list).
+        app.MapPost("/api/router/vram/reclaim", ReclaimVramHandler);
+        app.MapPost("/api/router/fleet/unload", ReclaimVramHandler);
+
         app.MapPost("/api/router/context/evaluate", async (
             HttpRequest request,
             IOptions<OllamaRouterOptions> options,
@@ -138,6 +151,109 @@ public static class RouterApiEndpointsExtensions
         });
 
         return app;
+    }
+
+    // ------------------------------------------------------------------
+    //  POST /api/router/vram/reclaim (+ POST /api/router/fleet/unload alias)
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// Fleet VRAM reclaim handler (canonical path <c>/api/router/vram/reclaim</c>, exact
+    /// alias <c>/api/router/fleet/unload</c>): unloads the running models on the selected
+    /// effective target (case-insensitive name match; unknown name → 404) or on ALL
+    /// effective configured targets (fail-soft per target) when no target is specified.
+    /// Parameters are accepted via query string and/or an optional JSON body; body values
+    /// win over query values. Optional <c>disableTarget</c> (default false) administratively
+    /// disables each processed target via <see cref="ITargetAvailabilityService"/> (persisted).
+    /// KV-cache leases of every processed target are reset so the next request starts at
+    /// the baseline bucket. Dependency-free beyond options + catalog client (the
+    /// availability service and context-shrink manager are resolved defensively).
+    /// </summary>
+    private static async Task<IResult> ReclaimVramHandler(
+        HttpRequest request,
+        IOptions<OllamaRouterOptions> options,
+        IOllamaModelCatalogClient catalogClient,
+        IServiceProvider serviceProvider,
+        [FromQuery] string? target,
+        [FromQuery] bool? disableTarget,
+        CancellationToken cancellationToken)
+    {
+        // Optional JSON body: a malformed body falls through to the query values (the same
+        // pattern as /api/router/context/evaluate), so a bad body never 400s a request the
+        // query string already satisfies.
+        RouterVramReclaimRequest? body = null;
+        try
+        {
+            body = await System.Text.Json.JsonSerializer.DeserializeAsync(
+                request.Body,
+                OllamaRouterJsonSerializerContext.Default.RouterVramReclaimRequest,
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            // Malformed JSON body: fall through to the query values.
+        }
+
+        // Body values win over query values: an explicit body is authoritative for both fields
+        // (a body with absent fields uses the record defaults: target null, disableTarget false);
+        // an absent/malformed body falls back entirely to the query values.
+        var effectiveTargetName = body is not null
+            ? (string.IsNullOrWhiteSpace(body.Target) ? target : body.Target)
+            : target;
+        var effectiveDisable = body is not null
+            ? body.DisableTarget
+            : disableTarget ?? false;
+
+        var effectiveTargets = options.Value.GetEffectiveTargets();
+        if (effectiveTargets.Count == 0)
+        {
+            return Results.Json(
+                new RouterVramReclaimResponse(
+                    Success: false,
+                    TotalUnloaded: 0,
+                    Targets: [],
+                    Message: "no targets configured"),
+                OllamaRouterJsonSerializerContext.Default.RouterVramReclaimResponse);
+        }
+
+        // Single target: case-insensitive match against the effective fleet (D4: unknown → 404).
+        IReadOnlyList<OllamaTargetOptions> selected;
+        if (!string.IsNullOrWhiteSpace(effectiveTargetName))
+        {
+            var match = effectiveTargets.FirstOrDefault(t =>
+                string.Equals(t.Name, effectiveTargetName, StringComparison.OrdinalIgnoreCase));
+            if (match is null)
+            {
+                return Results.Json(
+                    new OllamaErrorResponse($"target not found: {effectiveTargetName}"),
+                    OllamaRouterJsonSerializerContext.Default.OllamaErrorResponse,
+                    statusCode: StatusCodes.Status404NotFound);
+            }
+
+            selected = [match];
+        }
+        else
+        {
+            // Fleet-wide: ALL effective configured targets regardless of liveness/enablement
+            // (unreachable daemons fail soft per target via StopRunningModelsAsync).
+            selected = effectiveTargets;
+        }
+
+        var availability = serviceProvider.GetService<ITargetAvailabilityService>();
+        var shrinkManager = serviceProvider.GetService<IContextAutoShrinkManager>();
+
+        // Concurrent per-target unload (fail-soft; results preserve the configured order).
+        var results = await Task.WhenAll(selected.Select(t =>
+            VramReclaimCore.ReclaimTargetAsync(
+                t, effectiveDisable, catalogClient, availability, shrinkManager, cancellationToken)))
+            .ConfigureAwait(false);
+
+        return Results.Json(
+            new RouterVramReclaimResponse(
+                Success: true,
+                TotalUnloaded: results.Sum(r => r.UnloadedModels.Count),
+                Targets: results),
+            OllamaRouterJsonSerializerContext.Default.RouterVramReclaimResponse);
     }
 
     // ------------------------------------------------------------------
@@ -1184,3 +1300,36 @@ public sealed record RouterContextEvaluateResponse(
     [property: JsonPropertyName("estimatedTokensWithMargin")] int EstimatedTokensWithMargin,
     [property: JsonPropertyName("targetMaxContext")] int TargetMaxContext,
     [property: JsonPropertyName("affinityScore")] double AffinityScore);
+
+/// <summary>
+/// Optional request body of <c>POST /api/router/vram/reclaim</c> / <c>POST /api/router/fleet/unload</c>:
+/// the target name to unload (null/absent = all effective targets) and whether to
+/// administratively disable the processed target(s) (default false). The same parameters are
+/// also accepted as query string values; body values win when both are present.
+/// </summary>
+public sealed record RouterVramReclaimRequest(
+    [property: JsonPropertyName("target")] string? Target = null,
+    [property: JsonPropertyName("disableTarget")] bool DisableTarget = false);
+
+/// <summary>
+/// One row of the <c>targets</c> array of the fleet VRAM reclaim response: the target's
+/// canonical configured name, the models unloaded on it (empty when the daemon was
+/// unreachable or had no running models) and whether it was administratively disabled.
+/// </summary>
+public sealed record RouterVramReclaimTargetResult(
+    [property: JsonPropertyName("target")] string Target,
+    [property: JsonPropertyName("unloadedModels")] IReadOnlyList<string> UnloadedModels,
+    [property: JsonPropertyName("disabled")] bool Disabled);
+
+/// <summary>
+/// Response payload of <c>POST /api/router/vram/reclaim</c> / <c>POST /api/router/fleet/unload</c>:
+/// whether the operation executed against a valid target set (individual unreachable daemons
+/// are fail-soft), the total number of unloaded models across the fleet, and the per-target
+/// results in configured fleet order. <see cref="Message"/> is omitted (null) on success and
+/// set to "no targets configured" when the effective target list is empty.
+/// </summary>
+public sealed record RouterVramReclaimResponse(
+    [property: JsonPropertyName("success")] bool Success,
+    [property: JsonPropertyName("totalUnloaded")] int TotalUnloaded,
+    [property: JsonPropertyName("targets")] IReadOnlyList<RouterVramReclaimTargetResult> Targets,
+    [property: JsonPropertyName("message")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Message = null);

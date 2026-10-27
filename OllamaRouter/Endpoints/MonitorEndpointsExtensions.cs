@@ -58,72 +58,75 @@ public static class MonitorEndpointsExtensions
             IOllamaModelCatalogClient catalogClient,
             ITargetAvailabilityService targetAvailability,
             IOptions<OllamaRouterOptions> options,
+            IServiceProvider serviceProvider,
             CancellationToken cancellationToken) =>
-        {
-            var shouldDisable = disableTarget ?? true;
-
-            if (shouldDisable)
-            {
-                DisableLocalTarget(targetAvailability);
-            }
-
-            var localUrl = options.Value.LocalUrl?.TrimEnd('/');
-            if (string.IsNullOrWhiteSpace(localUrl))
-            {
-                return Results.Ok(new ReclaimVramResponse(
-                    Success: false,
-                    Message: "Local URL is not configured.",
-                    Count: 0,
-                    UnloadedModels: Array.Empty<string>(),
-                    LocalDisabled: shouldDisable));
-            }
-
-            var unloaded = await catalogClient.StopRunningModelsAsync(localUrl, cancellationToken);
-            return Results.Ok(new ReclaimVramResponse(
-                Success: true,
-                Message: null,
-                Count: unloaded.Count,
-                UnloadedModels: unloaded,
-                LocalDisabled: shouldDisable));
-        });
+            await ReclaimLocalLegacyAsync(
+                disableTarget ?? true, catalogClient, targetAvailability, options,
+                serviceProvider.GetService<IContextAutoShrinkManager>(), cancellationToken));
 
         app.MapPost("/api/models/unload", async (
             [FromQuery] bool? disableTarget,
             IOllamaModelCatalogClient catalogClient,
             ITargetAvailabilityService targetAvailability,
             IOptions<OllamaRouterOptions> options,
+            IServiceProvider serviceProvider,
             CancellationToken cancellationToken) =>
-        {
-            var shouldDisable = disableTarget ?? false;
-
-            if (shouldDisable)
-            {
-                DisableLocalTarget(targetAvailability);
-            }
-
-            var localUrl = options.Value.LocalUrl?.TrimEnd('/');
-            if (string.IsNullOrWhiteSpace(localUrl))
-            {
-                return Results.Ok(new ReclaimVramResponse(
-                    Success: false,
-                    Message: "Local URL is not configured.",
-                    Count: 0,
-                    UnloadedModels: Array.Empty<string>(),
-                    LocalDisabled: shouldDisable));
-            }
-
-            var unloaded = await catalogClient.StopRunningModelsAsync(localUrl, cancellationToken);
-            return Results.Ok(new ReclaimVramResponse(
-                Success: true,
-                Message: null,
-                Count: unloaded.Count,
-                UnloadedModels: unloaded,
-                LocalDisabled: shouldDisable));
-        });
+            await ReclaimLocalLegacyAsync(
+                disableTarget ?? false, catalogClient, targetAvailability, options,
+                serviceProvider.GetService<IContextAutoShrinkManager>(), cancellationToken));
 
         app.MapGet("/monitor", () => Results.Content(MonitorPageHtml, "text/html"));
 
         return app;
+    }
+
+    /// <summary>
+    /// Shared legacy per-"Local"-target reclaim core for <c>POST /monitor/reclaim-vram</c>
+    /// (default <c>disableTarget: true</c>) and <c>POST /api/models/unload</c> (default
+    /// <c>false</c>): keeps the exact legacy behavior — "Local" is disabled FIRST (even when
+    /// <c>LocalUrl</c> is unconfigured, in which case the response is
+    /// <c>success: false</c> + "Local URL is not configured.") and the unload is routed
+    /// through the shared per-target <see cref="VramReclaimCore"/>, preserving the legacy
+    /// <see cref="ReclaimVramResponse"/> shape byte-for-byte.
+    /// </summary>
+    private static async Task<IResult> ReclaimLocalLegacyAsync(
+        bool shouldDisable,
+        IOllamaModelCatalogClient catalogClient,
+        ITargetAvailabilityService targetAvailability,
+        IOptions<OllamaRouterOptions> options,
+        IContextAutoShrinkManager? shrinkManager,
+        CancellationToken cancellationToken)
+    {
+        if (shouldDisable)
+        {
+            DisableLocalTarget(targetAvailability);
+        }
+
+        var localUrl = options.Value.LocalUrl?.TrimEnd('/');
+        if (string.IsNullOrWhiteSpace(localUrl))
+        {
+            return Results.Ok(new ReclaimVramResponse(
+                Success: false,
+                Message: "Local URL is not configured.",
+                Count: 0,
+                UnloadedModels: Array.Empty<string>(),
+                LocalDisabled: shouldDisable));
+        }
+
+        var result = await VramReclaimCore.ReclaimTargetAsync(
+            new OllamaTargetOptions { Name = "Local", Url = localUrl },
+            false, // Already disabled above (legacy pre-disable ordering).
+            catalogClient,
+            targetAvailability,
+            shrinkManager,
+            cancellationToken).ConfigureAwait(false);
+
+        return Results.Ok(new ReclaimVramResponse(
+            Success: true,
+            Message: null,
+            Count: result.UnloadedModels.Count,
+            UnloadedModels: result.UnloadedModels,
+            LocalDisabled: shouldDisable));
     }
 
     // "Reclaim" behavior: disable the target named "Local" (case-insensitive); when no such
