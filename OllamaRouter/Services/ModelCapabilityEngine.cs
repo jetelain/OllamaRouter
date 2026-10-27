@@ -116,6 +116,18 @@ public sealed class ModelCapabilityEngine(
     public const long LargeDenseParameterThreshold = 14_000_000_000;
 
     /// <summary>
+    /// Exact human-readable veto reason exposed by the model capability API for
+    /// <see cref="ModelArchitectureKind.LargeDense"/> models on small-class (&lt; 12 GB) targets.
+    /// </summary>
+    public const string LargeDenseVetoReason = "Dense model >= 14B exceeds 8GB hardware limit";
+
+    /// <summary>
+    /// Wire name for REST DTOs: "Moe" for MoE, "Dense" for Small/LargeDense.
+    /// </summary>
+    public static string ArchitectureWireName(ModelArchitectureKind kind) =>
+        kind == ModelArchitectureKind.Moe ? "Moe" : "Dense";
+
+    /// <summary>
     /// Minimum effective VRAM (in MB) of a server-class ("96gb") target.
     /// </summary>
     private const int ServerCeilingMB = 98304;

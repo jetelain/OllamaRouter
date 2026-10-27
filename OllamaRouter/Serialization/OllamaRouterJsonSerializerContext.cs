@@ -27,6 +27,12 @@ namespace OllamaRouter.Serialization;
 [JsonSerializable(typeof(RouterTargetItem))]
 [JsonSerializable(typeof(RouterTargetHardware))]
 [JsonSerializable(typeof(RouterTargetExecution))]
+[JsonSerializable(typeof(RouterModelSummary))]
+[JsonSerializable(typeof(RouterModelsResponse))]
+[JsonSerializable(typeof(RouterModelDetailResponse))]
+[JsonSerializable(typeof(RouterModelTargetCompatibility))]
+[JsonSerializable(typeof(RouterContextEvaluateRequest))]
+[JsonSerializable(typeof(RouterContextEvaluateResponse))]
 public partial class OllamaRouterJsonSerializerContext : JsonSerializerContext
 {
 }
