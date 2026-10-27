@@ -59,7 +59,9 @@ public sealed class TargetLivenessService(
     //  ITargetLivenessService
     // ------------------------------------------------------------------
 
-    public bool IsOnline(RoutingTarget target)
+    public bool IsOnline(RoutingTarget target) => IsOnline(target, _onlineCacheTtl);
+
+    public bool IsOnline(RoutingTarget target, TimeSpan maxAge)
     {
         if (!_slots.TryGetValue(target, out var slot))
         {
@@ -68,8 +70,7 @@ public sealed class TargetLivenessService(
 
         lock (slot)
         {
-            return slot.State == TargetLivenessState.Online &&
-                   DateTimeOffset.UtcNow - slot.CachedAt <= _onlineCacheTtl;
+            return slot.IsOnlineWithinTtl(DateTimeOffset.UtcNow, maxAge);
         }
     }
 

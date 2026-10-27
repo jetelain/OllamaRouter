@@ -46,6 +46,7 @@ public class AggregatedEndpointsTests
             .Setup(t => t.EnsureKnownAsync(It.IsAny<RoutingTarget>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(TargetLivenessState.Online);
         liveness.Setup(t => t.IsOnline(It.IsAny<RoutingTarget>())).Returns(true);
+        liveness.Setup(t => t.IsOnline(It.IsAny<RoutingTarget>(), It.IsAny<TimeSpan>())).Returns(true);
         liveness.SetupGet(t => t.ServiceStartTimeUtc).Returns(DateTimeOffset.UtcNow.AddMinutes(1));
         liveness.Setup(t => t.GetFleetTargets()).Returns(new[]
         {
@@ -130,6 +131,7 @@ public class AggregatedEndpointsTests
 
             // Laptop goes asleep: it is offline AND its live fetch would miss the budget.
             liveness.Setup(t => t.IsOnline(new RoutingTarget("Laptop"))).Returns(false);
+            liveness.Setup(t => t.IsOnline(new RoutingTarget("Laptop"), It.IsAny<TimeSpan>())).Returns(false);
             liveness.Setup(t => t.GetEntries()).Returns(new Dictionary<RoutingTarget, TargetLivenessEntry>
             {
                 [new RoutingTarget("Desktop")] = new(new RoutingTarget("Desktop"), TargetLivenessState.Online, null, DateTimeOffset.UtcNow),

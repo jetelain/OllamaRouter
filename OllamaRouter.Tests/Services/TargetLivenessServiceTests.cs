@@ -499,6 +499,40 @@ public class TargetLivenessServiceTests : IDisposable
         okListener.Stop();
     }
 
+    [Fact]
+    public async Task IsOnline_WithMaxAge_AcceptsExpiredDefaultTtl_UntilMaxAge()
+    {
+        var (sut, _, _) = CreateSut(_ => Ok(), onlineCacheTtl: TimeSpan.FromMilliseconds(50));
+
+        var state = await sut.EnsureKnownAsync(RoutingTarget.Local);
+        Assert.Equal(TargetLivenessState.Online, state);
+
+        Assert.True(sut.IsOnline(RoutingTarget.Local));
+        Assert.True(sut.IsOnline(RoutingTarget.Local, TimeSpan.FromMilliseconds(500)));
+
+        await Task.Delay(80);
+
+        // Strict default IsOnline has expired (50ms)
+        Assert.False(sut.IsOnline(RoutingTarget.Local));
+
+        // Tolerant IsOnline with maxAge 500ms still passes
+        Assert.True(sut.IsOnline(RoutingTarget.Local, TimeSpan.FromMilliseconds(500)));
+
+        // Smaller maxAge fails
+        Assert.False(sut.IsOnline(RoutingTarget.Local, TimeSpan.FromMilliseconds(50)));
+    }
+
+    [Fact]
+    public async Task IsOnline_WithMaxAge_OfflineTarget_ReturnsFalseRegardlessOfMaxAge()
+    {
+        var (sut, _, _) = CreateSut(_ => throw Refused());
+
+        await sut.EnsureKnownAsync(RoutingTarget.Local);
+
+        Assert.False(sut.IsOnline(RoutingTarget.Local));
+        Assert.False(sut.IsOnline(RoutingTarget.Local, TimeSpan.FromMinutes(10)));
+    }
+
     private static async Task AssertEventuallyAsync(Func<bool> condition, int timeoutMs = 3000, int pollMs = 20)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();

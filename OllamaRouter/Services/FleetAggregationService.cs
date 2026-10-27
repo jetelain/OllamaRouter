@@ -39,7 +39,7 @@ public sealed class FleetAggregationService(
             .Where(t => t.Enabled &&
                         !string.Equals(t.Name, RoutingTarget.Cloud.Value, StringComparison.OrdinalIgnoreCase) &&
                         !string.IsNullOrWhiteSpace(t.Url) &&
-                        (liveness.IsOnline((RoutingTarget)t.Name!) ||
+                        (liveness.IsOnline((RoutingTarget)t.Name!, ITargetLivenessService.DefaultTolerantCacheTtl) ||
                          (withinGrace &&
                           entries.TryGetValue((RoutingTarget)t.Name!, out var entry) &&
                           entry.State == TargetLivenessState.Unknown)))
@@ -206,7 +206,7 @@ public sealed class FleetAggregationService(
     // 10 s startup grace window.
     private bool IsTargetRoutable(RoutingTarget target)
     {
-        if (liveness.IsOnline(target))
+        if (liveness.IsOnline(target, ITargetLivenessService.DefaultTolerantCacheTtl))
         {
             return true;
         }

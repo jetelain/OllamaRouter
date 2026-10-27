@@ -65,12 +65,24 @@ public sealed record TargetLivenessSnapshot(IReadOnlyList<TargetLivenessEntry> E
 public interface ITargetLivenessService
 {
     /// <summary>
+    /// Default tolerance for non-routing operations (metadata aggregation, background stats refresh):
+    /// 15 seconds, comfortably exceeding the 10 s background reprobe cycle while still bounded.
+    /// </summary>
+    public static readonly TimeSpan DefaultTolerantCacheTtl = TimeSpan.FromSeconds(15);
+
+    /// <summary>
     /// Fast, TTL-aware "is this target currently safe to route to" predicate:
     /// true iff the state machine says Online AND the last successful probe is
     /// within the 3 s cache TTL. A target whose cache expired is stale and must be
     /// re-probed via <see cref="EnsureKnownAsync"/> before being trusted again.
     /// </summary>
     bool IsOnline(RoutingTarget target);
+
+    /// <summary>
+    /// Tolerant liveness predicate for non-routing callers (metadata aggregation, background stats refresh):
+    /// true iff the state machine says Online AND the last successful probe is within <paramref name="maxAge"/>.
+    /// </summary>
+    bool IsOnline(RoutingTarget target, TimeSpan maxAge);
 
     /// <summary>
     /// Ensures the liveness state of <paramref name="target"/> is known and fresh:

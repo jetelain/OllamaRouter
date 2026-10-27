@@ -245,7 +245,7 @@ public sealed class TargetExecutionTracker : ITargetExecutionTracker
             .Where(t => t.Enabled &&
                         !string.Equals(t.Name, RoutingTarget.Cloud.Value, StringComparison.OrdinalIgnoreCase) &&
                         !string.IsNullOrWhiteSpace(t.Url) &&
-                        (_liveness.IsOnline((RoutingTarget)t.Name!) ||
+                        (_liveness.IsOnline((RoutingTarget)t.Name!, ITargetLivenessService.DefaultTolerantCacheTtl) ||
                          (withinGrace &&
                           entries.TryGetValue((RoutingTarget)t.Name!, out var entry) &&
                           entry.State == TargetLivenessState.Unknown)))

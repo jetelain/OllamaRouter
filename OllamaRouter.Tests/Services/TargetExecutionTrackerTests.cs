@@ -785,6 +785,7 @@ public class TargetExecutionTrackerTests : IDisposable
             .ToDictionary(t => t, t => new TargetLivenessEntry(t, TargetLivenessState.Online, null, DateTimeOffset.UtcNow, null));
 
         liveness.Setup(t => t.IsOnline(It.IsAny<RoutingTarget>())).Returns(true);
+        liveness.Setup(t => t.IsOnline(It.IsAny<RoutingTarget>(), It.IsAny<TimeSpan>())).Returns(true);
         liveness.SetupGet(t => t.ServiceStartTimeUtc).Returns(DateTimeOffset.UtcNow.AddMinutes(1)); // Grace window already elapsed.
         liveness.Setup(t => t.GetFleetTargets()).Returns(fleet);
         liveness.Setup(t => t.GetEntries()).Returns(entries);

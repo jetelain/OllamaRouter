@@ -219,6 +219,9 @@ public class RouterModelApiEndpointsTests
             .Setup(l => l.IsOnline(It.IsAny<RoutingTarget>()))
             .Returns<RoutingTarget>(t => states.TryGetValue(t, out var state) && state == TargetLivenessState.Online);
         liveness
+            .Setup(l => l.IsOnline(It.IsAny<RoutingTarget>(), It.IsAny<TimeSpan>()))
+            .Returns<RoutingTarget, TimeSpan>((t, _) => states.TryGetValue(t, out var state) && state == TargetLivenessState.Online);
+        liveness
             .SetupGet(l => l.ServiceStartTimeUtc)
             .Returns(DateTimeOffset.UtcNow.AddMinutes(1));
 

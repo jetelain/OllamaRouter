@@ -47,6 +47,7 @@ public class FleetAggregationServiceTests : IDisposable
             .Setup(t => t.EnsureKnownAsync(It.IsAny<RoutingTarget>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(TargetLivenessState.Online);
         _liveness.Setup(t => t.IsOnline(It.IsAny<RoutingTarget>())).Returns(true);
+        _liveness.Setup(t => t.IsOnline(It.IsAny<RoutingTarget>(), It.IsAny<TimeSpan>())).Returns(true);
         _liveness.SetupGet(t => t.ServiceStartTimeUtc).Returns(DateTimeOffset.UtcNow.AddMinutes(1));
         _liveness
             .Setup(t => t.GetFleetTargets())
@@ -226,6 +227,7 @@ public class FleetAggregationServiceTests : IDisposable
         // The Lp goes Offline: it must not be contacted, yet its cached catalog
         // (60 s stale slot) is still served.
         _liveness.Setup(t => t.IsOnline(Lp)).Returns(false);
+        _liveness.Setup(t => t.IsOnline(Lp, It.IsAny<TimeSpan>())).Returns(false);
         _liveness.Setup(t => t.GetEntries()).Returns(new Dictionary<RoutingTarget, TargetLivenessEntry>
         {
             [Dt] = new(Dt, TargetLivenessState.Online, null, DateTimeOffset.UtcNow),
@@ -305,6 +307,7 @@ public class FleetAggregationServiceTests : IDisposable
         // There is no "Local"-named target, so the primary is the first enabled effective
         // target, i.e. Dt.
         _liveness.Setup(t => t.IsOnline(Sv)).Returns(false);
+        _liveness.Setup(t => t.IsOnline(Sv, It.IsAny<TimeSpan>())).Returns(false);
         _liveness.Setup(t => t.EnsureKnownAsync(Sv, It.IsAny<CancellationToken>())).ReturnsAsync(TargetLivenessState.Offline);
 
         var result = await CreateService().GetShowFleetAsync("llama3", pinned: Sv);
@@ -352,6 +355,7 @@ public class FleetAggregationServiceTests : IDisposable
     public void GetFanOutTargets_ExcludesOfflineTargets()
     {
         _liveness.Setup(t => t.IsOnline(Lp)).Returns(false);
+        _liveness.Setup(t => t.IsOnline(Lp, It.IsAny<TimeSpan>())).Returns(false);
         _liveness.Setup(t => t.GetEntries()).Returns(new Dictionary<RoutingTarget, TargetLivenessEntry>
         {
             [Dt] = new(Dt, TargetLivenessState.Online, null, DateTimeOffset.UtcNow),
@@ -361,5 +365,21 @@ public class FleetAggregationServiceTests : IDisposable
 
         var fanOut = CreateService().GetFanOutTargets();
         Assert.Equal(new[] { "Desktop", "Server" }, fanOut.Select(t => t.Name));
+    }
+
+    [Fact]
+    public void GetFanOutTargets_ToleratesProbeOlderThanDefaultTtl_WhenWithinTolerantWindow()
+    {
+        _liveness.Setup(t => t.IsOnline(It.IsAny<RoutingTarget>())).Returns(false);
+        _liveness.Setup(t => t.IsOnline(It.IsAny<RoutingTarget>(), ITargetLivenessService.DefaultTolerantCacheTtl)).Returns(true);
+        _liveness.Setup(t => t.GetEntries()).Returns(new Dictionary<RoutingTarget, TargetLivenessEntry>
+        {
+            [Dt] = new(Dt, TargetLivenessState.Online, null, DateTimeOffset.UtcNow.AddSeconds(-6)),
+            [Sv] = new(Sv, TargetLivenessState.Online, null, DateTimeOffset.UtcNow.AddSeconds(-6)),
+            [Lp] = new(Lp, TargetLivenessState.Online, null, DateTimeOffset.UtcNow.AddSeconds(-6))
+        });
+
+        var fanOut = CreateService().GetFanOutTargets();
+        Assert.Equal(new[] { "Desktop", "Server", "Laptop" }, fanOut.Select(t => t.Name));
     }
 }
