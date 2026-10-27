@@ -56,8 +56,11 @@ public static class OllamaRouterServiceCollectionExtensions
         TimeSpan? onlineCacheTtl = null)
     {
         var effectiveStateDirectory = string.IsNullOrWhiteSpace(stateDirectory)
-            ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OllamaRouter")
+            ? (string.IsNullOrWhiteSpace(options.StateDirectory)
+                ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OllamaRouter", "state")
+                : options.StateDirectory)
             : stateDirectory;
+        options.StateDirectory = effectiveStateDirectory;
 
         services.ConfigureHttpJsonOptions(httpJsonOptions =>
         {

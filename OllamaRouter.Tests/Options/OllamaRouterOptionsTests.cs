@@ -145,6 +145,35 @@ public class OllamaRouterOptionsTests
         Assert.All(warnings, message => Assert.Contains("skipped", message, StringComparison.OrdinalIgnoreCase));
     }
 
+    [Fact]
+    public void StateDirectory_DefaultsToNull()
+    {
+        var options = new OllamaRouterOptions();
+        Assert.Null(options.StateDirectory);
+    }
+
+    [Fact]
+    public void AddOllamaRouter_UsesOptionsStateDirectory_WhenParameterIsNull()
+    {
+        var services = new Microsoft.Extensions.DependencyInjection.ServiceCollection();
+        var options = new OllamaRouterOptions { StateDirectory = @"C:\custom\state" };
+
+        OllamaRouter.Extensions.OllamaRouterServiceCollectionExtensions.AddOllamaRouter(services, options, stateDirectory: null, enableTui: false);
+
+        Assert.Equal(@"C:\custom\state", options.StateDirectory);
+    }
+
+    [Fact]
+    public void AddOllamaRouter_ExplicitParameterOverridesOptionsStateDirectory()
+    {
+        var services = new Microsoft.Extensions.DependencyInjection.ServiceCollection();
+        var options = new OllamaRouterOptions { StateDirectory = @"C:\custom\state" };
+
+        OllamaRouter.Extensions.OllamaRouterServiceCollectionExtensions.AddOllamaRouter(services, options, stateDirectory: @"C:\override\state", enableTui: false);
+
+        Assert.Equal(@"C:\override\state", options.StateDirectory);
+    }
+
     private sealed class CapturingLogger : ILogger
     {
         private readonly List<string> warnings;

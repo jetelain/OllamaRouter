@@ -5,11 +5,38 @@ using OllamaRouter.Options;
 using OllamaRouter.ReverseProxy;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services;
+using Serilog;
+using Serilog.Events;
 
 Console.OutputEncoding = Encoding.UTF8;
 Console.Title = "Ollama Router";
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Configure Serilog file & console logging
+var rawLogsDir = builder.Configuration["Logging:LogsDirectory"] ?? "logs";
+var logsDirectory = Path.IsPathRooted(rawLogsDir)
+    ? rawLogsDir
+    : Path.Combine(AppContext.BaseDirectory, rawLogsDir);
+Directory.CreateDirectory(logsDirectory);
+var logFilePath = Path.Combine(logsDirectory, "ollamarouter-.log");
+
+builder.Services.AddSerilog((services, lc) =>
+{
+    lc.MinimumLevel.Warning()
+      .MinimumLevel.Override("OllamaRouter", LogEventLevel.Information)
+      .ReadFrom.Services(services)
+      .Enrich.FromLogContext()
+      .WriteTo.Console(restrictedToMinimumLevel: LogEventLevel.Fatal)
+      .WriteTo.File(
+          path: logFilePath,
+          rollingInterval: RollingInterval.Day,
+          retainedFileCountLimit: 31,
+          shared: true,
+          outputTemplate: "[{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} {Level:u3}] {SourceContext}: {Message:lj}{NewLine}{Exception}");
+
+    ApplyLogLevelsFromConfiguration(lc, builder.Configuration);
+});
 
 builder.Services.ConfigureHttpJsonOptions(options =>
 {
@@ -38,9 +65,7 @@ if (disableTui)
 static bool IsTuiDisabled(string[] args) => args.Any(a => string.Equals(a, "--no-tui", StringComparison.OrdinalIgnoreCase));
 
 // Effective fleet targets plus the Cloud pseudo-target (deduplicated, case-insensitively).
-var startupLoggerFactory = LoggerFactory.Create(loggingBuilder =>
-    loggingBuilder.AddConfiguration(builder.Configuration.GetSection("Logging")));
-var startupLogger = startupLoggerFactory.CreateLogger("OllamaRouter.Startup");
+var startupLogger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("OllamaRouter.Startup");
 var fleetTargets = OllamaRouterServiceCollectionExtensions.BuildFleetTargets(ollamaOptions, startupLogger);
 
 // Startup fleet log line + deprecation warnings.
@@ -84,6 +109,49 @@ app.Lifetime.ApplicationStarted.Register(() =>
 
 // Listen on the configured address (defaults to the standard Ollama port).
 app.Run(ollamaOptions.BindAddress);
+
+static void ApplyLogLevelsFromConfiguration(LoggerConfiguration lc, IConfiguration configuration)
+{
+    var logLevelSection = configuration.GetSection("Logging:LogLevel");
+    foreach (var child in logLevelSection.GetChildren())
+    {
+        if (ParseLogLevel(child.Value) is { } level)
+        {
+            if (string.Equals(child.Key, "Default", StringComparison.OrdinalIgnoreCase))
+            {
+                lc.MinimumLevel.Is(level);
+            }
+            else
+            {
+                lc.MinimumLevel.Override(child.Key, level);
+            }
+        }
+    }
+
+    var serilogLevel = configuration["Serilog:MinimumLevel"];
+    if (ParseLogLevel(serilogLevel) is { } sLevel)
+    {
+        lc.MinimumLevel.Is(sLevel);
+    }
+    foreach (var child in configuration.GetSection("Serilog:MinimumLevel:Override").GetChildren())
+    {
+        if (ParseLogLevel(child.Value) is { } sOverrideLevel)
+        {
+            lc.MinimumLevel.Override(child.Key, sOverrideLevel);
+        }
+    }
+}
+
+static LogEventLevel? ParseLogLevel(string? value) => value?.ToLowerInvariant() switch
+{
+    "trace" or "verbose" => LogEventLevel.Verbose,
+    "debug" => LogEventLevel.Debug,
+    "information" or "info" => LogEventLevel.Information,
+    "warning" or "warn" => LogEventLevel.Warning,
+    "error" => LogEventLevel.Error,
+    "critical" or "fatal" => LogEventLevel.Fatal,
+    _ => null
+};
 
 // Entry point exposed for integration tests (WebApplicationFactory).
 public partial class Program;
