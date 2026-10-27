@@ -22,6 +22,19 @@ Scenario[] scenarios =
     MonitorScenarios.ServiceUnavailableWhenNoTargets()
 ];
 
+// Opt-in live dual-router mesh group (plan §5): runs only when OLLAMAROUTER_E2E_MESH=1 AND a
+// second router URL (OLLAMAROUTER_E2E_MESH_URL_B) are supplied. The default single-router run
+// is byte-for-byte unaffected — when the flag is off, the group is skipped with a printed notice.
+if (config.MeshEnabled && config.RouterUrlB.Length > 0)
+{
+    scenarios = scenarios.Concat(MeshScenarios.All(config)).ToArray();
+}
+else if (config.MeshEnabled)
+{
+    Console.WriteLine();
+    Console.WriteLine("[SKIP] Live dual-router mesh scenarios skipped: set OLLAMAROUTER_E2E_MESH_URL_B to the second router's base URL.");
+}
+
 var failureCount = 0;
 
 foreach (var scenario in scenarios)

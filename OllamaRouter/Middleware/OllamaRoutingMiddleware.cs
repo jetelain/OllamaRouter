@@ -70,6 +70,12 @@ public sealed class OllamaRoutingMiddleware(
     // capturing stream IS the response body.
     internal const string CapturingStreamKey = "OllamaRouter.CapturingStream";
 
+    // HttpContext.Items key under which the dispatch loop publishes the target it is CURRENTLY
+    // attempting to forward. The pre-dispatch telemetry OnStarting closure reads it at the
+    // moment the response commits (see the failover-telemetry note above) so a successful
+    // fallback's flushed headers carry the served target, not the decided primary.
+    internal const string CurrentServedTargetKey = "OllamaRouter.CurrentServedTarget";
+
     /// <summary>
     /// The Auto-Shrink Manager (Phase 3, item 2): consulted after the stateless sizing decision
     /// to apply the KV-cache-hysteresis lease (retain an expanded bucket across the cooldown /
@@ -283,6 +289,41 @@ public sealed class OllamaRoutingMiddleware(
                entry.State == TargetLivenessState.Unknown;
     }
 
+    /// <summary>
+    /// Refreshes the liveness of every ENABLED fleet target whose TTL-aware
+    /// <see cref="ITargetLivenessService.IsOnline"/> verdict is currently false, by running one
+    /// on-demand probe per such target (bounded by the 1.5 s probe timeout; a probe failure
+    /// leaves the prior state). Called BEFORE a dynamic routing decision so a continuously
+    /// healthy target whose Online verdict merely LAPSED (raw state still Online) between the
+    /// background re-prober's last tick and this decision is not misrouted: without this, the
+    /// decision reads a stale <c>IsOnline == false</c>, disqualifies the target as offline, and
+    /// silently routes its hot model to a lower-scoring fallback (task #12 hot-affinity defect).
+    /// Targets already Online within TTL are untouched (a no-op probe would be wasted work), and
+    /// each target's probe is best-effort so one slow/blackholed daemon cannot stall the whole
+    /// decision (the per-target probe timeout bounds it).
+    /// </summary>
+    private async Task RefreshFleetLivenessAsync(CancellationToken cancellationToken)
+    {
+        foreach (var fleetTarget in targetLiveness.GetFleetTargets())
+        {
+            if (!targetAvailability.IsEnabled(fleetTarget) || targetLiveness.IsOnline(fleetTarget))
+            {
+                continue;
+            }
+
+            try
+            {
+                await targetLiveness.EnsureKnownAsync(fleetTarget, cancellationToken);
+            }
+            catch
+            {
+                // Best-effort: a probe failure leaves the prior (offline/unknown) state, which is
+                // itself the correct liveness signal for the decision (the target stays unroutable
+                // and the decision fails over).
+            }
+        }
+    }
+
     // Whether any response bytes have already been committed to the client: the real
     // HttpResponse.HasStarted flag, OR (in the DefaultHttpContext test host, where HasStarted
     // never flips after a write) the first-write marker on the capturing stream installed by
@@ -295,7 +336,28 @@ public sealed class OllamaRoutingMiddleware(
         }
 
         return context.Items[CapturingStreamKey] is ResponseCapturingStream { HasWritten: true };
-    }
+        }
+
+        // Reset an UNCOMMITTED response so the next dispatch-loop candidate can be forwarded
+        // (called only after an uncommitted failure — no byte reached the client). YARP's
+        // SendAsync throws InvalidOperationException when RequestUtilities.IsResponseSet is true
+        // (StatusCode != 200 || HasStarted); its failure path sets StatusCode = 502 WITHOUT
+        // flushing (HasStarted stays false). Left in place, the NEXT candidate's forward throws
+        // before it can fail over, so the client sees a bare 500 instead of a completed response
+        // from a healthy target. The ONLY thing that blocks IsResponseSet is a non-200 status,
+        // so restore it to 200 WITHOUT clearing the pre-dispatch telemetry headers (which in the
+        // test host are not re-asserted, since the response may never commit before the test
+        // reads them). IForwarderErrorFeature is set on context.Features by YARP before SendAsync
+        // returns and is deliberately preserved: the post-dispatch error classification
+        // (client-abort / mid-stream) reads it after the loop.
+        private static void ResetUncommittedResponse(HttpContext context)
+        {
+            if (IsResponseCommitted(context))
+            {
+                return; // Bytes already flushed: never mutate a committed response.
+            }
+            context.Response.StatusCode = StatusCodes.Status200OK;
+        }
 
     // The client-abort classification (binding): the five client-side ForwarderError values (or a
     // canceled request token) mean the client went away. Client aborts never retry, never feed the
@@ -486,6 +548,18 @@ public sealed class OllamaRoutingMiddleware(
         var body = await ReadBodyAsync(context.Request);
         var endpoint = context.Request.Path.Value ?? "/";
 
+        // Detach the request body from the client's (network) content stream immediately: the
+        // dispatch loop buffers and forwards the body ASYNCHRONOUSLY, and the client is free to
+        // dispose its own request content (HttpClient.Dispose on the request) as soon as
+        // SendAsync returns. Reading/rewinding the original network stream after that disposal
+        // would surface as an ObjectDisposedException, so the body is held in an in-memory
+        // stream from the first byte onward. The dynamic-context sizing step below may replace
+        // it with a rewritten (but still in-memory) stream.
+        var initialBodyBytes = Encoding.UTF8.GetBytes(body);
+        context.Request.Body = new MemoryStream(initialBodyBytes);
+        context.Request.ContentLength = initialBodyBytes.Length;
+        context.Request.Body.Position = 0;
+
         // The target that actually produced the response (may differ from the decided primary
         // after an uncommitted failover), or the last attempted one on terminal failure.
         RoutingTarget? servedTarget = null;
@@ -554,6 +628,10 @@ public sealed class OllamaRoutingMiddleware(
             }
             else
             {
+                // Dynamic routing: refresh every enabled target's TTL-aware liveness verdict first
+                // (see RefreshFleetLivenessAsync) so a healthy target whose Online verdict merely
+                // lapsed between re-probe ticks is not disqualified as offline and misrouted.
+                await RefreshFleetLivenessAsync(context.RequestAborted);
                 target = await routingDecisionService.DecideAsync(tokenCount, modelName, clientNumCtx, context.RequestAborted);
             }
 
@@ -562,6 +640,46 @@ public sealed class OllamaRoutingMiddleware(
         catch (NoAvailableTargetException ex)
         {
             logger.LogWarning(ex, "No target could handle the request: {Message}", ex.Message);
+
+            // All-fleet-dead fast path: the routability check inside DecideAsync disqualifies
+            // every OFFLINE target (stage 2), so when the WHOLE fleet is offline the decision
+            // throws BEFORE the post-decision all-offline gate below can run. Handle the
+            // all-dead case HERE so the client gets the rich diagnostics payload (targets[] with
+            // per-target states) instead of a bare 503. (When Cloud Overflow is available it is
+            // already a ranked candidate in DecideAsync and is returned as the decision — this
+            // throw only fires when Cloud is disabled/unavailable, so the cloudEnabled flag here
+            // is false by construction.)
+            // Force a fresh on-demand probe of each enabled target (the post-decision gate's
+            // EnsureKnownAsync pattern) so the all-dead verdict reflects a hard kill even when
+            // the background re-prober has not yet caught up; then emit the rich diagnostics.
+            foreach (var fleetTarget in targetLiveness.GetFleetTargets())
+            {
+                if (!targetAvailability.IsEnabled(fleetTarget))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    await targetLiveness.EnsureKnownAsync(fleetTarget, context.RequestAborted);
+                }
+                catch
+                {
+                    // Best-effort: a probe failure leaves the prior state (still an offline signal).
+                }
+            }
+
+            if (IsFleetAllOffline())
+            {
+                logger.LogWarning("All fleet targets are offline or disabled and Cloud Overflow is unavailable; returning 503 with diagnostics for {ModelName}.", modelName);
+                context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+                context.Response.ContentType = "application/json";
+                await context.Response.WriteAsync(JsonSerializer.Serialize(
+                    BuildAllOfflineDiagnostics(cloudEnabled: false),
+                    OllamaRouterJsonSerializerContext.Default.AllOfflineDiagnostics));
+                return;
+            }
+
             context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
             context.Response.ContentType = "application/json";
             await context.Response.WriteAsync(JsonSerializer.Serialize(new OllamaErrorResponse(ex.Message), OllamaRouterJsonSerializerContext.Default.OllamaErrorResponse));
@@ -639,6 +757,13 @@ public sealed class OllamaRoutingMiddleware(
         // OnStarting closure so streamed responses (NDJSON/SSE) re-assert the served target
         // before the first body byte.
         var telemetryTarget = target;
+        // Share the CURRENTLY-ATTEMPTED target with the OnStarting closure below. The dispatch
+        // loop updates this slot before each candidate's forward, so when a successful fallback
+        // commits the response MID-loop (YARP flushes headers → OnStarting fires inside that
+        // SendAsync), the closure reads the SERVED target — not the decided primary captured at
+        // registration. Without this, a streamed uncommitted-failover response carries the stale
+        // primary header (the outer post-dispatch update is skipped once the response committed).
+        context.Items[CurrentServedTargetKey] = target;
         context.Response.Headers[OllamaReverseProxyConfig.PublicTargetHeader] = telemetryTarget.ToString();
         context.Response.Headers[OllamaReverseProxyConfig.TelemetryModelHeader] = modelName;
         context.Response.Headers[OllamaReverseProxyConfig.TelemetryEstimatedTokensHeader] = tokenCount.ToString();
@@ -649,7 +774,8 @@ public sealed class OllamaRoutingMiddleware(
 
         context.Response.OnStarting(() =>
         {
-            context.Response.Headers[OllamaReverseProxyConfig.PublicTargetHeader] = telemetryTarget.ToString();
+            context.Response.Headers[OllamaReverseProxyConfig.PublicTargetHeader] =
+                (context.Items[CurrentServedTargetKey] as RoutingTarget? ?? telemetryTarget).ToString();
             context.Response.Headers[OllamaReverseProxyConfig.TelemetryModelHeader] = modelName;
             context.Response.Headers[OllamaReverseProxyConfig.TelemetryEstimatedTokensHeader] = tokenCount.ToString();
             if (injectedNumCtx.HasValue)
@@ -752,6 +878,8 @@ public sealed class OllamaRoutingMiddleware(
                 isClientAborted = true;
             }
 
+
+
             var (actualPromptTokens, actualResponseTokens) = TryExtractActualTokens(capturingStream.CapturedTail);
             var isStreamCompleted = IsResponseComplete(context, capturingStream.CapturedTail, actualResponseTokens);
 
@@ -765,8 +893,16 @@ public sealed class OllamaRoutingMiddleware(
             // alive daemon (headers flushed, stream intact) never does either (Q4: streaks
             // track transport reliability only — only a transport-level uncommitted failure or
             // a mid-stream drop counts).
+            //
+            // The client-abort gate below keys off the authoritative ForwarderError value
+            // rather than the request token: a destination-side drop (ForwarderError =
+            // ResponseBody/RequestBody Destination) is the daemon resetting the connection
+            // mid-stream, and that same reset can propagate to cancel the router's request
+            // token, which would otherwise misclassify the daemon drop as a client abort and
+            // suppress the streak. Only a genuinely client-initiated cancellation suppresses it.
+            var midStreamClientAbort = isClientAborted && (forwarderError is null || IsClientAbort(forwarderError.Error));
             if (servedTarget is { } midStreamTarget
-                && !isClientAborted
+                && !midStreamClientAbort
                 && forwarderError is not null
                 && forwarderError.Error != ForwarderError.None
                 && IsResponseCommitted(context))
@@ -912,6 +1048,9 @@ public sealed class OllamaRoutingMiddleware(
                 bodyStream.Position = 0; // rewind before every attempt (acceptance criterion).
             }
             lastAttempted = candidate;
+            // Publish the candidate being attempted so a successful fallback's committed
+            // response (headers flushed inside SendAsync → OnStarting) reports THIS target.
+            context.Items[CurrentServedTargetKey] = candidate;
             var error = await forwarder
                 .SendAsync(context, url, ProxyClient, ForwarderRequestConfig, PassThroughTransformer, context.RequestAborted)
                 .AsTask();
@@ -940,6 +1079,7 @@ public sealed class OllamaRoutingMiddleware(
             // Uncommitted failure: rewind (next iteration), strike the failure streak, and
             // apply one best-effort liveness strike through the existing hysteresis (Q2).
             streakTracker.RecordFailure(candidate);
+            ResetUncommittedResponse(context);
             try
             {
                 await targetLiveness.MarkHardFailureAsync(candidate);

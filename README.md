@@ -279,7 +279,81 @@ With both numbers and the exact payload of each request, you can tokenize locall
 
 The output directory is capped at `Recording:MaxFiles` payload files (default `500`); when the cap is exceeded, the oldest records are deleted and the manifest is rewritten so it only references still-existing payloads. The recorder is best-effort: an I/O failure only produces a log entry and never affects routing.
 
+## Dual-Router Mesh (Desktop + Laptop)
+
+OllamaRouter is designed to run as a **symmetrical mesh**: place one router on *each* node and let every router see every physical daemon. Because a router only ever forwards **directly to a physical daemon** (it never lists a peer router as a target), the mesh is loop-free by construction — there is no router→router hop to recurse on.
+
+### Architecture
+
+```
+                      ┌────────────────────┐            ┌────────────────────┐
+   Local clients ────▶│  Desktop Router    │            │  Laptop Router     │ ◀──── Local clients
+                      │   (bind :11434)    │            │   (bind :11434)    │
+                      └─────────┬──────────┘            └─────────┬──────────┘
+                               │  forwards ONLY to physical daemons on :11435
+                               ▼                                  ▼
+                 ┌───────────────────────────────┐  ┌───────────────────────────────┐
+                 │ Desktop daemon :11435         │  │ Laptop daemon :11435          │
+                 │ (OLLAMA_HOST=0.0.0.0:11435)   │  │ (OLLAMA_HOST=0.0.0.0:11435)   │
+                 └───────────────────────────────┘  └───────────────────────────────┘
+```
+
+Both routers run the same `Targets` list (each node's local daemon + the peer's LAN daemon). A request that lands on either router is routed by the full shared scoring engine to the best **daemon**, so a laptop client and a desktop client get identical routing decisions regardless of which router they hit.
+
+### Windows: moving the Ollama daemon to `OLLAMA_HOST=0.0.0.0:11435`
+
+On Windows the Ollama GUI (`ollama app.exe`) binds **11434** automatically at user login, which is exactly the port OllamaRouter wants to bind. Move the daemon to 11435 so the router can take 11434:
+
+1. Open **System environment variables** (not just *User*): `System Properties → Advanced → Environment Variables`.
+2. Set `OLLAMA_HOST` = `0.0.0.0:11435` (a **System** variable, so it applies to the daemon process).
+3. Sign out / sign back in (or restart) and let Ollama relaunch the daemon on the new port.
+
+`OLLAMA_HOST` must bind to `0.0.0.0` (not `127.0.0.1`) so the *peer* router can reach the daemon over the LAN. If a node only ever serves **local** clients through its own router, you can instead bind the *router* to `127.0.0.1:11434` (`BindAddress`) and keep the daemon on `0.0.0.0:11435` for the peer.
+
+### LAN firewall: restrict the daemon to your private subnet
+
+Binding the daemon to `0.0.0.0:11435` exposes it on every interface. Restrict inbound traffic to your private subnet (example for `192.168.1.0/24`):
+
+```powershell
+# Allow the LAN, block everything else, for the Ollama daemon port.
+New-NetFirewallRule -DisplayName "Ollama daemon - LAN" -Direction Inbound -Protocol TCP -LocalPort 11435 -RemoteAddress 192.168.1.0/24 -Action Allow
+New-NetFirewallRule -DisplayName "Ollama daemon - block others" -Direction Inbound -Protocol TCP -LocalPort 11435 -RemoteAddress Any -Action Block
+```
+
+### Router port-availability detection
+
+Before starting `ollama app.exe`, the router now **probes the expected daemon port** (11435, or 11434 as a fallback). If that port is already occupied by a (manually managed) daemon, the router logs a warning and **does not** spawn a second `ollama` process. This makes the `OLLAMA_HOST` manual setup above safe to combine with the auto-launcher — you will never end up with two competing daemons on the same port.
+
+### Per-node `Targets` configuration
+
+> **Loop-free invariant:** a router's `Targets` must **never** list a peer router's `:11434` — only physical daemons on `:11435`. Listing a peer router as a target is the only way to introduce a loop.
+
+Desktop node (`appsettings.json`):
+
+```json
+"Targets": [
+  { "Name": "desktop", "Url": "http://127.0.0.1:11435" },
+  { "Name": "laptop",  "Url": "http://192.168.1.20:11435" }
+]
+```
+
+Laptop node (`appsettings.json`):
+
+```json
+"Targets": [
+  { "Name": "laptop",  "Url": "http://127.0.0.1:11435" },
+  { "Name": "desktop", "Url": "http://192.168.1.10:11435" }
+]
+```
+
+(Swap `192.168.1.10` / `192.168.1.20` for each node's real LAN IP. Hardware-hint / `MaxParallel` / `MaxVramMB` settings apply per target exactly as in the single-router [Configuration](#configuration) section.)
+
+### Validating the mesh
+
+The simulated fleet (two in-process routers + N daemon stubs), the full §4 acceptance matrix, fault injection, the loop-free / exactly-once delivery proofs, and a bounded concurrency smoke all run under the standard `dotnet test` suite. The opt-in **live** mesh validation and the extended high-concurrency soak are documented under [End-to-end tests](#end-to-end-tests).
+
 ## Installation
+
 
 ### Manual (Windows)
 
@@ -411,6 +485,27 @@ The executable prints a `PASS`/`FAIL` line per scenario and exits with a non-zer
 |----------------------------|----------------------------------------------------------------------|----------------------------|
 | `OLLAMAROUTER_E2E_URL`     | Base URL of the OllamaRouter instance under test.                    | `http://localhost:11434`  |
 | `OLLAMAROUTER_E2E_MODEL`   | Name of the model aliased on both the local and remote instances.    | `Qwen3.8-27B:latest`      |
+| `OLLAMAROUTER_E2E_MESH`    | Set to `1` to also run the **live dual-router mesh** scenario group (skipped otherwise). | *(unset — skipped)*   |
+| `OLLAMAROUTER_E2E_MESH_URL_B` | Base URL of the **second** router in the mesh (router A is `OLLAMAROUTER_E2E_URL`). | *(required when mesh is on)* |
+| `OLLAMAROUTER_E2E_MESH_TARGETS` | Comma-separated fleet target names for the mesh pin scenarios. | *(optional)*             |
+
+To validate a real 3-node mesh (two physical routers, two daemons), enable the opt-in mesh group:
+
+```powershell
+$env:OLLAMAROUTER_E2E_MESH = "1"
+$env:OLLAMAROUTER_E2E_URL  = "http://127.0.0.1:11434"          # router A (desktop)
+$env:OLLAMAROUTER_E2E_MESH_URL_B = "http://192.168.1.10:11434" # router B (laptop)
+$env:OLLAMAROUTER_E2E_MESH_TARGETS = "desktop,laptop"
+```
+
+The mesh scenarios verify that both routers expose the **same** `/api/tags` union, that `/api/chat` completes from each router within a bounded time (no router→router loop), and that `X-OllamaRouter-Target` pins are honored from each router. When `OLLAMAROUTER_E2E_MESH` is unset (or no second URL is supplied), the mesh group is skipped with a printed notice and the default single-router run is unchanged.
+
+The in-process fleet simulation (two in-process routers + N daemon stubs, loop-free operation, fault injection, and the bounded concurrency smoke) runs under `dotnet test` as part of the standard unit-test suite. An extended high-concurrency soak is available opt-in:
+
+```powershell
+$env:OLLAMAROUTER_MESH_SOAK = "1"   # enables the 10 s sustained-concurrency soak under dotnet test
+dotnet test
+```
 
 ## License
 
