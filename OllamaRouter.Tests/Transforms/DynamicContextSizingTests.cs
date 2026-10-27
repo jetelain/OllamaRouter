@@ -265,7 +265,7 @@ public class DynamicContextSizingTests
     {
         var options = new DynamicContextOptions();
 
-        Assert.True(options.Enabled);
+        Assert.False(options.Enabled);
         Assert.Equal(32_768, options.BucketStepTokens);
         Assert.Equal(3, options.AutoShrinkCooldownTurns);
         Assert.Equal(60, options.AutoShrinkIdleTimeoutSeconds);
@@ -367,7 +367,7 @@ public class DynamicContextSizingTests
         const string body = """{"model":"qwen3.6-35b-a3b","messages":[{"role":"user","content":"hi"}]}""";
         var decision = new ContextSizingDecision("Moe", 221_184, 262_144, false);
 
-        var (newBody, injected) = DynamicContextPayloadTransformer.Apply(body, decision, new DynamicContextOptions());
+        var (newBody, injected) = DynamicContextPayloadTransformer.Apply(body, decision, new DynamicContextOptions { Enabled = true });
 
         Assert.Equal(221_184, injected);
         using var doc = JsonDocument.Parse(newBody);
@@ -382,7 +382,7 @@ public class DynamicContextSizingTests
         const string body = """{"model":"m","options":{"num_ctx":131072,"temperature":0.1}}""";
         var decision = new ContextSizingDecision("DenseDesktop16gb", 49_152, 49_152, true);
 
-        var (newBody, injected) = DynamicContextPayloadTransformer.Apply(body, decision, new DynamicContextOptions());
+        var (newBody, injected) = DynamicContextPayloadTransformer.Apply(body, decision, new DynamicContextOptions { Enabled = true });
 
         Assert.Equal(49_152, injected);
         using var doc = JsonDocument.Parse(newBody);

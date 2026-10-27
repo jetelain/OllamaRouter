@@ -152,6 +152,7 @@ public sealed class MeshRouter : IAsyncDisposable
             TerminalMonitoring = new TerminalMonitoringOptions { Enabled = false }
         };
         options.CloudOverflow.Enabled = cloudEnabled;
+        options.DynamicContext.Enabled = true;
         configureOptions?.Invoke(options);
         options.DynamicContext.Normalize();
 

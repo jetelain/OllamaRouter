@@ -61,7 +61,8 @@ public class RouterModelApiEndpointsTests
     private static OllamaRouterOptions ThreeTargetOptions(
         bool cloudEnabled = true,
         string? cloudDefaultModel = null,
-        IReadOnlyDictionary<string, ModelThresholds>? models = null) => new()
+        IReadOnlyDictionary<string, ModelThresholds>? models = null,
+        bool dynamicContextEnabled = true) => new()
         {
             Targets =
             [
@@ -89,6 +90,7 @@ public class RouterModelApiEndpointsTests
                 }
             ],
             Models = (models as Dictionary<string, ModelThresholds>) ?? new Dictionary<string, ModelThresholds>(),
+            DynamicContext = new DynamicContextOptions { Enabled = dynamicContextEnabled },
             CloudOverflow =
             {
                 Enabled = cloudEnabled,

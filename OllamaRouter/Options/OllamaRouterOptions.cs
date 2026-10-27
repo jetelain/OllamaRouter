@@ -140,7 +140,7 @@ public sealed class OllamaRouterOptions
     /// <summary>
     /// Dynamic context sizing configuration (Phase 2): when enabled, the router selects a
     /// quantized context bucket per (target, model, prompt) triple and injects/overwrites
-    /// <c>options.num_ctx</c> in the outgoing inference payload. Enabled by default.
+    /// <c>options.num_ctx</c> in the outgoing inference payload. Disabled by default.
     /// </summary>
     public DynamicContextOptions DynamicContext { get; set; } = new();
 
@@ -207,6 +207,16 @@ public sealed class OllamaRouterOptions
 
         return synthesized;
     }
+
+    /// <summary>
+    /// Returns true when Cloud Overflow is statically enabled (<see cref="CloudOverflowOptions.Enabled"/>)
+    /// and has at least one cloud model configured (either <see cref="CloudOverflowOptions.DefaultModel"/>
+    /// is set or at least one model in <see cref="Models"/> has an explicit <see cref="ModelThresholds.CloudModel"/>).
+    /// </summary>
+    public bool IsCloudOverflowConfigured() =>
+        CloudOverflow.Enabled &&
+        (!string.IsNullOrEmpty(CloudOverflow.DefaultModel) ||
+         (Models is { Count: > 0 } && Models.Values.Any(m => !string.IsNullOrEmpty(m.CloudModel))));
 }
 
 /// <summary>
@@ -365,9 +375,9 @@ public sealed class DynamicContextOptions
 
     /// <summary>
     /// Enables dynamic context sizing. When false, the payload is NEVER rewritten (pass-through)
-    /// and no sizing capability lookups are performed by the router middleware. Defaults to true.
+    /// and no sizing capability lookups are performed by the router middleware. Defaults to false.
     /// </summary>
-    public bool Enabled { get; set; } = true;
+    public bool Enabled { get; set; } = false;
 
     /// <summary>
     /// Grid step (in tokens) used to synthesize the intermediate bucket of custom profiles

@@ -715,7 +715,7 @@ setInterval(refresh, 2000);
         var snapshot = activityMonitor.GetSnapshot();
         var statistics = activityStatistics.GetSnapshot();
         var now = DateTimeOffset.UtcNow;
-        var cloudEnabled = options.Value.Models.Values.Any(m => !string.IsNullOrEmpty(m.CloudModel));
+        var cloudEnabled = options.Value.IsCloudOverflowConfigured();
         var targets = targetAvailability.GetSnapshot();
 
         var effectiveTargets = options.Value.GetEffectiveTargets();

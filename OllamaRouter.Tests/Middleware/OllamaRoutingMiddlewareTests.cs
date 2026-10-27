@@ -1319,8 +1319,14 @@ public class OllamaRoutingMiddlewareTests
         OllamaRouterOptions options,
         ModelCapabilityEngine capabilityEngine,
         Mock<IModelCatalogCacheService> modelCatalogCache,
-        Mock<IActivityMonitorService>? activityMonitor = null)
+        Mock<IActivityMonitorService>? activityMonitor = null,
+        bool enableDynamicContext = true)
     {
+        if (enableDynamicContext && !options.DynamicContext.Enabled)
+        {
+            options.DynamicContext.Enabled = true;
+        }
+
         var availability = new Mock<ITargetAvailabilityService>();
         availability.Setup(t => t.IsEnabled(It.IsAny<RoutingTarget>())).Returns(true);
 
@@ -1529,7 +1535,8 @@ public class OllamaRoutingMiddlewareTests
             routingDecisionService,
             options,
             capabilityEngine,
-            cache);
+            cache,
+            enableDynamicContext: false);
 
         await sut.InvokeAsync(context);
 

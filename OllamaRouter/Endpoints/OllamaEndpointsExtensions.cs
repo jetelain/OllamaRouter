@@ -97,9 +97,15 @@ public static class OllamaEndpointsExtensions
     }
 
     // Cloud model synthesis for /api/tags (shape preserved exactly as before the fleet
+    // Cloud synthesis models for /api/tags (injected into the merged model list during fleet
     // aggregation; appended only when not already present in the merged catalog).
     private static IReadOnlyList<JsonNode>? BuildCloudTagSyntheses(OllamaRouterOptions options)
     {
+        if (!options.CloudOverflow.Enabled)
+        {
+            return null;
+        }
+
         var syntheses = new List<JsonNode>();
         if (options.Models != null)
         {
@@ -125,12 +131,38 @@ public static class OllamaEndpointsExtensions
             }
         }
 
+        if (!string.IsNullOrWhiteSpace(options.CloudOverflow.DefaultModel))
+        {
+            var defaultModel = options.CloudOverflow.DefaultModel;
+            if (!syntheses.Any(s => string.Equals(s["name"]?.ToString(), defaultModel, StringComparison.OrdinalIgnoreCase)))
+            {
+                syntheses.Add((JsonNode)new JsonObject
+                {
+                    ["name"] = defaultModel,
+                    ["model"] = defaultModel,
+                    ["modified_at"] = DateTime.UtcNow.ToString("o"),
+                    ["size"] = 0,
+                    ["details"] = new JsonObject
+                    {
+                        ["family"] = "cloud",
+                        ["parameter_size"] = "cloud",
+                        ["quantization_level"] = "cloud"
+                    }
+                });
+            }
+        }
+
         return syntheses.Count > 0 ? syntheses : null;
     }
 
     // Cloud model synthesis for /v1/models (OpenAI shape, preserved exactly).
     private static IReadOnlyList<JsonNode>? BuildCloudModelSyntheses(OllamaRouterOptions options)
     {
+        if (!options.CloudOverflow.Enabled)
+        {
+            return null;
+        }
+
         var syntheses = new List<JsonNode>();
         if (options.Models != null)
         {
@@ -147,6 +179,21 @@ public static class OllamaEndpointsExtensions
                         ["owned_by"] = "cloud"
                     });
                 }
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(options.CloudOverflow.DefaultModel))
+        {
+            var defaultModel = options.CloudOverflow.DefaultModel;
+            if (!syntheses.Any(s => string.Equals(s["id"]?.ToString(), defaultModel, StringComparison.OrdinalIgnoreCase)))
+            {
+                syntheses.Add((JsonNode)new JsonObject
+                {
+                    ["id"] = defaultModel,
+                    ["object"] = "model",
+                    ["created"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    ["owned_by"] = "cloud"
+                });
             }
         }
 

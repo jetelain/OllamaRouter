@@ -342,6 +342,76 @@ public class MonitorEndpointsExtensionsTests
     }
 
     [Fact]
+    public async Task GetMonitorApi_WithCloudOverflowDefaultModel_ReportsCloudOnline()
+    {
+        var (app, client, _) = await CreateTestAppAsync(
+            options: new OllamaRouterOptions
+            {
+                Targets =
+                [
+                    new OllamaTargetOptions { Name = "Local", Url = "http://127.0.0.1:11435", HardwareHint = "16gb" }
+                ],
+                CloudOverflow = new CloudOverflowOptions
+                {
+                    Enabled = true,
+                    DefaultModel = "glm-5.3-flash:cloud"
+                }
+            });
+        try
+        {
+            var response = await client.GetAsync("/monitor/api");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var json = await response.Content.ReadFromJsonAsync<JsonObject>();
+            var fleet = json!["fleet"]!.AsArray();
+
+            var cloud = fleet.Single(f => f!["name"]?.GetValue<string>() == "Cloud");
+            Assert.Equal("Online", cloud!["liveness"]?.GetValue<string>());
+            Assert.True(json["cloudEnabled"]?.GetValue<bool>());
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task GetMonitorApi_WithCloudOverflowDisabled_ReportsCloudOffline()
+    {
+        var (app, client, _) = await CreateTestAppAsync(
+            options: new OllamaRouterOptions
+            {
+                Targets =
+                [
+                    new OllamaTargetOptions { Name = "Local", Url = "http://127.0.0.1:11435", HardwareHint = "16gb" }
+                ],
+                CloudOverflow = new CloudOverflowOptions
+                {
+                    Enabled = false,
+                    DefaultModel = "glm-5.3-flash:cloud"
+                }
+            });
+        try
+        {
+            var response = await client.GetAsync("/monitor/api");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var json = await response.Content.ReadFromJsonAsync<JsonObject>();
+            var fleet = json!["fleet"]!.AsArray();
+
+            var cloud = fleet.Single(f => f!["name"]?.GetValue<string>() == "Cloud");
+            Assert.Equal("Offline", cloud!["liveness"]?.GetValue<string>());
+            Assert.False(json["cloudEnabled"]?.GetValue<bool>());
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    [Fact]
     public async Task GetMonitorApi_WithoutLivenessService_FallsBackToCatalogCheck()
     {
         var (app, client, mocks) = await CreateTestAppAsync("http://127.0.0.1:11435");
