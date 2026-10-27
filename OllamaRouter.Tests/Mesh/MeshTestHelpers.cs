@@ -260,16 +260,23 @@ public static class MeshTestHelpers
                 return true;
             }
 
-            // Keep the target's Online TTL fresh so the background tracker refresh (2 s cadence)
-            // includes it in its /api/ps fan-out on the next tick. The probe is a local GET / bounded
-            // by the 1.5 s probe timeout; a failure leaves the prior state (still fine to retry).
+            // Keep the target's Online TTL fresh and trigger a tracker refresh (which runs when
+            // outside the 2 s TTL window, or coalesces with the background refresh).
             try
             {
                 _ = await router.Liveness.EnsureKnownAsync(routingTarget, CancellationToken.None);
+                await router.ExecutionTracker.RefreshAsync(CancellationToken.None);
             }
             catch
             {
                 // Best-effort: a probe hiccup never blocks the wait.
+            }
+
+            state = router.ExecutionTracker.GetState(routingTarget);
+            if (state is { } snapshotAfterRefresh && snapshotAfterRefresh.LoadedModels.Any(m =>
+                string.Equals(m.Name, model, StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
             }
 
             await Task.Delay(100, CancellationToken.None);
