@@ -428,7 +428,11 @@ FodyWeavers.xsd
 *.msm
 *.msp
 /OllamaRouter-win-x64
- 
+
+# User-owned configuration layer (config/config.json next to the executable) survives app
+# updates and is gitignored; the config/ folder itself stays tracked (see config/README.md).
+config/*.json
+
 # NightCodeForge task artifacts and transcripts
 docs/tasks/
 docs/transcripts/

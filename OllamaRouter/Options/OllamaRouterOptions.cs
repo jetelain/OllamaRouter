@@ -3,7 +3,9 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace OllamaRouter.Options;
 
 /// <summary>
-/// Configuration options for the Ollama router, bound to the "OllamaRouter" section of appsettings.json.
+/// Configuration options for the Ollama router, bound to the "OllamaRouter" section of the
+/// factory `appsettings.json` plus the optional user-owned `config/config.json` (next to the
+/// executable; user values override factory defaults, standard sources override both).
 /// </summary>
 public sealed class OllamaRouterOptions
 {

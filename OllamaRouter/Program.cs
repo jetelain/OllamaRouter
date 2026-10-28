@@ -1,5 +1,6 @@
 using System.Text;
 using Microsoft.Extensions.Options;
+using OllamaRouter.Configuration;
 using OllamaRouter.Extensions;
 using OllamaRouter.Options;
 using OllamaRouter.ReverseProxy;
@@ -12,6 +13,15 @@ Console.OutputEncoding = Encoding.UTF8;
 Console.Title = "Ollama Router";
 
 var builder = WebApplication.CreateBuilder(args);
+
+// User-owned configuration layer (config/config.json next to the executable), layered on top of
+// the read-only factory appsettings.json. Must run before the OllamaRouter options read below.
+// Fail-open: an invalid user file is reported and ignored, never prevents startup.
+RouterConfigurationSources.AddUserConfiguration(
+    builder.Configuration,
+    builder.Environment.ContentRootPath,
+    builder.Environment.EnvironmentName,
+    logger: null);
 
 // Configure Serilog file & console logging
 var rawLogsDir = builder.Configuration["Logging:LogsDirectory"] ?? "logs";

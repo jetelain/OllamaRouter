@@ -199,7 +199,16 @@ curl http://localhost:11434/api/create -d '{
 
 ## Configuration
 
-Configuration is provided through the `OllamaRouter` section of `appsettings.json` (or any other standard .NET configuration source, such as environment variables):
+Configuration uses a two-layer model so user settings survive application updates:
+
+- **`appsettings.json`** (next to the executable) holds **read-only factory defaults**. It ships with the app, is never modified at runtime, and is replaced by a software update.
+- **`config/config.json`** (in a `config/` directory next to the executable) is the **optional user-owned layer** for all user-changeable settings. It is created lazily (by the Setup API or manually), is absent on a fresh install, and — because it lives beside the executable, outside the files a publish/upgrade replaces — it **survives updates and deletions of the application**. The provider is wired with `reloadOnChange: true` so `IOptionsMonitor` consumers observe file changes at runtime. If the file exists but contains invalid JSON, the router **fails open**: it logs a prominent error, ignores the file, and boots with factory defaults (fix or delete the file to apply user settings). See `config/README.md`.
+
+Configuration is provided through the `OllamaRouter` section of `config/config.json` (user values) or `appsettings.json` (factory defaults), or any other standard .NET configuration source such as environment variables. Effective precedence (later wins):
+
+```
+appsettings.json  <  config/config.json  <  user secrets  <  environment variables  <  command-line arguments
+```
 
 ```json
 {
@@ -262,7 +271,7 @@ OllamaRouter estimates prompt token count prior to routing so it can check again
 
 Because the optimal overhead factor depends on your exact models and prompt mix, OllamaRouter can record every inference request so the difference between the **estimated** token count (used for routing) and the **actual** token count (reported by Ollama) can be investigated per request. This recording mode is **disabled by default**.
 
-Enable it in `appsettings.json`:
+Enable it in `config/config.json` (or `appsettings.json` factory defaults):
 
 ```json
 "Recording": {
@@ -328,7 +337,7 @@ Before starting `ollama app.exe`, the router now **probes the expected daemon po
 
 > **Loop-free invariant:** a router's `Targets` must **never** list a peer router's `:11434` — only physical daemons on `:11435`. Listing a peer router as a target is the only way to introduce a loop.
 
-Desktop node (`appsettings.json`):
+Desktop node (`config/config.json`):
 
 ```json
 "Targets": [
@@ -337,7 +346,7 @@ Desktop node (`appsettings.json`):
 ]
 ```
 
-Laptop node (`appsettings.json`):
+Laptop node (`config/config.json`):
 
 ```json
 "Targets": [
@@ -382,13 +391,13 @@ OllamaRouter exposes a very lightweight, dependency-free monitoring page at `/mo
 The page shows:
 
 - Whether each instance (**Local**/**Remote**, and **Cloud** when at least one model has a `CloudModel` configured, see [Cloud overflow](#cloud-overflow)) is currently **busy** processing a chat/generate request.
-- An **Enabled** checkbox per instance, to enable/disable each target at runtime. Toggling it immediately changes the routing behavior: a disabled target is completely excluded from routing and will never receive requests (unlike a busy target, which can still queue requests if all eligible targets are busy). The new state is persisted to a dedicated JSON file (`%LOCALAPPDATA%\OllamaRouter\targets.json` on Windows), so it is restored on the next startup. The state file is written on a best-effort ("failsafe") basis: if it cannot be written, the change still takes effect in memory and a warning is logged — `appsettings.json` is never modified at runtime.
+- An **Enabled** checkbox per instance, to enable/disable each target at runtime. Toggling it immediately changes the routing behavior: a disabled target is completely excluded from routing and will never receive requests (unlike a busy target, which can still queue requests if all eligible targets are busy). The new state is persisted to a dedicated JSON file (`%LOCALAPPDATA%\OllamaRouter\targets.json` on Windows), so it is restored on the next startup. The state file is written on a best-effort ("failsafe") basis: if it cannot be written, the change still takes effect in memory and a warning is logged — `appsettings.json` (factory defaults) is never modified at runtime.
 - The requests currently **in progress**, with target instance, model, estimated input tokens and running time.
 - A history of the most recent completed requests (last 50), with model, estimated vs. actual input tokens, actual output tokens, elapsed time and HTTP status. Failed requests are highlighted.
 - Aggregated **token statistics** per target (and overall total): number of requests, actual input tokens and actual output tokens, both for the **current day** and for the **last 7 days**. Only successful requests with actual token counts are counted. These statistics are persisted to a dedicated JSON file (`%LOCALAPPDATA%\OllamaRouter\activity-statistics.json` on Windows) so they survive restarts, and are written on a best-effort basis (throttled to at most one write per 30 seconds, on day rollover, and on application shutdown).
 - A **target usage ratio progress bar** visually breaking down the share of tokens processed by each target (**Local**, **Remote**, and **Cloud**) over the **last 7 days**.
 - **Estimated savings and cloud overflow cost** based on the **last 7 days**, displayed whenever `Pricing` is configured in the settings. It calculates the money saved by serving requests locally and remotely instead of paying cloud API rates, as well as the cost incurred from cloud overflow. If pricing is not configured, this section is completely hidden.
-- A **live token estimation overhead recommendation** card at the bottom of the page, computed from recent requests by comparing raw estimator token counts against the actual prompt tokens reported by Ollama. It displays the overall observed factor, per-model factors, and the exact recommended value to put in `appsettings.json`.
+- A **live token estimation overhead recommendation** card at the bottom of the page, computed from recent requests by comparing raw estimator token counts against the actual prompt tokens reported by Ollama. It displays the overall observed factor, per-model factors, and the exact recommended value to put in `config/config.json` (or `appsettings.json` factory defaults).
 
 The page auto-refreshes every 2 seconds by polling `/monitor/api`. A clickable link to this page is printed to the console when the router starts (see [Running](#running)).
 

@@ -659,7 +659,7 @@ function renderOverhead(overhead) {
     <span style="color: #888; font-size: 0.82rem; margin-left: 8px;">(${diffText} ${overhead.configuredFactor}, based on ${overhead.sampleCount} request${overhead.sampleCount > 1 ? 's' : ''}, Estimator: <strong>${overhead.estimator}</strong>)</span>
   </div>
   <div style="font-size: 0.85rem; color: #bbb;">
-    Recommended setting for <code>appsettings.json</code>: <code style="background: #181818; padding: 2px 6px; border-radius: 4px; color: #3f9eff;">"TokenEstimationOverheadFactor": ${factor}</code>
+    Recommended setting for <code>config/config.json</code> (or <code>appsettings.json</code> factory defaults): <code style="background: #181818; padding: 2px 6px; border-radius: 4px; color: #3f9eff;">"TokenEstimationOverheadFactor": ${factor}</code>
   </div>`;
 
   if (overhead.models && overhead.models.length > 1) {
