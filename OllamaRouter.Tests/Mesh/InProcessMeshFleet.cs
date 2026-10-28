@@ -45,6 +45,7 @@ public static class MeshCatalog
             SizeBytes = MoeBytes,
             ParameterCount = MoeParams,
             ExpertCount = 16, // MoE signal (expert_count > 0).
+            NativeContextLength = 262_144, // native GGUF context → CMax 262,144 (no Modelfile pin) so the 195k/175k rows qualify.
             Family = "llama"
         }
     ];
@@ -57,6 +58,7 @@ public static class MeshCatalog
             SizeBytes = MoeBytes,
             ParameterCount = MoeParams,
             ExpertCount = 16,
+            NativeContextLength = 262_144,
             Family = "llama"
         }
     ];
@@ -69,7 +71,7 @@ public static class MeshCatalog
             SizeBytes = DenseBytes,
             ParameterCount = DenseParams,
             ExpertCount = 0,
-            ModelfileNumCtx = null, // server dense has no Modelfile pin -> 262,144 hardware ceiling.
+            ModelfileNumCtx = null, // server dense has no Modelfile pin → FallbackContextWindow 131,072 assumed.
             Family = "llama"
         },
         new DaemonModel
@@ -78,6 +80,7 @@ public static class MeshCatalog
             SizeBytes = MoeBytes,
             ParameterCount = MoeParams,
             ExpertCount = 16,
+            NativeContextLength = 262_144,
             Family = "llama"
         }
     ];

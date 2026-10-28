@@ -18,9 +18,10 @@ public class ModelCapabilityEngineTests
         string? family = null,
         bool hasModelInfo = true,
         int? numCtx = null,
-        long weightBytes = 0)
+        long weightBytes = 0,
+        long? nativeContextLength = null)
     {
-        return new ModelMetadata("test-model:latest", weightBytes, parameterCount, expertCount, family, numCtx, hasModelInfo, numCtx is null ? null : $"num_ctx {numCtx}\n");
+        return new ModelMetadata("test-model:latest", weightBytes, parameterCount, expertCount, family, numCtx, hasModelInfo, numCtx is null ? null : $"num_ctx {numCtx}\n", nativeContextLength);
     }
 
     private static OllamaTargetOptions Target(string? hint, int? maxVram = null)
@@ -164,7 +165,53 @@ public class ModelCapabilityEngineTests
     }
 
     [Fact]
-    public void DeriveCapability_NoNumCtx_27BDense_96gb_ReturnsServerCeiling()
+    public void DeriveCapability_NoNumCtx_NativeContextBeatsFallback()
+    {
+        var engine = CreateEngine();
+        // No Modelfile pin, native GGUF context 65,536 → CMax is the native length (NOT the
+        // 131,072 assumed fallback) on ANY target class.
+        var metadata = Metadata(27_800_000_000L, family: "qwen3", nativeContextLength: 65_536, weightBytes: 16L * 1_048_576);
+
+        var desktop = engine.DeriveCapability(metadata, "t", Target("16gb"), null);
+        var server = engine.DeriveCapability(metadata, "t", Target("96gb"), null);
+
+        Assert.Equal(65_536, desktop.CMax);
+        Assert.Equal(65_536, server.CMax);
+        Assert.True(desktop.HardwareCapable);
+    }
+
+    [Fact]
+    public void DeriveCapability_NoNumCtx_NoNative_ReturnsAssumed128kFallbackOnAnyTargetClass()
+    {
+        var engine = CreateEngine();
+        var metadata = Metadata(27_800_000_000L, family: "qwen3", weightBytes: 16L * 1_048_576);
+
+        var server = engine.DeriveCapability(metadata, "t", Target("96gb"), null);
+        var desktop = engine.DeriveCapability(metadata, "t", Target("16gb"), null);
+        var laptop = engine.DeriveCapability(metadata, "t", Target("8gb"), null);
+        var unknown = engine.DeriveCapability(metadata, "t", Target(null), null);
+
+        Assert.Equal(ModelCapabilityEngine.FallbackContextWindow, server.CMax);
+        Assert.Equal(131_072, server.CMax);
+        Assert.Equal(ModelCapabilityEngine.FallbackContextWindow, desktop.CMax);
+        Assert.Equal(ModelCapabilityEngine.FallbackContextWindow, laptop.CMax);
+        Assert.Equal(ModelCapabilityEngine.FallbackContextWindow, unknown.CMax);
+    }
+
+    [Fact]
+    public void DeriveCapability_ExplicitNumCtxBeatsNativeContext()
+    {
+        var engine = CreateEngine();
+        // Modelfile pin 49,152 beats the model's (larger) native 131,072 context.
+        var metadata = Metadata(27_800_000_000L, family: "qwen3", numCtx: 49_152, nativeContextLength: 131_072, weightBytes: 16L * 1_048_576);
+
+        var capability = engine.DeriveCapability(metadata, "t", Target("16gb"), null);
+
+        Assert.Equal(49_152, capability.CMax);
+    }
+
+    [Fact]
+    public void DeriveCapability_NoNumCtx_27BDense_96gb_ReturnsFallbackWindow()
     {
         var engine = CreateEngine();
         var metadata = Metadata(27_800_000_000L, family: "qwen3", weightBytes: 16L * 1_048_576);
@@ -172,7 +219,7 @@ public class ModelCapabilityEngineTests
         var capability = engine.DeriveCapability(metadata, "t", Target("96gb"), null);
 
         Assert.Equal(ModelCapabilityEngine.OllamaDefaultContext, capability.CDefault);
-        Assert.Equal(ModelCapabilityEngine.ServerCeiling, capability.CMax);
+        Assert.Equal(ModelCapabilityEngine.FallbackContextWindow, capability.CMax);
         Assert.True(capability.HardwareCapable);
     }
 
@@ -184,7 +231,7 @@ public class ModelCapabilityEngineTests
 
         var capability = engine.DeriveCapability(metadata, "t", Target("16gb"), null);
 
-        Assert.Equal(ModelCapabilityEngine.DesktopCeiling, capability.CMax);
+        Assert.Equal(ModelCapabilityEngine.FallbackContextWindow, capability.CMax);
         Assert.True(capability.HardwareCapable);
     }
 
@@ -213,11 +260,11 @@ public class ModelCapabilityEngineTests
         Assert.Equal(ModelArchitectureKind.Moe, capability.Architecture);
         Assert.True(capability.HardwareCapable);
         Assert.True(capability.AvailableVramForKVCacheMB is < 0);
-        Assert.Equal(ModelCapabilityEngine.DesktopCeiling, capability.CMax);
+        Assert.Equal(ModelCapabilityEngine.FallbackContextWindow, capability.CMax);
     }
 
     [Fact]
-    public void DeriveCapability_Moe35BA3B_96gb_IsCapable_WithServerCeiling()
+    public void DeriveCapability_Moe35BA3B_96gb_IsCapable_WithFallbackWindow()
     {
         var engine = CreateEngine();
         var metadata = Metadata(35_000_000_000L, expertCount: 128, family: "qwen3", weightBytes: 21_500L * 1_048_576);
@@ -225,21 +272,21 @@ public class ModelCapabilityEngineTests
         var capability = engine.DeriveCapability(metadata, "t", Target("96gb"), null);
 
         Assert.True(capability.HardwareCapable);
-        Assert.Equal(ModelCapabilityEngine.ServerCeiling, capability.CMax);
+        Assert.Equal(ModelCapabilityEngine.FallbackContextWindow, capability.CMax);
     }
 
     [Fact]
-    public void DeriveCapability_SmallMoeOn8gb_ElasticServerCeiling()
+    public void DeriveCapability_SmallMoeOn8gb_ElasticFallbackWindow()
     {
         var engine = CreateEngine();
-        // Small MoE whose weights fit on an 8gb target → elastic 262144 ceiling.
+        // Small MoE whose weights fit on an 8gb target → assumed 128k fallback window.
         var metadata = Metadata(4_000_000_000L, expertCount: 64, family: "qwen3moe", weightBytes: 4L * 1_048_576);
 
         var capability = engine.DeriveCapability(metadata, "t", Target("8gb"), null);
 
         Assert.Equal(ModelArchitectureKind.Moe, capability.Architecture);
         Assert.True(capability.HardwareCapable);
-        Assert.Equal(ModelCapabilityEngine.ServerCeiling, capability.CMax);
+        Assert.Equal(ModelCapabilityEngine.FallbackContextWindow, capability.CMax);
     }
 
     [Fact]
@@ -254,14 +301,14 @@ public class ModelCapabilityEngineTests
     }
 
     [Fact]
-    public void DeriveCapability_UnknownVram_FallsBackToDefaultNoHeadroom()
+    public void DeriveCapability_UnknownVram_FallsBackToAssumed128kNoHeadroom()
     {
         var engine = CreateEngine();
         var metadata = Metadata(4_002_082_688L, family: "llama", weightBytes: 2L * 1_048_576);
 
         var capability = engine.DeriveCapability(metadata, "t", Target(null), null);
 
-        Assert.Equal(ModelCapabilityEngine.OllamaDefaultContext, capability.CMax);
+        Assert.Equal(ModelCapabilityEngine.FallbackContextWindow, capability.CMax);
         Assert.Null(capability.AvailableVramForKVCacheMB);
     }
 
@@ -279,15 +326,16 @@ public class ModelCapabilityEngineTests
 
     // --- Client context clamping ------------------------------------------------------
 
-    // --- 32 GB server-class ceiling (task #21) -----------------------------------------
+    // --- Assumed-128k fallback (task #25) -----------------------------------------
 
     [Theory]
-    // 32 GB, 64 GB and 96 GB are ALL server-class now (the boundary moved to 32 GB):
-    // LargeDense earns the full 262,144 elastic ceiling.
+    // 32 GB, 64 GB and 96 GB unpinned targets with no discoverable native context all get
+    // the assumed 128k fallback window (hardware-derived ceilings are no longer capacity
+    // sources).
     [InlineData(32_768)]
     [InlineData(65_536)]
     [InlineData(98_304)]
-    public void DeriveCapability_NoNumCtx_ServerClassBudgets_LargeDenseGets262kCeiling(int maxVramMB)
+    public void DeriveCapability_NoNumCtx_ServerClassBudgets_LargeDenseGets128kFallback(int maxVramMB)
     {
         var engine = CreateEngine();
         var metadata = Metadata(27_800_000_000L, family: "qwen3", weightBytes: 16L * 1_048_576);
@@ -295,12 +343,12 @@ public class ModelCapabilityEngineTests
         var capability = engine.DeriveCapability(metadata, "t", Target(null, maxVramMB), null);
 
         Assert.True(capability.HardwareCapable);
-        Assert.Equal(ModelCapabilityEngine.ServerCeiling, capability.CMax);
-        Assert.Equal(262_144, capability.CMax);
+        Assert.Equal(ModelCapabilityEngine.FallbackContextWindow, capability.CMax);
+        Assert.Equal(131_072, capability.CMax);
     }
 
     [Fact]
-    public void DeriveCapability_NoNumCtx_16GB_LargeDense_KeepsDesktopCeiling()
+    public void DeriveCapability_NoNumCtx_16GB_LargeDense_GetsFallbackWindow()
     {
         var engine = CreateEngine();
         var metadata = Metadata(27_800_000_000L, family: "qwen3", weightBytes: 16L * 1_048_576);
@@ -308,8 +356,8 @@ public class ModelCapabilityEngineTests
         var capability = engine.DeriveCapability(metadata, "t", Target(null, 16_384), null);
 
         Assert.True(capability.HardwareCapable);
-        Assert.Equal(ModelCapabilityEngine.DesktopCeiling, capability.CMax);
-        Assert.Equal(49_152, capability.CMax);
+        Assert.Equal(ModelCapabilityEngine.FallbackContextWindow, capability.CMax);
+        Assert.Equal(131_072, capability.CMax);
     }
 
     [Fact]
@@ -324,18 +372,18 @@ public class ModelCapabilityEngineTests
     }
 
     [Theory]
-    // MoE on 16 GB → desktop (49,152); MoE on 8 GB → elastic server ceiling (262,144).
-    // The < 12 GB arm is unchanged by the threshold move.
-    [InlineData(16_384, 49152)]
-    [InlineData(8_192, 262144)]
-    public void DeriveCapability_Moe_CeilingUnchangedByThresholdMove(int maxVramMB, int expectedCMax)
+    // MoE unpinned on 16 GB and 8 GB → assumed 128k fallback window on BOTH (the capacity
+    // no longer depends on the hardware class; the < 12 GB LargeDense veto is unchanged).
+    [InlineData(16_384)]
+    [InlineData(8_192)]
+    public void DeriveCapability_Moe_Unpinned_FallbackWindow(int maxVramMB)
     {
         var engine = CreateEngine();
         var metadata = Metadata(4_000_000_000L, expertCount: 64, family: "qwen3moe", weightBytes: 4L * 1_048_576);
 
         var capability = engine.DeriveCapability(metadata, "t", Target(null, maxVramMB), null);
 
-        Assert.Equal(expectedCMax, capability.CMax);
+        Assert.Equal(ModelCapabilityEngine.FallbackContextWindow, capability.CMax);
     }
 
     // --- Client context clamping ------------------------------------------------------
@@ -343,7 +391,8 @@ public class ModelCapabilityEngineTests
     [Fact]
     public void EvaluateClientContext_ClientNumCtxClampedToCMax()
     {
-        // 2000 tokens, client requests 131072, CMax 49152 → clamped to 49152, qualified.
+        // 2000 tokens, client requests 131072, CMax 49152 → 2000 + 8192 = 10192 ≤ 49152
+        // qualifies; the injected value clamps to min(131072, 49152) = 49152.
         var (qualified, injected) = ModelCapabilityEngine.EvaluateClientContext(2000, 131072, 49152);
 
         Assert.True(qualified);
@@ -351,23 +400,87 @@ public class ModelCapabilityEngineTests
     }
 
     [Fact]
-    public void EvaluateClientContext_NoClientNumCtx_UsesEstimatedTokensWithMargin()
+    public void EvaluateClientContext_NoClientNumCtx_AddsMargin()
     {
-        // 2000 tokens, no client num_ctx → 2000 * 1.25 = 2500, well below CMax.
+        // 2000 tokens, no client num_ctx → 2000 + 8192 = 10192, well below CMax.
         var (qualified, injected) = ModelCapabilityEngine.EvaluateClientContext(2000, null, 49152);
 
         Assert.True(qualified);
-        Assert.Equal(2500, injected);
+        Assert.Equal(10_192, injected);
+    }
+
+    [Fact]
+    public void EvaluateClientContext_BoundaryFit_Qualifies()
+    {
+        // 40,960 + 8,192 = 49,152 ≤ 49,152 → fits exactly at the boundary.
+        var (qualified, _) = ModelCapabilityEngine.EvaluateClientContext(40_960, null, 49_152);
+
+        Assert.True(qualified);
+    }
+
+    [Fact]
+    public void EvaluateClientContext_BoundaryPlusOneToken_NotQualified()
+    {
+        // 40,961 + 8,192 = 49,153 > 49,152 → disqualified by a single token.
+        var (qualified, _) = ModelCapabilityEngine.EvaluateClientContext(40_961, null, 49_152);
+
+        Assert.False(qualified);
     }
 
     [Fact]
     public void EvaluateClientContext_OversizedRequest_NotQualified()
     {
-        // 150000 tokens, no client num_ctx → 187500 required, exceeds CMax 49152.
+        // 150,000 + 8,192 = 158,192 required, exceeds CMax 49,152.
         var (qualified, injected) = ModelCapabilityEngine.EvaluateClientContext(150_000, null, 49152);
 
         Assert.False(qualified);
         Assert.Equal(49152, injected); // Injected value still clamped to CMax.
+    }
+
+    [Fact]
+    public void EvaluateClientContext_SmallClientNumCtx_LowersRequirement()
+    {
+        // 150,000 tokens would overflow CMax 49,152, but the client's static num_ctx 8,192 is
+        // an upper-bound preference: min(158,192, 8,192) = 8,192 ≤ 49,152 → qualified.
+        var (qualified, injected) = ModelCapabilityEngine.EvaluateClientContext(150_000, 8_192, 49_152);
+
+        Assert.True(qualified);
+        Assert.Equal(8_192, injected);
+    }
+
+    [Fact]
+    public void EvaluateClientContext_CustomMargin_Honored()
+    {
+        // Margin 32,000: 17,000 + 32,000 = 49,000 ≤ 49,152 qualifies…
+        var (qualifiedLarge, _) = ModelCapabilityEngine.EvaluateClientContext(17_000, null, 49_152, contextFitMarginTokens: 32_000);
+        Assert.True(qualifiedLarge);
+
+        // …and at the boundary: 17,152 + 32,000 = 49,152 qualifies, 17,153 + 32,000 = 49,153
+        // > 49,152 → disqualified, proving the margin is the configured value (not 1.25).
+
+        var (qualified, _) = ModelCapabilityEngine.EvaluateClientContext(17_153, null, 49_152, contextFitMarginTokens: 32_000);
+        Assert.False(qualified);
+    }
+
+    [Fact]
+    public void EvaluateClientContext_ZeroMargin_TokensAlone()
+    {
+        // Margin 0: the raw estimate is the requirement (40,960 ≤ 49,152 qualifies; the
+        // default 8,192 margin would have disqualified 40,961+).
+        var (qualified, injected) = ModelCapabilityEngine.EvaluateClientContext(40_960, null, 49_152, contextFitMarginTokens: 0);
+
+        Assert.True(qualified);
+        Assert.Equal(40_960, injected);
+    }
+
+    [Fact]
+    public void EvaluateClientContext_NegativeMargin_ClampsToZero()
+    {
+        // A negative margin is treated as 0 (defensive clamp inside the engine).
+        var (qualified, injected) = ModelCapabilityEngine.EvaluateClientContext(2_000, null, 49_152, contextFitMarginTokens: -100);
+
+        Assert.True(qualified);
+        Assert.Equal(2_000, injected);
     }
 
     // --- Caching / single-flight ------------------------------------------------------

@@ -79,9 +79,10 @@ public sealed record TargetModelCapability(
 /// Discovers model capabilities per target by inspecting the target's /api/tags entry and
 /// POST /api/show, caches the parsed <see cref="ModelMetadata"/> keyed by target + model +
 /// catalog digest, and derives the architecture classification and the per-target context
-/// ceilings (C_default / C_max) through the zero-config routing hierarchy:
-/// explicit Modelfile num_ctx → client options.num_ctx clamping (request time) →
-/// hardware-derived safe ceiling.
+/// ceilings (C_default / C_max) through the capacity hierarchy:
+/// the node's pre-configured Modelfile num_ctx → the model's native GGUF context length
+/// (model_info "*.context_length") → the assumed 128k fallback
+/// (<see cref="FallbackContextWindow").
 /// </summary>
 public sealed class ModelCapabilityEngine(
     IOllamaModelCatalogClient catalogClient,
@@ -95,14 +96,29 @@ public sealed class ModelCapabilityEngine(
     public const int OllamaDefaultContext = 4096;
 
     /// <summary>
-    /// Context ceiling for "16gb" desktop-class targets (48k = 48 × 1024).
+    /// Deprecated: the legacy hardware-derived context ceiling for "16gb" desktop-class
+    /// targets (48k = 48 × 1024). No longer consulted for qualification (task #25): the
+    /// capacity is the node's pre-configured num_ctx, the native GGUF context length, or the
+    /// <see cref="FallbackContextWindow"/> assumption. Retained for documentation and legacy
+    /// test fixtures.
     /// </summary>
     public const int DesktopCeiling = 49152;
 
     /// <summary>
-    /// Context ceiling for "96gb" server-class targets.
+    /// Deprecated: the legacy hardware-derived context ceiling for "96gb" server-class
+    /// targets. No longer consulted for qualification (task #25): the capacity is the node's
+    /// pre-configured num_ctx, the native GGUF context length, or the
+    /// <see cref="FallbackContextWindow"/> assumption. Retained for documentation and legacy
+    /// test fixtures.
     /// </summary>
     public const int ServerCeiling = 262144;
+
+    /// <summary>
+    /// Assumed context window (128,000 tokens ≈ 131,072) used as the LAST-resort CMax when a
+    /// node's Modelfile pre-configures no num_ctx AND the model's native GGUF context length
+    /// is undiscoverable. Replaces the retired hardware-derived ceilings as a capacity source.
+    /// </summary>
+    public const int FallbackContextWindow = 131_072;
 
     /// <summary>
     /// Targets with fewer megabytes of VRAM than this are "small" (8gb laptop-class) targets.
@@ -127,13 +143,6 @@ public sealed class ModelCapabilityEngine(
     public static string ArchitectureWireName(ModelArchitectureKind kind) =>
         kind == ModelArchitectureKind.Moe ? "Moe" : "Dense";
 
-    /// <summary>
-    /// Minimum effective VRAM (in MB) of a server-class target: references the shared
-    /// <see cref="DynamicContextSizingEngine.ServerClassVramThresholdMB"/> constant so the
-    /// ceiling boundary (32 GB) and the bucket-profile boundary stay a single source of truth.
-    /// </summary>
-    private const int ServerCeilingMB = DynamicContextSizingEngine.ServerClassVramThresholdMB;
-
     private static readonly TimeSpan CapabilityCacheDuration = TimeSpan.FromSeconds(30);
 
     /// <summary>
@@ -148,7 +157,7 @@ public sealed class ModelCapabilityEngine(
     {
         if (string.IsNullOrWhiteSpace(targetUrl) || string.IsNullOrEmpty(modelName) || string.IsNullOrEmpty(catalogDigest))
         {
-            return new ModelMetadata(modelName, 0, null, 0, null, null, false, null);
+            return new ModelMetadata(modelName, 0, null, 0, null, null, false, null, null);
         }
 
         var cacheKey = BuildCacheKey(targetUrl, catalogDigest, modelName);
@@ -169,7 +178,7 @@ public sealed class ModelCapabilityEngine(
         };
 
         return (ModelMetadata?)await memoryCache.GetOrCreateAsync(cacheKey, factory) ??
-               new ModelMetadata(modelName, 0, null, 0, null, null, false, null);
+               new ModelMetadata(modelName, 0, null, 0, null, null, false, null, null);
     }
 
     /// <summary>
@@ -231,10 +240,10 @@ public sealed class ModelCapabilityEngine(
         var weightMB = (int)(metadata.WeightSizeBytes / 1_048_576);
         var availableMB = maxVram.HasValue ? (int?)(maxVram.Value - weightMB) : null;
 
-        // Hierarchy level 1: an explicit Modelfile num_ctx wins outright.
-        var cMax = metadata.ModelfileNumCtx is { } explicitNumCtx
-            ? explicitNumCtx
-            : HardwareCeiling(maxVram);
+        // Capacity hierarchy (task #25): the node's pre-configured Modelfile num_ctx wins
+        // outright; otherwise the model's native GGUF context length; otherwise the assumed
+        // 128k fallback (hardware-derived ceilings are no longer capacity sources).
+        var cMax = metadata.ModelfileNumCtx ?? AsContextInt(metadata.NativeContextLength) ?? FallbackContextWindow;
 
         // 8gb / &lt;12000 MB hard veto for LargeDense only: MoE and SmallDense are NEVER
         // VRAM-vetoed (MoE is capable on all targets; see the zero-config routing plan §2.1).
@@ -252,18 +261,21 @@ public sealed class ModelCapabilityEngine(
     }
 
     /// <summary>
-    /// Request-time clamping helper (hierarchy level 2): computes whether a target with
-    /// ceiling <paramref name="cMax"/> is qualified for a request of
-    /// <paramref name="estimatedTokens"/> (plus the safety margin) and the <c>num_ctx</c>
-    /// value to inject: min(client-requested num_ctx ?? effective required, cMax).
+    /// Request-time clamping helper: computes whether a target with capacity
+    /// <paramref name="cMax"/> is qualified for a request of <paramref name="estimatedTokens"/>
+    /// plus the additive reasoning-fit margin, and the <c>num_ctx</c> value to inject:
+    /// min(client-requested num_ctx ?? effective required, cMax). Qualification uses
+    /// <c>estimatedTokens + contextFitMarginTokens</c> (clamped to the client's requested
+    /// num_ctx when smaller — an upper-bound preference that can only LOWER the requirement);
+    /// the client value never disqualifies by itself.
     /// </summary>
     public static (bool Qualified, int InjectedNumCtx) EvaluateClientContext(
         int estimatedTokens,
         int? clientRequestedNumCtx,
         int cMax,
-        double margin = 1.25)
+        int contextFitMarginTokens = 8192)
     {
-        var effectiveRequired = (long)Math.Ceiling((double)estimatedTokens * margin);
+        var effectiveRequired = (long)estimatedTokens + Math.Max(0, contextFitMarginTokens);
         if (clientRequestedNumCtx.HasValue)
         {
             effectiveRequired = Math.Min(effectiveRequired, clientRequestedNumCtx.Value);
@@ -289,19 +301,14 @@ public sealed class ModelCapabilityEngine(
         return (kind, ArchitectureDetectionSource.DenseParameterCount);
     }
 
-    private static int HardwareCeiling(int? maxVram)
+    private static int? AsContextInt(long? value)
     {
-        // Per target class (hierarchy level 3): server-class (≥ 32 GB) → 262144;
-        // 12-32 GB desktop → 49152;
-        // 8gb small → 262144 elastic ceiling for MoE/SmallDense (LargeDense is vetoed
-        // separately); unknown VRAM → Ollama default, no headroom claims.
-        return maxVram switch
+        if (value is null || value <= 0 || value > int.MaxValue)
         {
-            >= ServerCeilingMB => ServerCeiling,
-            >= SmallTargetVramThresholdMB => DesktopCeiling,
-            >= 0 => ServerCeiling,
-            _ => OllamaDefaultContext
-        };
+            return null;
+        }
+
+        return (int)value!;
     }
 
     private static string BuildCacheKey(string targetUrl, string catalogDigest, string modelName) =>

@@ -32,9 +32,11 @@ public static class DynamicContextSizingEngine
     /// above this budget use the <see cref="DynamicContextOptions.DenseServer96gbProfileName"/>
     /// profile (the "96gb" in its name is a historical artifact; 32 GB targets select it
     /// too, and operators may override the profile via <c>OllamaRouter:DynamicContext:Profiles</c>).
-    /// This constant is the single source of truth for the server-class boundary: the ceiling
-    /// classes in <see cref="ModelCapabilityEngine"/> and the <c>GetTargetClass</c> / hardware
-    /// role-slot rules in the routing decision service all derive from it.
+    /// This constant is the single source of truth for the server-class boundary used for
+    /// PROFILE BUCKETING (<see cref="SelectProfile"/>) and the routing decision service's
+    /// <c>GetTargetClass</c> / hardware role-slot rules. It is NOT a capacity/ceiling source:
+    /// context capacities (C_max) derive from the node's pre-configured num_ctx, the model's
+    /// native GGUF context length, or the assumed 128k fallback (task #25).
     /// </summary>
     public const int ServerClassVramThresholdMB = 32_768;
 

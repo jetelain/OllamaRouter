@@ -97,15 +97,13 @@ On catalog synchronization or first model touch, the router queries `POST /api/s
   1. **Explicit Modelfile Parameter:** Extracted directly from alias parameters (`num_ctx` integer value in `parameters` multiline string).
      - Desktop alias `Qwen3.8-27B:latest` with `num_ctx 49152` $\rightarrow$ Max tokens = 49,152.
      - Server alias `Qwen3.8-27B` with `num_ctx 262144` $\rightarrow$ Max tokens = 262,144.
-  2. **Client Request Override & Context Clamping:** If the incoming request specifies `options.num_ctx` (as many IDE extensions like Continue, Roo Code, and Zed do by default with static values like `131072`), that value is treated as an *upper bound preference* rather than an absolute minimum threshold. The router evaluates:
-     $$\text{EffectiveContextRequired} = \min(\text{EstimatedTokens} \times \text{Margin}, \text{ClientRequestedNumCtx})$$
-     A small prompt (e.g. 2,000 tokens) accompanied by a static `options.num_ctx: 131072` will **not** disqualify the Desktop (capped at 48k) nor force an unnecessary failover to the AI Server. The request runs on Desktop, and the injected `num_ctx` is clamped to the hardware-safe bucket.
-  3. **Hardware-Derived Safe Ceiling (when `num_ctx` is omitted in the model Modelfile):**
-     Standard models pulled directly from ollama.com do not define `num_ctx` in Modelfile parameters. Rather than naively capping all targets at 4,096 tokens, the router calculates the maximum safe context supported by the target's physical memory:
-     $$\text{AvailableVramForKVCache} = \text{TargetMaxVramMB} - \text{ModelWeightSizeMB}$$
-     - For `HardwareHint == "96gb"`: Default ceiling allows up to $\min(\text{EstimatedTokens} \times 1.25, \text{GGUF Context Length}, 262144)$.
-     - For `HardwareHint == "16gb"`: Dense $\ge 14\text{B}$ ceiling is capped at 49,152 tokens.
-     - Fallback: Standard Ollama default (4,096 tokens) if prompt length fits and no higher headroom is available.
+  2. **Client Request Override & Context Clamping (Additive Fit Rule):** If the incoming request specifies `options.num_ctx` (as many IDE extensions like Continue, Roo Code, and Zed do by default with static values like `131072`), that value is treated as an *upper bound preference* rather than an absolute minimum threshold. The router qualifies the target with an **additive** reasoning-fit margin (configurable via `OllamaRouter:ContextFitMarginTokens`, default **8,192** — recommend 10,240 for long-thinking agent models):
+     $$\text{EffectiveContextRequired} = \min(\text{EstimatedTokens} + \text{ContextFitMarginTokens}, \text{ClientRequestedNumCtx} \|\, \infty)$$
+     A small prompt (e.g. 2,000 tokens) accompanied by a static `options.num_ctx: 131072` will **not** disqualify a target with capacity 49,152 (2,000 + 8,192 = 10,192 ≤ 49,152) nor force an unnecessary failover to the AI Server. The request runs on the smallest-capacity qualified target, and the injected `num_ctx` is clamped to the hardware-safe bucket.
+  3. **Native Context / Assumed-128k Fallback (when `num_ctx` is omitted in the model Modelfile) — *supersedes the retired hardware-derived safe ceiling*:**
+     Standard models pulled directly from ollama.com do not define `num_ctx` in Modelfile parameters. The capacity then falls back to the **model's native GGUF context length** (the maximum numeric `*.context_length` value in `/api/show` `model_info`, e.g. `qwen3.context_length`), and when that is undiscoverable, to the **assumed 128k fallback** (`131,072` tokens, `ModelCapabilityEngine.FallbackContextWindow`). The legacy hardware-derived ceilings (49,152 desktop / 262,144 server) are **no longer capacity sources** (task #25):
+     $$\text{CMax} = \text{ModelfileNumCtx} \;?\; : \; \text{NativeContextLength} \;?\; : \; 131{,}072$$
+     The `4,096` Ollama default is no longer a CMax fallback (it remains the `CDefault` baseline and degraded-summary value).
 
 - **Model Sizing & Architecture Classification:**
   - **Model Weight Size:** Directly read from `size` (bytes on disk) in `GET /api/tags`.

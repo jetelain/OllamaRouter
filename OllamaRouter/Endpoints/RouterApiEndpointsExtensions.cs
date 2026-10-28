@@ -891,7 +891,7 @@ public static class RouterApiEndpointsExtensions
             Name: name,
             Architecture: ModelCapabilityEngine.ArchitectureWireName(architecture),
             ParameterCount: metadata.ParameterCount,
-            NativeContextWindow: metadata.ModelfileNumCtx ?? ModelCapabilityEngine.OllamaDefaultContext,
+            NativeContextWindow: metadata.NativeContextLength is { } nativeLen ? (int)Math.Min(nativeLen, int.MaxValue) : ModelCapabilityEngine.OllamaDefaultContext,
             RecommendedContextWindow: recommended,
             CloudOverflowAvailable: cloudOverflowAvailable);
     }
@@ -1086,7 +1086,7 @@ public static class RouterApiEndpointsExtensions
         }
 
         var affinityScore = evaluations.FirstOrDefault(e => e.Target == selected)?.Score ?? 0;
-        var estimatedTokensWithMargin = (int)Math.Ceiling(request.EstimatedTokens * 1.25);
+        var estimatedTokensWithMargin = request.EstimatedTokens + Math.Max(0, opt.ContextFitMarginTokens);
 
         // Cloud pseudo-target: the preview cannot know a cloud daemon's ceiling; it reports
         // what the client's/static value would flow through (contextMode "expanded").

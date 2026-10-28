@@ -258,15 +258,16 @@ public class RoutingDecisionServiceTests
         var desktop = h.Eval(TDesktop)!;
         Assert.True(desktop.Qualified);
         Assert.Equal(100, desktop.AffinityBonus);  // 27B is hot on Desktop
-        Assert.Equal(20, desktop.HardwareBonus);   // desktop-class, ≤48k Architect sweet spot
+        Assert.Equal(20, desktop.HardwareBonus);   // desktop-class: 30k + 8,192 = 38,192 ≤ the desktop's own 131,072 fallback CMax
         Assert.Equal(0, desktop.EvictionPenalty);  // requested model already loaded
         Assert.Equal(140, desktop.ConcurrencyPenalty); // 1 in-flight ×40 + cliff(1≥1)×100
         Assert.Equal(-20, desktop.Score);          // 120 − 140 (documented AC3 example)
 
         var server = h.Eval(TServer)!;
         Assert.True(server.Qualified);
-        // 30k tokens (effective 37.5k) is within the 48k desktop sweet spot, so the +20 role
-        // bonus goes to the desktop class, not the server class: Server scores 0 vs
+        // 30k tokens (30,000 + 8,192 = 38,192) fits the desktop's OWN capacity (the 16 GB
+        // unpinned target's 131,072 assumed fallback), so the +20 role bonus goes to the
+        // desktop class, not the server class: Server scores 0 vs
         // Desktop's −20 (120 − 140, the documented AC3 example) ⇒ the second concurrent
         // 27B request spills immediately to the idle Server.
         Assert.Equal(0, server.HardwareBonus);
@@ -445,7 +446,7 @@ public class RoutingDecisionServiceTests
     [Fact]
     public async Task Stage1_ContextOverflow_TokensExceedCMax_DisqualifiesTarget()
     {
-        // Modelfile num_ctx pins CMax at 4096; 30k tokens (×1.25 = 37500) does not fit.
+        // Modelfile num_ctx pins CMax at 4096; 30k tokens (+8,192 = 38,192) does not fit.
         var meta = new MetaMap();
         foreach (var url in new[] { DesktopUrl, LaptopUrl, ServerUrl })
         {
@@ -468,7 +469,7 @@ public class RoutingDecisionServiceTests
         // per-candidate evaluations survive the throw path via the reporting callback.
         await Assert.ThrowsAsync<NoAvailableTargetException>(() => h.Decide(30_000, "m"));
 
-        // Desktop (CMax 4096): 37500 > 4096 → context overflow.
+        // Desktop (CMax 4096): 30,000 + 8,192 = 38,192 > 4096 → context overflow.
         Assert.False(h.Eval(TDesktop)!.Qualified);
         Assert.StartsWith("context overflow", h.Eval(TDesktop)!.DisqualifiedReason);
     }
@@ -488,7 +489,7 @@ public class RoutingDecisionServiceTests
 
         var winner = await h.Decide(1_000, "qwen3.8-27B", numCtx: 131_072);
 
-        // 1000 × 1.25 = 1250 ≤ min(131072) and ≤ 49152 → Desktop qualifies and wins by order.
+        // 1000 + 8,192 = 9,192 ≤ min(131072, ∞) and ≤ 49152 → Desktop qualifies and wins by order.
         Assert.True(h.Eval(TDesktop)!.Qualified);
         Assert.Equal(TDesktop, winner);
     }
@@ -827,8 +828,8 @@ public class RoutingDecisionServiceTests
     public async Task Stage1_ClientNumCtxSmallerThanRequired_StillDisqualifiesOnOverflow()
     {
         // The client's num_ctx is an upper-bound preference, never a disqualifier — but when
-        // BOTH the token×1.25 estimate and the client num_ctx exceed CMax, the target is still
-        // disqualified: the clamp can only LOWER the requirement, never raise it.
+        // BOTH the token+margin estimate (5000 + 8,192 = 13,192) and the client num_ctx exceed
+        // CMax 4096, the target is still disqualified: the clamp can only LOWER the requirement.
         var meta = new MetaMap();
         foreach (var url in new[] { DesktopUrl, LaptopUrl, ServerUrl })
         {
@@ -843,20 +844,25 @@ public class RoutingDecisionServiceTests
             onlineTargets: new() { "Desktop", "Laptop", "Server" },
             meta: meta);
 
-        // 5000 tokens × 1.25 = 6250; client num_ctx 8192 → clamped requirement min(6250, 8192) =
-        // 6250 > CMax 4096 → context overflow on the Desktop (the Laptop is hardware-incapable
-        // for the 27B metadata as well) ⇒ nothing qualifies and no CloudModel is configured.
+        // 5000 tokens + 8,192 = 13,192; client num_ctx 8192 → clamped requirement
+        // min(13,192, 8,192) = 8,192 > CMax 4096 → context overflow on the Desktop (the Laptop
+        // is hardware-incapable for the 27B metadata as well) ⇒ nothing qualifies and no
+        // CloudModel is configured.
         await Assert.ThrowsAsync<NoAvailableTargetException>(() => h.Decide(5_000, "m", numCtx: 8_192));
         Assert.False(h.Eval(TDesktop)!.Qualified);
         Assert.StartsWith("context overflow", h.Eval(TDesktop)!.DisqualifiedReason);
     }
 
     [Fact]
-    public async Task Stage1_LargeDenseAboveDesktopCeiling_QualifiesOnServerClass()
+    public async Task Stage1_LargeDenseExceedingDesktopNodeCapacity_QualifiesOnServerClass()
     {
-        // 60k tokens → effective 75k > 49152 desktop ceiling: the Desktop (CMax 49152) overflows
-        // and is disqualified, while the Server-class target (CMax 262144) qualifies and wins.
-        var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        // 60k tokens + 8,192 = 68,192 > 49,152 (the Desktop's own Modelfile-pin CMax): the
+        // Desktop overflows and is disqualified, while the unpinned Server-class target (the
+        // assumed 128k fallback CMax 131,072) qualifies and wins (the only survivor).
+        var meta = new MetaMap();
+        meta.Add(DesktopUrl, "qwen3.8-27B", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 49_152), 16 * Gb);
+        meta.Add(LaptopUrl, "qwen3.8-27B", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 49_152), 16 * Gb);
+        meta.Add(ServerUrl, "qwen3.8-27B", DenseShow(27_800_000_000), 16 * Gb);
         var (h, _) = Build(
             FleetOptions("qwen3.8-27B"),
             withEngine: true,
@@ -869,7 +875,146 @@ public class RoutingDecisionServiceTests
         Assert.False(h.Eval(TDesktop)!.Qualified);
         Assert.StartsWith("context overflow", h.Eval(TDesktop)!.DisqualifiedReason);
         Assert.True(h.Eval(TServer)!.Qualified);
-        Assert.Equal(20, h.Eval(TServer)!.HardwareBonus); // >48k ⇒ server-class role match
+        Assert.Equal(0, h.Eval(TServer)!.HardwareBonus); // request fits the server's own CMax ⇒ not the "over-capacity" server role
+        Assert.Equal(TServer, winner);
+    }
+
+    [Fact]
+    public async Task Stage1_ConfiguredMargin_Honored_FromOptions()
+    {
+        // ContextFitMarginTokens = 32,000: a 15k-token dense request requires 15,000 + 32,000
+        // = 47,000 ≤ 49,152 → the Desktop (own CMax 49,152) qualifies and wins.
+        var options = FleetOptions("qwen3.8-27B");
+        options.ContextFitMarginTokens = 32_000;
+        var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{LaptopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            meta: meta);
+
+        var winner = await h.Decide(15_000, "qwen3.8-27B");
+
+        Assert.True(h.Eval(TDesktop)!.Qualified);
+        Assert.Equal(20, h.Eval(TDesktop)!.HardwareBonus); // 47,000 ≤ desktop's own CMax 49,152
+        Assert.Equal(TDesktop, winner);
+    }
+
+    [Fact]
+    public async Task Stage1_ZeroMargin_AllowsTokensAlone()
+    {
+        // ContextFitMarginTokens = 0: 40,961 tokens alone ≤ 49,152 qualifies (the default
+        // 8,192 margin would have disqualified 40,961 + 8,192 = 49,153 > 49,152).
+        var options = FleetOptions("qwen3.8-27B");
+        options.ContextFitMarginTokens = 0;
+        var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{LaptopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            meta: meta);
+
+        await h.Decide(40_961, "qwen3.8-27B");
+
+        Assert.True(h.Eval(TDesktop)!.Qualified);
+    }
+
+    [Fact]
+    public async Task Stage1_VeryLongPrompt_FitsOnlyNodePreconfiguredAbove160k()
+    {
+        // A 150k-token dense request needs 150,000 + 8,192 = 158,192 tokens of context:
+        // disqualified on a node pre-configured at 49,152 (Desktop) AND on an unpinned node
+        // (the assumed 128k fallback CMax 131,072), but served by a node pre-configured at
+        // 196,608.
+        var big = new OllamaTargetOptions { Name = "BigCtx", Url = "http://bigctx:11434", HardwareHint = "96gb", MaxParallel = 2 };
+        var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { Desktop, big } };
+        options.Models["qwen3.8-27B"] = new ModelThresholds();
+
+        var meta = new MetaMap();
+        meta.Add(DesktopUrl, "qwen3.8-27B", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 49_152), 16 * Gb);
+        meta.Add(big.Url!, "qwen3.8-27B", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 196_608), 16 * Gb);
+
+        var tBig = new RoutingTarget("BigCtx");
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{big.Url}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "BigCtx" },
+            states: new() { [TDesktop] = State(TDesktop, 0), [tBig] = State(tBig, 0) },
+            meta: meta);
+
+        var winner = await h.Decide(150_000, "qwen3.8-27B");
+
+        Assert.False(h.Eval(TDesktop)!.Qualified); // 158,192 > 49,152
+        Assert.StartsWith("context overflow", h.Eval(TDesktop)!.DisqualifiedReason);
+        Assert.True(h.Eval(tBig)!.Qualified);      // 158,192 ≤ 196,608 node pin
+        Assert.Equal(tBig, winner);
+    }
+
+    [Fact]
+    public async Task Stage1_VeryLongPrompt_ExceedsUnpinnedAssumed128kFallback()
+    {
+        // A 150k-token dense request needs 158,192 tokens: an unpinned Server-class node
+        // (no Modelfile num_ctx, no native context_length) has CMax = the 131,072 assumed
+        // fallback → context overflow (158,192 > 131,072).
+        var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        var (h, _) = Build(
+            FleetOptions("qwen3.8-27B"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{LaptopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            meta: meta);
+
+        // Nothing qualifies (all targets overflow the 131,072 fallback) and no CloudModel is
+        // configured → the decision throws, but the per-candidate evaluations survive.
+        await Assert.ThrowsAsync<NoAvailableTargetException>(() => h.Decide(150_000, "qwen3.8-27B"));
+
+        Assert.False(h.Eval(TDesktop)!.Qualified); // 158,192 > 131,072 assumed fallback (16 GB unpinned)
+        Assert.False(h.Eval(TServer)!.Qualified);  // 158,192 > 131,072 assumed fallback (96 GB unpinned)
+        Assert.StartsWith("context overflow", h.Eval(TServer)!.DisqualifiedReason);
+        Assert.False(h.Eval(TLaptop)!.Qualified);  // 158,192 > 131,072 (8 GB unpinned)
+    }
+
+    [Fact]
+    public async Task HardwareBonus_RoleDecidedByTargetOwnCapacity()
+    {
+        // Role rule (task #25): the LargeDense HardwareBonus is decided by the target's OWN
+        // pre-configured capacity (CMax), never a hardcoded desktop ceiling: the desktop-class
+        // target earns +20 when the margin-adjusted requirement fits ITS OWN CMax, the
+        // server-class target earns +20 only when the requirement exceeds the target's own CMax
+        // (the "over-capacity server role"). A 30k-token request needs 38,192, which the
+        // desktop's own 49,152 pin covers → the desktop earns the bonus; a 60k-token request
+        // needs 68,192, which does NOT fit the desktop's 49,152 (it is overflow-disqualified)
+        // but fits the server's 131,072 (→ the server scores the 0, non-role, and still wins).
+        var meta = new MetaMap();
+        meta.Add(DesktopUrl, "qwen3.8-27B", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 49_152), 16 * Gb);
+        meta.Add(LaptopUrl, "qwen3.8-27B", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 49_152), 16 * Gb);
+        meta.Add(ServerUrl, "qwen3.8-27B", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 131_072), 16 * Gb);
+        var (h, _) = Build(
+            FleetOptions("qwen3.8-27B"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{LaptopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            meta: meta);
+
+        // 30k tokens (38,192 needed): the desktop's own 49,152 covers it → desktop role +20;
+        // the server's 131,072 also covers it but a server that FITS is not the over-capacity
+        // server role → 0. Desktop wins on the +20.
+        var winner = await h.Decide(30_000, "qwen3.8-27B");
+        Assert.True(h.Eval(TDesktop)!.Qualified);
+        Assert.Equal(20, h.Eval(TDesktop)!.HardwareBonus); // desktop's own 49,152 covers 38,192
+        Assert.Equal(0, h.Eval(TServer)!.HardwareBonus);   // server that fits is not the over-capacity role
+        Assert.Equal(TDesktop, winner);
+
+        // 60k tokens (68,192 needed): the desktop's 49,152 does NOT cover it → overflow-
+        // disqualified (0, never scored); the server's 131,072 covers it → 0 (not the over-
+        // capacity role) but it is the only qualifier → it wins.
+        winner = await h.Decide(60_000, "qwen3.8-27B");
+        Assert.False(h.Eval(TDesktop)!.Qualified);
+        Assert.True(h.Eval(TServer)!.Qualified);
+        Assert.Equal(0, h.Eval(TServer)!.HardwareBonus);
         Assert.Equal(TServer, winner);
     }
 
@@ -1627,19 +1772,22 @@ public class RoutingDecisionServiceTests
     }
 
     [Fact]
-    public async Task HardwareBonus_64GBServerClass_EarnsRoleBonus_AboveDesktopCeiling()
+    public async Task HardwareBonus_64GBServerClass_QualifiedServerScoresNoRoleBonus()
     {
-        // A 64 GB target (MaxVramMB 65536) is Server-class (≥ 32 GB threshold): a LargeDense
-        // request of 60k tokens (effective 75k > 49152) earns the server-class HardwareBonus
-        // (+20); the 16 GB Desktop is context-overflow disqualified (CMax 49152). A 32 GB
-        // target (MaxVramMB 32768) also qualifies and earns the same role bonus.
+        // A 64 GB target (MaxVramMB 65536) is Server-class (≥ 32 GB threshold). A LargeDense
+        // request of 60k tokens needs 68,192: the 16 GB Desktop pinned at 49,152 is
+        // context-overflow disqualified, while both server-class targets (the assumed 131,072
+        // fallback) qualify. Under the task #25 role rule a server that FITS the request in its
+        // own CMax scores no role bonus (0, never the over-capacity role) — the bonus is no
+        // longer awarded by the retired hardcoded desktop-ceiling comparison; the first
+        // server-class target in declaration order wins the tie at 0.
         var s64 = new OllamaTargetOptions { Name = "aiserver2", Url = "http://as64:11434", MaxVramMB = 65_536, MaxParallel = 2 };
         var s32 = new OllamaTargetOptions { Name = "aiserver3", Url = "http://as32:11434", MaxVramMB = 32_768, MaxParallel = 2 };
         var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { Desktop, s64, s32 } };
         options.Models["qwen3.8-27B"] = new ModelThresholds();
 
         var meta = new MetaMap();
-        meta.Add(DesktopUrl, "qwen3.8-27B", DenseShow(27_800_000_000), 16 * Gb);
+        meta.Add(DesktopUrl, "qwen3.8-27B", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 49_152), 16 * Gb);
         meta.Add(s64.Url!, "qwen3.8-27B", DenseShow(27_800_000_000), 16 * Gb);
         meta.Add(s32.Url!, "qwen3.8-27B", DenseShow(27_800_000_000), 16 * Gb);
 
@@ -1655,13 +1803,13 @@ public class RoutingDecisionServiceTests
 
         var winner = await h.Decide(60_000, "qwen3.8-27B");
 
-        Assert.False(h.Eval(TDesktop)!.Qualified); // 75k effective > 49152 CMax ⇒ context overflow
+        Assert.False(h.Eval(TDesktop)!.Qualified); // 68,192 > 49,152 own CMax ⇒ context overflow
         Assert.StartsWith("context overflow", h.Eval(TDesktop)!.DisqualifiedReason);
         Assert.True(h.Eval(t64)!.Qualified);
-        Assert.Equal(20, h.Eval(t64)!.HardwareBonus); // 64 GB = Server class, > 48k role slot
+        Assert.Equal(0, h.Eval(t64)!.HardwareBonus); // 64 GB = Server class, but it FITS its own 131,072 ⇒ no over-capacity role
         Assert.True(h.Eval(t32)!.Qualified);
-        Assert.Equal(20, h.Eval(t32)!.HardwareBonus); // 32 GB = Server class too
-        Assert.Equal(t64, winner); // first server-class in declaration order at the 20 tie
+        Assert.Equal(0, h.Eval(t32)!.HardwareBonus); // 32 GB = Server class too
+        Assert.Equal(t64, winner); // first server-class in declaration order at the 0 tie
     }
 
     [Fact]

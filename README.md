@@ -169,6 +169,8 @@ Invoke-RestMethod -Uri 'http://localhost:11435/api/create' -Method Post -Content
 ```
 
 > With `num_ctx` set to `49152`, the corresponding `Models:Qwen3.8-27B:MaxLocalTokens` setting should be around `36864` (75% of `num_ctx`, see [Configuration](#configuration)).
+>
+> **This local/remote alias `num_ctx` is the source of truth for the router's context capacity.** Each target's maximum context (`CMax`) is exactly the `num_ctx` pre-configured on its alias — the router does *not* invent a ceiling from the hardware. A request of T estimated tokens is qualified for a target only when `T + ContextFitMarginTokens ≤ CMax` (the default margin is `8192`; see [Configuration](#configuration)). Only when a node's alias sets **no** `num_ctx` does the router fall back to the model's native GGUF context length, then to an assumed 128,000 tokens.
 
 ### Remote Ollama
 
@@ -244,6 +246,7 @@ appsettings.json  <  config/config.json  <  user secrets  <  environment variabl
 | `BindAddress`      | Address the router itself listens on. Defaults to `http://localhost:11434`. Set it to e.g. `http://0.0.0.0:11434` to accept connections from other machines. |
 | `TokenEstimator`   | Token estimation strategy: `"Heuristic"` (default, fast, zero heap memory overhead, saves ~24 MB RAM by omitting the BPE dictionary) or `"Tiktoken"` (uses Microsoft.ML.Tokenizers `cl100k_base`). |
 | `TokenEstimationOverheadFactor` | Multiplicative correction applied to the estimated token count, to compensate for the systematic underestimation of the generic tokenizer versus the actual tokenizer and chat template of targeted models. Defaults to `1.0` (no correction); see [recommendations below](#token-estimation-overhead-recommendations). |
+| `ContextFitMarginTokens` | Additive **reasoning-fit margin** (in tokens) added to the estimated prompt token count before qualifying a target: a prompt of T tokens is routed to a target only when `T + ContextFitMarginTokens ≤ CMax` (the target's [pre-configured node context](#setup-ollama-instances)). The margin reserves a typical high-reasoning/generation budget so the model's output never overflows the node's context. Defaults to `8192`; for long-thinking agent models a larger value (e.g. `10240`) is recommended. Negative values are clamped to `0`. Applied even when `DynamicContext:Enabled` is `false`. |
 | `MaxConsecutiveFailures` | Number of consecutive failures on a target for adjacent requests within `ConsecutiveFailuresTokenTolerance` before switching to the next target in the chain (`Local` → `Remote` → `Cloud`). Defaults to `3`. Set to `0` to disable automatic target switching. |
 | `ConsecutiveFailuresTokenTolerance` | Maximum difference in estimated prompt tokens between adjacent requests to consider them part of the same retry streak. Defaults to `4000`. Set to `0` to require an exact match. |
 | `Recording:Enabled` | Enables the optional [inference request recording](#inference-request-recording-optional), saving each request's metadata and full request body for investigation of estimated vs actual token counts. Defaults to `false`. |

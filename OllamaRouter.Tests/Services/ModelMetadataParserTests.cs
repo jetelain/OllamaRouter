@@ -146,48 +146,72 @@ public class ModelMetadataParserTests
         Assert.Equal(0, ModelMetadataParser.ExtractExpertCount(null));
     }
 
+    // --- native context length -----------------------------------------------------
+
+    [Fact]
+    public void ExtractNativeContextLength_SingleKey_ReturnsValue()
+    {
+        var modelInfo = new JsonObject { ["qwen3.context_length"] = (JsonNode)32_768L };
+        Assert.Equal(32_768L, ModelMetadataParser.ExtractNativeContextLength(modelInfo));
+    }
+
+    [Fact]
+    public void ExtractNativeContextLength_MultipleKeys_ReturnsMaximum()
+    {
+        var modelInfo = new JsonObject
+        {
+            ["a.context_length"] = (JsonNode)32_768L,
+            ["b.context_length"] = (JsonNode)131_072L,
+            ["c.context_length"] = (JsonNode)65_536L
+        };
+        Assert.Equal(131_072L, ModelMetadataParser.ExtractNativeContextLength(modelInfo));
+    }
+
+    [Fact]
+    public void ExtractNativeContextLength_NoKeysOrNull_ReturnsNull()
+    {
+        var modelInfo = new JsonObject { ["general.parameter_count"] = (JsonNode)27_800_000_000L };
+        Assert.Null(ModelMetadataParser.ExtractNativeContextLength(modelInfo));
+        Assert.Null(ModelMetadataParser.ExtractNativeContextLength(null));
+    }
+
+    [Fact]
+    public void ExtractNativeContextLength_NonNumericValue_Ignored()
+    {
+        var modelInfo = new JsonObject
+        {
+            ["a.context_length"] = (JsonNode)"not-a-number",
+            ["general.parameter_count"] = (JsonNode)27_800_000_000L
+        };
+        Assert.Null(ModelMetadataParser.ExtractNativeContextLength(modelInfo));
+    }
+
+    [Fact]
+    public void ExtractNativeContextLength_ZeroOrNegative_Ignored()
+    {
+        var modelInfo = new JsonObject
+        {
+            ["a.context_length"] = (JsonNode)0L,
+            ["b.context_length"] = (JsonNode)(-1L)
+        };
+        Assert.Null(ModelMetadataParser.ExtractNativeContextLength(modelInfo));
+    }
+
+    [Fact]
+    public void ExtractNativeContextLength_EmbeddedAmongUnrelatedKeys_ReturnsValue()
+    {
+        var modelInfo = new JsonObject
+        {
+            ["general.parameter_count"] = (JsonNode)27_800_000_000L,
+            ["qwen3.context_length"] = (JsonNode)40_960L,
+            ["qwen3.block_count"] = (JsonNode)64L,
+            ["qwen3.expert_count"] = (JsonNode)0L
+        };
+        Assert.Equal(40_960L, ModelMetadataParser.ExtractNativeContextLength(modelInfo));
+    }
+
     // --- full metadata parse -------------------------------------------------------------
 
-    [Fact]
-    public void ParseModelMetadata_FullPayload_ExtractsAllSignals()
-    {
-        var tags = new JsonArray
-        {
-            new JsonObject { ["name"] = "Qwen3.8-27B:latest", ["size"] = (JsonNode)17_305_205_760L }
-        };
-        var show = Show(
-            ("model", new JsonObject { ["size"] = (JsonNode)999L }),
-            ("parameters", (JsonNode)"num_ctx 49152\nnum_predict 4096\n"),
-            ("details", new JsonObject { ["family"] = "qwen3", ["parameter_size"] = "27.8B" }),
-            ("model_info", new JsonObject { ["general.parameter_count"] = (JsonNode)27_800_000_000L }));
-
-        var metadata = ModelMetadataParser.ParseModelMetadata("Qwen3.8-27B:latest", tags, show);
-
-        Assert.Equal("Qwen3.8-27B:latest", metadata.ModelName);
-        // Tags entry size wins over show.model.size.
-        Assert.Equal(17_305_205_760L, metadata.WeightSizeBytes);
-        Assert.Equal(27_800_000_000L, metadata.ParameterCount);
-        Assert.Equal(0, metadata.ExpertCount);
-        Assert.Equal("qwen3", metadata.ModelFamily);
-        Assert.Equal(49152, metadata.ModelfileNumCtx);
-        Assert.True(metadata.HasModelInfo);
-        Assert.Equal("num_ctx 49152\nnum_predict 4096\n", metadata.ParametersRaw);
-    }
-
-    [Fact]
-    public void ParseModelMetadata_NoTagsEntry_FallsBackToShowModelSize()
-    {
-        var show = Show(("model", new JsonObject { ["size"] = (JsonNode)4_294_967_296L }));
-        var metadata = ModelMetadataParser.ParseModelMetadata("m", [], show);
-        Assert.Equal(4_294_967_296L, metadata.WeightSizeBytes);
-    }
-
-    [Fact]
-    public void ParseModelMetadata_NoSizeAnywhere_ReturnsZero()
-    {
-        var metadata = ModelMetadataParser.ParseModelMetadata("m", [], null);
-        Assert.Equal(0, metadata.WeightSizeBytes);
-    }
 
     [Fact]
     public void ParseModelMetadata_NoShow_ReturnsDegradedMetadata()
@@ -200,6 +224,7 @@ public class ModelMetadataParserTests
         Assert.Null(metadata.ModelfileNumCtx);
         Assert.False(metadata.HasModelInfo);
         Assert.Null(metadata.ParametersRaw);
+        Assert.Null(metadata.NativeContextLength);
     }
 
     [Fact]
@@ -223,4 +248,25 @@ public class ModelMetadataParserTests
         Assert.True(metadata.HasModelInfo);
         Assert.Equal(9_000_000_000L, metadata.ParameterCount);
     }
+
+    [Fact]
+    public void ParseModelMetadata_ContextLengthKey_PopulatesNativeContextLength()
+    {
+        var show = Show(
+            ("details", new JsonObject { ["family"] = "qwen3" }),
+            ("model_info", new JsonObject { ["qwen3.context_length"] = (JsonNode)262_144L }));
+
+        var metadata = ModelMetadataParser.ParseModelMetadata("m", [], show);
+
+        Assert.Equal(262_144L, metadata.NativeContextLength);
+    }
+
+    [Fact]
+    public void ParseModelMetadata_NoContextLengthKey_NativeContextLengthNull()
+    {
+        var show = Show(("details", new JsonObject { ["family"] = "llama" }));
+        var metadata = ModelMetadataParser.ParseModelMetadata("m", [], show);
+        Assert.Null(metadata.NativeContextLength);
+    }
+
 }

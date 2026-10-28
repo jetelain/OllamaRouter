@@ -1508,8 +1508,11 @@ public class OllamaRoutingMiddlewareTests
 
         Assert.NotNull(captured[0]);
         using var doc = JsonDocument.Parse(captured[0]!);
-        // 100k tokens on the 16 GB MoE target: the 184,320 baseline is selected, then the
-        // hardware CMax (49,152 for the 16gb class) clamps the injected value.
+        // 100k tokens on the 16 GB target: the fixture's expert_count (128) classifies it as
+        // MoE, so the MoE profile's 184,320 baseline is selected, then clamped to the
+        // 49,152 max bucket of the 16 GB DenseDesktop16gb-class profile. CMax is now the
+        // 131,072 assumed fallback (no node pin), but the effective ceiling is the smaller
+        // profile max bucket (49,152), so the injected value clamps to 49,152.
         Assert.Equal(49_152, doc.RootElement.GetProperty("options").GetProperty("num_ctx").GetInt32());
     }
 

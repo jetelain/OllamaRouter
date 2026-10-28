@@ -71,20 +71,23 @@ public class RoutingContextCapabilityWiringTests
         Assert.Equal(ModelArchitectureKind.LargeDense, capability!.Architecture);
         Assert.Equal(ArchitectureDetectionSource.DenseParameterCount, capability.Source);
         Assert.Equal(ModelCapabilityEngine.OllamaDefaultContext, capability.CDefault);
-        // Unknown target (no targets list) → unknown VRAM → default ceiling, no headroom.
-        Assert.Equal(ModelCapabilityEngine.OllamaDefaultContext, capability.CMax);
+        // Unknown target (no targets list) → unknown VRAM → assumed 128k fallback window, no headroom.
+        Assert.Equal(ModelCapabilityEngine.FallbackContextWindow, capability.CMax);
         Assert.Null(capability.AvailableVramForKVCacheMB);
     }
 
     [Fact]
-    public async Task GetTargetCapabilityAsync_TargetWithVram_UsesHardwareCeiling()
+    public async Task GetTargetCapabilityAsync_UnpinnedTarget_UsesFallbackContextWindow()
     {
         var (context, _) = CreateContext(targets: [new OllamaTargetOptions { Name = "Local", Url = LocalUrl, HardwareHint = "16gb" }]);
 
         var capability = await context.GetTargetCapabilityAsync(new RoutingTarget("Local"), LocalUrl);
 
         Assert.NotNull(capability);
-        Assert.Equal(ModelCapabilityEngine.DesktopCeiling, capability!.CMax);
+        // No Modelfile num_ctx and no native context_length → the assumed 128k fallback,
+        // NOT the retired hardware-derived desktop ceiling (task #25).
+        Assert.Equal(ModelCapabilityEngine.FallbackContextWindow, capability!.CMax);
+        Assert.Equal(131_072, capability.CMax);
         Assert.True(capability.HardwareCapable);
     }
 

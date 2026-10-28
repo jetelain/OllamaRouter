@@ -353,20 +353,46 @@ public class RouterModelApiEndpointsTests
         var moe = ModelNode(root!, MoeModel);
         Assert.NotNull(moe);
         Assert.Equal("Moe", moe!["architecture"]!.ToString());
-        Assert.Equal("262144", moe["recommendedContextWindow"]!.ToString()); // Server CMax wins; Laptop must not drag it down
-        Assert.Equal("4096", moe["nativeContextWindow"]!.ToString()); // no Modelfile num_ctx
+        Assert.Equal("131072", moe["recommendedContextWindow"]!.ToString()); // max CMax over hardware-capable targets = assumed 128k fallback (no node pin)
+        Assert.Equal("4096", moe["nativeContextWindow"]!.ToString()); // no native context_length in model_info
 
         var dense = ModelNode(root, DenseModel);
         Assert.NotNull(dense);
         Assert.Equal("Dense", dense!["architecture"]!.ToString());
         Assert.Equal("32500000000", dense["parameterCount"]!.ToString());
         Assert.Equal("4096", dense["nativeContextWindow"]!.ToString());
-        Assert.Equal("262144", dense["recommendedContextWindow"]!.ToString());
+        Assert.Equal("131072", dense["recommendedContextWindow"]!.ToString());
 
-        // A model with "PARAMETER num_ctx 131072" in its Modelfile reports it as the native window.
+        // A model with a Modelfile "PARAMETER num_ctx 131072" still reports the native
+        // (unpinned) context window: the native window is the model's own context_length /
+        // Ollama default, NOT the node's pre-configured num_ctx (that caps CMax instead).
         var small = ModelNode(root, SmallModel);
         Assert.NotNull(small);
-        Assert.Equal("131072", small!["nativeContextWindow"]!.ToString());
+        Assert.Equal("4096", small!["nativeContextWindow"]!.ToString());
+        Assert.Equal("131072", small["recommendedContextWindow"]!.ToString()); // Modelfile pin 131,072 == CMax
+    }
+
+    [Fact]
+    public async Task ModelsList_NativeContextLengthInModelInfo_ReportedAsNativeContextWindow()
+    {
+        // A /api/show model_info carrying "qwen2.5.context_length" populates the model's
+        // nativeContextWindow (task #25): the summary reports the parsed native GGUF context
+        // instead of the 4096 Ollama default.
+        var moeTags = (MoeModel, 20L * 1024 * 1024 * 1024);
+        var denseTags = (DenseModel, 19L * 1024 * 1024 * 1024);
+        var show = DenseShow(32_500_000_000);
+        ((JsonObject)show["model_info"]!)["qwen2.5.context_length"] = (JsonNode)65_536L;
+        var catalog = CreateCatalogClientMock((LocalUrl, [moeTags, denseTags], new Dictionary<string, JsonObject> { [DenseModel] = show }));
+        await using var harness = await CreateTestAppAsync(ThreeTargetOptions(cloudEnabled: false), catalog);
+
+        using var response = await harness.Client.GetAsync("/api/router/models");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var root = (JsonObject?)JsonNode.Parse(await response.Content.ReadAsStringAsync());
+        Assert.NotNull(root);
+
+        var dense = ModelNode(root, DenseModel);
+        Assert.NotNull(dense);
+        Assert.Equal("65536", dense!["nativeContextWindow"]!.ToString()); // parsed *.context_length
     }
 
     [Fact]
@@ -401,12 +427,12 @@ public class RouterModelApiEndpointsTests
         // fleet-only ceiling (no cloud inflation).
         var dense = ModelNode(root, DenseModel)!;
         Assert.Equal("true", dense["cloudOverflowAvailable"]!.ToString());
-        Assert.Equal("262144", dense["recommendedContextWindow"]!.ToString());
+        Assert.Equal("131072", dense["recommendedContextWindow"]!.ToString());
 
         // The default cloud model makes the hint available for EVERY model.
         var moe = ModelNode(root, MoeModel)!;
         Assert.Equal("true", moe["cloudOverflowAvailable"]!.ToString());
-        Assert.Equal("262144", moe["recommendedContextWindow"]!.ToString());
+        Assert.Equal("131072", moe["recommendedContextWindow"]!.ToString());
     }
 
     [Fact]
@@ -424,7 +450,7 @@ public class RouterModelApiEndpointsTests
 
         var dense = ModelNode(root, DenseModel)!;
         Assert.Equal("false", dense["cloudOverflowAvailable"]!.ToString());
-        Assert.Equal("262144", dense["recommendedContextWindow"]!.ToString());
+        Assert.Equal("131072", dense["recommendedContextWindow"]!.ToString());
     }
 
     // ------------------------------------------------------------------
@@ -459,7 +485,7 @@ public class RouterModelApiEndpointsTests
         Assert.Equal("Dense", root["architecture"]!.ToString());
         Assert.Equal("32500000000", root["parameterCount"]!.ToString());
         Assert.Equal("4096", root["nativeContextWindow"]!.ToString());
-        Assert.Equal("262144", root["recommendedContextWindow"]!.ToString());
+        Assert.Equal("131072", root["recommendedContextWindow"]!.ToString());
 
         var targets = root["targets"]!.AsArray();
         Assert.Equal(3, targets.Count); // declaration order, Cloud never listed
@@ -473,7 +499,7 @@ public class RouterModelApiEndpointsTests
 
         var server = TargetNode(root, "Server")!;
         Assert.Equal("true", server["capable"]!.ToString());
-        Assert.Equal("262144", server["contextCeiling"]!.ToString());
+        Assert.Equal("131072", server["contextCeiling"]!.ToString());
         Assert.Equal("true", server["isResident"]!.ToString());
         Assert.Equal("1", server["inFlightRequests"]!.ToString());
         Assert.False((server as JsonObject)?.TryGetPropertyValue("vetoReason", out _) == true,
@@ -481,7 +507,7 @@ public class RouterModelApiEndpointsTests
 
         var local = TargetNode(root, "Local")!;
         Assert.Equal("true", local["capable"]!.ToString());
-        Assert.Equal("49152", local["contextCeiling"]!.ToString());
+        Assert.Equal("131072", local["contextCeiling"]!.ToString());
         Assert.Equal("false", local["isResident"]!.ToString());
     }
 
@@ -503,7 +529,7 @@ public class RouterModelApiEndpointsTests
 
         var local = TargetNode(root, "Local")!;
         Assert.Equal("true", local["capable"]!.ToString());
-        Assert.Equal("49152", local["contextCeiling"]!.ToString());
+        Assert.Equal("131072", local["contextCeiling"]!.ToString());
 
         var server = TargetNode(root, "Server")!;
         Assert.Equal("false", server["capable"]!.ToString());
@@ -613,7 +639,7 @@ public class RouterModelApiEndpointsTests
         var profile = options.DynamicContext.GetProfile(expected.ProfileName);
         var expectedMode = expected.InjectedNumCtx > profile.DefaultContext ? "expanded" : "baseline";
         Assert.Equal(expectedMode, root["contextMode"]!.ToString());
-        Assert.Equal(56250, (int)root["estimatedTokensWithMargin"]!.GetValue<int>()); // ceil(45000 * 1.25)
+        Assert.Equal(53_192, (int)root["estimatedTokensWithMargin"]!.GetValue<int>()); // 45,000 + 8,192 additive margin
 
         // The winner's evaluation score is reported as the affinity score.
         Assert.True((double)root["affinityScore"]!.GetValue<double>() >= 0);
@@ -631,7 +657,8 @@ public class RouterModelApiEndpointsTests
         ModelFamily: "qwen3.6",
         ModelfileNumCtx: null,
         HasModelInfo: true,
-        ParametersRaw: null);
+        ParametersRaw: null,
+        NativeContextLength: null);
 
     [Fact]
     public async Task Evaluate_SmallDenseCrossingBaselineBucket_ReportsExpandedMode()
@@ -640,9 +667,9 @@ public class RouterModelApiEndpointsTests
         var catalog = DefaultFleetCatalog(moeOnAllTargets: true);
         await using var harness = await CreateTestAppAsync(options, catalog);
 
-        // 40000 tokens: Local (CMax 49152) is overflow-disqualified (50000 > 49152), so the
-        // decision winner is the next qualified target; the SmallDense requirement 40000
-        // crosses the 32768 baseline → the intermediate 65536 bucket ("expanded").
+        // 40000 tokens: Local (CMax 131,072 Modelfile pin) qualifies (40,000 + 8,192 = 48,192 ≤
+        // 131,072) and wins; the SmallDense requirement 40000 crosses the 32768 baseline →
+        // the intermediate 65536 bucket ("expanded").
         var (status, root) = await PostEvaluateAsync(harness.Client,
             new { model = SmallModel, estimatedTokens = 40000, clientRequestedNumCtx = (object?)null });
         Assert.Equal(200, status);
@@ -655,7 +682,7 @@ public class RouterModelApiEndpointsTests
 
         var target = options.GetEffectiveTargets()
             .Single(t => string.Equals(t.Name, root!["selectedTarget"]!.ToString(), StringComparison.OrdinalIgnoreCase));
-        var smallMetadata = new ModelMetadata(SmallModel, 5L * 1024 * 1024 * 1024, 8_000_000_000, 0, "llama", 131_072, true, null);
+        var smallMetadata = new ModelMetadata(SmallModel, 5L * 1024 * 1024 * 1024, 8_000_000_000, 0, "llama", 131_072, true, null, null);
         var capability = new ModelCapabilityEngine(
                 (IOllamaModelCatalogClient)harness.CatalogClient.Object,
                 harness.App.Services.GetRequiredService<IMemoryCache>(),
@@ -669,7 +696,7 @@ public class RouterModelApiEndpointsTests
         var profile = options.DynamicContext.GetProfile(expected.ProfileName);
         Assert.True((int)root!["injectedNumCtx"]!.GetValue<int>() > profile.DefaultContext);
         Assert.Equal("expanded", root["contextMode"]!.ToString());
-        Assert.Equal(50000, (int)root["estimatedTokensWithMargin"]!.GetValue<int>());
+        Assert.Equal(48_192, (int)root["estimatedTokensWithMargin"]!.GetValue<int>()); // 40,000 + 8,192 additive margin
     }
 
     [Fact]
@@ -680,7 +707,8 @@ public class RouterModelApiEndpointsTests
         await using var harness = await CreateTestAppAsync(options, catalog);
 
         // Small prompt on the desktop-class Local target: the client's static 131072 is an
-        // upper-bound preference, clamped to Local's CMax (49152).
+        // upper-bound preference; the requirement 1,000 + 8,192 = 9,192 qualifies and the
+        // injected value stays within Local's CMax (131,072 Modelfile pin).
         var (status, root) = await PostEvaluateAsync(harness.Client,
             new { model = SmallModel, estimatedTokens = 1000, clientRequestedNumCtx = 131072 });
         Assert.Equal(200, status);
@@ -689,7 +717,7 @@ public class RouterModelApiEndpointsTests
         Assert.Equal("Local", root!["selectedTarget"]!.ToString());
 
         var target = options.GetEffectiveTargets().Single(t => t.Name == "Local");
-        var smallMetadata = new ModelMetadata(SmallModel, 5L * 1024 * 1024 * 1024, 8_000_000_000, 0, "llama", 131_072, true, null);
+        var smallMetadata = new ModelMetadata(SmallModel, 5L * 1024 * 1024 * 1024, 8_000_000_000, 0, "llama", 131_072, true, null, null);
         var capability = new ModelCapabilityEngine(
                 (IOllamaModelCatalogClient)harness.CatalogClient.Object,
                 harness.App.Services.GetRequiredService<IMemoryCache>(),
@@ -704,7 +732,7 @@ public class RouterModelApiEndpointsTests
         var profile = options.DynamicContext.GetProfile(expected.ProfileName);
         Assert.Equal(expected.InjectedNumCtx > profile.DefaultContext ? "expanded" : "baseline",
             root["contextMode"]!.ToString());
-        Assert.Equal(1250, (int)root["estimatedTokensWithMargin"]!.GetValue<int>());
+        Assert.Equal(9_192, (int)root["estimatedTokensWithMargin"]!.GetValue<int>()); // 1,000 + 8,192
     }
 
     [Fact]

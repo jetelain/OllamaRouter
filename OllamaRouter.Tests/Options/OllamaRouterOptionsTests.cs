@@ -154,6 +154,49 @@ public class OllamaRouterOptionsTests
     }
 
     [Fact]
+    public void ContextFitMarginTokens_DefaultsTo8192()
+    {
+        var options = new OllamaRouterOptions();
+        Assert.Equal(8192, options.ContextFitMarginTokens);
+    }
+
+    [Fact]
+    public void Normalize_NegativeContextFitMarginTokens_ClampedToZero()
+    {
+        var options = new OllamaRouterOptions { ContextFitMarginTokens = -1 };
+
+        options.Normalize();
+
+        Assert.Equal(0, options.ContextFitMarginTokens);
+    }
+
+    [Fact]
+    public void Normalize_NonNegativeContextFitMarginTokens_Unchanged()
+    {
+        var options = new OllamaRouterOptions { ContextFitMarginTokens = 10_240 };
+
+        options.Normalize();
+
+        Assert.Equal(10_240, options.ContextFitMarginTokens);
+    }
+
+    [Fact]
+    public void ContextFitMarginTokens_BindsFromConfiguration()
+    {
+        var configuration = new Microsoft.Extensions.Configuration.ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["OllamaRouter:ContextFitMarginTokens"] = "12345"
+            })
+            .Build();
+
+        var options = configuration.GetSection(OllamaRouterOptions.SectionName).Get<OllamaRouterOptions>();
+
+        Assert.NotNull(options);
+        Assert.Equal(12345, options!.ContextFitMarginTokens);
+    }
+
+    [Fact]
     public void SpeedFactor_DefaultsToOne()
     {
         Assert.Equal(1.0, new OllamaTargetOptions().SpeedFactor);

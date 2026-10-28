@@ -314,7 +314,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
 
         // 4. Hardware capable (capability engine + suitability rules) with the permissive
         //    fallback for unknown/degraded metadata (the config-pinned Dense veto still applies).
-        // 5. Context fit: min(ceil(tokens × 1.25), clientNumCtx ?? ∞) ≤ CMax.
+        // 5. Context fit: min(estimated + ContextFitMarginTokens, clientNumCtx ?? ∞) ≤ CMax.
         var capability = await context.GetTargetCapabilityAsync(target, targetOptions.Url!, cancellationToken);
         if (capability is null)
         {
@@ -337,7 +337,11 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             return Disqualified(target, $"hardware incapable ({capability.Architecture} on target with MaxVramMB {maxVramDescription})");
         }
 
-        if (!ModelCapabilityEngine.EvaluateClientContext(context.TokenCount, context.ClientRequestedNumCtx, capability.CMax).Qualified)
+        if (!ModelCapabilityEngine.EvaluateClientContext(
+                context.TokenCount,
+                context.ClientRequestedNumCtx,
+                capability.CMax,
+                _options.Value.ContextFitMarginTokens).Qualified)
         {
             return Disqualified(target, $"context overflow (estimated {context.TokenCount} tokens does not fit CMax {capability.CMax})");
         }
@@ -393,9 +397,11 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
     /// <summary>
     /// Stage-2 HardwareBonus (+20) role matching:
     /// <list type="bullet">
-    /// <item>LargeDense: +20 to a desktop-class target when the effective requirement is ≤ the
-    /// desktop ceiling (the ≤ 48k Architect sweet spot); +20 to a server-class target when it
-    /// exceeds it. At most one target kind is role-matched per request (by its own class).</item>
+    /// <item>LargeDense: +20 to the target whose OWN pre-configured capacity (CMax) covers the
+    /// margin-adjusted requirement (estimated + ContextFitMarginTokens, client upper-bound
+    /// clamp) — the role is "the class whose pre-configured capacity covers the request":
+    /// the desktop-class target when it covers it, otherwise the server-class target. At
+    /// most one target kind is role-matched per request (by its own class).</item>
     /// <item>MoE / SmallDense: +20 to the FIRST small-class (Laptop) target only when any
     /// desktop/server-class fleet target holds a dense model hot (per /api/ps classification)
     /// or is busy (InFlight &gt; 0). Otherwise no bonus — an idle desktop wins a standalone
@@ -413,15 +419,16 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
 
         if (capability.Architecture == ModelArchitectureKind.LargeDense)
         {
-            var effectiveRequired = (long)Math.Ceiling((double)context.TokenCount * 1.25);
+            // The role is decided by the target's OWN pre-configured capacity (task #25):
+            // the same additive margin-adjusted requirement used for Stage-1 qualification
+            // (no hardcoded capacity ceiling).
+            var effectiveRequired = (long)context.TokenCount + Math.Max(0, _options.Value.ContextFitMarginTokens);
             if (context.ClientRequestedNumCtx.HasValue)
             {
                 effectiveRequired = Math.Min(effectiveRequired, context.ClientRequestedNumCtx.Value);
             }
 
-            // The role slot is single per request: ≤ 48k (the Architect sweet spot) belongs to
-            // the desktop class, > 48k to the server class. Only the role-matched kind scores.
-            if (effectiveRequired <= ModelCapabilityEngine.DesktopCeiling)
+            if (effectiveRequired <= capability.CMax)
             {
                 return targetClass == TargetClass.Desktop ? HardwareBonus : 0;
             }

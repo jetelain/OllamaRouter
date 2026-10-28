@@ -53,11 +53,13 @@ builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.TypeInfoResolverChain.Insert(0, OllamaRouterJsonSerializerContext.Default);
 });
 
-// Resolved + normalized options (DynamicContext.Normalize() restores missing or zero-valued built-in
-// profiles; .NET config binding would otherwise replace the whole Profiles dictionary on partial
-// overrides). The exact same instance is registered by AddOllamaRouter.
+// Resolved + normalized options (Normalize() clamps the additive context fit margin; the
+// DynamicContext.Normalize() step restores missing or zero-valued built-in profiles; .NET
+// config binding would otherwise replace the whole Profiles dictionary on partial overrides).
+// The exact same instance is registered by AddOllamaRouter.
 var ollamaOptions = builder.Configuration.GetSection(OllamaRouterOptions.SectionName).Get<OllamaRouterOptions>()
     ?? new OllamaRouterOptions();
+ollamaOptions.Normalize();
 ollamaOptions.DynamicContext.Normalize();
 
 // Full service registration + request pipeline (YARP from the effective fleet target list, the

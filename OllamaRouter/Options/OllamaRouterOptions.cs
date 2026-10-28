@@ -84,6 +84,20 @@ public sealed class OllamaRouterOptions
     public double TokenEstimationOverheadFactor { get; set; } = 1.0;
 
     /// <summary>
+    /// Additive reasoning-fit margin (in tokens) added to the estimated prompt token count
+    /// before qualifying a target for a request: a prompt of T estimated tokens needs
+    /// <c>T + ContextFitMarginTokens ≤ CMax</c> (the target's pre-configured node context,
+    /// falling back to the native GGUF context length, then the assumed 128k fallback) to be
+    /// qualified. The margin reserves a typical high-reasoning/generation budget so the
+    /// model's output tokens never overflow the node's context. Defaults to 8,192; for
+    /// long-thinking agent models a larger value (e.g. 10,240) is recommended.
+    /// Negative values are clamped to 0 by <see cref="Normalize"/>.
+    /// This lives in the root <c>OllamaRouter</c> section (not under <c>DynamicContext</c>)
+    /// because qualification happens even when <see cref="DynamicContextOptions.Enabled"/> is false.
+    /// </summary>
+    public int ContextFitMarginTokens { get; set; } = 8192;
+
+    /// <summary>
     /// Token estimation strategy: "Heuristic" (default, zero heap memory overhead) or "Tiktoken" (Microsoft.ML.Tokenizers cl100k_base).
     /// </summary>
     public string TokenEstimator { get; set; } = "Heuristic";
@@ -228,6 +242,18 @@ public sealed class OllamaRouterOptions
         CloudOverflow.Enabled &&
         (!string.IsNullOrEmpty(CloudOverflow.DefaultModel) ||
          (Models is { Count: > 0 } && Models.Values.Any(m => !string.IsNullOrEmpty(m.CloudModel))));
+
+    /// <summary>
+    /// Normalizes the root section after config binding: clamps a negative
+    /// <see cref="ContextFitMarginTokens"/> to 0. Never throws.
+    /// </summary>
+    public void Normalize()
+    {
+        if (ContextFitMarginTokens < 0)
+        {
+            ContextFitMarginTokens = 0;
+        }
+    }
 }
 
 /// <summary>

@@ -38,6 +38,8 @@ public sealed class DaemonModel
     public long ExpertCount { get; init; }
     /// <summary>Optional explicit Modelfile <c>num_ctx</c> surfaced in the <c>parameters</c> block (caps C_max).</summary>
     public int? ModelfileNumCtx { get; init; }
+    /// <summary>Optional native GGUF context length surfaced as <c>model_info["&lt;family&gt;.context_length"]</c>.</summary>
+    public long? NativeContextLength { get; init; }
     public string Family { get; init; } = "llama";
 }
 
@@ -442,6 +444,11 @@ public sealed class FakeOllamaDaemon : IAsyncDisposable
         if (m is not null && m.ExpertCount > 0)
         {
             modelInfo[$"{m.Family}.expert_count"] = m.ExpertCount;
+        }
+
+        if (m is not null && m.NativeContextLength.HasValue)
+        {
+            modelInfo[$"{m.Family}.context_length"] = m.NativeContextLength.Value;
         }
 
         var result = new JsonObject

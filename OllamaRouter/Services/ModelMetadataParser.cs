@@ -21,7 +21,8 @@ public sealed record ModelMetadata(
     string? ModelFamily,
     int? ModelfileNumCtx,
     bool HasModelInfo,
-    string? ParametersRaw);
+    string? ParametersRaw,
+    long? NativeContextLength);
 
 /// <summary>
 /// Pure, stateless parsers that turn raw Ollama <c>/api/tags</c> and <c>/api/show</c> JSON
@@ -205,6 +206,44 @@ public static class ModelMetadataParser
     }
 
     /// <summary>
+    /// Scans <c>model_info</c> for any key ending in "context_length" with a numeric value and
+    /// returns the maximum positive value found (the model's native GGUF context limit), or
+    /// null when no such key is present (absent, non-numeric, zero, or non-representable).
+    /// </summary>
+    public static long? ExtractNativeContextLength(JsonObject? modelInfo)
+    {
+        if (modelInfo is null)
+        {
+            return null;
+        }
+
+        long? max = null;
+        foreach (KeyValuePair<string, JsonNode?> property in modelInfo)
+        {
+            if (!property.Key.EndsWith(".context_length", StringComparison.Ordinal) ||
+                property.Value?.GetValueKind() != JsonValueKind.Number)
+            {
+                continue;
+            }
+
+            try
+            {
+                var value = property.Value!.GetValue<long>();
+                if (value > 0 && (max is null || value > max.Value))
+                {
+                    max = value;
+                }
+            }
+            catch (Exception)
+            {
+                // Non-representable numeric value: ignore this key.
+            }
+        }
+
+        return max;
+    }
+
+    /// <summary>
     /// Aggregates the raw <c>/api/tags</c> entry (for the model weight size) and the
     /// <c>/api/show</c> response (for <c>num_ctx</c>, parameter count, family, expert count)
     /// into a single <see cref="ModelMetadata"/>. A null <paramref name="show"/> produces the
@@ -223,7 +262,8 @@ public static class ModelMetadataParser
             ModelFamily: TryGetString(show?["details"]?["family"], out var family) ? family!.ToLowerInvariant() : null,
             ModelfileNumCtx: ParseNumCtx(show),
             HasModelInfo: modelInfo is not null,
-            ParametersRaw: TryGetString(show?["parameters"], out var parameters) ? parameters : null);
+            ParametersRaw: TryGetString(show?["parameters"], out var parameters) ? parameters : null,
+            NativeContextLength: ExtractNativeContextLength(modelInfo));
     }
 
     private static long ResolveWeightSize(string modelName, JsonArray? tags, JsonObject? show)
