@@ -51,8 +51,11 @@ public class RoutingDecisionServiceTests
         public Task<RoutingTarget> Decide(int tokens, string model, string sessionId)
             => SUT.DecideWithEvaluationsAsync(tokens, model, null, e => Evaluations.Add(e), sessionId: sessionId);
 
+        public Task<RoutingDecisionResult> DecideDetailed(int tokens, string model, int? numCtx = null, string? sessionId = null)
+            => SUT.DecideWithEvaluationsDetailedAsync(tokens, model, numCtx, e => Evaluations.Add(e), sessionId: sessionId);
+
         public RoutingCandidateEvaluation? Eval(RoutingTarget t) => Evaluations.LastOrDefault(e => e.Target == t);
-        }
+    }
 
     private sealed class MetaMap
     {
@@ -93,7 +96,8 @@ public class RoutingDecisionServiceTests
         MetaMap? meta = null,
         Mock<ITargetLivenessService>? livenessOverride = null,
         Func<RoutingTarget, int>? failureStreaks = null,
-        ISessionAffinityService? sessionAffinity = null)
+        ISessionAffinityService? sessionAffinity = null,
+        ILogger<RoutingDecisionService>? logger = null)
     {
         meta ??= new MetaMap();
         var metaMap = meta;
@@ -181,16 +185,20 @@ public class RoutingDecisionServiceTests
             tracker.Object,
             engine,
             cloudHandler,
-            NullLogger<RoutingDecisionService>.Instance,
+            logger ?? NullLogger<RoutingDecisionService>.Instance,
             streakTracker,
             sessionAffinity);
 
         return (new Harness { SUT = sut, States = statesStore }, meta);
-        }
+    }
 
     // ---- option / metadata builders ----
 
-    private static OllamaRouterOptions FleetOptions(string model, string? architecture = null, string? cloudModel = null)
+    private static OllamaRouterOptions FleetOptions(
+        string model,
+        string? architecture = null,
+        string? cloudModel = null,
+        bool dispatchToLargestCapacityOnOverflow = true)
     {
         var options = new OllamaRouterOptions
         {
@@ -198,7 +206,8 @@ public class RoutingDecisionServiceTests
             Models = new Dictionary<string, ModelThresholds>
             {
                 [model] = new ModelThresholds { Architecture = architecture, CloudModel = cloudModel }
-            }
+            },
+            DispatchToLargestCapacityOnOverflow = dispatchToLargestCapacityOnOverflow
         };
         return options;
     }
@@ -458,7 +467,7 @@ public class RoutingDecisionServiceTests
         }
 
         var (h, _) = Build(
-            FleetOptions("m"),
+            FleetOptions("m", dispatchToLargestCapacityOnOverflow: false),
             withEngine: true,
             catalogModels: new() { $"{DesktopUrl}|m", $"{LaptopUrl}|m", $"{ServerUrl}|m" },
             onlineTargets: new() { "Desktop", "Laptop", "Server" },
@@ -838,7 +847,7 @@ public class RoutingDecisionServiceTests
         }
 
         var (h, _) = Build(
-            FleetOptions("m"),
+            FleetOptions("m", dispatchToLargestCapacityOnOverflow: false),
             withEngine: true,
             catalogModels: new() { $"{DesktopUrl}|m", $"{LaptopUrl}|m", $"{ServerUrl}|m" },
             onlineTargets: new() { "Desktop", "Laptop", "Server" },
@@ -961,7 +970,7 @@ public class RoutingDecisionServiceTests
         // fallback → context overflow (158,192 > 131,072).
         var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
         var (h, _) = Build(
-            FleetOptions("qwen3.8-27B"),
+            FleetOptions("qwen3.8-27B", dispatchToLargestCapacityOnOverflow: false),
             withEngine: true,
             catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{LaptopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
             onlineTargets: new() { "Desktop", "Laptop", "Server" },
@@ -2069,6 +2078,307 @@ public class RoutingDecisionServiceTests
         Assert.True(h.Eval(TServer)!.Qualified);
         Assert.Equal(0, h.Eval(TServer)!.SpeedBonus); // only Desktop had a factor ⇒ maxHint over QUALIFIED set is 1.0
         Assert.Equal(TServer, winner);
+    }
+
+    // ==================================================================
+    // Largest-Capacity Fallback Dispatch tests (§4 of incident report)
+    // ==================================================================
+
+    [Fact]
+    public async Task LargestCapacityFallback_DispatchesToTargetWithHighestCMax()
+    {
+        var meta = new MetaMap();
+        meta.Add(DesktopUrl, "m", PinnedDenseShow(7_000_000_000, modelfileNumCtx: 4096), 16 * Gb);
+        meta.Add(LaptopUrl, "m", PinnedDenseShow(7_000_000_000, modelfileNumCtx: 16384), 8 * Gb);
+        meta.Add(ServerUrl, "m", PinnedDenseShow(7_000_000_000, modelfileNumCtx: 65536), 16 * Gb);
+
+        var (h, _) = Build(
+            FleetOptions("m", dispatchToLargestCapacityOnOverflow: true),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|m", $"{LaptopUrl}|m", $"{ServerUrl}|m" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            meta: meta);
+
+        // 70,000 + 8,192 = 78,192 tokens > 65536 max capacity -> all targets overflow context
+        var result = await h.DecideDetailed(70_000, "m");
+
+        Assert.Equal(TServer, result.Target);
+        Assert.True(result.IsFallback);
+        Assert.Equal("LargestCapacityOverflow", result.FallbackStrategy);
+        Assert.Equal(65536, result.TargetCMax);
+
+        // Per-candidate evaluations confirm context overflow on each target
+        Assert.False(h.Eval(TDesktop)!.Qualified);
+        Assert.Contains("context overflow", h.Eval(TDesktop)!.DisqualifiedReason);
+        Assert.False(h.Eval(TLaptop)!.Qualified);
+        Assert.Contains("context overflow", h.Eval(TLaptop)!.DisqualifiedReason);
+        Assert.False(h.Eval(TServer)!.Qualified);
+        Assert.Contains("context overflow", h.Eval(TServer)!.DisqualifiedReason);
+    }
+
+    [Fact]
+    public async Task LargestCapacityFallback_TieBreaksByLowestInFlight_ThenDeclarationOrder()
+    {
+        var meta = new MetaMap();
+        meta.Add(DesktopUrl, "m", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 65536), 16 * Gb);
+        meta.Add(ServerUrl, "m", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 65536), 16 * Gb);
+
+        // Desktop has 2 in-flight, Server has 0 in-flight
+        var states = new Dictionary<RoutingTarget, TargetExecutionState>
+        {
+            [TDesktop] = State(TDesktop, inFlight: 2),
+            [TServer] = State(TServer, inFlight: 0)
+        };
+
+        var (h, _) = Build(
+            FleetOptions("m", dispatchToLargestCapacityOnOverflow: true),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|m", $"{ServerUrl}|m" },
+            onlineTargets: new() { "Desktop", "Server" },
+            states: states,
+            meta: meta);
+
+        var result = await h.DecideDetailed(70_000, "m");
+        // Lower in-flight wins tie
+        Assert.Equal(TServer, result.Target);
+        Assert.True(result.IsFallback);
+        Assert.Equal(65536, result.TargetCMax);
+
+        // When in-flight is equal (0 vs 0), declaration order wins (Desktop declared before Server)
+        var equalStates = new Dictionary<RoutingTarget, TargetExecutionState>
+        {
+            [TDesktop] = State(TDesktop, inFlight: 0),
+            [TServer] = State(TServer, inFlight: 0)
+        };
+        var (hEqual, _) = Build(
+            FleetOptions("m", dispatchToLargestCapacityOnOverflow: true),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|m", $"{ServerUrl}|m" },
+            onlineTargets: new() { "Desktop", "Server" },
+            states: equalStates,
+            meta: meta);
+
+        var equalResult = await hEqual.DecideDetailed(70_000, "m");
+        Assert.Equal(TDesktop, equalResult.Target);
+        Assert.True(equalResult.IsFallback);
+    }
+
+    [Fact]
+    public async Task LargestCapacityFallback_ExcludesHardwareIncapableTargets()
+    {
+        var meta = new MetaMap();
+        // Laptop has larger CMax (131072) but 8GB VRAM with 27B model -> hardware unsuitable hard veto
+        meta.Add(LaptopUrl, "qwen3.8-27B", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 131_072), 8 * Gb);
+        // Desktop has smaller CMax (49152) but 16GB VRAM -> hardware suitable
+        meta.Add(DesktopUrl, "qwen3.8-27B", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 49_152), 16 * Gb);
+
+        var (h, _) = Build(
+            FleetOptions("qwen3.8-27B", dispatchToLargestCapacityOnOverflow: true),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{LaptopUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Laptop" },
+            meta: meta);
+
+        // 60,000 + 8,192 = 68,192 tokens > 49152 -> Desktop context overflow.
+        // Laptop is hardware unsuitable, so only Desktop is eligible for fallback.
+        var result = await h.DecideDetailed(60_000, "qwen3.8-27B");
+
+        Assert.Equal(TDesktop, result.Target);
+        Assert.True(result.IsFallback);
+        Assert.Equal(49152, result.TargetCMax);
+    }
+
+    [Fact]
+    public async Task LargestCapacityFallback_ExcludesOfflineAndDisabledTargets()
+    {
+        var meta = new MetaMap();
+        meta.Add(ServerUrl, "m", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 131_072), 16 * Gb);
+        meta.Add(DesktopUrl, "m", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 49_152), 16 * Gb);
+
+        // Server is offline; Desktop is online
+        var (h, _) = Build(
+            FleetOptions("m", dispatchToLargestCapacityOnOverflow: true),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|m", $"{ServerUrl}|m" },
+            onlineTargets: new() { "Desktop" }, // Server offline
+            meta: meta);
+
+        var result = await h.DecideDetailed(60_000, "m");
+        Assert.Equal(TDesktop, result.Target);
+        Assert.True(result.IsFallback);
+        Assert.Equal(49152, result.TargetCMax);
+    }
+
+    [Fact]
+    public async Task LargestCapacityFallback_FailureStreak_SwitchesToNextEligibleFallback()
+    {
+        var meta = new MetaMap();
+        meta.Add(ServerUrl, "m", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 131_072), 16 * Gb);
+        meta.Add(DesktopUrl, "m", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 49_152), 16 * Gb);
+
+        var options = FleetOptions("m", dispatchToLargestCapacityOnOverflow: true);
+        options.MaxConsecutiveFailures = 2;
+
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|m", $"{ServerUrl}|m" },
+            onlineTargets: new() { "Desktop", "Server" },
+            failureStreaks: t => t == TServer ? 3 : 0, // Server streak (3) > threshold (2)
+            meta: meta);
+
+        var result = await h.DecideDetailed(150_000, "m");
+        // Switches to next eligible fallback: Desktop
+        Assert.Equal(TDesktop, result.Target);
+        Assert.True(result.IsFallback);
+        Assert.Equal(49152, result.TargetCMax);
+    }
+
+    [Fact]
+    public async Task LargestCapacityFallback_BindsSessionAffinityLease()
+    {
+        var meta = new MetaMap();
+        meta.Add(ServerUrl, "m", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 131_072), 16 * Gb);
+
+        var sessionAffinity = CreateSessionAffinity();
+        var (h, _) = Build(
+            FleetOptions("m", dispatchToLargestCapacityOnOverflow: true),
+            withEngine: true,
+            catalogModels: new() { $"{ServerUrl}|m" },
+            onlineTargets: new() { "Server" },
+            sessionAffinity: sessionAffinity,
+            meta: meta);
+
+        var result = await h.DecideDetailed(60_000, "m", sessionId: "sess-abc");
+        Assert.Equal(TServer, result.Target);
+
+        // Session affinity was leased to the fallback winner
+        Assert.True(sessionAffinity.TryGetAffinity("sess-abc", out var leasedTarget));
+        Assert.Equal(TServer, leasedTarget);
+    }
+
+    [Fact]
+    public async Task LargestCapacityFallback_Disabled_ThrowsNoAvailableTargetException()
+    {
+        var meta = new MetaMap();
+        meta.Add(ServerUrl, "m", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 131_072), 16 * Gb);
+
+        var (h, _) = Build(
+            FleetOptions("m", dispatchToLargestCapacityOnOverflow: false),
+            withEngine: true,
+            catalogModels: new() { $"{ServerUrl}|m" },
+            onlineTargets: new() { "Server" },
+            meta: meta);
+
+        await Assert.ThrowsAsync<NoAvailableTargetException>(() => h.DecideDetailed(150_000, "m"));
+    }
+
+    [Fact]
+    public async Task DecideDetailedAsync_InvokedViaInterface_ReturnsExpectedFallbackResult()
+    {
+        var meta = new MetaMap();
+        meta.Add(ServerUrl, "m", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 131_072), 16 * Gb);
+
+        var (h, _) = Build(
+            FleetOptions("m", dispatchToLargestCapacityOnOverflow: true),
+            withEngine: true,
+            catalogModels: new() { $"{ServerUrl}|m" },
+            onlineTargets: new() { "Server" },
+            meta: meta);
+
+        IRoutingDecisionService iface = h.SUT;
+        var result = await iface.DecideDetailedAsync(150_000, "m");
+
+        Assert.Equal(TServer, result.Target);
+        Assert.True(result.IsFallback);
+        Assert.Equal("LargestCapacityOverflow", result.FallbackStrategy);
+        Assert.Equal(131_072, result.TargetCMax);
+    }
+
+    [Fact]
+    public async Task LargestCapacityFallback_LogsWarningWithStructuredBreakdownAndDistinctPlaceholders()
+    {
+        var meta = new MetaMap();
+        meta.Add(ServerUrl, "m", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 131_072), 16 * Gb);
+        meta.Add(DesktopUrl, "m", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 49_152), 16 * Gb);
+
+        var options = FleetOptions("m", dispatchToLargestCapacityOnOverflow: true);
+        options.MaxConsecutiveFailures = 2;
+
+        var mockLogger = new Mock<ILogger<RoutingDecisionService>>();
+        var loggedWarnings = new List<string>();
+        mockLogger.Setup(l => l.Log(
+            LogLevel.Warning,
+            It.IsAny<EventId>(),
+            It.IsAny<It.IsAnyType>(),
+            It.IsAny<Exception>(),
+            It.IsAny<Func<It.IsAnyType, Exception?, string>>()))
+            .Callback(new InvocationAction(invocation =>
+            {
+                var state = invocation.Arguments[2];
+                loggedWarnings.Add(state?.ToString() ?? "");
+            }));
+
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|m", $"{ServerUrl}|m" },
+            onlineTargets: new() { "Desktop", "Server" },
+            failureStreaks: t => t == TServer ? 3 : 0, // Server streak (3) > threshold (2) -> switches to Desktop
+            meta: meta,
+            logger: mockLogger.Object);
+
+        var result = await h.DecideDetailed(150_000, "m");
+        Assert.Equal(TDesktop, result.Target);
+        Assert.True(result.IsFallback);
+
+        var warning = loggedWarnings.FirstOrDefault(w => w.Contains("exceeds all fleet context capacities"));
+        Assert.NotNull(warning);
+        // Confirms true max available was Server (131072) even though winner switched to Desktop (49152)
+        Assert.Contains("Max available: Server with 131072", warning);
+        Assert.Contains("Dispatching best-effort to largest-capacity target 'Desktop' with num_ctx clamped to 49152", warning);
+        Assert.Contains("Desktop (Url: http://desktop:11434): Disqualified (CMax: 49152 < Required: 158192)", warning);
+        Assert.Contains("Server (Url: http://server:11434): Disqualified (CMax: 131072 < Required: 158192)", warning);
+    }
+
+    [Fact]
+    public async Task LargestCapacityFallback_Disabled_LogsRejectionWarningWithCandidateBreakdown()
+    {
+        var meta = new MetaMap();
+        meta.Add(ServerUrl, "m", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 131_072), 16 * Gb);
+        meta.Add(DesktopUrl, "m", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 49_152), 16 * Gb);
+
+        var options = FleetOptions("m", dispatchToLargestCapacityOnOverflow: false);
+
+        var mockLogger = new Mock<ILogger<RoutingDecisionService>>();
+        var loggedWarnings = new List<string>();
+        mockLogger.Setup(l => l.Log(
+            LogLevel.Warning,
+            It.IsAny<EventId>(),
+            It.IsAny<It.IsAnyType>(),
+            It.IsAny<Exception>(),
+            It.IsAny<Func<It.IsAnyType, Exception?, string>>()))
+            .Callback(new InvocationAction(invocation =>
+            {
+                var state = invocation.Arguments[2];
+                loggedWarnings.Add(state?.ToString() ?? "");
+            }));
+
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|m", $"{ServerUrl}|m" },
+            onlineTargets: new() { "Desktop", "Server" },
+            meta: meta,
+            logger: mockLogger.Object);
+
+        await Assert.ThrowsAsync<NoAvailableTargetException>(() => h.DecideDetailed(150_000, "m"));
+
+        var warning = loggedWarnings.FirstOrDefault(w => w.Contains("No enabled target can handle the request"));
+        Assert.NotNull(warning);
+        Assert.Contains("Request for 'm' (estimated 150000 tokens + margin 8192): No enabled target can handle the request.", warning);
+        Assert.Contains("Desktop (Url: http://desktop:11434): Disqualified (CMax: 49152 < Required: 158192)", warning);
+        Assert.Contains("Server (Url: http://server:11434): Disqualified (CMax: 131072 < Required: 158192)", warning);
     }
 
     // ==================================================================

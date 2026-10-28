@@ -125,6 +125,24 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             sessionId);
     }
 
+    public Task<RoutingDecisionResult> DecideDetailedAsync(
+        int tokenCount,
+        string modelName,
+        int? clientRequestedNumCtx = null,
+        string? sessionId = null,
+        CancellationToken cancellationToken = default)
+    {
+        return DecideWithEvaluationsDetailedAsync(
+            tokenCount,
+            modelName,
+            clientRequestedNumCtx,
+            evaluation => _logger.LogDebug(
+                "{Model}: Candidate {Target} qualified={Qualified} score={Score}: session={Session} {Detail}",
+                NormalizeModelName(modelName), evaluation.Target, evaluation.Qualified, evaluation.Score, evaluation.SessionAffinityBonus, evaluation.Detail),
+            cancellationToken,
+            sessionId);
+    }
+
     /// <summary>
     /// Runs the full two-stage pipeline and reports every per-candidate evaluation (fleet
     /// targets in declaration order, then the Cloud pseudo-target when eligible) through
@@ -133,6 +151,28 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
     /// is thrown. Returns the selected target.
     /// </summary>
     public async Task<RoutingTarget> DecideWithEvaluationsAsync(
+        int tokenCount,
+        string modelName,
+        int? clientRequestedNumCtx,
+        Action<RoutingCandidateEvaluation> reportEvaluation,
+        CancellationToken cancellationToken = default,
+        string? sessionId = null)
+    {
+        var result = await DecideWithEvaluationsDetailedAsync(
+            tokenCount,
+            modelName,
+            clientRequestedNumCtx,
+            reportEvaluation,
+            cancellationToken,
+            sessionId);
+        return result.Target;
+    }
+
+    /// <summary>
+    /// Runs the full two-stage pipeline and returns a detailed <see cref="RoutingDecisionResult"/>
+    /// including whether fallback was applied and candidate evaluations.
+    /// </summary>
+    public async Task<RoutingDecisionResult> DecideWithEvaluationsDetailedAsync(
         int tokenCount,
         string modelName,
         int? clientRequestedNumCtx,
@@ -221,7 +261,101 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         var qualified = evaluations.Where(e => e.Qualified).ToList();
         if (qualified.Count == 0)
         {
-            _logger.LogWarning("{Model}: No enabled target can handle the request.", normalizedName);
+            if (settings.DispatchToLargestCapacityOnOverflow)
+            {
+                var fallbackCandidates = new List<(RoutingTarget Target, OllamaTargetOptions Options, TargetModelCapability Capability, int InFlight, int Index)>();
+                for (var i = 0; i < fleetTargets.Count; i++)
+                {
+                    var targetOptions = fleetTargets[i];
+                    var target = new RoutingTarget(targetOptions.Name!);
+                    var eval = evaluations.FirstOrDefault(e => e.Target == target);
+                    if (eval is not null && !eval.Qualified && eval.DisqualifiedReason != null && eval.DisqualifiedReason.StartsWith("context overflow", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var capability = await context.GetTargetCapabilityAsync(target, targetOptions.Url!, cancellationToken);
+                        if (capability is not null)
+                        {
+                            var inFlight = context.GetExecutionState(target)?.InFlightRequests ?? 0;
+                            fallbackCandidates.Add((target, targetOptions, capability, inFlight, i));
+                        }
+                    }
+                }
+
+                if (fallbackCandidates.Count > 0)
+                {
+                    var fallbackRanked = fallbackCandidates
+                        .OrderByDescending(c => c.Capability.CMax)
+                        .ThenBy(c => c.InFlight)
+                        .ThenBy(c => c.Index)
+                        .ToList();
+
+                    var maxAvailableCandidate = fallbackRanked[0];
+                    var winnerCandidate = maxAvailableCandidate;
+                    var finalFallbackWinner = winnerCandidate.Target;
+
+                    var maxFailuresFallback = settings.MaxConsecutiveFailures;
+                    if (maxFailuresFallback > 0 && _streakTracker.ShouldSkip(winnerCandidate.Target, maxFailuresFallback))
+                    {
+                        var nextCandidate = fallbackRanked
+                            .Skip(1)
+                            .FirstOrDefault(c => !_streakTracker.ShouldSkip(c.Target, maxFailuresFallback));
+
+                        if (nextCandidate.Options is not null)
+                        {
+                            _logger.LogInformation(
+                                "{Model}: Target {FailedTarget} has a failure streak of {Streak} above threshold {MaxFailures}. Switching to next fallback target {NewTarget}.",
+                                normalizedName, winnerCandidate.Target, _streakTracker.GetStreak(winnerCandidate.Target), maxFailuresFallback, nextCandidate.Target);
+                            winnerCandidate = nextCandidate;
+                            finalFallbackWinner = nextCandidate.Target;
+                        }
+                        else
+                        {
+                            _logger.LogWarning(
+                                "{Model}: Target {FailedTarget} has a failure streak of {Streak} above threshold {MaxFailures}, but no subsequent fallback target is enabled or can process the request. Keeping {FailedTarget}.",
+                                normalizedName, winnerCandidate.Target, _streakTracker.GetStreak(winnerCandidate.Target), maxFailuresFallback, winnerCandidate.Target);
+                        }
+                    }
+
+                    if (_sessionAffinity is { } fallbackAffinity &&
+                        !string.IsNullOrWhiteSpace(sessionId) &&
+                        finalFallbackWinner != RoutingTarget.Cloud)
+                    {
+                        fallbackAffinity.SetAffinity(sessionId, finalFallbackWinner);
+                    }
+
+                    var margin = Math.Max(0, settings.ContextFitMarginTokens);
+                    var breakdown = BuildCandidateBreakdown(fleetTargets, evaluations, context);
+
+                    _logger.LogWarning(
+                        "Request for '{Model}' (estimated {Tokens} tokens + margin {Margin}) exceeds all fleet context capacities (Max available: {MaxAvailableTarget} with {MaxAvailableCMax}).\n" +
+                        "Dispatching best-effort to largest-capacity target '{WinnerTarget}' with num_ctx clamped to {WinnerCMax}.\n" +
+                        "Candidate breakdown:\n{Breakdown}",
+                        modelName,
+                        tokenCount,
+                        margin,
+                        maxAvailableCandidate.Options.Name,
+                        maxAvailableCandidate.Capability.CMax,
+                        winnerCandidate.Options.Name,
+                        winnerCandidate.Capability.CMax,
+                        breakdown);
+
+                    return new RoutingDecisionResult(
+                        finalFallbackWinner,
+                        IsFallback: true,
+                        FallbackStrategy: "LargestCapacityOverflow",
+                        TargetCMax: winnerCandidate.Capability.CMax);
+                }
+            }
+
+            var rejectionMargin = Math.Max(0, settings.ContextFitMarginTokens);
+            var rejectionBreakdown = BuildCandidateBreakdown(fleetTargets, evaluations, context);
+            _logger.LogWarning(
+                "Request for '{Model}' (estimated {Tokens} tokens + margin {Margin}): No enabled target can handle the request.\n" +
+                "Candidate breakdown:\n{Breakdown}",
+                modelName,
+                tokenCount,
+                rejectionMargin,
+                rejectionBreakdown);
+
             throw new NoAvailableTargetException($"No enabled routing target is available to handle the request for model '{modelName}'.");
         }
 
@@ -278,7 +412,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             writeAffinity.SetAffinity(sessionId, finalWinner);
         }
 
-        return finalWinner;
+        return new RoutingDecisionResult(finalWinner);
     }
 
     // ---- Stage 1 + Stage 2 for one fleet target. ----
@@ -337,13 +471,19 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             return Disqualified(target, $"hardware incapable ({capability.Architecture} on target with MaxVramMB {maxVramDescription})");
         }
 
+        var effectiveRequired = (long)context.TokenCount + Math.Max(0, _options.Value.ContextFitMarginTokens);
+        if (context.ClientRequestedNumCtx.HasValue)
+        {
+            effectiveRequired = Math.Min(effectiveRequired, context.ClientRequestedNumCtx.Value);
+        }
+
         if (!ModelCapabilityEngine.EvaluateClientContext(
                 context.TokenCount,
                 context.ClientRequestedNumCtx,
                 capability.CMax,
                 _options.Value.ContextFitMarginTokens).Qualified)
         {
-            return Disqualified(target, $"context overflow (estimated {context.TokenCount} tokens does not fit CMax {capability.CMax})");
+            return Disqualified(target, $"context overflow (CMax: {capability.CMax} < Required: {effectiveRequired})");
         }
 
         // ---- Stage 2 scoring for the qualified candidate. ----
@@ -723,5 +863,65 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
 
         var idx = modelName.IndexOf(':');
         return idx > 0 ? modelName[..idx] : modelName;
+    }
+
+    private string BuildCandidateBreakdown(
+        IReadOnlyList<OllamaTargetOptions> fleetTargets,
+        List<RoutingCandidateEvaluation> evaluations,
+        RoutingContext context)
+    {
+        var sb = new System.Text.StringBuilder();
+        for (var i = 0; i < fleetTargets.Count; i++)
+        {
+            var targetOptions = fleetTargets[i];
+            var target = new RoutingTarget(targetOptions.Name);
+            var targetName = !string.IsNullOrEmpty(targetOptions.Name) ? targetOptions.Name : "Unknown";
+            var eval = evaluations.FirstOrDefault(e => e.Target == target);
+
+            if (eval?.Qualified == true)
+            {
+                sb.Append(" - ")
+                  .Append(targetName)
+                  .Append(" (Url: ")
+                  .Append(targetOptions.Url)
+                  .AppendLine("): Qualified");
+                continue;
+            }
+
+            var reason = eval?.DisqualifiedReason ?? "Unknown";
+            if (reason.StartsWith("context overflow (", StringComparison.OrdinalIgnoreCase) && reason.EndsWith(')'))
+            {
+                reason = reason["context overflow (".Length..^1];
+            }
+
+            sb.Append(" - ")
+              .Append(targetName)
+              .Append(" (Url: ")
+              .Append(targetOptions.Url)
+              .Append("): Disqualified (")
+              .Append(reason)
+              .AppendLine(")");
+        }
+
+        string cloudStatus;
+        if (!_cloudHandler.IsEnabled)
+        {
+            cloudStatus = "Administratively Disabled";
+        }
+        else if (!(_options.Value?.CloudOverflow?.Enabled ?? true))
+        {
+            cloudStatus = "Statically Disabled";
+        }
+        else if (_options.Value is { } opt && string.IsNullOrEmpty(CloudRelayResolver.ResolveCloudModel(opt, context.ModelName)))
+        {
+            cloudStatus = "No CloudModel configured";
+        }
+        else
+        {
+            cloudStatus = "Unavailable";
+        }
+
+        sb.Append(" - Cloud: ").Append(cloudStatus);
+        return sb.ToString();
     }
 }

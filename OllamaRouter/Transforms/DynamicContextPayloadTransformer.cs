@@ -61,6 +61,20 @@ public static class DynamicContextPayloadTransformer
             return (body, null);
         }
 
+        return ApplyExplicitNumCtx(body, injectedNumCtx);
+    }
+
+    /// <summary>
+    /// Injects or overwrites <c>options.num_ctx</c> with the explicit value, regardless of
+    /// <see cref="DynamicContextOptions.Enabled"/>. Used for emergency clamping (e.g. Largest-Capacity Overflow).
+    /// </summary>
+    public static (string NewBody, int? InjectedNumCtx) ApplyExplicitNumCtx(string body, int injectedNumCtx)
+    {
+        if (string.IsNullOrWhiteSpace(body) || injectedNumCtx <= 0)
+        {
+            return (body, null);
+        }
+
         try
         {
             if (JsonNode.Parse(body) is not JsonObject root)
@@ -98,6 +112,11 @@ public static class DynamicContextPayloadTransformer
     /// </summary>
     public static int? ExtractClientNumCtx(string body)
     {
+        if (string.IsNullOrWhiteSpace(body))
+        {
+            return null;
+        }
+
         try
         {
             using var document = JsonDocument.Parse(body);

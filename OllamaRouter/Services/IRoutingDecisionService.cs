@@ -49,4 +49,16 @@ public interface IRoutingDecisionService
     /// <c>X-OllamaRouter-Session-Id</c> header), or null/blank for stateless routing.</param>
     /// <exception cref="NoAvailableTargetException">Thrown when no candidate passes Stage 1 and Cloud is unavailable.</exception>
     Task<RoutingTarget> DecideAsync(int tokenCount, string modelName, int? clientRequestedNumCtx, string? sessionId, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Determines the routing target for the request and returns a detailed <see cref="RoutingDecisionResult"/>,
+    /// including whether an emergency fallback policy was applied (such as largest-capacity overflow dispatch).
+    /// </summary>
+    /// <param name="tokenCount">Estimated token count of the prompt.</param>
+    /// <param name="modelName">Name of the model targeted by the request.</param>
+    /// <param name="clientRequestedNumCtx">The client's static <c>options.num_ctx</c>, if any.</param>
+    /// <param name="sessionId">The opaque session/agent identifier, or null/blank for stateless routing.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <exception cref="NoAvailableTargetException">Thrown when no candidate passes Stage 1 and Cloud is unavailable.</exception>
+    Task<RoutingDecisionResult> DecideDetailedAsync(int tokenCount, string modelName, int? clientRequestedNumCtx = null, string? sessionId = null, CancellationToken cancellationToken = default);
 }

@@ -1471,6 +1471,136 @@ public class OllamaRoutingMiddlewareTests
         Assert.Equal("Local", context.Response.Headers["X-OllamaRouter-Target"]);
     }
 
+    [Fact]
+    public async Task Fallback_WhenLargestCapacityOverflow_ClampsNumCtxAndSetsHeaders()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "qwen3.8-27b", "prompt": "huge prompt" }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(200_000);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService.Setup(r => r.DecideDetailedAsync(200_000, "qwen3.8-27b", null, null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new RoutingDecisionResult(
+                RoutingTarget.Remote,
+                IsFallback: true,
+                FallbackStrategy: "LargestCapacityOverflow",
+                TargetCMax: 65536));
+
+        var capabilityEngine = CreateCapabilityEngine(out _);
+        var options = new OllamaRouterOptions { RemoteUrl = "http://remoteserver:11434" };
+        options.Targets.Add(new OllamaTargetOptions { Name = "Remote", Url = "http://remoteserver:11434", HardwareHint = "96gb" });
+
+        var captured = new string[1];
+        var sut = CreateSizingSut(
+            CaptureBodyDelegate(captured),
+            tokenEstimator,
+            routingDecisionService,
+            options,
+            capabilityEngine,
+            DigestCache("digest-1"),
+            enableDynamicContext: false); // Verifies fallback clamping works even when DynamicContext is disabled
+
+        await sut.InvokeAsync(context);
+
+        Assert.NotNull(captured[0]);
+        using var doc = JsonDocument.Parse(captured[0]!);
+        // Clamped to TargetCMax (65536)
+        Assert.Equal(65_536, doc.RootElement.GetProperty("options").GetProperty("num_ctx").GetInt32());
+        Assert.Equal("65536", context.Response.Headers[OllamaReverseProxyConfig.TelemetryContextSizeHeader]);
+        Assert.Equal("LargestCapacityOverflow", context.Response.Headers[OllamaReverseProxyConfig.FallbackHeader]);
+        Assert.Equal("Requested 200000 exceeds capacity 65536; clamped to ceiling.", context.Response.Headers[OllamaReverseProxyConfig.ContextWarningHeader]);
+        Assert.Equal("Remote", context.Response.Headers[OllamaReverseProxyConfig.PublicTargetHeader]);
+    }
+
+    [Fact]
+    public async Task Fallback_WhenTargetIsCloud_DoesNotApplyClampingOrFallbackHeaders()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "qwen3.8-27b", "prompt": "huge prompt" }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(200_000);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        // Decision was Cloud (e.g. cloud overflow)
+        routingDecisionService.Setup(r => r.DecideDetailedAsync(200_000, "qwen3.8-27b", null, null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new RoutingDecisionResult(
+                RoutingTarget.Cloud,
+                IsFallback: false));
+
+        var capabilityEngine = CreateCapabilityEngine(out _);
+        var options = new OllamaRouterOptions { LocalUrl = "http://localhost:11434" };
+        options.Targets.Add(new OllamaTargetOptions { Name = "Local", Url = "http://localhost:11434" });
+
+        var captured = new string[1];
+        var sut = CreateSizingSut(
+            CaptureBodyDelegate(captured),
+            tokenEstimator,
+            routingDecisionService,
+            options,
+            capabilityEngine,
+            DigestCache("digest-1"),
+            enableDynamicContext: false);
+
+        await sut.InvokeAsync(context);
+
+        Assert.False(context.Response.Headers.ContainsKey(OllamaReverseProxyConfig.FallbackHeader));
+        Assert.False(context.Response.Headers.ContainsKey(OllamaReverseProxyConfig.ContextWarningHeader));
+        Assert.Equal("Cloud", context.Response.Headers[OllamaReverseProxyConfig.PublicTargetHeader]);
+    }
+
+    [Fact]
+    public async Task Fallback_WhenFleetTargetFailsUncommittedAndFailsOverToCloud_RemovesFallbackHeadersInOnStarting()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "qwen3.8-27b", "prompt": "huge prompt" }""");
+        context.Response.Body = new MemoryStream();
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(200_000);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        // Decision was Remote (overflow fallback)
+        routingDecisionService.Setup(r => r.DecideDetailedAsync(200_000, "qwen3.8-27b", null, null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new RoutingDecisionResult(
+                RoutingTarget.Remote,
+                IsFallback: true,
+                FallbackStrategy: "LargestCapacityOverflow",
+                TargetCMax: 65536));
+
+        var (availability, liveness) = OnlineMocks();
+        var options = new OllamaRouterOptions
+        {
+            LocalUrl = FailoverLocalUrl,
+            RemoteUrl = FailoverRemoteUrl,
+            CloudOverflow = new CloudOverflowOptions { Enabled = true, DefaultModel = "cloud-model" }
+        };
+
+        var forwarder = new Mock<IHttpForwarder>();
+        var sentUrls = new List<string>();
+        WireForwarder(forwarder, new List<Func<HttpContext, string, ForwarderError>>
+        {
+            (ctx, url) => Uncommitted(ctx, url), // Remote fails uncommitted
+            (ctx, url) => Uncommitted(ctx, url), // Local fails uncommitted
+            (ctx, url) =>
+            {
+                // Cloud relay writes response, triggering OnStarting
+                ctx.Response.StatusCode = 200;
+                ctx.Response.WriteAsync(DoneBody).GetAwaiter().GetResult();
+                return ForwarderError.None;
+            }
+        }, sentUrls);
+
+        var streak = new TargetFailureStreakService();
+        var sut = BuildFailoverSut(tokenEstimator, routingDecisionService, availability, liveness, options, forwarder, streak);
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("Cloud", context.Response.Headers[OllamaReverseProxyConfig.PublicTargetHeader]);
+        Assert.False(context.Response.Headers.ContainsKey(OllamaReverseProxyConfig.FallbackHeader));
+        Assert.False(context.Response.Headers.ContainsKey(OllamaReverseProxyConfig.ContextWarningHeader));
+        Assert.False(context.Response.Headers.ContainsKey(OllamaReverseProxyConfig.TelemetryContextSizeHeader));
+    }
+
     [Theory]
     [InlineData("/api/chat")]
     [InlineData("/api/generate")]

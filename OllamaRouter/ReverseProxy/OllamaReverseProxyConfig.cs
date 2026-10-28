@@ -70,6 +70,16 @@ public static class OllamaReverseProxyConfig
     /// </summary>
     public const string TelemetryContextModeHeader = "X-OllamaRouter-Context-Mode";
 
+    /// <summary>
+    /// Telemetry response header indicating an emergency fallback policy was applied (e.g. "LargestCapacityOverflow").
+    /// </summary>
+    public const string FallbackHeader = "X-OllamaRouter-Fallback";
+
+    /// <summary>
+    /// Telemetry response header warning that requested context exceeds capacity and was clamped to ceiling.
+    /// </summary>
+    public const string ContextWarningHeader = "X-OllamaRouter-Context-Warning";
+
     public const string LocalTarget = "Local";
     public const string RemoteTarget = "Remote";
 

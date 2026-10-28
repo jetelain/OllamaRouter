@@ -465,4 +465,89 @@ public class DynamicContextSizingTests
         Assert.Same(body, newBody);
         Assert.Null(injected);
     }
+
+    [Fact]
+    public void ApplyExplicitNumCtx_InjectsOptionsAndNumCtx_WhenOptionsMissing()
+    {
+        const string body = """{"model":"qwen3.8-27b","prompt":"hello"}""";
+
+        var (newBody, injected) = DynamicContextPayloadTransformer.ApplyExplicitNumCtx(body, 65_536);
+
+        Assert.Equal(65_536, injected);
+        using var doc = JsonDocument.Parse(newBody);
+        Assert.Equal(65_536, doc.RootElement.GetProperty("options").GetProperty("num_ctx").GetInt32());
+        Assert.Equal("qwen3.8-27b", doc.RootElement.GetProperty("model").GetString());
+    }
+
+    [Fact]
+    public void ApplyExplicitNumCtx_OverwritesNumCtx_WhenOptionsAlreadyHasNumCtx()
+    {
+        const string body = """{"model":"qwen3.8-27b","options":{"num_ctx":131072,"temperature":0.7}}""";
+
+        var (newBody, injected) = DynamicContextPayloadTransformer.ApplyExplicitNumCtx(body, 49_152);
+
+        Assert.Equal(49_152, injected);
+        using var doc = JsonDocument.Parse(newBody);
+        var options = doc.RootElement.GetProperty("options");
+        Assert.Equal(49_152, options.GetProperty("num_ctx").GetInt32());
+        Assert.Equal(0.7, options.GetProperty("temperature").GetDouble());
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-100)]
+    public void ApplyExplicitNumCtx_NonPositiveValue_ReturnsBodyUnchanged(int invalidVal)
+    {
+        const string body = """{"model":"m"}""";
+
+        var (newBody, injected) = DynamicContextPayloadTransformer.ApplyExplicitNumCtx(body, invalidVal);
+
+        Assert.Same(body, newBody);
+        Assert.Null(injected);
+    }
+
+    [Fact]
+    public void ApplyExplicitNumCtx_UnparseableBody_ReturnsBodyUnchanged()
+    {
+        const string body = "invalid-json";
+
+        var (newBody, injected) = DynamicContextPayloadTransformer.ApplyExplicitNumCtx(body, 65_536);
+
+        Assert.Same(body, newBody);
+        Assert.Null(injected);
+    }
+
+    [Fact]
+    public void ApplyExplicitNumCtx_NonObjectRoot_ReturnsBodyUnchanged()
+    {
+        const string body = "[1, 2, 3]";
+
+        var (newBody, injected) = DynamicContextPayloadTransformer.ApplyExplicitNumCtx(body, 65_536);
+
+        Assert.Same(body, newBody);
+        Assert.Null(injected);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void ApplyExplicitNumCtx_NullOrWhiteSpaceBody_ReturnsBodyUnchanged(string? body)
+    {
+        var (newBody, injected) = DynamicContextPayloadTransformer.ApplyExplicitNumCtx(body!, 65_536);
+
+        Assert.Same(body, newBody);
+        Assert.Null(injected);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void ExtractClientNumCtx_NullOrWhiteSpaceBody_ReturnsNull(string? body)
+    {
+        var result = DynamicContextPayloadTransformer.ExtractClientNumCtx(body!);
+
+        Assert.Null(result);
+    }
 }

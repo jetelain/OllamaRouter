@@ -429,6 +429,19 @@ public sealed class OllamaRoutingMiddleware(
             : routingDecisionService.DecideAsync(tokenCount, modelName, clientNumCtx, sessionId, context.RequestAborted);
     }
 
+    private async Task<RoutingDecisionResult> DecideDetailedWithSessionAsync(
+        int tokenCount, string modelName, int? clientNumCtx, string? sessionId, HttpContext context)
+    {
+        var result = await routingDecisionService.DecideDetailedAsync(tokenCount, modelName, clientNumCtx, sessionId, context.RequestAborted);
+        if (result != null)
+        {
+            return result;
+        }
+
+        var decidedTarget = await DecideWithSessionAsync(tokenCount, modelName, clientNumCtx, sessionId, context);
+        return new RoutingDecisionResult(decidedTarget);
+    }
+
     // Diagnostics payload for the all-offline 503: enumerates the ENABLED fleet targets
     // in fleet order with their raw (non-TTL) state lowercased and the last probe error.
     // <paramref name="cloudEnabled"/> is false on the pre-dispatch gate (Cloud was NOT
@@ -436,8 +449,8 @@ public sealed class OllamaRoutingMiddleware(
     // runtime AFTER the Cloud relay step was attempted/available).
     private AllOfflineDiagnostics BuildAllOfflineDiagnostics(bool cloudEnabled)
     {
-        var entries = targetLiveness.GetEntries();
-        var targets = targetLiveness.GetFleetTargets()
+        var entries = targetLiveness.GetEntries() ?? new Dictionary<RoutingTarget, TargetLivenessEntry>();
+        var targets = (targetLiveness.GetFleetTargets() ?? Array.Empty<RoutingTarget>())
             .Where(t => targetAvailability.IsEnabled(t))
             .Select(t =>
             {
@@ -544,7 +557,7 @@ public sealed class OllamaRoutingMiddleware(
             }
         }
 
-        var served = pinned is not null ? pinned : (RoutingTarget)GetDefaultHeaderValue();
+        var served = pinned ?? (RoutingTarget)GetDefaultHeaderValue();
         context.Request.Headers[OllamaReverseProxyConfig.TargetHeader] = served.ToString();
 
         // Response telemetry header (mirrors the completion path: set eagerly so it is visible
@@ -646,6 +659,8 @@ public sealed class OllamaRoutingMiddleware(
         var tokenCount = 0;
         var rawTokenCount = 0;
         RoutingTarget target;
+        var isPinned = false;
+        RoutingDecisionResult? detailedDecision = null;
 
         try
         {
@@ -679,6 +694,8 @@ public sealed class OllamaRoutingMiddleware(
                         if (await IsPinnedTargetCapableAsync(requestedTarget, modelName, context))
                         {
                             target = requestedTarget;
+                            isPinned = true;
+                            detailedDecision = new RoutingDecisionResult(target);
                             logger.LogInformation("Routing target explicitly pinned via request header: {Target}", target);
                             // Session stickiness (Q1 resolution): an HONORED pin explicitly
                             // sets/refreshes the session lease to the pinned target, so the
@@ -692,19 +709,22 @@ public sealed class OllamaRoutingMiddleware(
                         else
                         {
                             logger.LogWarning("Pinned target {Target} does not host model {Model}; falling back to dynamic routing.", requestedTarget, modelName);
-                            target = await DecideWithSessionAsync(tokenCount, modelName, clientNumCtx, sessionId, context);
+                            detailedDecision = await DecideDetailedWithSessionAsync(tokenCount, modelName, clientNumCtx, sessionId, context);
+                            target = detailedDecision.Target;
                         }
                     }
                     else
                     {
                         logger.LogWarning("Requested target {Target} is offline (liveness {State}). Falling back to dynamic routing.", requestedTarget, pinnedState);
-                        target = await DecideWithSessionAsync(tokenCount, modelName, clientNumCtx, sessionId, context);
+                        detailedDecision = await DecideDetailedWithSessionAsync(tokenCount, modelName, clientNumCtx, sessionId, context);
+                        target = detailedDecision.Target;
                     }
                 }
                 else
                 {
                     logger.LogWarning("Requested target {Target} is disabled. Falling back to dynamic routing.", requestedTarget);
-                    target = await DecideWithSessionAsync(tokenCount, modelName, clientNumCtx, sessionId, context);
+                    detailedDecision = await DecideDetailedWithSessionAsync(tokenCount, modelName, clientNumCtx, sessionId, context);
+                    target = detailedDecision.Target;
                 }
             }
             else
@@ -713,7 +733,8 @@ public sealed class OllamaRoutingMiddleware(
                 // (see RefreshFleetLivenessAsync) so a healthy target whose Online verdict merely
                 // lapsed between re-probe ticks is not disqualified as offline and misrouted.
                 await RefreshFleetLivenessAsync(context.RequestAborted);
-                target = await DecideWithSessionAsync(tokenCount, modelName, clientNumCtx, sessionId, context);
+                detailedDecision = await DecideDetailedWithSessionAsync(tokenCount, modelName, clientNumCtx, sessionId, context);
+                target = detailedDecision.Target;
             }
 
             logger.LogInformation("{ModelName} - Tokens: {TokenCount} => {Target}", modelName, tokenCount, target);
@@ -815,14 +836,31 @@ public sealed class OllamaRoutingMiddleware(
 
         context.Request.Headers[OllamaReverseProxyConfig.TargetHeader] = MapTargetToHeader(target);
 
-        // Dynamic context sizing (Phase 2): for non-cloud targets, consult the decided
-        // target's derived capability and inject/overwrite options.num_ctx with the selected
-        // hardware-safe bucket. The Cloud path is never rewritten (the cloud relay decides its
-        // own context). Any lookup failure degrades to a full pass-through (no rewrite, no
-        // header) - a sizing miss never blocks inference.
-        var (injectedNumCtx, sizedBody) = target != RoutingTarget.Cloud
-            ? await TryApplyDynamicContextSizingAsync(context, target, modelName, tokenCount, body)
-            : (null, null);
+        int? injectedNumCtx = null;
+        string? sizedBody = null;
+
+        if (detailedDecision is { IsFallback: true, TargetCMax: not null } && target != RoutingTarget.Cloud && detailedDecision.Target == target)
+        {
+            var cMax = detailedDecision.TargetCMax.Value;
+            var warning = $"Requested {tokenCount} exceeds capacity {cMax}; clamped to ceiling.";
+            context.Response.Headers[OllamaReverseProxyConfig.FallbackHeader] = detailedDecision.FallbackStrategy ?? "LargestCapacityOverflow";
+            context.Response.Headers[OllamaReverseProxyConfig.ContextWarningHeader] = warning;
+            context.Items[OllamaReverseProxyConfig.FallbackHeader] = detailedDecision.FallbackStrategy ?? "LargestCapacityOverflow";
+            context.Items[OllamaReverseProxyConfig.ContextWarningHeader] = warning;
+
+            var (rewrittenBody, injectedNum) = DynamicContextPayloadTransformer.ApplyExplicitNumCtx(body, cMax);
+            injectedNumCtx = injectedNum ?? cMax;
+            sizedBody = rewrittenBody;
+            var rewrittenBytes = Encoding.UTF8.GetBytes(rewrittenBody);
+            context.Request.Body = new MemoryStream(rewrittenBytes);
+            context.Request.ContentLength = rewrittenBytes.Length;
+            context.Request.Body.Position = 0;
+        }
+        else if (target != RoutingTarget.Cloud)
+        {
+            (injectedNumCtx, sizedBody) = await TryApplyDynamicContextSizingAsync(context, target, modelName, tokenCount, body);
+        }
+
         var contextModeHeader = context.Response.Headers.ContainsKey(OllamaReverseProxyConfig.TelemetryContextModeHeader)
             ? context.Response.Headers[OllamaReverseProxyConfig.TelemetryContextModeHeader].ToString()
             : null;
@@ -862,21 +900,39 @@ public sealed class OllamaRoutingMiddleware(
 
         context.Response.OnStarting(() =>
         {
-            context.Response.Headers[OllamaReverseProxyConfig.PublicTargetHeader] =
-                (context.Items[CurrentServedTargetKey] as RoutingTarget? ?? telemetryTarget).ToString();
+            var effectiveServed = context.Items[CurrentServedTargetKey] as RoutingTarget? ?? telemetryTarget;
+            context.Response.Headers[OllamaReverseProxyConfig.PublicTargetHeader] = effectiveServed.ToString();
             context.Response.Headers[OllamaReverseProxyConfig.TelemetryModelHeader] = modelName;
             context.Response.Headers[OllamaReverseProxyConfig.TelemetryEstimatedTokensHeader] = tokenCount.ToString();
             if (sessionId is not null)
             {
                 context.Response.Headers[OllamaReverseProxyConfig.PublicSessionIdHeader] = sessionId;
             }
-            if (injectedNumCtx.HasValue)
+            if (effectiveServed == RoutingTarget.Cloud)
             {
-                context.Response.Headers[OllamaReverseProxyConfig.TelemetryContextSizeHeader] = injectedNumCtx.Value.ToString();
+                context.Response.Headers.Remove(OllamaReverseProxyConfig.FallbackHeader);
+                context.Response.Headers.Remove(OllamaReverseProxyConfig.ContextWarningHeader);
+                context.Response.Headers.Remove(OllamaReverseProxyConfig.TelemetryContextSizeHeader);
+                context.Response.Headers.Remove(OllamaReverseProxyConfig.TelemetryContextModeHeader);
             }
-            if (contextModeHeader is not null)
+            else
             {
-                context.Response.Headers[OllamaReverseProxyConfig.TelemetryContextModeHeader] = contextModeHeader;
+                if (injectedNumCtx.HasValue)
+                {
+                    context.Response.Headers[OllamaReverseProxyConfig.TelemetryContextSizeHeader] = injectedNumCtx.Value.ToString();
+                }
+                if (contextModeHeader is not null)
+                {
+                    context.Response.Headers[OllamaReverseProxyConfig.TelemetryContextModeHeader] = contextModeHeader;
+                }
+                if (context.Items[OllamaReverseProxyConfig.FallbackHeader] is string fallback)
+                {
+                    context.Response.Headers[OllamaReverseProxyConfig.FallbackHeader] = fallback;
+                }
+                if (context.Items[OllamaReverseProxyConfig.ContextWarningHeader] is string contextWarning)
+                {
+                    context.Response.Headers[OllamaReverseProxyConfig.ContextWarningHeader] = contextWarning;
+                }
             }
 
             return Task.CompletedTask;
@@ -913,7 +969,7 @@ public sealed class OllamaRoutingMiddleware(
             // forwarder sets the same IForwarderErrorFeature on context.Features that YARP
             // did, so the response-completeness / token-extraction logic below is unchanged.
             (servedTarget, body) = await DispatchLoopAsync(context, body, target);
-            if (servedTarget is not null && servedTarget != target && !IsResponseCommitted(context))
+            if (servedTarget is not null && servedTarget != target && !context.Response.HasStarted)
             {
                 // Telemetry failover-correctness: the dispatch loop served a DIFFERENT target
                 // than the decided primary (an uncommitted failover — the first attempt died
@@ -924,6 +980,13 @@ public sealed class OllamaRoutingMiddleware(
                 // targets) and the decided-target value stands (already flushed).
                 telemetryTarget = servedTarget.Value;
                 context.Response.Headers[OllamaReverseProxyConfig.PublicTargetHeader] = telemetryTarget.ToString();
+                if (telemetryTarget == RoutingTarget.Cloud)
+                {
+                    context.Response.Headers.Remove(OllamaReverseProxyConfig.FallbackHeader);
+                    context.Response.Headers.Remove(OllamaReverseProxyConfig.ContextWarningHeader);
+                    context.Response.Headers.Remove(OllamaReverseProxyConfig.TelemetryContextSizeHeader);
+                    context.Response.Headers.Remove(OllamaReverseProxyConfig.TelemetryContextModeHeader);
+                }
             }
             if (servedTarget is not null && servedTarget != inFlightTarget)
             {

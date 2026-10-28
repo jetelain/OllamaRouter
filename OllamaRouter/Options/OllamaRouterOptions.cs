@@ -98,6 +98,13 @@ public sealed class OllamaRouterOptions
     public int ContextFitMarginTokens { get; set; } = 8192;
 
     /// <summary>
+    /// When true and all enabled fleet targets fail Stage-1 context qualification,
+    /// the router dispatches the request to the online, capable target with the largest context
+    /// capacity (Max CMax) rather than rejecting with a 503 error.
+    /// </summary>
+    public bool DispatchToLargestCapacityOnOverflow { get; set; } = true;
+
+    /// <summary>
     /// Token estimation strategy: "Heuristic" (default, zero heap memory overhead) or "Tiktoken" (Microsoft.ML.Tokenizers cl100k_base).
     /// </summary>
     public string TokenEstimator { get; set; } = "Heuristic";

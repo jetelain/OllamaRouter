@@ -197,6 +197,31 @@ public class OllamaRouterOptionsTests
     }
 
     [Fact]
+    public void DispatchToLargestCapacityOnOverflow_DefaultsToTrue()
+    {
+        var options = new OllamaRouterOptions();
+        Assert.True(options.DispatchToLargestCapacityOnOverflow);
+    }
+
+    [Theory]
+    [InlineData("false", false)]
+    [InlineData("true", true)]
+    public void DispatchToLargestCapacityOnOverflow_BindsFromConfiguration(string configValue, bool expected)
+    {
+        var configuration = new Microsoft.Extensions.Configuration.ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["OllamaRouter:DispatchToLargestCapacityOnOverflow"] = configValue
+            })
+            .Build();
+
+        var options = configuration.GetSection(OllamaRouterOptions.SectionName).Get<OllamaRouterOptions>();
+
+        Assert.NotNull(options);
+        Assert.Equal(expected, options!.DispatchToLargestCapacityOnOverflow);
+    }
+
+    [Fact]
     public void SpeedFactor_DefaultsToOne()
     {
         Assert.Equal(1.0, new OllamaTargetOptions().SpeedFactor);
