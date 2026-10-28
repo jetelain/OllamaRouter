@@ -7,9 +7,11 @@ namespace OllamaRouter.Services;
 /// the Cloud pseudo-target when Cloud Overflow is eligible). Fleet candidates that fail a
 /// Stage-1 hard qualification carry <see cref="Qualified"/> false and <see cref="Score"/>
 /// null; qualified candidates carry the calibrated score
-/// <c>Score = SessionAffinityBonus(+150) + AffinityBonus(+100) + HardwareBonus(+20) − EvictionPenalty(−80) − ConcurrencyPenalty</c>
-/// (the Cloud pseudo-target always carries the fixed score 0, a SessionAffinityBonus of 0,
-/// and is never leased). Selection is the stable sort
+/// <c>Score = SpeedBonus(+0…150, per-decision normalized) + SessionAffinityBonus(+150) + AffinityBonus(+100) + HardwareBonus(+20) − EvictionPenalty(−80) − ConcurrencyPenalty</c>
+/// (the per-decision normalized SpeedBonus rewards the fastest-configured qualified candidate;
+/// maxHint ≤ 1.0 ⇒ every SpeedBonus = 0, legacy byte-identical; the Cloud pseudo-target
+/// always carries the fixed score 0, a SessionAffinityBonus of 0, a SpeedBonus of 0, and
+/// is never leased). Selection is the stable sort
 /// by (score descending, declaration index ascending), so equal scores resolve by
 /// declaration order and the Cloud candidate (sorted after all fleet targets) loses
 /// 0-vs-0 ties.
@@ -27,6 +29,10 @@ namespace OllamaRouter.Services;
 /// +150 when the candidate matches the request's active session lease (KV-cache stickiness);
 /// 0 otherwise, and always 0 for the Cloud pseudo-target (never leased).
 /// </param>
+/// <param name="SpeedBonus">
+/// +0…150 per-decision-normalized speed bonus (see the scoring formula); always 0 for the
+/// Cloud pseudo-target and for candidates with no configured factor.
+/// </param>
 public sealed record RoutingCandidateEvaluation(
     RoutingTarget Target,
     bool Qualified,
@@ -37,4 +43,5 @@ public sealed record RoutingCandidateEvaluation(
     int EvictionPenalty,
     int ConcurrencyPenalty,
     string? Detail,
-    int SessionAffinityBonus = 0);
+    int SessionAffinityBonus = 0,
+    int SpeedBonus = 0);

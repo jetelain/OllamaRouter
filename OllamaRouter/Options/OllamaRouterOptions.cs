@@ -262,6 +262,22 @@ public sealed class OllamaTargetOptions
     public int? MaxVramMB { get; set; }
 
     /// <summary>
+    /// Static processing-speed hint: relative generation-throughput multiplier vs the fleet
+    /// baseline (1.0 = fleet average / unset). Only values > 1.0 earn a Stage-2 SpeedBonus
+    /// (the fastest-configured qualified node earns the full +150); non-finite values and
+    /// values <= 1.0 collapse to an effective 1.0 (zero bonus) via <see cref="GetEffectiveSpeedFactor"/>.
+    /// </summary>
+    public double SpeedFactor { get; set; } = 1.0;
+
+    /// <summary>
+    /// The single read site for <see cref="SpeedFactor"/> clamping: non-finite values (NaN,
+    /// +/-Infinity) or values <= 1.0 are treated as exactly 1.0 (no speed bonus); values > 1.0
+    /// pass through unchanged. No Normalize() mutation - clamping is at read time only.
+    /// </summary>
+    public double GetEffectiveSpeedFactor() =>
+        !double.IsFinite(SpeedFactor) || SpeedFactor <= 1.0 ? 1.0 : SpeedFactor;
+
+    /// <summary>
     /// Maximum number of concurrent requests this target can serve. Defaults to 1.
     /// (Scheduling on this value arrives in a later release; it is only stored/normalized now.)
     /// </summary>

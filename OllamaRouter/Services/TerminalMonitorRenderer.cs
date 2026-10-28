@@ -128,8 +128,8 @@ public static class TerminalMonitorRenderer
         if (enableAnsi) sb.Append(Reset);
         lines.Add(sb.ToString());
 
-        lines.Add("   Target       Liveness  HW    Active Model               In  Ctx");
-        lines.Add("   ─────────── ───────── ───── ──────────────────────── ── ────────────────");
+        lines.Add("   Target       Liveness  HW        Active Model               In  Ctx");
+        lines.Add("   ─────────── ───────── ───────── ──────────────────────── ── ────────────────");
 
         foreach (var item in state.Fleet)
         {
@@ -142,7 +142,7 @@ public static class TerminalMonitorRenderer
             row.Append(' ');
             AppendLivenessBadge(row, item, enableAnsi);
             row.Append(' ');
-            row.Append(PadRightDisplay(Truncate(item.HardwareProfile ?? "-", 5), 5));
+            row.Append(PadRightDisplay(Truncate(item.HardwareProfile ?? "-", 9), 9));
             row.Append(' ');
             row.Append(PadRightDisplay(Truncate(item.ActiveModel ?? "-", 20), 20));
             row.Append(' ');

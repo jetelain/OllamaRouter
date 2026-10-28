@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using OllamaRouter.Options;
 
@@ -150,6 +151,71 @@ public class OllamaRouterOptionsTests
     {
         var options = new OllamaRouterOptions();
         Assert.Null(options.StateDirectory);
+    }
+
+    [Fact]
+    public void SpeedFactor_DefaultsToOne()
+    {
+        Assert.Equal(1.0, new OllamaTargetOptions().SpeedFactor);
+    }
+
+    [Fact]
+    public void SpeedFactor_BindsFromConfigurationPath()
+    {
+        // The .NET configuration binder accepts colon-free segment keys; the target list index
+        // is the second segment (OllamaRouter:Targets:0:SpeedFactor).
+        var config = new Microsoft.Extensions.Configuration.ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["OllamaRouter:Targets:0:Name"] = "Local",
+                ["OllamaRouter:Targets:0:Url"] = "http://127.0.0.1:11435",
+                ["OllamaRouter:Targets:0:SpeedFactor"] = "2.0"
+            })
+            .Build();
+        var options = new OllamaRouterOptions();
+        config.Bind("OllamaRouter", options);
+
+        var target = Assert.Single(options.Targets);
+        Assert.Equal(2.0, target.SpeedFactor);
+        Assert.Equal(2.0, target.GetEffectiveSpeedFactor());
+    }
+
+    [Theory]
+    [InlineData(-1.0)]
+    [InlineData(0.0)]
+    [InlineData(0.5)]
+    [InlineData(1.0)]
+    [InlineData(double.NaN)]
+    [InlineData(double.PositiveInfinity)]
+    [InlineData(double.NegativeInfinity)]
+    public void GetEffectiveSpeedFactor_NonFiniteOrBelowBaseline_ClampsToOne(double factor)
+    {
+        var target = new OllamaTargetOptions { SpeedFactor = factor };
+        Assert.Equal(1.0, target.GetEffectiveSpeedFactor());
+    }
+
+    [Theory]
+    [InlineData(2.0, 2.0)]
+    [InlineData(1.5, 1.5)]
+    [InlineData(3.75, 3.75)]
+    public void GetEffectiveSpeedFactor_AboveBaseline_PassesThrough(double factor, double expected)
+    {
+        var target = new OllamaTargetOptions { SpeedFactor = factor };
+        Assert.Equal(expected, target.GetEffectiveSpeedFactor());
+    }
+
+    [Fact]
+    public void GetEffectiveTargets_LegacyConfig_SynthesizedTargetsKeepDefaultSpeedFactor()
+    {
+        var options = new OllamaRouterOptions
+        {
+            LocalUrl = "http://127.0.0.1:11435",
+            RemoteUrl = "http://aiserver.local:11434"
+        };
+
+        var effective = options.GetEffectiveTargets();
+
+        Assert.All(effective, t => Assert.Equal(1.0, t.GetEffectiveSpeedFactor()));
     }
 
     [Fact]

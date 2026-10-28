@@ -91,6 +91,68 @@ public class TerminalMonitorRendererTests
             overhead);
     }
 
+    [Fact]
+    public void Render_FleetTable_HWColumnIsNineWide_SpeedFactorSuffixRendersIntact()
+    {
+        // The HW column is 9-wide (header + separator) and a hinted profile "16gb,2.0x"
+        // (9 chars) renders intact without truncating or shifting the other columns.
+        var fleet = new List<MonitorFleetTargetItem>
+        {
+            FleetItem("Local", "http://127.0.0.1:11435", true, "Online", "qwen3:8b", 0, "16gb,2.0x", "-"),
+            FleetItem("Remote", "http://192.168.1.2:11434", true, "Online", null, 0, "96gb", "-"),
+            FleetItem("Cloud", null, true, "Online", null, 0, null, "baseline")
+        };
+
+        var state = new MonitorStateResponse(
+            CloudEnabled: true,
+            Fleet: fleet,
+            Statistics: new MonitorStatisticsStatus(
+                new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["Local"] = new ActivityStatisticsTotals(0, 0, 0),
+                    ["Remote"] = new ActivityStatisticsTotals(0, 0, 0),
+                    ["Cloud"] = new ActivityStatisticsTotals(0, 0, 0),
+                    ["total"] = new ActivityStatisticsTotals(0, 0, 0)
+                },
+                new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["Local"] = new ActivityStatisticsTotals(0, 0, 0),
+                    ["Remote"] = new ActivityStatisticsTotals(0, 0, 0),
+                    ["Cloud"] = new ActivityStatisticsTotals(0, 0, 0),
+                    ["total"] = new ActivityStatisticsTotals(0, 0, 0)
+                }),
+            InProgress: [],
+            Requests: [],
+            Cost: null,
+            Overhead: null);
+
+        var output = TerminalMonitorRenderer.Render(state, "http://localhost:11434/monitor", enableAnsi: false);
+        var lines = output.Split(["\r\n", "\n"], StringSplitOptions.None);
+
+        // Header + separator: HW column is 9-wide.
+        var headerIndex = lines.Select((line, index) => (Line: line, Index: index))
+            .First(x => x.Line.StartsWith("   Target") && x.Line.Contains("Liveness")).Index;
+        var header = lines[headerIndex];
+        Assert.Contains("HW        Active Model", header);
+        var separator = lines[headerIndex + 1];
+        Assert.Contains("─────────", separator);
+
+        // Local row: the full "16gb,2.0x" profile renders intact (no "…" truncation),
+        // and the Active Model column follows at the widened (9-char) HW offset.
+        var localRow = lines.Single(l => l.Contains("Local"));
+        Assert.Contains("16gb,2.0x", localRow);
+        Assert.DoesNotContain("…", localRow);
+        Assert.Contains("qwen3:8b", localRow);
+
+        // Remote row: plain profile still fits the 9-wide column.
+        var remoteRow = lines.Single(l => l.Contains("Remote"));
+        Assert.Contains("96gb", remoteRow);
+
+        // Cloud row: null profile renders "-".
+        var cloudRow = lines.Single(l => l.Contains("Cloud") && !l.Contains("Cloud:"));
+        Assert.Contains("-", cloudRow);
+    }
+
     private static MonitorCostStatus Cost(double savings, double cloudCost, params (string Name, double Savings)[] perTarget)
     {
         return new MonitorCostStatus(

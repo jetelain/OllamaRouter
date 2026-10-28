@@ -10,9 +10,12 @@ namespace OllamaRouter.Services;
 /// qualifies every effective fleet target (admin enabled, liveness online with the 10 s
 /// startup grace, catalog presence, hardware capability, context fit), Stage 2 scores the
 /// qualified candidates with the calibrated formula
-/// <c>Score = SessionAffinityBonus(+150) + AffinityBonus(+100) + HardwareBonus(+20) − EvictionPenalty(−80) − ConcurrencyPenalty</c>,
-/// and the highest score wins with equal scores resolved by declaration order in the
-/// <see cref="OllamaRouterOptions.Targets"/> list. The Cloud pseudo-target participates as a
+/// <c>Score = SpeedBonus(+0…150, per-decision normalized) + SessionAffinityBonus(+150) + AffinityBonus(+100) + HardwareBonus(+20) − EvictionPenalty(−80) − ConcurrencyPenalty</c>,
+
+/// where the per-decision normalized SpeedBonus rewards the fastest-configured qualified fleet
+/// candidate (maxHint ≤ 1.0 ⇒ every SpeedBonus = 0, legacy byte-identical). The highest score wins with
+/// equal scores resolved by declaration order in the <see cref="OllamaRouterOptions.Targets"/> list. The
+/// Cloud pseudo-target participates as a
 /// fixed score-0 candidate appended after all fleet targets (it therefore loses 0-vs-0 ties
 /// but beats every negative fleet score), never earns the SessionAffinityBonus, and is never
 /// leased to a session. When a request carries a session ID, the final winning target is
@@ -37,6 +40,16 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
 
     /// <summary>Session affinity bonus: the candidate is this session's leased (sticky) target.</summary>
     private const int SessionAffinityBonus = 150;
+
+    /// <summary>
+    /// Maximum speed bonus: the fastest-configured qualified fleet candidate (per-decision
+    /// normalized against the fleet's max effective SpeedFactor). Calibrated to outrank
+    /// AffinityBonus (+100) so the fastest cold node beats a hot slower node, to sit below
+    /// SessionAffinity + Affinity (250) so a session-leased hot node still wins, and to keep
+    /// an evicting fast candidate (150 − 80 = 70) or a MaxParallel-cliff candidate
+    /// (150 − 140 = 10) below a hot slower node (100).
+    /// </summary>
+    private const int SpeedBonusMax = 150;
 
     /// <summary>Bytes per MiB for the eviction VRAM-sum comparison (mirrors ModelCapabilityEngine's weight→MB conversion).</summary>
     private const long BytesPerMiB = 1_048_576;
@@ -159,6 +172,10 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         }
 
         // ---- Stage 1 + Stage 2: every fleet target, in declaration order. ----
+        // Evaluations are accumulated first and reported only AFTER the per-decision speed
+        // post-pass (ApplySpeedBonuses), because the SpeedBonus depends on the WHOLE
+        // qualified fleet set (its max factor) — reporting inside the loop would emit
+        // pre-bonus artifacts into the test Evaluations lists and the Debug log.
         var offloadSlotTaken = false;
         foreach (var targetOptions in fleetTargets)
         {
@@ -172,6 +189,14 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             }
 
             evaluations.Add(evaluation);
+        }
+
+        // ---- Per-decision speed post-pass (whole qualified fleet set; see ApplySpeedBonuses). ----
+        ApplySpeedBonuses(evaluations, fleetTargets);
+
+        // ---- Report: fleet candidates in declaration order, post-bonus artifacts. ----
+        foreach (var evaluation in evaluations)
+        {
             reportEvaluation(evaluation);
         }
 
@@ -580,6 +605,79 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             Detail: $"disqualified: {reason}");
     }
 
+    /// <summary>
+    /// Stage-2 SpeedBonus post-pass (per-decision linear normalization, self-calibrating):
+    /// <list type="number">
+    /// <item>Map each qualified fleet evaluation to its target options by <see cref="RoutingTarget"/> name
+    /// (fleet evaluations are in declaration order, 1:1 with <paramref name="fleetTargets"/>).</item>
+    /// <item><c>maxHint = max(GetEffectiveSpeedFactor())</c> over the qualified fleet targets.
+    /// <c>maxHint ≤ 1.0</c> ⇒ return unchanged (byte-identical legacy path — no factors
+    /// configured anywhere, or a uniformly slow fleet).</item>
+    /// <item>Otherwise <c>SpeedBonus_i = round(SpeedBonusMax × (factor_i − 1) / (maxHint − 1))</c>,
+    /// clamped ≥ 0 (MidpointRounding.AwayFromZero); 1.0-factor candidates get 0. The bonus is
+    /// ADDED to the existing Score (which already includes session/affinity/hardware/eviction/
+    /// concurrency) — no other component is recomputed.</item>
+    /// </list>
+    /// Calibration interplay (all vs a hot slower node at +100): fast cold winner 150 > 100;
+    /// fast + evicting 150 − 80 = 70 < 100 (anti-thrash preserved); fast + MaxParallel cliff
+    /// 150 − 140 = 10 < 100; session-leased hot 150 + 100 = 250 > 150 (stickiness preserved).
+    /// Disqualified fleet evaluations and the Cloud pseudo-target never receive a speed bonus.
+    /// </summary>
+    private void ApplySpeedBonuses(List<RoutingCandidateEvaluation> fleetEvaluations, IReadOnlyList<OllamaTargetOptions> fleetTargets)
+    {
+        // Max effective factor over the qualified fleet TARGETS (the normalization base is the
+        // whole qualified set, per the resolved normalization model).
+        double maxHint = 1.0;
+        for (var i = 0; i < fleetEvaluations.Count; i++)
+        {
+            var evaluation = fleetEvaluations[i];
+            if (!evaluation.Qualified || evaluation.Target == RoutingTarget.Cloud)
+            {
+                continue;
+            }
+
+            var factor = fleetTargets[i].GetEffectiveSpeedFactor();
+            if (factor > maxHint)
+            {
+                maxHint = factor;
+            }
+        }
+
+        if (maxHint <= 1.0)
+        {
+            return; // No configured factor ⇒ every SpeedBonus = 0 (legacy byte-identical).
+        }
+
+        for (var i = 0; i < fleetEvaluations.Count; i++)
+        {
+            var e = fleetEvaluations[i];
+            if (!e.Qualified || e.Target == RoutingTarget.Cloud)
+            {
+                continue;
+            }
+
+            var factor = fleetTargets[i].GetEffectiveSpeedFactor();
+            if (factor <= 1.0)
+            {
+                continue; // Baseline/unset factor ⇒ 0 bonus.
+            }
+
+            int bonus = (int)Math.Round(SpeedBonusMax * (factor - 1.0) / (maxHint - 1.0), MidpointRounding.AwayFromZero);
+            bonus = Math.Max(0, bonus);
+            if (bonus <= 0)
+            {
+                continue;
+            }
+
+            fleetEvaluations[i] = e with
+            {
+                Score = e.Score!.Value + bonus,
+                SpeedBonus = bonus,
+                Detail = e.Detail is null ? null : $"{e.Detail} speed=+{bonus} (factor {factor.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)})"
+            };
+        }
+    }
+
     private static RoutingCandidateEvaluation Scored(
         RoutingTarget target,
         int score,
@@ -588,7 +686,8 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         int eviction,
         int concurrency,
         int sessionAffinity,
-        string detail)
+        string detail,
+        int speedBonus = 0)
     {
         return new RoutingCandidateEvaluation(
             target,
@@ -600,7 +699,8 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             EvictionPenalty: eviction,
             ConcurrencyPenalty: concurrency,
             Detail: detail,
-            SessionAffinityBonus: sessionAffinity);
+            SessionAffinityBonus: sessionAffinity,
+            SpeedBonus: speedBonus);
     }
 
     /// <summary>

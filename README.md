@@ -240,6 +240,7 @@ appsettings.json  <  config/config.json  <  user secrets  <  environment variabl
 | `Models:*:CloudModel`| Optional name of the equivalent model hosted on [ollama.com cloud](https://ollama.com) (e.g. `glm-5.3-flash:cloud`). When set, enables overflow to **Cloud** for this model whenever Remote is busy (see [Cloud overflow](#cloud-overflow)). Leave unset to disable cloud overflow for this model. |
 | `LocalUrl`         | Base URL of the local Ollama instance.                                                            |
 | `RemoteUrl`        | Base URL of the remote Ollama instance.                                                           |
+| `Targets:*:SpeedFactor` | Optional per-target **static processing-speed hint**: relative generation-throughput multiplier vs the fleet baseline (`1.0` = fleet average / unset; only values `> 1.0` mean something). At routing time the qualified candidate with the highest effective factor earns the full Stage-2 speed bonus (+150), and the others are scaled linearly between 0 and +150 — so a fast cold node (e.g. your local workstation) can be preferred over a slower node that happens to hold the model hot, while Stage-1 hardware/context gates are untouched (a 48k-ceiling request never routes to a too-small fast node) and a fast node that would evict another model still loses to the hot one (70 < 100, anti-thrash). Recommended heterogenous setup: fast workstation `"SpeedFactor": 2.0`, servers default/omitted. Non-finite or `≤ 1.0` values are treated as `1.0` (zero bonus). See also `GET /api/router/fleet` (`hardware.speedFactor`) and the terminal monitor HW column (`16gb,2.0x`). |
 | `BindAddress`      | Address the router itself listens on. Defaults to `http://localhost:11434`. Set it to e.g. `http://0.0.0.0:11434` to accept connections from other machines. |
 | `TokenEstimator`   | Token estimation strategy: `"Heuristic"` (default, fast, zero heap memory overhead, saves ~24 MB RAM by omitting the BPE dictionary) or `"Tiktoken"` (uses Microsoft.ML.Tokenizers `cl100k_base`). |
 | `TokenEstimationOverheadFactor` | Multiplicative correction applied to the estimated token count, to compensate for the systematic underestimation of the generic tokenizer versus the actual tokenizer and chat template of targeted models. Defaults to `1.0` (no correction); see [recommendations below](#token-estimation-overhead-recommendations). |
@@ -341,7 +342,7 @@ Desktop node (`config/config.json`):
 
 ```json
 "Targets": [
-  { "Name": "desktop", "Url": "http://127.0.0.1:11435" },
+  { "Name": "desktop", "Url": "http://127.0.0.1:11435", "SpeedFactor": 2.0 },
   { "Name": "laptop",  "Url": "http://192.168.1.20:11435" }
 ]
 ```
@@ -350,12 +351,12 @@ Laptop node (`config/config.json`):
 
 ```json
 "Targets": [
-  { "Name": "laptop",  "Url": "http://127.0.0.1:11435" },
+  { "Name": "laptop",  "Url": "http://127.0.0.1:11435", "SpeedFactor": 2.0 },
   { "Name": "desktop", "Url": "http://192.168.1.10:11435" }
 ]
 ```
 
-(Swap `192.168.1.10` / `192.168.1.20` for each node's real LAN IP. Hardware-hint / `MaxParallel` / `MaxVramMB` settings apply per target exactly as in the single-router [Configuration](#configuration) section.)
+(Swap `192.168.1.10` / `192.168.1.20` for each node's real LAN IP. Hardware-hint / `MaxParallel` / `MaxVramMB` / `SpeedFactor` settings apply per target exactly as in the single-router [Configuration](#configuration) section — e.g. a fast local workstation can carry `"SpeedFactor": 2.0` so the router prefers it even when a slower peer holds the model hot, as long as Stage-1 context/hardware gates still qualify it.)
 
 ### Validating the mesh
 

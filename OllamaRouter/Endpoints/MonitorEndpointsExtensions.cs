@@ -761,6 +761,14 @@ setInterval(refresh, 2000);
                 ? $"{target.MaxVramMB.Value} MB"
                 : target.HardwareHint;
 
+            // Append the configured speed factor to the HW cell (e.g. "16gb,2.0x") only when it
+            // is above the fleet baseline (1.0); the TUI HW column is 9-wide to hold "16gb,2.0x".
+            var effectiveSpeedFactor = target.GetEffectiveSpeedFactor();
+            if (effectiveSpeedFactor > 1.0)
+            {
+                hardwareProfile = $"{hardwareProfile},{effectiveSpeedFactor.ToString("0.0#", System.Globalization.CultureInfo.InvariantCulture)}x";
+            }
+
             fleet.Add(new MonitorFleetTargetItem(
                 Name: name,
                 Url: target.Url,

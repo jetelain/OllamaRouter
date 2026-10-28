@@ -397,6 +397,10 @@ public static class RouterApiEndpointsExtensions
             var activeModel = executionState?.LoadedModels.FirstOrDefault()?.Name;
             var inFlight = executionState?.InFlightRequests ?? 0;
 
+            // speedFactor: always present; null when the effective factor is 1.0 (unset/default),
+            // consistent with maxVramMB's nullable semantics.
+            var speedFactor = target.GetEffectiveSpeedFactor();
+
             targets.Add(new RouterTargetItem(
                 Name: name,
                 Url: target.Url,
@@ -408,7 +412,8 @@ public static class RouterApiEndpointsExtensions
                     GpuVendor: isLocalWorkstation ? localGpuSnapshot.Vendor : "Unknown",
                     Devices: isLocalWorkstation ? localGpuSnapshot.Devices : Array.Empty<string>(),
                     MaxVramMB: target.GetEffectiveMaxVramMB(),
-                    MaxParallel: target.MaxParallel),
+                    MaxParallel: target.MaxParallel,
+                    SpeedFactor: speedFactor == 1.0 ? null : speedFactor),
                 Execution: new RouterTargetExecution(
                     InFlightRequests: inFlight,
                     ActiveModel: activeModel,
@@ -431,7 +436,8 @@ public static class RouterApiEndpointsExtensions
                 GpuVendor: "Cloud",
                 Devices: new[] { "Cloud Overflow" },
                 MaxVramMB: null,
-                MaxParallel: 10),
+                MaxParallel: 10,
+                SpeedFactor: null),
             Execution: new RouterTargetExecution(
                 InFlightRequests: 0,
                 ActiveModel: null,
@@ -1228,7 +1234,8 @@ public sealed record RouterTargetHardware(
     [property: JsonPropertyName("gpuVendor")] string GpuVendor,
     [property: JsonPropertyName("devices")] IReadOnlyList<string> Devices,
     [property: JsonPropertyName("maxVramMB")] int? MaxVramMB,
-    [property: JsonPropertyName("maxParallel")] int MaxParallel);
+    [property: JsonPropertyName("maxParallel")] int MaxParallel,
+    [property: JsonPropertyName("speedFactor")] double? SpeedFactor);
 
 public sealed record RouterTargetExecution(
     [property: JsonPropertyName("inFlightRequests")] int InFlightRequests,

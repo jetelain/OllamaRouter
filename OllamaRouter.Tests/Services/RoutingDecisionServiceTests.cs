@@ -1674,6 +1674,259 @@ public class RoutingDecisionServiceTests
 
     // ---- helpers ----
 
+    // ==================================================================
+    // Speed bonus (SpeedFactor): per-decision normalized Stage-2 SpeedBonus
+    // ==================================================================
+
+    private static OllamaRouterOptions SpeedOptions(string model, double desktopSpeed, double serverSpeed)
+    {
+        var options = new OllamaRouterOptions
+        {
+            Targets = new List<OllamaTargetOptions>
+            {
+                new() { Name = "Desktop", Url = DesktopUrl, HardwareHint = "16gb", MaxParallel = 1, SpeedFactor = desktopSpeed },
+                new() { Name = "Server", Url = ServerUrl, HardwareHint = "96gb", MaxParallel = 2, SpeedFactor = serverSpeed }
+            },
+            Models = new Dictionary<string, ModelThresholds> { [model] = new ModelThresholds() }
+        };
+        return options;
+    }
+
+    [Fact]
+    public async Task Speed_ColdFastNode_BeatsHotSlowerNode()
+    {
+        // Desktop (SpeedFactor 2.0) is cold; Server holds the model hot (+100). The
+        // per-decision normalized speed bonus (maxHint 2.0 ⇒ full +150 on Desktop)
+        // outranks the affinity: the faster cold node wins.
+        var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        var (h, _) = Build(
+            SpeedOptions("qwen3.8-27B", desktopSpeed: 2.0, serverSpeed: 1.0),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Server" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, 0),
+                [TServer] = State(TServer, 0, ("qwen3.8-27B", 16 * Gb))
+            },
+            meta: meta);
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B");
+
+        Assert.Equal(TDesktop, winner);
+        Assert.Equal(150, h.Eval(TDesktop)!.SpeedBonus);       // maxHint 2.0 ⇒ full bonus
+        Assert.Equal(0, h.Eval(TServer)!.SpeedBonus);          // baseline factor ⇒ 0
+        Assert.Equal(170, h.Eval(TDesktop)!.Score);            // 150 speed + 20 role + 0
+        Assert.Equal(100, h.Eval(TServer)!.Score);             // hot, no speed
+        Assert.Contains("speed=+150 (factor 2)", h.Eval(TDesktop)!.Detail!);
+        Assert.DoesNotContain("speed=", h.Eval(TServer)!.Detail!);
+    }
+
+    [Fact]
+    public async Task Speed_NoFactorsConfigured_AllSpeedBonusesZero_LegacyScores()
+    {
+        // Regression lock: with no SpeedFactor configured (all default 1.0) every
+        // SpeedBonus is 0 and the scores are byte-identical to the legacy formula.
+        var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        var (h, _) = Build(
+            SpeedOptions("qwen3.8-27B", desktopSpeed: 1.0, serverSpeed: 1.0),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Server" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, 0),
+                [TServer] = State(TServer, 0, ("qwen3.8-27B", 16 * Gb))
+            },
+            meta: meta);
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B");
+
+        Assert.Equal(TServer, winner); // hot +100 wins on the legacy formula
+        Assert.Equal(0, h.Eval(TDesktop)!.SpeedBonus);
+        Assert.Equal(0, h.Eval(TServer)!.SpeedBonus);
+        Assert.Equal(20, h.Eval(TDesktop)!.Score);   // legacy: role only
+        Assert.Equal(100, h.Eval(TServer)!.Score);   // legacy: affinity only
+        Assert.DoesNotContain("speed=", h.Eval(TDesktop)!.Detail!);
+        Assert.DoesNotContain("speed=", h.Eval(TServer)!.Detail!);
+    }
+
+    [Fact]
+    public async Task Speed_IntermediateFactors_NormalizationScalesLinearly()
+    {
+        // Factors 1.5 (Desktop) vs 2.0 (Server): maxHint 2.0 ⇒ Desktop round(150 × 0.5 / 1.0) = 75,
+        // Server full 150 (MidpointRounding.AwayFromZero).
+        var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        var (h, _) = Build(
+            SpeedOptions("qwen3.8-27B", desktopSpeed: 1.5, serverSpeed: 2.0),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Server" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, 0),
+                [TServer] = State(TServer, 0)
+            },
+            meta: meta);
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B");
+
+        Assert.Equal(75, h.Eval(TDesktop)!.SpeedBonus);
+        Assert.Equal(150, h.Eval(TServer)!.SpeedBonus);
+        Assert.Equal(TServer, winner);
+    }
+
+    [Fact]
+    public async Task Speed_FastEvictingNode_LosesToHotSlowerNode()
+    {
+        // Anti-thrash: Desktop (SpeedFactor 2.0) is cold and its load would evict the other
+        // loaded model (16 GiB free, 16 GiB other model + 16 GiB new > 16 GiB ⇒ −80):
+        // 150 − 80 = 70 + 20 role = 90 < Server hot 100 ⇒ the hot slower node wins.
+        var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        var (h, _) = Build(
+            SpeedOptions("qwen3.8-27B", desktopSpeed: 2.0, serverSpeed: 1.0),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Server" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, 0, ("llama3:8b", 16 * Gb)), // 16 GiB loaded ⇒ new 16 GiB load evicts
+                [TServer] = State(TServer, 0, ("qwen3.8-27B", 16 * Gb))
+            },
+            meta: meta);
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B");
+
+        Assert.Equal(150, h.Eval(TDesktop)!.SpeedBonus);
+        Assert.Equal(80, h.Eval(TDesktop)!.EvictionPenalty);
+        Assert.Equal(90, h.Eval(TDesktop)!.Score);   // 150 + 20 role − 80 = 90
+        Assert.Equal(100, h.Eval(TServer)!.Score);   // hot
+        Assert.Equal(TServer, winner);               // 90 < 100: anti-thrash preserved
+    }
+
+    [Fact]
+    public async Task Speed_FastNodeAtConcurrencyCliff_LosesToIdleHotSlowerNode()
+    {
+        // Desktop (SpeedFactor 2.0) at its MaxParallel cliff (1 in-flight ⇒ −140):
+        // 150 + 20 role − 140 = 30 < Server hot 100 ⇒ the idle hot slower node wins.
+        var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        var (h, _) = Build(
+            SpeedOptions("qwen3.8-27B", desktopSpeed: 2.0, serverSpeed: 1.0),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Server" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, inFlight: 1), // MaxParallel 1 ⇒ cliff −140
+                [TServer] = State(TServer, 0, ("qwen3.8-27B", 16 * Gb))
+            },
+            meta: meta);
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B");
+
+        Assert.Equal(150, h.Eval(TDesktop)!.SpeedBonus);
+        Assert.Equal(140, h.Eval(TDesktop)!.ConcurrencyPenalty);
+        Assert.Equal(30, h.Eval(TDesktop)!.Score);   // 150 + 20 role − 140 = 30
+        Assert.Equal(100, h.Eval(TServer)!.Score);
+        Assert.Equal(TServer, winner);
+    }
+
+    [Fact]
+    public async Task Speed_CloudPseudoTarget_NeverEarnsSpeedBonus()
+    {
+        // Cloud stays fixed-score-0 with SpeedBonus 0 and no speed suffix in its Detail;
+        // the +150-speed fleet candidate still beats Cloud (150 > 0).
+        var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        var optionsWithCloud = SpeedOptions("qwen3.8-27B", 2.0, 1.0);
+        optionsWithCloud.Models["qwen3.8-27B"].CloudModel = "glm-5.3-flash:cloud";
+        var (h, _) = Build(
+            optionsWithCloud,
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Server" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, 0),
+                [TServer] = State(TServer, 0)
+            },
+            meta: meta);
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B");
+
+        Assert.Equal(150, h.Eval(TDesktop)!.SpeedBonus);
+        Assert.Equal(0, h.Eval(RoutingTarget.Cloud)!.Score);
+        Assert.Equal(0, h.Eval(RoutingTarget.Cloud)!.SpeedBonus);
+        Assert.DoesNotContain("speed=", h.Eval(RoutingTarget.Cloud)!.Detail!);
+        Assert.Equal(TDesktop, winner); // 150 > 0: the fast fleet candidate beats Cloud
+    }
+
+    [Fact]
+    public async Task Speed_SessionLeasedHotNode_BeatsFasterColdNode()
+    {
+        // Pins the 250 calibration: a session-leased HOT Server (150 + 100 = 250) still
+        // outranks the faster cold Desktop (150 speed only) — stickiness beats speed.
+        var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        var affinity = CreateSessionAffinity();
+        affinity.SetAffinity("agent-1", TServer);
+        var (h, _) = Build(
+            SpeedOptions("qwen3.8-27B", desktopSpeed: 2.0, serverSpeed: 1.0),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Server" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, 0),
+                [TServer] = State(TServer, 0, ("qwen3.8-27B", 16 * Gb)) // hot AND leased
+            },
+            meta: meta,
+            sessionAffinity: affinity);
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B", "agent-1");
+
+        Assert.Equal(TServer, winner);
+        Assert.Equal(250, h.Eval(TServer)!.Score);              // 150 session + 100 affinity
+        Assert.Equal(0, h.Eval(TServer)!.SpeedBonus);
+        Assert.Equal(150, h.Eval(TDesktop)!.SpeedBonus);
+        Assert.Equal(170, h.Eval(TDesktop)!.Score);             // 150 speed + 20 role
+    }
+
+    [Fact]
+    public async Task Speed_Stage1Invariance_OverCeilingRequestStillDisqualifiesFastNode()
+    {
+        // The speed hint can never route an over-ceiling request to the faster node: the
+        // Modelfile pins CMax at 4096, so Desktop (SpeedFactor 2.0) is disqualified on
+        // context overflow BEFORE any speed bonus applies (no speed suffix in its Detail).
+        var meta = new MetaMap();
+        meta.Add(DesktopUrl, "m", new JsonObject
+        {
+            ["model_info"] = new JsonObject { ["general.parameter_count"] = (JsonNode)27_800_000_000L },
+            ["parameters"] = "num_ctx 4096"
+        }, 16 * Gb);
+        meta.Add(ServerUrl, "m", DenseShow(27_800_000_000), 16 * Gb);
+
+        var (h, _) = Build(
+            SpeedOptions("m", desktopSpeed: 2.0, serverSpeed: 1.0),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|m", $"{ServerUrl}|m" },
+            onlineTargets: new() { "Desktop", "Server" },
+            states: new() { [TDesktop] = State(TDesktop, 0), [TServer] = State(TServer, 0) },
+            meta: meta);
+
+        var winner = await h.Decide(30_000, "m");
+
+        Assert.False(h.Eval(TDesktop)!.Qualified);
+        Assert.StartsWith("context overflow", h.Eval(TDesktop)!.DisqualifiedReason);
+        Assert.Equal(0, h.Eval(TDesktop)!.SpeedBonus);
+        Assert.DoesNotContain("speed=", h.Eval(TDesktop)!.Detail!);
+        Assert.True(h.Eval(TServer)!.Qualified);
+        Assert.Equal(0, h.Eval(TServer)!.SpeedBonus); // only Desktop had a factor ⇒ maxHint over QUALIFIED set is 1.0
+        Assert.Equal(TServer, winner);
+    }
+
+    // ==================================================================
+    // Speed bonus tests end; shared helpers below
+    // ==================================================================
+
     [Fact]
     public void NormalizeModelName_StripsTagSuffix()
     {

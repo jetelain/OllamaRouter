@@ -437,6 +437,39 @@ public class RouterApiEndpointsTests
     }
 
     [Fact]
+    public async Task RouterFleet_SpeedFactor_RoundTrips_HintedValue_NullUnset_NullCloud()
+    {
+        var options = new OllamaRouterOptions
+        {
+            Targets =
+            [
+                new OllamaTargetOptions { Name = "Local", Url = "http://127.0.0.1:11435", HardwareHint = "16gb", SpeedFactor = 2.0 },
+                new OllamaTargetOptions { Name = "Server", Url = "http://192.168.1.100:11434", HardwareHint = "96gb" }
+            ]
+        };
+        await using var harness = await CreateTestAppAsync(options);
+
+        using var response = await harness.Client.GetAsync("/api/router/fleet");
+        Assert.Equal(System.Net.HttpStatusCode.OK, response.StatusCode);
+        var node = JsonNode.Parse(await response.Content.ReadAsStringAsync());
+
+        // Hinted target: speedFactor round-trips as 2.0.
+        var local = TargetItem(node, "Local");
+        Assert.Equal(2.0, local["hardware"]!["speedFactor"]!.GetValue<double>());
+
+        // Unset target: effective factor 1.0 ⇒ always-present null (maxVramMB-style semantics).
+        // (JsonNode's indexer returns null for a null-valued property, so check presence via the object.)
+        var serverHardware = TargetItem(node, "Server")["hardware"]!.AsObject();
+        Assert.True(serverHardware.ContainsKey("speedFactor"));
+        Assert.Null(serverHardware["speedFactor"]);
+
+        // Cloud pseudo-target: never carries a speed factor.
+        var cloudHardware = TargetItem(node, "Cloud")["hardware"]!.AsObject();
+        Assert.True(cloudHardware.ContainsKey("speedFactor"));
+        Assert.Null(cloudHardware["speedFactor"]);
+        }
+
+    [Fact]
     public async Task RouterFleet_UnknownLivenessState_ReportsProbing_WithNullLatency()
     {
         var options = new OllamaRouterOptions
