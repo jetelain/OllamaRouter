@@ -1,80 +1,83 @@
+using Pmad.AI.Tokens;
+using PmadTokenEstimator = Pmad.AI.Tokens.HeuristicTokenEstimator;
+
 namespace OllamaRouter.Services;
 
 /// <summary>
 /// A fast, zero-allocation token estimator that approximates token counts using character,
 /// word, punctuation, and Unicode heuristics without loading any vocabulary tables into memory.
-/// Keeps memory footprint at 0 MB heap and executes ~100x faster than full BPE tokenization.
+/// Powered by <see cref="Pmad.AI.Tokens.HeuristicTokenEstimator"/>, with tuned variants for
+/// model families such as Qwen and Gemma.
 /// </summary>
-public sealed class HeuristicTokenEstimator : ITokenEstimator
+public sealed class HeuristicTokenEstimator : IModelAwareTokenEstimator
 {
+    /// <summary>
+    /// Gets the default heuristic token estimator instance.
+    /// </summary>
+    public static PmadTokenEstimator Default => PmadTokenEstimator.Default;
+
+    /// <summary>
+    /// Gets the tuned heuristic token estimator instance for Qwen models.
+    /// </summary>
+    public static PmadTokenEstimator Qwen => PmadTokenEstimator.Qwen;
+
+    /// <summary>
+    /// Gets the tuned heuristic token estimator instance for Gemma models.
+    /// </summary>
+    public static PmadTokenEstimator Gemma => PmadTokenEstimator.Gemma;
+
     public int EstimateTokens(IReadOnlyList<string> texts)
     {
-        if (texts == null || texts.Count == 0)
-        {
-            return 0;
-        }
-
-        int total = 0;
-        for (int i = 0; i < texts.Count; i++)
-        {
-            var text = texts[i];
-            if (!string.IsNullOrEmpty(text))
-            {
-                total += EstimateTextTokens(text.AsSpan());
-            }
-        }
-
-        return total;
+        return PmadTokenEstimator.Default.Estimate(texts);
     }
 
-    public static int EstimateTextTokens(ReadOnlySpan<char> text)
+    public int EstimateTokens(IReadOnlyList<string> texts, string? modelName)
     {
-        if (text.IsEmpty || text.IsWhiteSpace())
+        return ResolveEstimator(modelName).Estimate(texts);
+    }
+
+    public static int EstimateTextTokens(ReadOnlySpan<char> text, string? modelName = null)
+    {
+        return ResolveEstimator(modelName).Estimate(text);
+    }
+
+    /// <summary>
+    /// Analyzes the character span to extract structural token metrics (words, symbols, non-ASCII characters, character count).
+    /// </summary>
+    public static TokenMetrics Analyze(ReadOnlySpan<char> text)
+    {
+        return PmadTokenEstimator.Analyze(text);
+    }
+
+    /// <summary>
+    /// Analyzes a collection of text strings to aggregate their structural token metrics.
+    /// </summary>
+    public static TokenMetrics Analyze(IReadOnlyList<string>? texts)
+    {
+        return PmadTokenEstimator.Analyze(texts);
+    }
+
+    /// <summary>
+    /// Resolves the tuned <see cref="PmadTokenEstimator"/> instance based on the target model name.
+    /// Falls back to <see cref="Default"/> for uncalibrated models or empty model names.
+    /// </summary>
+    public static PmadTokenEstimator ResolveEstimator(string? modelName)
+    {
+        if (string.IsNullOrEmpty(modelName))
         {
-            return 0;
+            return PmadTokenEstimator.Default;
         }
 
-        int words = 0;
-        int symbols = 0;
-        int nonAscii = 0;
-        bool inWord = false;
-
-        for (int i = 0; i < text.Length; i++)
+        if (modelName.Contains("qwen", StringComparison.OrdinalIgnoreCase))
         {
-            char c = text[i];
-            if (c > 127)
-            {
-                nonAscii++;
-                inWord = false;
-            }
-            else if (char.IsLetterOrDigit(c))
-            {
-                if (!inWord)
-                {
-                    words++;
-                    inWord = true;
-                }
-            }
-            else
-            {
-                inWord = false;
-                if (!char.IsWhiteSpace(c))
-                {
-                    symbols++;
-                }
-            }
+            return PmadTokenEstimator.Qwen;
         }
 
-        if (words == 0 && symbols == 0 && nonAscii == 0)
+        if (modelName.Contains("gemma", StringComparison.OrdinalIgnoreCase))
         {
-            return 0;
+            return PmadTokenEstimator.Gemma;
         }
 
-        // Blended heuristic: words (~1.25 tokens/word), punctuation/symbols (0.8 tokens), and non-ASCII (1 token).
-        // Fall back to a standard ~3.8 chars/token floor for atypical dense formatting.
-        int tokenEstimate = (int)Math.Ceiling(words * 1.25 + symbols * 0.8 + nonAscii * 1.0);
-        int charFloor = (int)Math.Ceiling(text.Length / 3.8);
-
-        return Math.Max(1, Math.Max(tokenEstimate, charFloor));
+        return PmadTokenEstimator.Default;
     }
 }

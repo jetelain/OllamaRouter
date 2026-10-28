@@ -6,7 +6,7 @@ namespace OllamaRouter.Services;
 /// Estimates the number of tokens using the Tiktoken tokenizer (CL100kBase), used as a fast
 /// and universal approximation regardless of the model actually targeted.
 /// </summary>
-public sealed class TiktokenTokenEstimator : ITokenEstimator
+public sealed class TiktokenTokenEstimator : IModelAwareTokenEstimator
 {
     private readonly Lazy<TiktokenTokenizer> _tokenizer = new(() => TiktokenTokenizer.CreateForModel("gpt-3.5-turbo"));
 
@@ -30,4 +30,6 @@ public sealed class TiktokenTokenEstimator : ITokenEstimator
 
         return total;
     }
+
+    public int EstimateTokens(IReadOnlyList<string> texts, string? modelName) => EstimateTokens(texts);
 }

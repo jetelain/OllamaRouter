@@ -39,6 +39,22 @@ public class OllamaRoutingMiddlewareTests
         ModelCapabilityEngine? capabilityEngine = null,
         Mock<IHttpForwarder>? forwarder = null,
         ITargetFailureStreakService? streakTracker = null,
+        ISessionAffinityService? sessionAffinity = null) =>
+        CreateSut(next, tokenEstimator.Object, routingDecisionService, modelCatalogCache, activityMonitor, activityStatistics, inferenceRequestRecorder, targetAvailability, targetLiveness, capabilityEngine, forwarder, streakTracker, sessionAffinity);
+
+    private static OllamaRoutingMiddleware CreateSut(
+        RequestDelegate next,
+        ITokenEstimator tokenEstimator,
+        Mock<IRoutingDecisionService> routingDecisionService,
+        Mock<IModelCatalogCacheService>? modelCatalogCache = null,
+        Mock<IActivityMonitorService>? activityMonitor = null,
+        Mock<IActivityStatisticsService>? activityStatistics = null,
+        Mock<IInferenceRequestRecorder>? inferenceRequestRecorder = null,
+        Mock<ITargetAvailabilityService>? targetAvailability = null,
+        Mock<ITargetLivenessService>? targetLiveness = null,
+        ModelCapabilityEngine? capabilityEngine = null,
+        Mock<IHttpForwarder>? forwarder = null,
+        ITargetFailureStreakService? streakTracker = null,
         ISessionAffinityService? sessionAffinity = null)
         {
         var effectiveTargetAvailability = targetAvailability ?? new Mock<ITargetAvailabilityService>();
@@ -2846,5 +2862,77 @@ public class OllamaRoutingMiddlewareTests
         await sut.InvokeAsync(context2);
         Assert.Equal("Local", context2.Response.Headers[OllamaReverseProxyConfig.PublicTargetHeader].ToString());
         routingDecisionService.Verify(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), "agent-1", It.IsAny<CancellationToken>()), Times.Exactly(2));
-        }
-        }
+    }
+
+    [Fact]
+    public async Task InvokeAsync_WithRealHeuristicTokenEstimator_QwenModel_UsesQwenTunedFactors()
+    {
+        // 50 Unicode chars:
+        // Default: 50 * 1.0 = 50 tokens
+        // Qwen: 50 * 0.40 = 20 tokens
+        var unicodePrompt = new string('é', 50);
+        var context = BuildContext("/api/chat", $$"""{ "model": "qwen2.5:7b", "prompt": "{{unicodePrompt}}" }""");
+
+        int capturedTokenCount = 0;
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), "qwen2.5:7b", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .Callback<int, string, int?, CancellationToken>((tokens, _, _, _) => capturedTokenCount = tokens)
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var realEstimator = new HeuristicTokenEstimator();
+        var sut = CreateSut(_ => Task.CompletedTask, realEstimator, routingDecisionService);
+
+        await sut.InvokeAsync(context);
+
+        // Qwen estimate: 20 tokens, overhead factor: 1.0 (default in OptionsWithCloud/ThreeTargetOptions)
+        Assert.Equal(20, capturedTokenCount);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_WithRealHeuristicTokenEstimator_GemmaModel_UsesGemmaTunedFactors()
+    {
+        // 50 Unicode chars:
+        // Default: 50 * 1.0 = 50 tokens
+        // Gemma: 50 * 0.37 = 19 tokens (Math.Ceiling(18.5) = 19)
+        var unicodePrompt = new string('é', 50);
+        var context = BuildContext("/api/chat", $$"""{ "model": "gemma4:12b", "prompt": "{{unicodePrompt}}" }""");
+
+        int capturedTokenCount = 0;
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), "gemma4:12b", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .Callback<int, string, int?, CancellationToken>((tokens, _, _, _) => capturedTokenCount = tokens)
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var realEstimator = new HeuristicTokenEstimator();
+        var sut = CreateSut(_ => Task.CompletedTask, realEstimator, routingDecisionService);
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal(19, capturedTokenCount);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_WithMockModelAwareTokenEstimator_PassesModelNameToEstimator()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "qwen3.5:32b", "prompt": "Hello world" }""");
+
+        var modelAwareMock = new Mock<IModelAwareTokenEstimator>();
+        modelAwareMock
+            .Setup(e => e.EstimateTokens(It.IsAny<IReadOnlyList<string>>(), "qwen3.5:32b"))
+            .Returns(77);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(77, "qwen3.5:32b", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var sut = CreateSut(_ => Task.CompletedTask, modelAwareMock.Object, routingDecisionService);
+
+        await sut.InvokeAsync(context);
+
+        modelAwareMock.Verify(e => e.EstimateTokens(It.IsAny<IReadOnlyList<string>>(), "qwen3.5:32b"), Times.Once);
+        routingDecisionService.Verify(r => r.DecideAsync(77, "qwen3.5:32b", It.IsAny<int?>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+}

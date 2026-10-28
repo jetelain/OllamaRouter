@@ -666,7 +666,7 @@ public sealed class OllamaRoutingMiddleware(
         {
             var requestInfo = OllamaRequestParser.ParseCompletionRequest(body);
             modelName = string.IsNullOrEmpty(requestInfo.ModelName) ? "unknown" : requestInfo.ModelName;
-            rawTokenCount = tokenEstimator.EstimateTokens(requestInfo.ContextParts)
+            rawTokenCount = tokenEstimator.EstimateTokens(requestInfo.ContextParts, modelName)
                 + requestInfo.PriorContextTokenCount;
             tokenCount = (int)Math.Ceiling(rawTokenCount * options.Value.TokenEstimationOverheadFactor);
             // The client's static options.num_ctx (upper-bound preference, never a disqualifier):
