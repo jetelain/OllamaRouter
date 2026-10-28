@@ -8,6 +8,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using OllamaRouter.Middleware;
 using OllamaRouter.Options;
+using OllamaRouter.ReverseProxy;
 using OllamaRouter.Services;
 using Yarp.ReverseProxy.Forwarder;
 using MsOptions = Microsoft.Extensions.Options.Options;
@@ -37,7 +38,8 @@ public class OllamaRoutingMiddlewareTests
         Mock<ITargetLivenessService>? targetLiveness = null,
         ModelCapabilityEngine? capabilityEngine = null,
         Mock<IHttpForwarder>? forwarder = null,
-        ITargetFailureStreakService? streakTracker = null)
+        ITargetFailureStreakService? streakTracker = null,
+        ISessionAffinityService? sessionAffinity = null)
         {
         var effectiveTargetAvailability = targetAvailability ?? new Mock<ITargetAvailabilityService>();
         if (targetAvailability is null)
@@ -93,7 +95,9 @@ public class OllamaRoutingMiddlewareTests
             NullLogger<OllamaRoutingMiddleware>.Instance,
             CreateForwarder(next, forwarder).Object,
             streakTracker ?? new TargetFailureStreakService(),
-            new Mock<ITargetExecutionTracker>().Object);
+            new Mock<ITargetExecutionTracker>().Object,
+            contextShrinkManager: null,
+            sessionAffinity);
             }
 
             // Builds the forwarder used by the middleware. When the caller does not supply an explicit
@@ -2522,5 +2526,192 @@ public class OllamaRoutingMiddlewareTests
         Assert.Equal("Local", context.Response.Headers["X-OllamaRouter-Target"]);
         Assert.Equal("llama3", context.Response.Headers["X-OllamaRouter-Model"]);
         Assert.Equal("100", context.Response.Headers["X-OllamaRouter-Estimated-Tokens"]);
-    }
-}
+        }
+
+        // ==================================================================
+        // Session/agent sticky-routing header (X-OllamaRouter-Session-Id /
+        // X-OllamaRouter-Agent-Id): extraction, response echo, lease wiring
+        // ==================================================================
+
+        [Fact]
+        public async Task Completion_SessionIdHeader_EchoedInResponse_PassedToDecisionService()
+        {
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Bonjour" }""");
+        context.Request.Headers[OllamaReverseProxyConfig.PublicSessionIdHeader] = "agent-1";
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(100, "llama3", (int?)null, "agent-1", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Remote);
+
+        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService,
+            sessionAffinity: new SessionAffinityService(
+                MsOptions.Create(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
+                NullLogger<SessionAffinityService>.Instance));
+
+        await sut.InvokeAsync(context);
+
+        // The new session-aware overload is used with the extracted session ID...
+        routingDecisionService.Verify(r => r.DecideAsync(100, "llama3", (int?)null, "agent-1", It.IsAny<CancellationToken>()), Times.Once);
+        // ...and the session ID is echoed back in the response telemetry.
+        Assert.Equal("agent-1", context.Response.Headers[OllamaReverseProxyConfig.PublicSessionIdHeader].ToString());
+        Assert.Equal("Remote", context.Response.Headers[OllamaReverseProxyConfig.PublicTargetHeader].ToString());
+        }
+
+        [Fact]
+        public async Task Completion_AgentIdHeader_Alone_FallsBackToAgentId()
+        {
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Bonjour" }""");
+        context.Request.Headers[OllamaReverseProxyConfig.PublicAgentIdHeader] = "agent-2";
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(100, "llama3", (int?)null, "agent-2", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService,
+            sessionAffinity: new SessionAffinityService(
+                MsOptions.Create(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
+                NullLogger<SessionAffinityService>.Instance));
+
+        await sut.InvokeAsync(context);
+
+        routingDecisionService.Verify(r => r.DecideAsync(100, "llama3", (int?)null, "agent-2", It.IsAny<CancellationToken>()), Times.Once);
+        Assert.Equal("agent-2", context.Response.Headers[OllamaReverseProxyConfig.PublicSessionIdHeader].ToString());
+        }
+
+        [Fact]
+        public async Task Completion_BothSessionAndAgentHeaders_SessionIdWins()
+        {
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Bonjour" }""");
+        context.Request.Headers[OllamaReverseProxyConfig.PublicSessionIdHeader] = "session-a";
+        context.Request.Headers[OllamaReverseProxyConfig.PublicAgentIdHeader] = "agent-b";
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(100, "llama3", (int?)null, "session-a", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService,
+            sessionAffinity: new SessionAffinityService(
+                MsOptions.Create(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
+                NullLogger<SessionAffinityService>.Instance));
+
+        await sut.InvokeAsync(context);
+
+        routingDecisionService.Verify(r => r.DecideAsync(100, "llama3", (int?)null, "session-a", It.IsAny<CancellationToken>()), Times.Once);
+        routingDecisionService.Verify(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), "agent-b", It.IsAny<CancellationToken>()), Times.Never);
+        Assert.Equal("session-a", context.Response.Headers[OllamaReverseProxyConfig.PublicSessionIdHeader].ToString());
+        }
+
+        [Fact]
+        public async Task Completion_NoSessionHeaders_UsesLegacyOverload_NoSessionResponseHeader()
+        {
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Bonjour" }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(100, "llama3", (int?)null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        // A real affinity store IS wired — but with no session headers the middleware must
+        // still use the legacy overload and emit no session response header.
+        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService,
+            sessionAffinity: new SessionAffinityService(
+                MsOptions.Create(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
+                NullLogger<SessionAffinityService>.Instance));
+
+        await sut.InvokeAsync(context);
+
+        routingDecisionService.Verify(r => r.DecideAsync(100, "llama3", (int?)null, It.IsAny<CancellationToken>()), Times.Once);
+        routingDecisionService.Verify(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Never);
+        Assert.False(context.Response.Headers.ContainsKey(OllamaReverseProxyConfig.PublicSessionIdHeader));
+        }
+
+        [Fact]
+        public async Task Completion_TooLongSessionId_Ignored_LegacyOverloadUsed()
+        {
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Bonjour" }""");
+        context.Request.Headers[OllamaReverseProxyConfig.PublicSessionIdHeader] = new string('x', 257);
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(100, "llama3", (int?)null, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService,
+            sessionAffinity: new SessionAffinityService(
+                MsOptions.Create(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
+                NullLogger<SessionAffinityService>.Instance));
+
+        await sut.InvokeAsync(context);
+
+        // Over-256-char session IDs are ignored (bounded store): legacy overload, no echo.
+        routingDecisionService.Verify(r => r.DecideAsync(100, "llama3", (int?)null, It.IsAny<CancellationToken>()), Times.Once);
+        routingDecisionService.Verify(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.Is<string>(s => !string.IsNullOrWhiteSpace(s)), It.IsAny<CancellationToken>()), Times.Never);
+        Assert.False(context.Response.Headers.ContainsKey(OllamaReverseProxyConfig.PublicSessionIdHeader));
+        }
+
+        [Fact]
+        public async Task Completion_SessionStickyThroughMiddleware_SecondTurnReceivesFirstTurnLease()
+        {
+        // Integration-level stickiness: two consecutive completion requests for agent-1
+        // against the same sut. The decision-service mock records the session overload's
+        // sessionId argument per call; after turn 1 the REAL SessionAffinityService (wired
+        // into both the middleware and observed here) holds the lease turn 1's winner set —
+        // the same store the production decision service reads for the +150 bonus in turn 2.
+        var affinity = new SessionAffinityService(
+            MsOptions.Create(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
+            NullLogger<SessionAffinityService>.Instance);
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        // Turn 1 decides Remote; turn 2 (sticky) decides Local — the real decision service
+        // would have kept agent-1 on Remote via the +150 bonus; here we just prove the
+        // middleware hands the lease through in both directions.
+        var callIndex = 0;
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .Returns((int _, string _, int? _, string? sessionId, CancellationToken _) =>
+            {
+                Assert.Equal("agent-1", sessionId); // both turns carry the session ID
+                return Task.FromResult(callIndex++ == 0 ? RoutingTarget.Remote : RoutingTarget.Local);
+            });
+
+        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService, sessionAffinity: affinity);
+
+        var context1 = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "turn 1" }""");
+        context1.Request.Headers[OllamaReverseProxyConfig.PublicSessionIdHeader] = "agent-1";
+        await sut.InvokeAsync(context1);
+        Assert.Equal("Remote", context1.Response.Headers[OllamaReverseProxyConfig.PublicTargetHeader].ToString());
+
+        // The production decision service writes the lease on the winner; simulate that
+        // write through the shared store and prove the second turn's middleware path still
+        // routes with the session ID (the store now pins agent-1 to Remote).
+        affinity.SetAffinity("agent-1", RoutingTarget.Remote);
+        Assert.True(affinity.TryGetAffinity("agent-1", out var pinned));
+        Assert.Equal(RoutingTarget.Remote, pinned);
+
+        var context2 = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "turn 2" }""");
+        context2.Request.Headers[OllamaReverseProxyConfig.PublicSessionIdHeader] = "agent-1";
+        await sut.InvokeAsync(context2);
+        Assert.Equal("Local", context2.Response.Headers[OllamaReverseProxyConfig.PublicTargetHeader].ToString());
+        routingDecisionService.Verify(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), "agent-1", It.IsAny<CancellationToken>()), Times.Exactly(2));
+        }
+        }

@@ -23,10 +23,12 @@ public class DynamicContextSizingTests
     [Theory]
     [InlineData(8192, "DenseDesktop16gb")]
     [InlineData(16384, "DenseDesktop16gb")]
-    [InlineData(98303, "DenseDesktop16gb")]
-    [InlineData(98304, "DenseServer96gb")]
+    [InlineData(32767, "DenseDesktop16gb")]
+    [InlineData(32768, "DenseServer96gb")]  // 32 GB boundary: now Server-class
+    [InlineData(65536, "DenseServer96gb")]   // 64 GB
+    [InlineData(98304, "DenseServer96gb")]   // 96 GB
     [InlineData(null, "DenseDesktop16gb")] // Unknown VRAM is conservative.
-    public void SelectProfile_Dense_SplitAt96GBClass(int? maxVramMB, string expected)
+    public void SelectProfile_Dense_SplitAt32GBClass(int? maxVramMB, string expected)
     {
         Assert.Equal(expected, DynamicContextSizingEngine.SelectProfile(ModelArchitectureKind.LargeDense, maxVramMB));
     }
@@ -38,6 +40,29 @@ public class DynamicContextSizingTests
     public void SelectProfile_SmallDense_AlwaysReturnsSmallDenseProfile(int? maxVramMB, string expected)
     {
         Assert.Equal(expected, DynamicContextSizingEngine.SelectProfile(ModelArchitectureKind.SmallDense, maxVramMB));
+    }
+
+    [Fact]
+    public void SelectProfile_Dense_32GBAnd64GB_SelectServerProfile()
+    {
+        // The 32 GB threshold (task #21): 32768 and 65536 MB both select the server profile,
+        // while the boundary-minus-one (32767) still selects the desktop profile.
+        Assert.Equal("DenseServer96gb", DynamicContextSizingEngine.SelectProfile(ModelArchitectureKind.LargeDense, 32_768));
+        Assert.Equal("DenseServer96gb", DynamicContextSizingEngine.SelectProfile(ModelArchitectureKind.LargeDense, 65_536));
+        Assert.Equal("DenseDesktop16gb", DynamicContextSizingEngine.SelectProfile(ModelArchitectureKind.LargeDense, 32_767));
+    }
+
+    [Fact]
+    public void Decide_Dense32GBTarget_SetsServerProfileAndCeiling()
+    {
+        // A 32 GB target selects the server profile; with the hardware ceiling at 262,144
+        // (server class) the effective ceiling is 262,144.
+        var decision = DynamicContextSizingEngine.Decide(
+            DefaultOptions(), ModelArchitectureKind.LargeDense, 32_768, 262_144, estimatedTokens: 50_000, clientRequestedNumCtx: null);
+
+        Assert.Equal("DenseServer96gb", decision.ProfileName);
+        Assert.Equal(262_144, decision.EffectiveCeiling);
+        Assert.Equal(65_536, decision.InjectedNumCtx); // 50k → smallest bucket ≥ 50k
     }
 
     // --- SelectBucket: MoE table (184,320 / 221,184 / 262,144) ------------------------

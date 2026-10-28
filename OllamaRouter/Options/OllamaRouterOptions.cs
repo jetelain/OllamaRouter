@@ -103,6 +103,15 @@ public sealed class OllamaRouterOptions
     public int MaxConsecutiveFailures { get; set; } = 3;
 
     /// <summary>
+    /// Sliding TTL (in minutes) of the in-memory session-affinity store
+    /// (<see cref="Services.ISessionAffinityService"/>): a session/agent lease pinned to a
+    /// fleet target expires after this much inactivity (every hit re-arms the window).
+    /// Defaults to 30. Set to 0 (or negative) to keep the safe default (the store normalizes
+    /// non-positive values back to 30).
+    /// </summary>
+    public int SessionAffinityTtlMinutes { get; set; } = 30;
+
+    /// <summary>
     /// Allowed difference in estimated prompt tokens between adjacent requests
     /// to consider them part of the same retry streak. Defaults to 4000.
     /// Set to 0 to require an exact match.

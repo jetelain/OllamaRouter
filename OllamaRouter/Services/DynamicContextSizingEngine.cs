@@ -28,12 +28,15 @@ public sealed record ContextSizingDecision(
 public static class DynamicContextSizingEngine
 {
     /// <summary>
-    /// Minimum effective VRAM (in MB) of a server-class ("96gb") target: dense models at or
+    /// Minimum effective VRAM (in MB) of a server-class target (≥ 32 GB): dense models at or
     /// above this budget use the <see cref="DynamicContextOptions.DenseServer96gbProfileName"/>
-    /// profile. Mirrors the ceiling class boundary used by
-    /// <see cref="ModelCapabilityEngine"/>.
+    /// profile (the "96gb" in its name is a historical artifact; 32 GB targets select it
+    /// too, and operators may override the profile via <c>OllamaRouter:DynamicContext:Profiles</c>).
+    /// This constant is the single source of truth for the server-class boundary: the ceiling
+    /// classes in <see cref="ModelCapabilityEngine"/> and the <c>GetTargetClass</c> / hardware
+    /// role-slot rules in the routing decision service all derive from it.
     /// </summary>
-    public const int ServerClassVramThresholdMB = 98_304;
+    public const int ServerClassVramThresholdMB = 32_768;
 
     /// <summary>
     /// Selects the bucket profile name for a (architecture, target VRAM) pair:

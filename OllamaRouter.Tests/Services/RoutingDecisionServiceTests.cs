@@ -48,8 +48,11 @@ public class RoutingDecisionServiceTests
         public Task<RoutingTarget> Decide(int tokens, string model, int? numCtx = null)
             => SUT.DecideWithEvaluationsAsync(tokens, model, numCtx, e => Evaluations.Add(e));
 
+        public Task<RoutingTarget> Decide(int tokens, string model, string sessionId)
+            => SUT.DecideWithEvaluationsAsync(tokens, model, null, e => Evaluations.Add(e), sessionId: sessionId);
+
         public RoutingCandidateEvaluation? Eval(RoutingTarget t) => Evaluations.LastOrDefault(e => e.Target == t);
-    }
+        }
 
     private sealed class MetaMap
     {
@@ -89,7 +92,8 @@ public class RoutingDecisionServiceTests
         HashSet<RoutingTarget>? disabled = null,
         MetaMap? meta = null,
         Mock<ITargetLivenessService>? livenessOverride = null,
-        Func<RoutingTarget, int>? failureStreaks = null)
+        Func<RoutingTarget, int>? failureStreaks = null,
+        ISessionAffinityService? sessionAffinity = null)
     {
         meta ??= new MetaMap();
         var metaMap = meta;
@@ -178,10 +182,11 @@ public class RoutingDecisionServiceTests
             engine,
             cloudHandler,
             NullLogger<RoutingDecisionService>.Instance,
-            streakTracker);
+            streakTracker,
+            sessionAffinity);
 
         return (new Harness { SUT = sut, States = statesStore }, meta);
-    }
+        }
 
     // ---- option / metadata builders ----
 
@@ -1335,6 +1340,336 @@ public class RoutingDecisionServiceTests
         await Assert.ThrowsAsync<NoAvailableTargetException>(() => h.Decide(1_000, "mystery"));
         Assert.False(h.Eval(TDesktop)!.Qualified);
         Assert.StartsWith("offline", h.Eval(TDesktop)!.DisqualifiedReason);
+    }
+
+    // ==================================================================
+    // Session affinity: sticky sessions (KV-cache), multi-agent isolation,
+    // failover rebinding, Cloud never leased, 32 GB server class
+    // ==================================================================
+
+    private static SessionAffinityService CreateSessionAffinity() =>
+        new SessionAffinityService(
+            Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions { SessionAffinityTtlMinutes = 30 }),
+            NullLogger<SessionAffinityService>.Instance);
+
+    [Fact]
+    public async Task SessionAffinity_Stickiness_OutRanksHotModelAffinity()
+    {
+        // Two equivalent idle server-class targets in declaration order; session "agent-1"
+        // turn 1 wins aiserver1 (declaration order, score 0). Turn 2 the model is now HOT on
+        // aiserver2 (+100) while aiserver1 is idle — agent-1 must STILL win aiserver1 with
+        // the SessionAffinityBonus (+150), beating +100.
+        var s1 = new OllamaTargetOptions { Name = "aiserver1", Url = "http://as1:11434", HardwareHint = "96gb", MaxParallel = 2 };
+        var s2 = new OllamaTargetOptions { Name = "aiserver2", Url = "http://as2:11434", HardwareHint = "96gb", MaxParallel = 2 };
+        var t1 = new RoutingTarget("aiserver1");
+        var t2 = new RoutingTarget("aiserver2");
+        var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { s1, s2 } };
+        options.Models["qwen3.8-27B"] = new ModelThresholds();
+
+        var meta = new MetaMap();
+        meta.Add(s1.Url!, "qwen3.8-27B", DenseShow(27_800_000_000), 16 * Gb);
+        meta.Add(s2.Url!, "qwen3.8-27B", DenseShow(27_800_000_000), 16 * Gb);
+
+        var affinity = CreateSessionAffinity();
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{s1.Url}|qwen3.8-27B", $"{s2.Url}|qwen3.8-27B" },
+            onlineTargets: new() { "aiserver1", "aiserver2" },
+            states: new() { [t1] = State(t1, 0), [t2] = State(t2, 0) },
+            meta: meta,
+            sessionAffinity: affinity);
+
+        // Turn 1: no lease yet → 0-0 tie → aiserver1 by declaration order. The lease is written.
+        var first = await h.Decide(30_000, "qwen3.8-27B", "agent-1");
+        Assert.Equal(t1, first);
+        Assert.True(affinity.TryGetAffinity("agent-1", out var pinned1));
+        Assert.Equal(t1, pinned1);
+
+        // Turn 2: the model is now HOT on aiserver2 (+100) but the session lease (+150)
+        // keeps agent-1 on aiserver1.
+        h.States[t1] = State(t1, inFlight: 0);
+        h.States[t2] = State(t2, inFlight: 0, ("qwen3.8-27B", 16 * Gb));
+        var second = await h.Decide(30_000, "qwen3.8-27B", "agent-1");
+
+        Assert.Equal(t1, second);
+        Assert.Equal(150, h.Eval(t1)!.SessionAffinityBonus);
+        Assert.Equal(150, h.Eval(t1)!.Score);          // session only
+        Assert.Equal(0, h.Eval(t2)!.SessionAffinityBonus);
+        Assert.Equal(100, h.Eval(t2)!.AffinityBonus);  // hot on aiserver2, but 100 < 150
+        Assert.Equal(100, h.Eval(t2)!.Score);
+    }
+
+    [Fact]
+    public async Task SessionAffinity_MultiAgentIsolation_DistinctSessions_BindDistinctTargets()
+    {
+        // agent-1 (turn 1) binds aiserver1. agent-2 turn 1 with aiserver1 carrying in-flight
+        // concurrency: agent-2's best is still aiserver2 (the pinned target of agent-1 does
+        // NOT leak its bonus to agent-2; aiserver1's −140 concurrency makes aiserver2 win).
+        // Interleaved turns keep each session on its own bound target.
+        var s1 = new OllamaTargetOptions { Name = "aiserver1", Url = "http://as1:11434", HardwareHint = "96gb", MaxParallel = 1 };
+        var s2 = new OllamaTargetOptions { Name = "aiserver2", Url = "http://as2:11434", HardwareHint = "96gb", MaxParallel = 1 };
+        var t1 = new RoutingTarget("aiserver1");
+        var t2 = new RoutingTarget("aiserver2");
+        var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { s1, s2 } };
+        options.Models["qwen3.8-27B"] = new ModelThresholds();
+
+        var meta = new MetaMap();
+        meta.Add(s1.Url!, "qwen3.8-27B", DenseShow(27_800_000_000), 16 * Gb);
+        meta.Add(s2.Url!, "qwen3.8-27B", DenseShow(27_800_000_000), 16 * Gb);
+
+        var affinity = CreateSessionAffinity();
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{s1.Url}|qwen3.8-27B", $"{s2.Url}|qwen3.8-27B" },
+            onlineTargets: new() { "aiserver1", "aiserver2" },
+            states: new() { [t1] = State(t1, 0), [t2] = State(t2, 0) },
+            meta: meta,
+            sessionAffinity: affinity);
+
+        // agent-1 turn 1: both idle → declaration order → aiserver1 (leased).
+        var a1 = await h.Decide(30_000, "qwen3.8-27B", "agent-1");
+        Assert.Equal(t1, a1);
+
+        // agent-2 turn 1: aiserver1 is now busy (in-flight 1, MaxParallel 1 ⇒ −140);
+        // agent-2 has no lease → aiserver2 (0) beats aiserver1 (−140) → aiserver2 (leased).
+        h.States[t1] = State(t1, inFlight: 1);
+        var b1 = await h.Decide(30_000, "qwen3.8-27B", "agent-2");
+        Assert.Equal(t2, b1);
+        Assert.Equal(0, h.Eval(t1)!.SessionAffinityBonus); // agent-2 sees no leak of agent-1's lease
+        Assert.Equal(0, h.Eval(t2)!.SessionAffinityBonus);
+
+        // Interleaved: both targets idle again. agent-1's +150 stays on aiserver1 and
+        // agent-2's +150 on aiserver2 — no cross-talk, no bouncing.
+        h.States[t1] = State(t1, inFlight: 0);
+        h.States[t2] = State(t2, inFlight: 0);
+        var a2 = await h.Decide(30_000, "qwen3.8-27B", "agent-1");
+        Assert.Equal(t1, a2);
+        Assert.Equal(150, h.Eval(t1)!.SessionAffinityBonus);
+        Assert.Equal(0, h.Eval(t2)!.SessionAffinityBonus);
+
+        var b2 = await h.Decide(30_000, "qwen3.8-27B", "agent-2");
+        Assert.Equal(t2, b2);
+        Assert.Equal(0, h.Eval(t1)!.SessionAffinityBonus);
+        Assert.Equal(150, h.Eval(t2)!.SessionAffinityBonus);
+    }
+
+    [Fact]
+    public async Task SessionAffinity_PinnedTargetGoesOffline_RebindsToFailoverTarget()
+    {
+        // agent-1 is bound to aiserver1; aiserver1 then goes OFFLINE (Stage-1 disqualified —
+        // no affinity rescue): the session earns 0 there, wins aiserver2, and the lease is
+        // rebound to aiserver2 on the same decision.
+        var s1 = new OllamaTargetOptions { Name = "aiserver1", Url = "http://as1:11434", HardwareHint = "96gb", MaxParallel = 2 };
+        var s2 = new OllamaTargetOptions { Name = "aiserver2", Url = "http://as2:11434", HardwareHint = "96gb", MaxParallel = 2 };
+        var t1 = new RoutingTarget("aiserver1");
+        var t2 = new RoutingTarget("aiserver2");
+        var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { s1, s2 } };
+        options.Models["qwen3.8-27B"] = new ModelThresholds();
+
+        var meta = new MetaMap();
+        meta.Add(s1.Url!, "qwen3.8-27B", DenseShow(27_800_000_000), 16 * Gb);
+        meta.Add(s2.Url!, "qwen3.8-27B", DenseShow(27_800_000_000), 16 * Gb);
+
+        var affinity = CreateSessionAffinity();
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{s1.Url}|qwen3.8-27B", $"{s2.Url}|qwen3.8-27B" },
+            onlineTargets: new() { "aiserver1", "aiserver2" },
+            states: new() { [t1] = State(t1, 0), [t2] = State(t2, 0) },
+            meta: meta,
+            sessionAffinity: affinity);
+
+        var first = await h.Decide(30_000, "qwen3.8-27B", "agent-1");
+        Assert.Equal(t1, first);
+        Assert.True(affinity.TryGetAffinity("agent-1", out var pinned));
+        Assert.Equal(t1, pinned);
+
+        // aiserver1 goes offline.
+        var liveness = new Mock<ITargetLivenessService>();
+        liveness.Setup(l => l.IsOnline(It.IsAny<RoutingTarget>())).Returns((RoutingTarget t) => t != t1);
+        liveness.Setup(l => l.ServiceStartTimeUtc).Returns(DateTimeOffset.MinValue);
+        liveness.Setup(l => l.GetEntries()).Returns(new Dictionary<RoutingTarget, TargetLivenessEntry>());
+
+        var (h2, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{s1.Url}|qwen3.8-27B", $"{s2.Url}|qwen3.8-27B" },
+            onlineTargets: new() { "aiserver1", "aiserver2" },
+            states: new() { [t1] = State(t1, 0), [t2] = State(t2, 0) },
+            meta: meta,
+            livenessOverride: liveness,
+            sessionAffinity: affinity);
+
+        var second = await h2.Decide(30_000, "qwen3.8-27B", "agent-1");
+
+        Assert.Equal(t2, second);
+        Assert.False(h2.Eval(t1)!.Qualified); // offline ⇒ Stage-1 disqualified, no affinity rescue
+        Assert.StartsWith("offline", h2.Eval(t1)!.DisqualifiedReason);
+        Assert.Equal(0, h2.Eval(t2)!.SessionAffinityBonus); // bonus no longer applies (target dead)
+        // The lease is rebound to the failover winner on the same decision.
+        Assert.True(affinity.TryGetAffinity("agent-1", out var rebound));
+        Assert.Equal(t2, rebound);
+    }
+
+    [Fact]
+    public async Task SessionAffinity_FailureStreakSwitchOver_RebindsToSwitchedTarget()
+    {
+        // agent-1 is bound to aiserver1 (the score winner), but aiserver1's uncommitted
+        // failure streak exceeds MaxConsecutiveFailures: the streak switch-over takes the
+        // next-ranked target AND the lease is written on the FINAL (switched) winner.
+        var s1 = new OllamaTargetOptions { Name = "aiserver1", Url = "http://as1:11434", HardwareHint = "96gb", MaxParallel = 2 };
+        var s2 = new OllamaTargetOptions { Name = "aiserver2", Url = "http://as2:11434", HardwareHint = "96gb", MaxParallel = 2 };
+        var t1 = new RoutingTarget("aiserver1");
+        var t2 = new RoutingTarget("aiserver2");
+        var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { s1, s2 } };
+        options.Models["qwen3.8-27B"] = new ModelThresholds();
+
+        var meta = new MetaMap();
+        meta.Add(s1.Url!, "qwen3.8-27B", DenseShow(27_800_000_000), 16 * Gb);
+        meta.Add(s2.Url!, "qwen3.8-27B", DenseShow(27_800_000_000), 16 * Gb);
+
+        var affinity = CreateSessionAffinity();
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{s1.Url}|qwen3.8-27B", $"{s2.Url}|qwen3.8-27B" },
+            onlineTargets: new() { "aiserver1", "aiserver2" },
+            states: new() { [t1] = State(t1, 0, ("qwen3.8-27B", 16 * Gb)), [t2] = State(t2, 0) },
+            failureStreaks: t => t == t1 ? 5 : 0,
+            meta: meta,
+            sessionAffinity: affinity);
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B", "agent-1");
+
+        // aiserver1 scores 250 (session 150 + affinity 100) but is streak-skipped; the lease
+        // lands on the FINAL winner (aiserver2).
+        Assert.Equal(t2, winner);
+        Assert.True(affinity.TryGetAffinity("agent-1", out var rebound));
+        Assert.Equal(t2, rebound);
+    }
+
+    [Fact]
+    public async Task SessionAffinity_CloudWinner_IsNeverLeased()
+    {
+        // All fleet offline + Cloud configured + session present: the winner is the Cloud
+        // pseudo-target and NO lease is created (the session re-decides next turn and rejoins
+        // the fleet as soon as a node recovers).
+        var s1 = new OllamaTargetOptions { Name = "aiserver1", Url = "http://as1:11434", HardwareHint = "96gb", MaxParallel = 2 };
+        var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { s1 } };
+        options.Models["qwen3.8-27B"] = new ModelThresholds { CloudModel = "deepseek-v3.1:671b-cloud" };
+
+        var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        var affinity = CreateSessionAffinity();
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{s1.Url}|qwen3.8-27B" },
+            onlineTargets: new() { }, // all fleet offline
+            meta: meta,
+            sessionAffinity: affinity);
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B", "agent-1");
+
+        Assert.Equal(RoutingTarget.Cloud, winner);
+        Assert.False(affinity.TryGetAffinity("agent-1", out _)); // never leased
+    }
+
+    [Fact]
+    public async Task SessionAffinity_NoSessionId_LegacyStatelessScores()
+    {
+        // sessionId: null ⇒ byte-identical legacy behavior: the SessionAffinityBonus field
+        // is 0 on every candidate even when a lease exists for some other session.
+        var s1 = new OllamaTargetOptions { Name = "aiserver1", Url = "http://as1:11434", HardwareHint = "96gb", MaxParallel = 2 };
+        var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { s1 } };
+        options.Models["qwen3.8-27B"] = new ModelThresholds();
+
+        var meta = new MetaMap();
+        meta.Add(s1.Url!, "qwen3.8-27B", DenseShow(27_800_000_000), 16 * Gb);
+
+        var affinity = CreateSessionAffinity();
+        affinity.SetAffinity("other-agent", new RoutingTarget("aiserver1"));
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{s1.Url}|qwen3.8-27B" },
+            onlineTargets: new() { "aiserver1" },
+            states: new() { [new RoutingTarget("aiserver1")] = State(new RoutingTarget("aiserver1"), 0) },
+            meta: meta,
+            sessionAffinity: affinity);
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B", (string?)null);
+
+        Assert.Equal(new RoutingTarget("aiserver1"), winner);
+        Assert.Equal(0, h.Eval(new RoutingTarget("aiserver1"))!.SessionAffinityBonus);
+        Assert.Equal(0, h.Eval(new RoutingTarget("aiserver1"))!.Score);
+    }
+
+    [Fact]
+    public async Task SessionAffinity_NoAffinityService_LegacyStatelessScores()
+    {
+        // A null ISessionAffinityService (pre-affinity test wiring) ⇒ no bonus, no throw,
+        // and the 9-arg construction stays source-compatible.
+        var seedMeta = new MetaMap();
+        var (h, meta) = Build(
+            FleetOptions("qwen3.8-27B"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{LaptopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            meta: AddDense(seedMeta, "qwen3.8-27B", 27_800_000_000));
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B", "agent-1");
+
+        Assert.Equal(TDesktop, winner);
+        Assert.Equal(0, h.Eval(TDesktop)!.SessionAffinityBonus);
+    }
+
+    [Fact]
+    public async Task HardwareBonus_64GBServerClass_EarnsRoleBonus_AboveDesktopCeiling()
+    {
+        // A 64 GB target (MaxVramMB 65536) is Server-class (≥ 32 GB threshold): a LargeDense
+        // request of 60k tokens (effective 75k > 49152) earns the server-class HardwareBonus
+        // (+20); the 16 GB Desktop is context-overflow disqualified (CMax 49152). A 32 GB
+        // target (MaxVramMB 32768) also qualifies and earns the same role bonus.
+        var s64 = new OllamaTargetOptions { Name = "aiserver2", Url = "http://as64:11434", MaxVramMB = 65_536, MaxParallel = 2 };
+        var s32 = new OllamaTargetOptions { Name = "aiserver3", Url = "http://as32:11434", MaxVramMB = 32_768, MaxParallel = 2 };
+        var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { Desktop, s64, s32 } };
+        options.Models["qwen3.8-27B"] = new ModelThresholds();
+
+        var meta = new MetaMap();
+        meta.Add(DesktopUrl, "qwen3.8-27B", DenseShow(27_800_000_000), 16 * Gb);
+        meta.Add(s64.Url!, "qwen3.8-27B", DenseShow(27_800_000_000), 16 * Gb);
+        meta.Add(s32.Url!, "qwen3.8-27B", DenseShow(27_800_000_000), 16 * Gb);
+
+        var t64 = new RoutingTarget("aiserver2");
+        var t32 = new RoutingTarget("aiserver3");
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{s64.Url}|qwen3.8-27B", $"{s32.Url}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "aiserver2", "aiserver3" },
+            states: new() { [TDesktop] = State(TDesktop, 0), [t64] = State(t64, 0), [t32] = State(t32, 0) },
+            meta: meta);
+
+        var winner = await h.Decide(60_000, "qwen3.8-27B");
+
+        Assert.False(h.Eval(TDesktop)!.Qualified); // 75k effective > 49152 CMax ⇒ context overflow
+        Assert.StartsWith("context overflow", h.Eval(TDesktop)!.DisqualifiedReason);
+        Assert.True(h.Eval(t64)!.Qualified);
+        Assert.Equal(20, h.Eval(t64)!.HardwareBonus); // 64 GB = Server class, > 48k role slot
+        Assert.True(h.Eval(t32)!.Qualified);
+        Assert.Equal(20, h.Eval(t32)!.HardwareBonus); // 32 GB = Server class too
+        Assert.Equal(t64, winner); // first server-class in declaration order at the 20 tie
+    }
+
+    [Fact]
+    public void ServerClassThreshold_IsSharedConstant()
+    {
+        // Single source of truth: the 32 GB boundary constant is exposed by the sizing engine
+        // and reused by the capability engine's ceiling classes.
+        Assert.Equal(32_768, DynamicContextSizingEngine.ServerClassVramThresholdMB);
     }
 
     // ---- helpers ----

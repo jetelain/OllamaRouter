@@ -29,6 +29,14 @@ public sealed class RoutingContext
     /// </summary>
     public int? ClientRequestedNumCtx { get; }
 
+    /// <summary>
+    /// The opaque session/agent identifier carried by the request's
+    /// <c>X-OllamaRouter-Session-Id</c> / <c>X-OllamaRouter-Agent-Id</c> header (null when
+    /// absent): used by the routing pipeline's Stage-2 SessionAffinityBonus (+150) to keep
+    /// a multi-agent caller's consecutive turns on the same target (KV-cache stickiness).
+    /// </summary>
+    public string? SessionId { get; }
+
     public RoutingContext(
         int tokenCount,
         string modelName,
@@ -41,13 +49,15 @@ public sealed class RoutingContext
         ModelCapabilityEngine? capabilityEngine = null,
         IReadOnlyList<OllamaTargetOptions>? targets = null,
         ITargetExecutionTracker? executionTracker = null,
-        int? clientRequestedNumCtx = null)
+        int? clientRequestedNumCtx = null,
+        string? sessionId = null)
     {
         TokenCount = tokenCount;
         ModelName = modelName;
         NormalizedModelName = normalizedModelName;
         Thresholds = thresholds;
         ClientRequestedNumCtx = clientRequestedNumCtx;
+        SessionId = sessionId;
         _modelCatalogCache = modelCatalogCache;
         _capabilityEngine = capabilityEngine;
         _executionTracker = executionTracker;

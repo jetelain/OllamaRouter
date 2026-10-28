@@ -36,8 +36,9 @@ public sealed class OllamaRoutingMiddleware(
     IHttpForwarder forwarder,
     ITargetFailureStreakService streakTracker,
     ITargetExecutionTracker executionTracker = null!,
-    IContextAutoShrinkManager? contextShrinkManager = null)
-{
+    IContextAutoShrinkManager? contextShrinkManager = null,
+    ISessionAffinityService? sessionAffinity = null)
+    {
     // During the first 10 s after the liveness prober started, an unresolved (Unknown)
     // target is treated as routable rather than offline, so a request arriving before the
     // boot probe completes is never bounced to 503 merely because probing is slow.
@@ -87,6 +88,15 @@ public sealed class OllamaRoutingMiddleware(
     /// two components that invalidate leases.
     /// </summary>
     private readonly IContextAutoShrinkManager? _contextShrinkManager = contextShrinkManager;
+
+    /// <summary>
+    /// The multi-agent session/agent sticky-routing lease store (null-guarded for unit-test
+    /// compatibility with the pre-affinity pipeline: when null, the middleware extracts no
+    /// session lease — the request always uses the stateless DecideAsync overloads, no
+    /// X-OllamaRouter-Session-Id response header is emitted, and no failover/liveness
+    /// invalidation happens).
+    /// </summary>
+    private readonly ISessionAffinityService? _sessionAffinity = sessionAffinity;
 
     // Last-seen raw liveness state per target, used to detect offline/online TRANSITIONS so
     // the Auto-Shrink Manager's leases are reset exactly when a daemon (re)loads (its KV cache
@@ -369,6 +379,56 @@ public sealed class OllamaRoutingMiddleware(
             or ForwarderError.RequestBodyCanceled
             or ForwarderError.RequestBodyClient;
 
+    // Session/agent sticky-routing extraction: X-OllamaRouter-Session-Id first, then the
+    // X-OllamaRouter-Agent-Id fallback (whitespace trimmed; empty ⇒ absent). The ID is opaque
+    // to the router (any string); values longer than 256 chars are ignored with a warning so
+    // a hostile header can never bloat the in-memory lease store. Returns null when no
+    // (valid) session/agent ID is present.
+    private string? TryExtractSessionId(HttpContext context)
+    {
+        string? sessionId = null;
+        var sourceHeader = OllamaReverseProxyConfig.PublicSessionIdHeader;
+        if (context.Request.Headers.TryGetValue(OllamaReverseProxyConfig.PublicSessionIdHeader, out var sessionHeader))
+        {
+            sessionId = sessionHeader.ToString()?.Trim();
+        }
+
+        if (string.IsNullOrWhiteSpace(sessionId) &&
+            context.Request.Headers.TryGetValue(OllamaReverseProxyConfig.PublicAgentIdHeader, out var agentHeader))
+        {
+            sessionId = agentHeader.ToString()?.Trim();
+            sourceHeader = OllamaReverseProxyConfig.PublicAgentIdHeader;
+        }
+
+        if (string.IsNullOrWhiteSpace(sessionId))
+        {
+            return null;
+        }
+
+        if (sessionId!.Length > 256)
+        {
+            logger.LogWarning(
+                "Ignoring {Header} session ID longer than 256 characters (routing stateless).",
+                sourceHeader);
+            return null;
+        }
+
+        return sessionId;
+    }
+
+    // Session-aware decision dispatch: when a session ID is present the new
+    // DecideAsync(..., sessionId, ...) overload is used (Stage-2 SessionAffinityBonus +
+    // lease rebinding on the winner); when absent the exact legacy 3-arg overloads are used
+    // (byte-identical stateless behavior, and the 4-arg overload is never invoked — the
+    // response echoes no session header in that case).
+    private Task<RoutingTarget> DecideWithSessionAsync(
+        int tokenCount, string modelName, int? clientNumCtx, string? sessionId, HttpContext context)
+    {
+        return sessionId is null
+            ? routingDecisionService.DecideAsync(tokenCount, modelName, clientNumCtx, context.RequestAborted)
+            : routingDecisionService.DecideAsync(tokenCount, modelName, clientNumCtx, sessionId, context.RequestAborted);
+    }
+
     // Diagnostics payload for the all-offline 503: enumerates the ENABLED fleet targets
     // in fleet order with their raw (non-TTL) state lowercased and the last probe error.
     // <paramref name="cloudEnabled"/> is false on the pre-dispatch gate (Cloud was NOT
@@ -402,7 +462,7 @@ public sealed class OllamaRoutingMiddleware(
     // is NOT a transition (the prober may simply have resolved the target for the first time).
     private void ResetLeasesOnLivenessTransition(RoutingTarget target, TargetLivenessState newState)
     {
-        if (_contextShrinkManager is null || target == RoutingTarget.Cloud)
+        if (target == RoutingTarget.Cloud)
         {
             return;
         }
@@ -412,7 +472,15 @@ public sealed class OllamaRoutingMiddleware(
             if (newState == TargetLivenessState.Offline || previous == TargetLivenessState.Offline)
             {
                 logger.LogInformation("Target {Target} liveness transitioned {Previous} -> {New}; resetting its auto-shrink context leases.", target.Value, previous, newState);
-                _contextShrinkManager.ResetTargetLeases(target);
+                _contextShrinkManager?.ResetTargetLeases(target);
+                if (newState == TargetLivenessState.Offline)
+                {
+                    // The KV cache of a target that just went offline is gone: release every
+                    // session/agent lease pinned to it immediately (the decision service's
+                    // next turn re-binds the session to a live target) rather than waiting
+                    // for the lease TTL to lapse.
+                    _sessionAffinity?.InvalidateTarget(target);
+                }
             }
         }
 
@@ -564,6 +632,11 @@ public sealed class OllamaRoutingMiddleware(
         // after an uncommitted failover), or the last attempted one on terminal failure.
         RoutingTarget? servedTarget = null;
 
+        // The request's session/agent sticky-routing ID (X-OllamaRouter-Session-Id with the
+        // X-OllamaRouter-Agent-Id fallback); null when absent. Used for the Stage-2
+        // SessionAffinityBonus + lease rebinding and echoed back in the response telemetry.
+        var sessionId = _sessionAffinity is not null ? TryExtractSessionId(context) : null;
+
         // The target currently holding an in-flight accounting slot (the decided primary);
         // reassigned to the finally-served target after the dispatch loop so a request that
         // fails over Remote→Local is counted against Local, never against an exhausted candidate.
@@ -607,23 +680,31 @@ public sealed class OllamaRoutingMiddleware(
                         {
                             target = requestedTarget;
                             logger.LogInformation("Routing target explicitly pinned via request header: {Target}", target);
+                            // Session stickiness (Q1 resolution): an HONORED pin explicitly
+                            // sets/refreshes the session lease to the pinned target, so the
+                            // caller's subsequent NON-pinned turns stay sticky on it. (Cloud
+                            // pins are never leased: SetAffinity ignores the pseudo-target.)
+                            if (sessionId is not null)
+                            {
+                                _sessionAffinity?.SetAffinity(sessionId, target);
+                            }
                         }
                         else
                         {
                             logger.LogWarning("Pinned target {Target} does not host model {Model}; falling back to dynamic routing.", requestedTarget, modelName);
-                            target = await routingDecisionService.DecideAsync(tokenCount, modelName, clientNumCtx, context.RequestAborted);
+                            target = await DecideWithSessionAsync(tokenCount, modelName, clientNumCtx, sessionId, context);
                         }
                     }
                     else
                     {
                         logger.LogWarning("Requested target {Target} is offline (liveness {State}). Falling back to dynamic routing.", requestedTarget, pinnedState);
-                        target = await routingDecisionService.DecideAsync(tokenCount, modelName, clientNumCtx, context.RequestAborted);
+                        target = await DecideWithSessionAsync(tokenCount, modelName, clientNumCtx, sessionId, context);
                     }
                 }
                 else
                 {
                     logger.LogWarning("Requested target {Target} is disabled. Falling back to dynamic routing.", requestedTarget);
-                    target = await routingDecisionService.DecideAsync(tokenCount, modelName, clientNumCtx, context.RequestAborted);
+                    target = await DecideWithSessionAsync(tokenCount, modelName, clientNumCtx, sessionId, context);
                 }
             }
             else
@@ -632,7 +713,7 @@ public sealed class OllamaRoutingMiddleware(
                 // (see RefreshFleetLivenessAsync) so a healthy target whose Online verdict merely
                 // lapsed between re-probe ticks is not disqualified as offline and misrouted.
                 await RefreshFleetLivenessAsync(context.RequestAborted);
-                target = await routingDecisionService.DecideAsync(tokenCount, modelName, clientNumCtx, context.RequestAborted);
+                target = await DecideWithSessionAsync(tokenCount, modelName, clientNumCtx, sessionId, context);
             }
 
             logger.LogInformation("{ModelName} - Tokens: {TokenCount} => {Target}", modelName, tokenCount, target);
@@ -767,6 +848,13 @@ public sealed class OllamaRoutingMiddleware(
         context.Response.Headers[OllamaReverseProxyConfig.PublicTargetHeader] = telemetryTarget.ToString();
         context.Response.Headers[OllamaReverseProxyConfig.TelemetryModelHeader] = modelName;
         context.Response.Headers[OllamaReverseProxyConfig.TelemetryEstimatedTokensHeader] = tokenCount.ToString();
+        if (sessionId is not null)
+        {
+            // Echo the recognized session/agent ID back (telemetry + client bookkeeping), both
+            // eagerly and re-asserted in the OnStarting closure so streamed NDJSON/SSE
+            // responses carry it too.
+            context.Response.Headers[OllamaReverseProxyConfig.PublicSessionIdHeader] = sessionId;
+        }
         if (injectedNumCtx.HasValue)
         {
             context.Response.Headers[OllamaReverseProxyConfig.TelemetryContextSizeHeader] = injectedNumCtx.Value.ToString();
@@ -778,6 +866,10 @@ public sealed class OllamaRoutingMiddleware(
                 (context.Items[CurrentServedTargetKey] as RoutingTarget? ?? telemetryTarget).ToString();
             context.Response.Headers[OllamaReverseProxyConfig.TelemetryModelHeader] = modelName;
             context.Response.Headers[OllamaReverseProxyConfig.TelemetryEstimatedTokensHeader] = tokenCount.ToString();
+            if (sessionId is not null)
+            {
+                context.Response.Headers[OllamaReverseProxyConfig.PublicSessionIdHeader] = sessionId;
+            }
             if (injectedNumCtx.HasValue)
             {
                 context.Response.Headers[OllamaReverseProxyConfig.TelemetryContextSizeHeader] = injectedNumCtx.Value.ToString();
@@ -1079,6 +1171,10 @@ public sealed class OllamaRoutingMiddleware(
             // Uncommitted failure: rewind (next iteration), strike the failure streak, and
             // apply one best-effort liveness strike through the existing hysteresis (Q2).
             streakTracker.RecordFailure(candidate);
+            // Release every session/agent lease pinned to the dying target immediately (the
+            // decision service's next turn re-binds those sessions to live targets) rather
+            // than waiting for the lease TTL or the liveness prober. Null-guarded, best-effort.
+            _sessionAffinity?.InvalidateTarget(candidate);
             ResetUncommittedResponse(context);
             try
             {

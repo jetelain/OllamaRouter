@@ -133,7 +133,13 @@ public static class OllamaRouterServiceCollectionExtensions
             sp.GetRequiredService<ModelCapabilityEngine>(),
             sp.GetRequiredService<CloudRoutingTargetHandler>(),
             sp.GetRequiredService<ILogger<RoutingDecisionService>>(),
-            sp.GetRequiredService<ITargetFailureStreakService>()));
+            sp.GetRequiredService<ITargetFailureStreakService>(),
+            sp.GetRequiredService<ISessionAffinityService>()));
+        // Multi-agent session/agent sticky-routing lease store: thread-safe singleton with a
+        // sliding TTL (OllamaRouterOptions.SessionAffinityTtlMinutes, default 30 min) and a
+        // bounded lazy sweep — shared by the decision service (Stage-2 bonus + rebinding) and
+        // the middleware (header extraction, failover/liveness invalidation).
+        services.AddSingleton<ISessionAffinityService, SessionAffinityService>();
         services.AddSingleton<IModelCatalogCacheService, ModelCatalogCacheService>();
         services.AddSingleton<IContextAutoShrinkManager>(sp => new ContextAutoShrinkManager(
             sp.GetRequiredService<ILogger<ContextAutoShrinkManager>>()));

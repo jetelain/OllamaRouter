@@ -279,6 +279,67 @@ public class ModelCapabilityEngineTests
 
     // --- Client context clamping ------------------------------------------------------
 
+    // --- 32 GB server-class ceiling (task #21) -----------------------------------------
+
+    [Theory]
+    // 32 GB, 64 GB and 96 GB are ALL server-class now (the boundary moved to 32 GB):
+    // LargeDense earns the full 262,144 elastic ceiling.
+    [InlineData(32_768)]
+    [InlineData(65_536)]
+    [InlineData(98_304)]
+    public void DeriveCapability_NoNumCtx_ServerClassBudgets_LargeDenseGets262kCeiling(int maxVramMB)
+    {
+        var engine = CreateEngine();
+        var metadata = Metadata(27_800_000_000L, family: "qwen3", weightBytes: 16L * 1_048_576);
+
+        var capability = engine.DeriveCapability(metadata, "t", Target(null, maxVramMB), null);
+
+        Assert.True(capability.HardwareCapable);
+        Assert.Equal(ModelCapabilityEngine.ServerCeiling, capability.CMax);
+        Assert.Equal(262_144, capability.CMax);
+    }
+
+    [Fact]
+    public void DeriveCapability_NoNumCtx_16GB_LargeDense_KeepsDesktopCeiling()
+    {
+        var engine = CreateEngine();
+        var metadata = Metadata(27_800_000_000L, family: "qwen3", weightBytes: 16L * 1_048_576);
+
+        var capability = engine.DeriveCapability(metadata, "t", Target(null, 16_384), null);
+
+        Assert.True(capability.HardwareCapable);
+        Assert.Equal(ModelCapabilityEngine.DesktopCeiling, capability.CMax);
+        Assert.Equal(49_152, capability.CMax);
+    }
+
+    [Fact]
+    public void DeriveCapability_NoNumCtx_8GB_LargeDense_StillVetoed()
+    {
+        var engine = CreateEngine();
+        var metadata = Metadata(27_800_000_000L, family: "qwen3", weightBytes: 16_500L * 1_048_576);
+
+        var capability = engine.DeriveCapability(metadata, "t", Target(null, 8_192), null);
+
+        Assert.False(capability.HardwareCapable);
+    }
+
+    [Theory]
+    // MoE on 16 GB → desktop (49,152); MoE on 8 GB → elastic server ceiling (262,144).
+    // The < 12 GB arm is unchanged by the threshold move.
+    [InlineData(16_384, 49152)]
+    [InlineData(8_192, 262144)]
+    public void DeriveCapability_Moe_CeilingUnchangedByThresholdMove(int maxVramMB, int expectedCMax)
+    {
+        var engine = CreateEngine();
+        var metadata = Metadata(4_000_000_000L, expertCount: 64, family: "qwen3moe", weightBytes: 4L * 1_048_576);
+
+        var capability = engine.DeriveCapability(metadata, "t", Target(null, maxVramMB), null);
+
+        Assert.Equal(expectedCMax, capability.CMax);
+    }
+
+    // --- Client context clamping ------------------------------------------------------
+
     [Fact]
     public void EvaluateClientContext_ClientNumCtxClampedToCMax()
     {

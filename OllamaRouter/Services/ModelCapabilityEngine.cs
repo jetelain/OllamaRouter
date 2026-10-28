@@ -128,9 +128,11 @@ public sealed class ModelCapabilityEngine(
         kind == ModelArchitectureKind.Moe ? "Moe" : "Dense";
 
     /// <summary>
-    /// Minimum effective VRAM (in MB) of a server-class ("96gb") target.
+    /// Minimum effective VRAM (in MB) of a server-class target: references the shared
+    /// <see cref="DynamicContextSizingEngine.ServerClassVramThresholdMB"/> constant so the
+    /// ceiling boundary (32 GB) and the bucket-profile boundary stay a single source of truth.
     /// </summary>
-    private const int ServerCeilingMB = 98304;
+    private const int ServerCeilingMB = DynamicContextSizingEngine.ServerClassVramThresholdMB;
 
     private static readonly TimeSpan CapabilityCacheDuration = TimeSpan.FromSeconds(30);
 
@@ -289,7 +291,8 @@ public sealed class ModelCapabilityEngine(
 
     private static int HardwareCeiling(int? maxVram)
     {
-        // Per target class (hierarchy level 3): 96gb server → 262144; 16gb desktop → 49152;
+        // Per target class (hierarchy level 3): server-class (≥ 32 GB) → 262144;
+        // 12-32 GB desktop → 49152;
         // 8gb small → 262144 elastic ceiling for MoE/SmallDense (LargeDense is vetoed
         // separately); unknown VRAM → Ollama default, no headroom claims.
         return maxVram switch

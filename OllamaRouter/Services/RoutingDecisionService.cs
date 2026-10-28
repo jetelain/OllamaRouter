@@ -10,11 +10,13 @@ namespace OllamaRouter.Services;
 /// qualifies every effective fleet target (admin enabled, liveness online with the 10 s
 /// startup grace, catalog presence, hardware capability, context fit), Stage 2 scores the
 /// qualified candidates with the calibrated formula
-/// <c>Score = AffinityBonus(+100) + HardwareBonus(+20) − EvictionPenalty(−80) − ConcurrencyPenalty</c>,
+/// <c>Score = SessionAffinityBonus(+150) + AffinityBonus(+100) + HardwareBonus(+20) − EvictionPenalty(−80) − ConcurrencyPenalty</c>,
 /// and the highest score wins with equal scores resolved by declaration order in the
 /// <see cref="OllamaRouterOptions.Targets"/> list. The Cloud pseudo-target participates as a
 /// fixed score-0 candidate appended after all fleet targets (it therefore loses 0-vs-0 ties
-/// but beats every negative fleet score).
+/// but beats every negative fleet score), never earns the SessionAffinityBonus, and is never
+/// leased to a session. When a request carries a session ID, the final winning target is
+/// leased back via <see cref="ISessionAffinityService"/> (failover re-binds automatically).
 /// </summary>
 public sealed class RoutingDecisionService : IRoutingDecisionService
 {
@@ -33,6 +35,9 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
     /// <summary>Concurrency cliff penalty when the target's MaxParallel is reached.</summary>
     private const int ConcurrencyCliffPenalty = 100;
 
+    /// <summary>Session affinity bonus: the candidate is this session's leased (sticky) target.</summary>
+    private const int SessionAffinityBonus = 150;
+
     /// <summary>Bytes per MiB for the eviction VRAM-sum comparison (mirrors ModelCapabilityEngine's weight→MB conversion).</summary>
     private const long BytesPerMiB = 1_048_576;
 
@@ -45,12 +50,15 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
     private readonly CloudRoutingTargetHandler _cloudHandler;
     private readonly ILogger<RoutingDecisionService> _logger;
     private readonly ITargetFailureStreakService _streakTracker;
+    private readonly ISessionAffinityService? _sessionAffinity;
 
     /// <summary>
     /// Creates the routing decision pipeline over the configured fleet. The Cloud terminal
     /// fallback handler is resolved directly (it is the sole <see cref="IRoutingTargetHandler"/>
     /// implementation); fleet targets are taken from the options' effective target list
     /// (including the legacy Local/Remote synthesis) and evaluated in declaration order.
+    /// <paramref name="sessionAffinity"/> enables the multi-agent sticky-session Stage-2 bonus;
+    /// when null (e.g. existing test constructions) the pipeline is fully stateless.
     /// </summary>
     public RoutingDecisionService(
         IOptions<OllamaRouterOptions> options,
@@ -61,7 +69,8 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         ModelCapabilityEngine? capabilityEngine,
         CloudRoutingTargetHandler cloudHandler,
         ILogger<RoutingDecisionService> logger,
-        ITargetFailureStreakService? streakTracker = null)
+        ITargetFailureStreakService? streakTracker = null,
+        ISessionAffinityService? sessionAffinity = null)
     {
         _options = options;
         _modelCatalogCacheService = modelCatalogCacheService;
@@ -74,6 +83,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         // A per-instance default keeps tests source-compatible; Program.cs injects the shared
         // singleton via the factory registration so all decision requests share one streak table.
         _streakTracker = streakTracker ?? new TargetFailureStreakService();
+        _sessionAffinity = sessionAffinity;
     }
 
     public Task<RoutingTarget> DecideAsync(int tokenCount, string modelName, CancellationToken cancellationToken = default)
@@ -83,6 +93,11 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
 
     public Task<RoutingTarget> DecideAsync(int tokenCount, string modelName, int? clientRequestedNumCtx, CancellationToken cancellationToken = default)
     {
+        return DecideAsync(tokenCount, modelName, clientRequestedNumCtx, sessionId: null, cancellationToken);
+    }
+
+    public Task<RoutingTarget> DecideAsync(int tokenCount, string modelName, int? clientRequestedNumCtx, string? sessionId, CancellationToken cancellationToken = default)
+    {
         // Per the scoring plan §1.6, every per-candidate evaluation artifact is logged at
         // Debug on the production path (the tests consume the same artifacts through the
         // DecideWithEvaluationsAsync reporting callback).
@@ -91,9 +106,10 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             modelName,
             clientRequestedNumCtx,
             evaluation => _logger.LogDebug(
-                "{Model}: Candidate {Target} qualified={Qualified} score={Score}: {Detail}",
-                NormalizeModelName(modelName), evaluation.Target, evaluation.Qualified, evaluation.Score, evaluation.Detail),
-            cancellationToken);
+                "{Model}: Candidate {Target} qualified={Qualified} score={Score}: session={Session} {Detail}",
+                NormalizeModelName(modelName), evaluation.Target, evaluation.Qualified, evaluation.Score, evaluation.SessionAffinityBonus, evaluation.Detail),
+            cancellationToken,
+            sessionId);
     }
 
     /// <summary>
@@ -108,7 +124,8 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         string modelName,
         int? clientRequestedNumCtx,
         Action<RoutingCandidateEvaluation> reportEvaluation,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? sessionId = null)
     {
         var settings = _options.Value;
         var normalizedName = NormalizeModelName(modelName);
@@ -126,16 +143,26 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             _capabilityEngine,
             settings.GetEffectiveTargets(_logger),
             _executionTracker,
-            clientRequestedNumCtx);
+            clientRequestedNumCtx,
+            sessionId);
 
         var fleetTargets = settings.GetEffectiveTargets(_logger);
         var evaluations = new List<RoutingCandidateEvaluation>(fleetTargets.Count + 1);
+
+        // ---- Session lease lookup (resolved ONCE before the fleet loop). ----
+        // A null/absent store (null _sessionAffinity) or a blank sessionId ⇒ no pinned target:
+        // the pipeline behaves byte-identically to the stateless (pre-affinity) formula.
+        RoutingTarget? pinnedTarget = null;
+        if (_sessionAffinity is { } sessionAffinityService && !string.IsNullOrWhiteSpace(sessionId))
+        {
+            pinnedTarget = sessionAffinityService.TryGetAffinity(sessionId, out var pinned) ? pinned : null;
+        }
 
         // ---- Stage 1 + Stage 2: every fleet target, in declaration order. ----
         var offloadSlotTaken = false;
         foreach (var targetOptions in fleetTargets)
         {
-            var evaluation = await EvaluateFleetTargetAsync(context, targetOptions, offloadSlotTaken, cancellationToken);
+            var evaluation = await EvaluateFleetTargetAsync(context, targetOptions, offloadSlotTaken, pinnedTarget, cancellationToken);
             // The MoE/SmallDense offload slot is single per decision: once the first
             // small-class target has claimed it (when justified), later ones never get the
             // HardwareBonus (role slot is single, per the scoring plan §1.2).
@@ -190,6 +217,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         // the next-ranked candidate (including the Cloud pseudo-target) whose streak is below
         // the threshold; otherwise keep the winner (a forced switch to another failing target
         // would be worse).
+        var finalWinner = winner.Target;
         var maxFailures = settings.MaxConsecutiveFailures;
         if (maxFailures > 0 && _streakTracker.ShouldSkip(winner.Target, maxFailures))
         {
@@ -202,15 +230,30 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
                 _logger.LogInformation(
                     "{Model}: Target {FailedTarget} has a failure streak of {Streak} above threshold {MaxFailures}. Switching to next target {NewTarget}.",
                     normalizedName, winner.Target, _streakTracker.GetStreak(winner.Target), maxFailures, nextCandidate.Target);
-                return nextCandidate.Target;
+                finalWinner = nextCandidate.Target;
             }
-
-            _logger.LogWarning(
-                "{Model}: Target {FailedTarget} has a failure streak of {Streak} above threshold {MaxFailures}, but no subsequent target is enabled or can process the request. Keeping {FailedTarget}.",
-                normalizedName, winner.Target, _streakTracker.GetStreak(winner.Target), maxFailures, winner.Target);
+            else
+            {
+                _logger.LogWarning(
+                    "{Model}: Target {FailedTarget} has a failure streak of {Streak} above threshold {MaxFailures}, but no subsequent target is enabled or can process the request. Keeping {FailedTarget}.",
+                    normalizedName, winner.Target, _streakTracker.GetStreak(winner.Target), maxFailures, winner.Target);
+            }
         }
 
-        return winner.Target;
+        // ---- Session lease write (on the FINAL winner, including the streak switch-over). ----
+        // The Cloud pseudo-target is NEVER leased (relay, no stable KV-cache node): a session
+        // that lands on Cloud keeps no lease and re-decides on the next turn, rejoining the
+        // fleet as soon as a node recovers. Writing the lease on the final winner also means a
+        // streak-skipped or offline pinned target is automatically rebound to the failover
+        // target — no extra invalidation path is needed here.
+        if (_sessionAffinity is { } writeAffinity &&
+            !string.IsNullOrWhiteSpace(sessionId) &&
+            finalWinner != RoutingTarget.Cloud)
+        {
+            writeAffinity.SetAffinity(sessionId, finalWinner);
+        }
+
+        return finalWinner;
     }
 
     // ---- Stage 1 + Stage 2 for one fleet target. ----
@@ -219,6 +262,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         RoutingContext context,
         OllamaTargetOptions targetOptions,
         bool offloadSlotTaken,
+        RoutingTarget? pinnedTarget,
         CancellationToken cancellationToken)
     {
         var target = new RoutingTarget(targetOptions.Name!);
@@ -257,7 +301,9 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
                 return Disqualified(target, "pinned-Dense model vetoed on a small-class target (MaxVramMB < 12000) with unknown capability metadata");
             }
 
-            return Scored(target, 0, 0, 0, 0, 0, "permissive qualification (no capability metadata discoverable)");
+            var permissiveSession = pinnedTarget is not null && target == pinnedTarget ? SessionAffinityBonus : 0;
+            return Scored(target, permissiveSession, 0, 0, 0, 0, permissiveSession,
+                "permissive qualification (no capability metadata discoverable)");
         }
 
         if (!DynamicContextSizingEngine.IsHardwareSuitable(capability))
@@ -296,9 +342,14 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         // declaration order is eligible (enforced by the caller's offloadSlotTaken flag).
         var hardware = await ComputeHardwareBonus(context, capability, maxVramMB, offloadSlotTaken, cancellationToken);
 
-        var score = affinity + hardware - eviction - concurrency;
-        return Scored(target, score, affinity, hardware, eviction, concurrency,
-            $"affinity={affinity:+#;-#;0} hardware={hardware:+#;-#;0} eviction=-{eviction} concurrency=-{concurrency} " +
+        // Session affinity: the candidate is this session's leased (sticky) target. Only ever
+        // applied to candidates that already passed Stage 1 (disqualified candidates return
+        // earlier with no bonus — no affinity rescue).
+        var session = pinnedTarget is not null && target == pinnedTarget ? SessionAffinityBonus : 0;
+
+        var score = session + affinity + hardware - eviction - concurrency;
+        return Scored(target, score, affinity, hardware, eviction, concurrency, session,
+            $"session={session:+#;-#;0} affinity={affinity:+#;-#;0} hardware={hardware:+#;-#;0} eviction=-{eviction} concurrency=-{concurrency} " +
             $"(inFlight={inFlight}, maxParallel={maxParallel}, loaded={loadedModels.Count}, stale={state?.Stale ?? true})");
     }
 
@@ -536,6 +587,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         int hardware,
         int eviction,
         int concurrency,
+        int sessionAffinity,
         string detail)
     {
         return new RoutingCandidateEvaluation(
@@ -547,7 +599,8 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             HardwareBonus: hardware,
             EvictionPenalty: eviction,
             ConcurrencyPenalty: concurrency,
-            Detail: detail);
+            Detail: detail,
+            SessionAffinityBonus: sessionAffinity);
     }
 
     /// <summary>

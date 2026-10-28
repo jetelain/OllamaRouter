@@ -7,8 +7,9 @@ namespace OllamaRouter.Services;
 /// the Cloud pseudo-target when Cloud Overflow is eligible). Fleet candidates that fail a
 /// Stage-1 hard qualification carry <see cref="Qualified"/> false and <see cref="Score"/>
 /// null; qualified candidates carry the calibrated score
-/// <c>Score = AffinityBonus + HardwareBonus − EvictionPenalty − ConcurrencyPenalty</c>
-/// (the Cloud pseudo-target always carries the fixed score 0). Selection is the stable sort
+/// <c>Score = SessionAffinityBonus(+150) + AffinityBonus(+100) + HardwareBonus(+20) − EvictionPenalty(−80) − ConcurrencyPenalty</c>
+/// (the Cloud pseudo-target always carries the fixed score 0, a SessionAffinityBonus of 0,
+/// and is never leased). Selection is the stable sort
 /// by (score descending, declaration index ascending), so equal scores resolve by
 /// declaration order and the Cloud candidate (sorted after all fleet targets) loses
 /// 0-vs-0 ties.
@@ -22,6 +23,10 @@ namespace OllamaRouter.Services;
 /// <param name="EvictionPenalty">+80 (applied negatively) when the load would evict a different model.</param>
 /// <param name="ConcurrencyPenalty">(InFlight × 40) + (InFlight ≥ MaxParallel ? 100 : 0), applied negatively.</param>
 /// <param name="Detail">Free-form human-readable breakdown for logs and tests.</param>
+/// <param name="SessionAffinityBonus">
+/// +150 when the candidate matches the request's active session lease (KV-cache stickiness);
+/// 0 otherwise, and always 0 for the Cloud pseudo-target (never leased).
+/// </param>
 public sealed record RoutingCandidateEvaluation(
     RoutingTarget Target,
     bool Qualified,
@@ -31,4 +36,5 @@ public sealed record RoutingCandidateEvaluation(
     int HardwareBonus,
     int EvictionPenalty,
     int ConcurrencyPenalty,
-    string? Detail);
+    string? Detail,
+    int SessionAffinityBonus = 0);
