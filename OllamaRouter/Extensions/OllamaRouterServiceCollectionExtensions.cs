@@ -47,14 +47,16 @@ public static class OllamaRouterServiceCollectionExtensions
     /// When false, disables the in-terminal activity monitor (mirrors the <c>--no-tui</c> flag).
     /// </param>
     /// <param name="reprobeInterval">Optional liveness re-probe interval override (default 10 s).</param>
-    /// <param name="onlineCacheTtl">Optional Online-verdict TTL override (default 3 s).</param>
+    /// <param name="onlineCacheTtl">Optional Online-verdict TTL override (default 15 s).</param>
+    /// <param name="probeTimeout">Optional liveness probe HTTP client timeout override (default 3.5 s).</param>
     public static IServiceCollection AddOllamaRouter(
         this IServiceCollection services,
         OllamaRouterOptions options,
         string? stateDirectory = null,
         bool enableTui = true,
         TimeSpan? reprobeInterval = null,
-        TimeSpan? onlineCacheTtl = null)
+        TimeSpan? onlineCacheTtl = null,
+        TimeSpan? probeTimeout = null)
     {
         var effectiveStateDirectory = string.IsNullOrWhiteSpace(stateDirectory)
             ? (string.IsNullOrWhiteSpace(options.StateDirectory)
@@ -96,11 +98,11 @@ public static class OllamaRouterServiceCollectionExtensions
             client.Timeout = TimeSpan.FromSeconds(4);
         });
 
-        // Dedicated liveness probe client: short 1.5 s timeout and a 10 s pooled-connection lifetime so a
+        // Dedicated liveness probe client: 3.5 s default timeout and a 10 s pooled-connection lifetime so a
         // sleeping-then-woken machine with a changed IP does not keep hitting dead pooled sockets.
         services.AddHttpClient("LivenessProbe", client =>
         {
-            client.Timeout = TimeSpan.FromMilliseconds(1500);
+            client.Timeout = probeTimeout ?? TimeSpan.FromMilliseconds(3500);
         })
         .ConfigurePrimaryHttpMessageHandler(_ =>
         {

@@ -21,7 +21,7 @@ namespace OllamaRouter.Services;
 /// State transitions are applied through the single <see cref="ApplyProbeResult"/>
 /// code path shared by on-demand probes and the background re-prober. The probe
 /// transport is the injected <see cref="HttpClient"/> (in production the
-/// "LivenessProbe" named client with a 1.5 s timeout and 10 s pooled-connection
+/// "LivenessProbe" named client with a 3.5 s timeout and 10 s pooled-connection
 /// lifetime); it is <b>not</b> disposed by this service because
 /// <see cref="IHttpClientFactory"/>-created clients must not be disposed — only
 /// the cancellation source is disposed in <see cref="StopAsync"/>.
@@ -35,13 +35,13 @@ public sealed class TargetLivenessService(
     TimeSpan? reprobeInterval = null,
     TimeSpan? onlineCacheTtl = null) : ITargetLivenessService, IHostedService
 {
-    /// <summary>Default: how long a successful probe's "Online" verdict is trusted before the next on-demand re-probe.</summary>
-    private static readonly TimeSpan DefaultOnlineCacheTtl = TimeSpan.FromSeconds(3);
+    /// <summary>Default: how long a successful probe's "Online" verdict is trusted before the next on-demand re-probe (15 s, matching <see cref="ITargetLivenessService.DefaultTolerantCacheTtl"/>).</summary>
+    private static readonly TimeSpan DefaultOnlineCacheTtl = TimeSpan.FromSeconds(15);
 
     /// <summary>Consecutive probe timeouts required before an Online/Unknown target is marked Offline (hysteresis).</summary>
     private const int TimeoutStrikesToTrip = 2;
 
-    /// <summary>How long a fire-and-forget catalog refresh on rejoin may run before being abandoned.</summary>
+    /// <summary>How long a catalog refresh on boot or rejoin may run before being abandoned.</summary>
     private static readonly TimeSpan CatalogRefreshBound = TimeSpan.FromSeconds(4);
 
     private readonly TimeSpan _reprobeInterval = reprobeInterval ?? TimeSpan.FromSeconds(10);
@@ -95,7 +95,11 @@ public sealed class TargetLivenessService(
             try
             {
                 var outcome = await ProbeOnceAsync(target, CancellationToken.None);
-                ApplyProbeResult(target, slot, outcome.Outcome, outcome.LatencyMs, source: "on-demand");
+                var previous = ApplyProbeResult(target, slot, outcome.Outcome, outcome.LatencyMs, source: "on-demand");
+                if (previous != TargetLivenessState.Online && slot.ReadState() == TargetLivenessState.Online)
+                {
+                    TriggerCatalogRefreshAsync(target);
+                }
                 return slot.ReadState();
             }
             finally
@@ -154,19 +158,19 @@ public sealed class TargetLivenessService(
     //  IHostedService: boot probe + background re-prober
     // ------------------------------------------------------------------
 
-    public Task StartAsync(CancellationToken cancellationToken)
+    public async Task StartAsync(CancellationToken cancellationToken)
     {
         ServiceStartTimeUtc = DateTimeOffset.UtcNow;
         _cts = new CancellationTokenSource();
         var token = _cts.Token;
 
-        // Asynchronous fleet probe at boot (non-blocking: app.Run() is never delayed).
-        _ = Task.Run(() => ProbeFleetAsync(GetFleetTargets(), token, source: "boot"), CancellationToken.None);
+        // Fleet probe at boot before listening starts:
+        // awaits initial probing and catalog refresh for reachable targets.
+        await ProbeFleetAsync(GetFleetTargets(), token, source: "boot");
 
         _reprobeLoopTask = Task.Run(() => RunReprobeLoopAsync(token), CancellationToken.None);
 
         logger.LogInformation("Target liveness prober started (re-probe interval: {Interval}).", _reprobeInterval);
-        return Task.CompletedTask;
     }
 
     public async Task StopAsync(CancellationToken cancellationToken)
@@ -219,12 +223,9 @@ public sealed class TargetLivenessService(
 
             try
             {
-                // Re-probe Offline targets (and any still Unknown, e.g. whose boot probe
-                // was a blackholed timeout-strike that never resolved); healthy Online
-                // targets are validated on demand by the middleware within the TTL.
-                var targets = GetFleetTargets()
-                    .Where(t => !IsOnline(t))
-                    .ToList();
+                // Re-probe all fleet targets so healthy targets stay fresh within TTL
+                // and offline targets rejoin automatically.
+                var targets = GetFleetTargets();
                 if (targets.Count > 0)
                 {
                     await ProbeFleetAsync(targets, token, source: "re-prober");
@@ -259,14 +260,21 @@ public sealed class TargetLivenessService(
         if (previous != TargetLivenessState.Online && slot.ReadState() == TargetLivenessState.Online)
         {
             // Rejoin: an Offline/Unknown target just became Online → refresh its catalog.
-            TriggerCatalogRefreshAsync(target);
+            if (source == "boot")
+            {
+                await RefreshCatalogAsync(target, link);
+            }
+            else
+            {
+                TriggerCatalogRefreshAsync(target);
+            }
         }
     }
 
     /// <summary>
     /// Performs one <c>GET {Url}/</c> probe and classifies the outcome into a
     /// <see cref="ProbeOutcome"/>. Bounded by the injected <see cref="HttpClient"/>
-    /// timeout (1.5 s in production); never throws — every failure maps to an
+    /// timeout (3.5 s in production); never throws — every failure maps to an
     /// outcome so the probe loop and the middleware gate can rely on it. On success
     /// the elapsed probe duration (milliseconds) is reported for latency reporting.
     /// </summary>
@@ -293,7 +301,7 @@ public sealed class TargetLivenessService(
             return (ProbeOutcome.Success, (long)stopwatch.ElapsedMilliseconds);
         }
         catch (Exception ex) when (ex is OperationCanceledException or HttpRequestException or
-                                   SocketException)
+                                   SocketException or IOException or TimeoutException)
         {
             return (Classify(ex, cancellationToken), null);
         }
@@ -389,7 +397,7 @@ public sealed class TargetLivenessService(
         }
     }
 
-    private void TriggerCatalogRefreshAsync(RoutingTarget target)
+    private async Task RefreshCatalogAsync(RoutingTarget target, CancellationToken cancellationToken)
     {
         var url = GetTargetUrl(target);
         if (url is null)
@@ -397,38 +405,53 @@ public sealed class TargetLivenessService(
             return;
         }
 
-        // Fire-and-forget, bounded to 4 s so a slow /api/tags cannot pile up
-        // unbounded work; failures are swallowed (the normal 30 s cache path
-        // will pick the catalog up on its own eventually).
-        _ = Task.Run(async () =>
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(CatalogRefreshBound);
+        try
         {
-            using var cts = new CancellationTokenSource(CatalogRefreshBound);
-            try
-            {
-                var names = await modelCatalogCache.RefreshAsync(url, cts.Token).ConfigureAwait(false);
-                logger.LogInformation("Catalog for rejoined target {Target} refreshed ({Count} models).", target, names.Count);
-            }
-            catch (Exception ex)
-            {
-                logger.LogDebug(ex, "Catalog refresh for rejoined target {Target} failed (ignored).", target);
-            }
-        }, CancellationToken.None);
+            var names = await modelCatalogCache.RefreshAsync(url, cts.Token).ConfigureAwait(false);
+            logger.LogInformation("Catalog for rejoined target {Target} refreshed ({Count} models).", target, names.Count);
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "Catalog refresh for rejoined target {Target} failed (ignored).", target);
+        }
+    }
+
+    private void TriggerCatalogRefreshAsync(RoutingTarget target)
+    {
+        _ = Task.Run(() => RefreshCatalogAsync(target, CancellationToken.None), CancellationToken.None);
+    }
+
+    private static bool IsTimeoutException(Exception exception)
+    {
+        if (exception is TimeoutException)
+            return true;
+
+        if (exception is SocketException se && se.SocketErrorCode == SocketError.TimedOut)
+            return true;
+
+        if (exception.InnerException is not null && IsTimeoutException(exception.InnerException))
+            return true;
+
+        return false;
     }
 
     private static ProbeOutcome Classify(Exception exception, CancellationToken externalToken)
     {
-        if (exception is OperationCanceledException oce && !oce.CancellationToken.IsCancellationRequested)
-        {
-            // The HttpClient's own timeout fired (no token set anywhere): a slow
-            // but connected daemon → a probe timeout (hysteresis strike).
-            return ProbeOutcome.Timeout;
-        }
-
         // Cancellation from the external token (shutdown/tick cancel) is not a
         // liveness signal.
-        if (exception is OperationCanceledException)
+        if (externalToken.IsCancellationRequested &&
+            (exception is OperationCanceledException ||
+             exception.InnerException is OperationCanceledException))
         {
-            return externalToken.IsCancellationRequested ? ProbeOutcome.Canceled : ProbeOutcome.Timeout;
+            return ProbeOutcome.Canceled;
+        }
+
+        if (exception is OperationCanceledException || IsTimeoutException(exception))
+        {
+            // The HttpClient's or socket's own timeout fired: a slow but connected daemon → a probe timeout (hysteresis strike).
+            return ProbeOutcome.Timeout;
         }
 
         // HttpRequestException (including one wrapping SocketException / a DNS

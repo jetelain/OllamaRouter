@@ -49,8 +49,8 @@ public sealed record TargetLivenessSnapshot(IReadOnlyList<TargetLivenessEntry> E
 /// <see cref="TargetLivenessState.Offline"/> immediately; a probe timeout requires
 /// 2 consecutive strikes before an Online/Unknown target goes Offline (hysteresis);
 /// a single successful probe returns the target to
-/// <see cref="TargetLivenessState.Online"/> and (re)starts the short
-/// <see cref="ITargetLivenessService.IsOnline"/> cache TTL (3 s).
+/// <see cref="TargetLivenessState.Online"/> and (re)starts the
+/// <see cref="ITargetLivenessService.IsOnline"/> cache TTL (15 s).
 /// </para>
 /// <para>
 /// The service is the ONLY component that mutates liveness state: the background
@@ -73,7 +73,7 @@ public interface ITargetLivenessService
     /// <summary>
     /// Fast, TTL-aware "is this target currently safe to route to" predicate:
     /// true iff the state machine says Online AND the last successful probe is
-    /// within the 3 s cache TTL. A target whose cache expired is stale and must be
+    /// within the cache TTL (default 15 s). A target whose cache expired is stale and must be
     /// re-probed via <see cref="EnsureKnownAsync"/> before being trusted again.
     /// </summary>
     bool IsOnline(RoutingTarget target);
@@ -88,7 +88,7 @@ public interface ITargetLivenessService
     /// Ensures the liveness state of <paramref name="target"/> is known and fresh:
     /// returns immediately when Online within TTL, otherwise runs (or coalesces
     /// onto, when a probe for the same target is already in flight) one probe
-    /// bounded by the probe <c>HttpClient</c> timeout (1.5 s) and applies the
+    /// bounded by the probe <c>HttpClient</c> timeout (3.5 s) and applies the
     /// result. Concurrent callers for the same target share a single in-flight
     /// probe, so no request can be blocked longer than one probe.
     /// </summary>

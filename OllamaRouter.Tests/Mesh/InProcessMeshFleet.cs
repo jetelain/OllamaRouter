@@ -143,6 +143,7 @@ public sealed class MeshRouter : IAsyncDisposable
         bool cloudEnabled,
         TimeSpan? reprobeInterval = null,
         TimeSpan? onlineCacheTtl = null,
+        TimeSpan? probeTimeout = null,
         Action<WebApplication>? configurePipeline = null,
         Action<OllamaRouterOptions>? configureOptions = null)
     {
@@ -178,7 +179,8 @@ public sealed class MeshRouter : IAsyncDisposable
             stateDirectory: stateDirectory,
             enableTui: false,
             reprobeInterval: reprobeInterval ?? TimeSpan.FromSeconds(1),
-            onlineCacheTtl: onlineCacheTtl ?? TimeSpan.FromSeconds(2));
+            onlineCacheTtl: onlineCacheTtl ?? TimeSpan.FromSeconds(2),
+            probeTimeout: probeTimeout ?? TimeSpan.FromMilliseconds(1500));
 
         var app = builder.Build();
         configurePipeline?.Invoke(app);

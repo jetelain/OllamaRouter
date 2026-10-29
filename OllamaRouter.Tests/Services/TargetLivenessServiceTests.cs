@@ -34,6 +34,7 @@ public class TargetLivenessServiceTests : IDisposable
     // Tracks RefreshAsync calls so tests can assert the catalog sync on rejoin.
     private sealed class CountingCatalogCache : IModelCatalogCacheService
     {
+        private readonly Lock _gate = new();
         public int RefreshCount { get; private set; }
         public List<string?> RefreshedUrls { get; } = [];
 
@@ -42,15 +43,21 @@ public class TargetLivenessServiceTests : IDisposable
 
         public Task<IReadOnlyList<string>> RefreshAsync(string? baseUrl, CancellationToken cancellationToken = default)
         {
-            RefreshCount++;
-            RefreshedUrls.Add(baseUrl);
+            lock (_gate)
+            {
+                RefreshCount++;
+                RefreshedUrls.Add(baseUrl);
+            }
             return Task.FromResult<IReadOnlyList<string>>([]);
         }
 
         public Task<(IReadOnlyList<string> Names, string Digest)> RefreshWithDigestAsync(string? baseUrl, CancellationToken cancellationToken = default)
         {
-            RefreshCount++;
-            RefreshedUrls.Add(baseUrl);
+            lock (_gate)
+            {
+                RefreshCount++;
+                RefreshedUrls.Add(baseUrl);
+            }
             return Task.FromResult((new List<string>() as IReadOnlyList<string>, string.Empty));
         }
 
@@ -531,6 +538,60 @@ public class TargetLivenessServiceTests : IDisposable
 
         Assert.False(sut.IsOnline(RoutingTarget.Local));
         Assert.False(sut.IsOnline(RoutingTarget.Local, TimeSpan.FromMinutes(10)));
+    }
+
+    [Fact]
+    public async Task StartAsync_AwaitsBootProbingAndPopulatesCatalogBeforeReturning()
+    {
+        var (sut, handler, catalog) = CreateSut(_ => Ok());
+
+        // Target state before boot is Unknown
+        var entriesBefore = sut.GetEntries();
+        Assert.Equal(TargetLivenessState.Unknown, entriesBefore[RoutingTarget.Local].State);
+        Assert.Equal(0, catalog.RefreshCount);
+
+        // When StartAsync returns, the boot probe has completed and catalog is refreshed
+        await sut.StartAsync(CancellationToken.None);
+        try
+        {
+            Assert.True(sut.IsOnline(RoutingTarget.Local));
+            Assert.True(sut.IsOnline(RoutingTarget.Remote));
+            Assert.True(catalog.RefreshCount >= 2);
+            Assert.Contains(LocalUrl, catalog.RefreshedUrls);
+            Assert.Contains(RemoteUrl, catalog.RefreshedUrls);
+        }
+        finally
+        {
+            await sut.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task EnsureKnownAsync_SocketTimedOutException_ClassifiedAsTimeoutSubjectToHysteresis()
+    {
+        var (sut, _, _) = CreateSut(_ => throw new HttpRequestException("Socket timed out", new SocketException((int)SocketError.TimedOut)));
+
+        // Strike 1: an Unknown target experiencing a timeout does NOT trip to Offline immediately (hysteresis)
+        var state1 = await sut.EnsureKnownAsync(RoutingTarget.Local);
+        Assert.Equal(TargetLivenessState.Unknown, state1);
+
+        // Strike 2: second consecutive timeout trips to Offline
+        var state2 = await sut.EnsureKnownAsync(RoutingTarget.Local);
+        Assert.Equal(TargetLivenessState.Offline, state2);
+    }
+
+    [Fact]
+    public async Task EnsureKnownAsync_WrappedTimeoutException_ClassifiedAsTimeoutSubjectToHysteresis()
+    {
+        var (sut, _, _) = CreateSut(_ => throw new IOException("I/O timeout", new TimeoutException("operation timed out")));
+
+        // Strike 1: preserved as Unknown (hysteresis)
+        var state1 = await sut.EnsureKnownAsync(RoutingTarget.Local);
+        Assert.Equal(TargetLivenessState.Unknown, state1);
+
+        // Strike 2: trips to Offline
+        var state2 = await sut.EnsureKnownAsync(RoutingTarget.Local);
+        Assert.Equal(TargetLivenessState.Offline, state2);
     }
 
     private static async Task AssertEventuallyAsync(Func<bool> condition, int timeoutMs = 3000, int pollMs = 20)

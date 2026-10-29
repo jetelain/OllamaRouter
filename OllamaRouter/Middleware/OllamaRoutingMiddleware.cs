@@ -302,7 +302,7 @@ public sealed class OllamaRoutingMiddleware(
     /// <summary>
     /// Refreshes the liveness of every ENABLED fleet target whose TTL-aware
     /// <see cref="ITargetLivenessService.IsOnline"/> verdict is currently false, by running one
-    /// on-demand probe per such target (bounded by the 1.5 s probe timeout; a probe failure
+    /// on-demand probe per such target in parallel (bounded by the 3.5 s probe timeout; a probe failure
     /// leaves the prior state). Called BEFORE a dynamic routing decision so a continuously
     /// healthy target whose Online verdict merely LAPSED (raw state still Online) between the
     /// background re-prober's last tick and this decision is not misrouted: without this, the
@@ -314,13 +314,17 @@ public sealed class OllamaRoutingMiddleware(
     /// </summary>
     private async Task RefreshFleetLivenessAsync(CancellationToken cancellationToken)
     {
-        foreach (var fleetTarget in targetLiveness.GetFleetTargets())
-        {
-            if (!targetAvailability.IsEnabled(fleetTarget) || targetLiveness.IsOnline(fleetTarget))
-            {
-                continue;
-            }
+        var targetsToProbe = targetLiveness.GetFleetTargets()
+            .Where(t => targetAvailability.IsEnabled(t) && !targetLiveness.IsOnline(t))
+            .ToList();
 
+        if (targetsToProbe.Count == 0)
+        {
+            return;
+        }
+
+        await Task.WhenAll(targetsToProbe.Select(async fleetTarget =>
+        {
             try
             {
                 await targetLiveness.EnsureKnownAsync(fleetTarget, cancellationToken);
@@ -331,7 +335,7 @@ public sealed class OllamaRoutingMiddleware(
                 // itself the correct liveness signal for the decision (the target stays unroutable
                 // and the decision fails over).
             }
-        }
+        }));
     }
 
     // Whether any response bytes have already been committed to the client: the real
