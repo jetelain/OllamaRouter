@@ -731,7 +731,6 @@ public class RoutingDecisionServiceTests
             sp.GetRequiredService<ITargetAvailabilityService>(),
             sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
             sp.GetRequiredService<ILogger<CloudRoutingTargetHandler>>()));
-        services.AddTransient<IRoutingTargetHandler>(sp => sp.GetRequiredService<CloudRoutingTargetHandler>());
         services.AddTransient<IRoutingDecisionService, RoutingDecisionService>();
 
         var serviceProvider = services.BuildServiceProvider(new ServiceProviderOptions
@@ -745,8 +744,7 @@ public class RoutingDecisionServiceTests
 
         // The resolved Cloud handler must have received its options: with CloudOverflow.Enabled
         // = false (configured above) and the Cloud toggle on, it must report itself unavailable.
-        var cloudHandler = serviceProvider.GetServices<IRoutingTargetHandler>()
-            .Single(h => h.Target == RoutingTarget.Cloud);
+        var cloudHandler = serviceProvider.GetRequiredService<CloudRoutingTargetHandler>();
         Assert.False(cloudHandler.IsAvailable());
     }
 

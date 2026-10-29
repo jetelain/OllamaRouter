@@ -9,13 +9,9 @@ public sealed class RoutingContext
 {
     private readonly IModelCatalogCacheService _modelCatalogCache;
     private readonly ModelCapabilityEngine? _capabilityEngine;
-    private readonly string _localUrl;
-    private readonly string _remoteUrl;
     private readonly IReadOnlyDictionary<string, OllamaTargetOptions>? _targetByName;
     private readonly ITargetExecutionTracker? _executionTracker;
     private readonly Dictionary<string, Task<ModelMetadata?>> _metadataTasks = new(StringComparer.OrdinalIgnoreCase);
-    private Task<bool>? _existsLocallyTask;
-    private Task<bool>? _existsRemotelyTask;
     private readonly Dictionary<RoutingTarget, Task<TargetModelCapability?>> _capabilityTasks = new();
 
     public int TokenCount { get; }
@@ -43,8 +39,6 @@ public sealed class RoutingContext
         string normalizedModelName,
         ModelThresholds? thresholds,
         IModelCatalogCacheService modelCatalogCache,
-        string localUrl,
-        string remoteUrl,
         CancellationToken cancellationToken = default,
         ModelCapabilityEngine? capabilityEngine = null,
         IReadOnlyList<OllamaTargetOptions>? targets = null,
@@ -61,19 +55,10 @@ public sealed class RoutingContext
         _modelCatalogCache = modelCatalogCache;
         _capabilityEngine = capabilityEngine;
         _executionTracker = executionTracker;
-        _localUrl = localUrl;
-        _remoteUrl = remoteUrl;
         _targetByName = targets is { Count: > 0 }
             ? targets.Where(t => !string.IsNullOrWhiteSpace(t.Name))
                 .ToDictionary(t => t.Name!.Trim(), StringComparer.OrdinalIgnoreCase)
             : null;
-
-        // If the model is configured, eagerly start catalog checks concurrently.
-        if (thresholds is not null)
-        {
-            _existsLocallyTask = modelCatalogCache.ModelExistsAsync(_localUrl, modelName, cancellationToken);
-            _existsRemotelyTask = modelCatalogCache.ModelExistsAsync(_remoteUrl, modelName, cancellationToken);
-        }
     }
 
     /// <summary>
@@ -146,21 +131,6 @@ public sealed class RoutingContext
         }
     }
 
-    /// <summary>
-    /// Returns whether the model exists in the local Ollama catalog.
-    /// </summary>
-    public Task<bool> ExistsLocallyAsync(CancellationToken cancellationToken = default)
-    {
-        return _existsLocallyTask ??= _modelCatalogCache.ModelExistsAsync(_localUrl, ModelName, cancellationToken);
-    }
-
-    /// <summary>
-    /// Returns whether the model exists in the remote Ollama catalog.
-    /// </summary>
-    public Task<bool> ExistsRemotelyAsync(CancellationToken cancellationToken = default)
-    {
-        return _existsRemotelyTask ??= _modelCatalogCache.ModelExistsAsync(_remoteUrl, ModelName, cancellationToken);
-    }
 
     /// <summary>
     /// Discovers (or returns the cached) per-target capability for this request's model:

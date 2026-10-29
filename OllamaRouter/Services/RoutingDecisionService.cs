@@ -67,8 +67,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
 
     /// <summary>
     /// Creates the routing decision pipeline over the configured fleet. The Cloud terminal
-    /// fallback handler is resolved directly (it is the sole <see cref="IRoutingTargetHandler"/>
-    /// implementation); fleet targets are taken from the options' effective target list
+    /// fallback handler is resolved directly; fleet targets are taken from the options' effective target list
     /// (including the legacy Local/Remote synthesis) and evaluated in declaration order.
     /// <paramref name="sessionAffinity"/> enables the multi-agent sticky-session Stage-2 bonus;
     /// when null (e.g. existing test constructions) the pipeline is fully stateless.
@@ -190,8 +189,6 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             normalizedName,
             thresholds,
             _modelCatalogCacheService,
-            settings.LocalUrl.TrimEnd('/'),
-            settings.RemoteUrl.TrimEnd('/'),
             cancellationToken,
             _capabilityEngine,
             settings.GetEffectiveTargets(_logger),

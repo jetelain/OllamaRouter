@@ -52,20 +52,20 @@ Requests to the following endpoints are inspected to extract the prompt and the 
 - `POST /v1/chat/completions`
 - `POST /v1/completions`
 
-For these requests, the routing decision is orchestrated by `RoutingDecisionService` using a priority-ordered chain of target handlers (`IRoutingTargetHandler`: **Local** → **Remote** → **Cloud**):
+For these requests, the routing decision is orchestrated by `RoutingDecisionService` using a two-stage evaluation engine over configured fleet `Targets`, with fallback to `CloudRoutingTargetHandler` when configured:
 
-1. **Available target dispatch:** The router evaluates targets in order and dispatches the request to the first target that is **available** (enabled and not busy) and **capable** of handling it (`CanProcessAsync`):
-   - **Local (`LocalRoutingTargetHandler`)**: Eligible if the model is configured under `OllamaRouter:Models`, exists in the local catalog, the estimated token count fits within `MaxLocalTokens`, and the model is either already loaded in memory (checked via `/api/ps`) or sufficient free GPU VRAM is available (checked via the GPU vendor tooling, see “GPU/VRAM detection” against `MinRequiredVramMB`). If a model is only available locally, Local handles it exclusively.
-   - **Remote (`RemoteRoutingTargetHandler`)**: Accepts requests for models that are available remotely (unconfigured models, models exceeding local token limits, or models that don't fit local VRAM naturally fall through to Remote).
-   - **Cloud (`CloudRoutingTargetHandler`, overflow)**: Acts as an overflow target. If Local and Remote are unavailable or cannot handle the request, Cloud accepts it if enabled and a `CloudModel` is configured for the requested model (see [Cloud overflow](#cloud-overflow)).
-2. **Busy fallback:** If all eligible targets are currently busy:
-   - The router falls back to the first capable **enabled non-overflow target** (Local or Remote), allowing requests to queue behind a busy primary instance.
-   - If no primary target can handle the request, it checks enabled overflow targets (Cloud).
-   - If no enabled target is capable of handling the request, OllamaRouter rejects the request with HTTP `503 Service Unavailable`.
+1. **Stage 1 — Hardware & Context Qualification:** The router evaluates all enabled targets to verify the target is online, possesses the requested model in its catalog, and has sufficient context capacity (`estimatedPromptTokens + ContextFitMarginTokens ≤ CMax`, where `CMax` is the target's pre-configured `num_ctx`).
+2. **Stage 2 — Heuristic Scoring & Dispatch:** Qualified candidates are scored based on state and capabilities:
+   - **Hot model bonus (+100):** If the model is already loaded in memory (verified via `/api/ps`).
+   - **Speed bonus (up to +150):** Scaled according to each target's configured `SpeedFactor`.
+   - **Anti-thrashing penalty (-100):** Avoids evicting a different active model when another node can take the request cold.
+   - **Load & concurrency penalties:** Prefers idle instances over instances already handling concurrent requests.
+3. **Cloud overflow fallback:** If primary fleet targets are busy, failing, or incapable of handling the request, OllamaRouter checks if cloud overflow is enabled and a `CloudModel` is configured for the requested model (see [Cloud overflow](#cloud-overflow)).
+4. If no enabled target is capable of handling the request, OllamaRouter rejects the request with HTTP `503 Service Unavailable`.
 
-If the request body cannot be parsed for any reason, the request falls back to the default enabled instance (Remote if enabled, otherwise Local).
+If the request body cannot be parsed for any reason, the request falls back to the default enabled primary target.
 
-> **Note.** Each target (**Local**, **Remote**, **Cloud**) can also be disabled individually, at any time, from the [monitoring page](#monitoring). If a target is disabled, it will **never** handle any request. A **busy** target can still accept queued requests as a fallback when all eligible instances are in use, but a **disabled** target is completely excluded from routing. Disabling **Cloud** disables cloud overflow for all models. This lets you switch the router between operating modes (Local only, Remote only, Local + Cloud, Remote + Cloud, …) without restarting it.
+> **Note.** Each target in `Targets` as well as **Cloud** can be toggled individually, at any time, from the [monitoring page](#monitoring). If a target is disabled, it will **never** handle any request. A **busy** target can still accept queued requests as a fallback when all eligible instances are in use, but a **disabled** target is completely excluded from routing. Disabling **Cloud** disables cloud overflow for all models.
 
 ### Cloud overflow
 
@@ -168,8 +168,7 @@ Invoke-RestMethod -Uri 'http://localhost:11435/api/create' -Method Post -Content
 }'
 ```
 
-> With `num_ctx` set to `49152`, the corresponding `Models:Qwen3.8-27B:MaxLocalTokens` setting should be around `36864` (75% of `num_ctx`, see [Configuration](#configuration)).
-> **This local/remote alias `num_ctx` is the source of truth for the router's context capacity.** Each target's maximum context (`CMax`) is exactly the `num_ctx` pre-configured on its alias — the router does *not* invent a ceiling from the hardware. A dense request of T estimated tokens is qualified for a target only when `T + ContextFitMarginTokens ≤ CMax` (the default margin is `8192`; see [Configuration](#configuration)). Only when a node's alias sets **no** `num_ctx` does the router fall back to the model's native GGUF context length, then to an assumed 128,000 tokens. For **MoE** models the pre-configured `num_ctx` is the *optimal baseline bucket*; when the request exceeds it, the router may elastically expand up to the model's native context limit (the *extensible* bucket, optionally capped by `Models:{model}:MaxContextTokens`) — see [Dynamic context sizing (MoE only)](#dynamic-context-sizing-moe-only).
+> **This target alias `num_ctx` is the source of truth for the router's context capacity.** Each target's maximum context (`CMax`) is exactly the `num_ctx` pre-configured on its alias — the router does *not* invent a ceiling from the hardware. A dense request of T estimated tokens is qualified for a target only when `T + ContextFitMarginTokens ≤ CMax` (the default margin is `8192`; see [Configuration](#configuration)). Only when a node's alias sets **no** `num_ctx` does the router fall back to the model's native GGUF context length, then to an assumed 128,000 tokens. For **MoE** models the pre-configured `num_ctx` is the *optimal baseline bucket*; when the request exceeds it, the router may elastically expand up to the model's native context limit (the *extensible* bucket, optionally capped by `Models:{model}:MaxContextTokens`) — see [Dynamic context sizing (MoE only)](#dynamic-context-sizing-moe-only).
 
 ### Remote Ollama
 
@@ -196,7 +195,7 @@ curl http://localhost:11434/api/create -d '{
 }'
 ```
 
-> The remote instance's larger `num_ctx` (`196608`) is only reached once the request no longer fits locally, so it does not need to follow the same 75% rule: the remote instance has no comparable `MaxLocalTokens` cap.
+> The remote instance's larger `num_ctx` (`196608`) allows it to qualify for larger context workloads whenever a smaller node's context capacity is exceeded.
 
 ## Configuration
 
@@ -214,19 +213,24 @@ appsettings.json  <  config/config.json  <  user secrets  <  environment variabl
 ```json
 {
   "OllamaRouter": {
-  "Models": {
-    "Qwen3.8-27B": {
-      "MaxLocalTokens": 36864,
-      "MinRequiredVramMB": 13500,
-      "CloudModel": "deepseek-v3.1:671b-cloud"
-    },
-    "llama3": {
-    "MaxLocalTokens": 24576,
-    "MinRequiredVramMB": 4096
+    "Targets": [
+      {
+        "Name": "Local",
+        "Url": "http://127.0.0.1:11435",
+        "HardwareHint": "16gb",
+        "SpeedFactor": 2.0
+      },
+      {
+        "Name": "Remote",
+        "Url": "http://aiserver.local:11434",
+        "HardwareHint": "96gb"
+      }
+    ],
+    "Models": {
+      "Qwen3.8-27B": {
+        "CloudModel": "deepseek-v3.1:671b-cloud"
+      }
     }
-  },
-  "LocalUrl": "http://127.0.0.1:11435",
-  "RemoteUrl": "http://aiserver.local:11434"
   }
 }
 ```
@@ -235,13 +239,13 @@ appsettings.json  <  config/config.json  <  user secrets  <  environment variabl
 
 | Setting            | Description                                                                                     |
 |--------------------|---------------------------------------------------------------------------------------------------|
-| `Models`           | Dictionary of model names (base name, no tag) to their routing thresholds. **Any model not listed here is always routed to the remote instance.**                          |
-| `Models:*:MaxLocalTokens`   | Maximum estimated token count that the local instance is allowed to handle for this model. Keep margin to leave room for model output, 75% of the local model's configured `num_ctx` should be fine. |
-| `Models:*:MinRequiredVramMB`| Minimum amount of free VRAM (in MB) required on the local GPU to route a request for this model there. It should match VRAM usage of the model with a little margin.           |
-| `Models:*:CloudModel`| Optional name of the equivalent model hosted on [ollama.com cloud](https://ollama.com) (e.g. `glm-5.3-flash:cloud`). When set, enables overflow to **Cloud** for this model whenever Remote is busy (see [Cloud overflow](#cloud-overflow)). Leave unset to disable cloud overflow for this model. |
-| `LocalUrl`         | Base URL of the local Ollama instance.                                                            |
-| `RemoteUrl`        | Base URL of the remote Ollama instance.                                                           |
+| `Targets`          | Array of named fleet targets (`Name`, `Url`, `HardwareHint`, `MaxVramMB`, `MaxParallel`, `SpeedFactor`, `Enabled`). See [Fleet Targets](#dual-router-mesh-desktop--laptop). |
 | `Targets:*:SpeedFactor` | Optional per-target **static processing-speed hint**: relative generation-throughput multiplier vs the fleet baseline (`1.0` = fleet average / unset; only values `> 1.0` mean something). At routing time the qualified candidate with the highest effective factor earns the full Stage-2 speed bonus (+150), and the others are scaled linearly between 0 and +150 — so a fast cold node (e.g. your local workstation) can be preferred over a slower node that happens to hold the model hot, while Stage-1 hardware/context gates are untouched (a 48k-ceiling request never routes to a too-small fast node) and a fast node that would evict another model still loses to the hot one (70 < 100, anti-thrash). Recommended heterogenous setup: fast workstation `"SpeedFactor": 2.0`, servers default/omitted. Non-finite or `≤ 1.0` values are treated as `1.0` (zero bonus). See also `GET /api/router/fleet` (`hardware.speedFactor`) and the terminal monitor HW column (`16gb,2.0x`). |
+| `Models`           | Dictionary of model names (base name, no tag) to model-specific routing settings (`CloudModel`, `MaxContextTokens`). |
+| `Models:*:CloudModel`| Optional name of the equivalent model hosted on [ollama.com cloud](https://ollama.com) (e.g. `glm-5.3-flash:cloud`). When set, enables overflow to **Cloud** for this model whenever primary targets are busy or failing (see [Cloud overflow](#cloud-overflow)). Leave unset to disable cloud overflow for this model. |
+| `Models:*:MaxContextTokens` | Optional operator cap (in tokens) on a model's **extensible** context limit, applied across all nodes as `min(native context ?? 128k, MaxContextTokens)`. Affects MoE dynamic sizing and Stage-1 MoE qualification only (it does not change a node's pre-configured `CMax`). Example: a VRAM-tuned or Q8-lossless ceiling. Defaults to unset (no cap). |
+| `LocalUrl`         | Base URL of the local Ollama instance (Legacy; prefer configuring `Targets`).                     |
+| `RemoteUrl`        | Base URL of the remote Ollama instance (Legacy; prefer configuring `Targets`).                    |
 | `BindAddress`      | Address the router itself listens on. Defaults to `http://localhost:11434`. Set it to e.g. `http://0.0.0.0:11434` to accept connections from other machines. |
 | `TokenEstimator`   | Token estimation strategy: `"Heuristic"` (default, fast, zero heap memory overhead, saves ~24 MB RAM by omitting the BPE dictionary) or `"Tiktoken"` (uses Microsoft.ML.Tokenizers `cl100k_base`). |
 | `TokenEstimationOverheadFactor` | Multiplicative correction applied to the estimated token count, to compensate for the systematic underestimation of the generic tokenizer versus the actual tokenizer and chat template of targeted models. Defaults to `1.0` (no correction); see [recommendations below](#token-estimation-overhead-recommendations). |
@@ -249,8 +253,7 @@ appsettings.json  <  config/config.json  <  user secrets  <  environment variabl
 | `DispatchToLargestCapacityOnOverflow` | When `true` and all enabled fleet targets fail Stage-1 context qualification due to context overflow, the router dispatches the request to the online, capable target with the largest context capacity (`Max(CMax)`) with `options.num_ctx` clamped to that ceiling, rather than rejecting with a 503 error. Defaults to `true`. |
 | `DynamicContext:Enabled` | Enables dynamic context sizing (MoE two-bucket ladder + dense clamp-only). Defaults to `false`. See [Dynamic context sizing (MoE only)](#dynamic-context-sizing-moe-only). |
 | `DynamicContext:DenseClampEnabled` | When `true` (default), a request on a **dense** model rewrites `options.num_ctx` only when the client's static value exceeds the node's pre-configured context, clamping it down (one-time KV reallocation; OOM protection). Set to `false` for pure dense pass-through. Dense values are never raised, bucketed, or leased. |
-| `Models:*:MaxContextTokens` | Optional operator cap (in tokens) on a model's **extensible** context limit, applied across all nodes as `min(native context ?? 128k, MaxContextTokens)`. Affects MoE dynamic sizing and Stage-1 MoE qualification only (it does not change a node's pre-configured `CMax`). Example: a VRAM-tuned or Q8-lossless ceiling. Defaults to unset (no cap). |
-| `MaxConsecutiveFailures` | Number of consecutive failures on a target for adjacent requests within `ConsecutiveFailuresTokenTolerance` before switching to the next target in the chain (`Local` → `Remote` → `Cloud`). Defaults to `3`. Set to `0` to disable automatic target switching. |
+| `MaxConsecutiveFailures` | Number of consecutive failures on a target for adjacent requests within `ConsecutiveFailuresTokenTolerance` before triggering fallback or cloud overflow. Defaults to `3`. Set to `0` to disable automatic target switching. |
 | `ConsecutiveFailuresTokenTolerance` | Maximum difference in estimated prompt tokens between adjacent requests to consider them part of the same retry streak. Defaults to `4000`. Set to `0` to require an exact match. |
 | `Recording:Enabled` | Enables the optional [inference request recording](#inference-request-recording-optional), saving each request's metadata and full request body for investigation of estimated vs actual token counts. Defaults to `false`. |
 | `Recording:OutputDirectory` | Directory where the records are stored: a `requests.jsonl` manifest plus one pretty-printed payload file per request. Defaults to the `inference-requests` folder in the local application data folder (`%LOCALAPPDATA%\OllamaRouter\inference-requests` on Windows). |
@@ -275,11 +278,11 @@ If the margin-adjusted requirement (`min(estimatedTokens + ContextFitMarginToken
 
 **Dense — clamp-only pass-through.** For a dense model the router rewrites `options.num_ctx` *only* when the client's static value **exceeds** the node's pre-configured context, clamping it **down** to that value (one-time KV reallocation; protects against OOM from static 131,072 requests on a 49,152 node). When the client value is absent or ≤ pre-configured, the payload is left byte-identical. Dense values are never raised, never bucketed, never leased. Set `DynamicContext:DenseClampEnabled` to `false` for pure dense pass-through (no clamping).
 
-Retired configuration keys (task #26 — still bind but are ignored, with a one-time startup warning): `DynamicContext:BucketStepTokens`, `DynamicContext:Profiles:*:IntermediateContext`, and the dense profile names `DenseDesktop16gb` / `DenseServer96gb` / `SmallDense`.
+Legacy dynamic context profiles (`DynamicContext:Profiles`) and intermediate context stepping (`DynamicContext:BucketStepTokens`) have been retired in favor of the clean two-bucket ladder and dense clamp-only architecture.
 
 ### Token estimation overhead recommendations
 
-OllamaRouter estimates prompt token count prior to routing so it can check against `MaxLocalTokens` without having to download full tokenizer files for every model. Because generic tokenizers (`Tiktoken` or `Heuristic`) differ from the exact vocabulary and chat templates used by targeted models, set `TokenEstimationOverheadFactor` according to your primary model family:
+OllamaRouter estimates prompt token count prior to routing so it can qualify target context capacity (`CMax` / `ContextFitMarginTokens`) without having to download full tokenizer files for every model. Because generic tokenizers (`Tiktoken` or `Heuristic`) differ from the exact vocabulary and chat templates used by targeted models, set `TokenEstimationOverheadFactor` according to your primary model family:
 
 | Model Family | Vocabulary Size | Recommended (`Tiktoken`) | Recommended (`Heuristic`) | Notes |
 | :--- | :---: | :---: | :---: | :--- |
@@ -469,12 +472,9 @@ Notes:
 ## Project structure
 
 - `Middleware/OllamaRoutingMiddleware.cs` – inspects intercepted requests, emits routing telemetry headers, enforces target pinning, and sets the `X-Ollama-Target` header used by YARP for routing.
-- `Services/RoutingDecisionService.cs` – orchestrates the chain of target handlers to make the routing decision (first available capable target, with queued fallback when busy).
-- `Services/IRoutingTargetHandler.cs` – abstraction for routing destinations (`Local`, `Remote`, `Cloud`) defining availability, overflow status, and request capability.
-- `Services/LocalRoutingTargetHandler.cs` – target handler for the local Ollama instance (model configuration, token limits, loaded models, GPU VRAM).
-- `Services/RemoteRoutingTargetHandler.cs` – target handler for the remote server.
-- `Services/CloudRoutingTargetHandler.cs` – overflow target handler relaying to ollama.com cloud models when primary instances are busy.
-- `Services/RoutingContext.cs` – encapsulates request parameters, token estimates, thresholds, and shared catalog checks for a routing decision.
+- `Services/RoutingDecisionService.cs` – orchestrates the multi-target routing engine (Stage-1 hardware/context capability filtering, Stage-2 heuristic scoring, and overflow fallback).
+- `Services/CloudRoutingTargetHandler.cs` – overflow target handler relaying to ollama.com cloud models when primary instances are busy or failing.
+- `Services/RoutingContext.cs` – encapsulates request parameters, token estimates, and fleet routing target evaluations.
 - `Services/OllamaModelCatalogClient.cs` – fetches and merges model catalogs (`/api/tags`, `/v1/models`, `/api/ps`) from both instances.
 - `Parsing/OllamaRequestParser.cs` – extracts the prompt, model name, and JSON Schema format from request bodies.
 - `ReverseProxy/OllamaReverseProxyConfig.cs` – builds the YARP routes/clusters in code.

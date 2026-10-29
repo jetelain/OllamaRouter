@@ -97,23 +97,6 @@ public sealed class ModelCapabilityEngine(
     /// </summary>
     public const int OllamaDefaultContext = 4096;
 
-    /// <summary>
-    /// Deprecated: the legacy hardware-derived context ceiling for "16gb" desktop-class
-    /// targets (48k = 48 × 1024). No longer consulted for qualification (task #25): the
-    /// capacity is the node's pre-configured num_ctx, the native GGUF context length, or the
-    /// <see cref="FallbackContextWindow"/> assumption. Retained for documentation and legacy
-    /// test fixtures.
-    /// </summary>
-    public const int DesktopCeiling = 49152;
-
-    /// <summary>
-    /// Deprecated: the legacy hardware-derived context ceiling for "96gb" server-class
-    /// targets. No longer consulted for qualification (task #25): the capacity is the node's
-    /// pre-configured num_ctx, the native GGUF context length, or the
-    /// <see cref="FallbackContextWindow"/> assumption. Retained for documentation and legacy
-    /// test fixtures.
-    /// </summary>
-    public const int ServerCeiling = 262144;
 
     /// <summary>
     /// Assumed context window (128,000 tokens ≈ 131,072) used as the LAST-resort CMax when a

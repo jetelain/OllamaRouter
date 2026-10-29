@@ -56,12 +56,8 @@ builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.TypeInfoResolverChain.Insert(0, OllamaRouterJsonSerializerContext.Default);
 });
 
-// Resolved + normalized options (Normalize() clamps the additive context fit margin; the
-// DynamicContext.Normalize(logger) step — invoked once the startup logger is available
-// below — restores the built-in Moe profile entry, clamps the obsolete BucketStepTokens,
-// and warns once per legacy dense profile a pre-task-#26 config still declares; .NET config
-// binding would otherwise replace the whole Profiles dictionary on partial overrides). The
-// exact same instance is registered by AddOllamaRouter.
+// Resolved + normalized options (Normalize() clamps the additive context fit margin and
+// normalizes dynamic context settings). The exact same instance is registered by AddOllamaRouter.
 var ollamaOptions = builder.Configuration.GetSection(OllamaRouterOptions.SectionName).Get<OllamaRouterOptions>()
     ?? new OllamaRouterOptions();
 ollamaOptions.Normalize();
@@ -85,15 +81,12 @@ static bool IsTuiDisabled(string[] args) => args.Any(a => string.Equals(a, "--no
 // Effective fleet targets plus the Cloud pseudo-target (deduplicated, case-insensitively).
 var startupLogger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("OllamaRouter.Startup");
 
-// DynamicContext post-binding normalization with startup logging (task #26): restores the
-// built-in Moe profile entry, clamps the obsolete BucketStepTokens, and warns once per
-// legacy dense profile (DenseDesktop16gb/DenseServer96gb/SmallDense) a pre-task-#26 config
-// still declares — those profiles bind but are ignored by the two-bucket ladder.
+// DynamicContext post-binding normalization with startup logging.
 ollamaOptions.DynamicContext.Normalize(startupLogger);
 
 var fleetTargets = OllamaRouterServiceCollectionExtensions.BuildFleetTargets(ollamaOptions, startupLogger);
 
-// Startup fleet log line + deprecation warnings.
+// Startup fleet log line.
 {
     startupLogger.LogInformation("Effective fleet targets: {Targets}", string.Join(", ", fleetTargets.Select(t => t.Value ?? "")));
 
@@ -101,17 +94,6 @@ var fleetTargets = OllamaRouterServiceCollectionExtensions.BuildFleetTargets(oll
     {
         startupLogger.LogInformation(
             "OllamaRouter:Targets is configured with {Count} fleet target(s); routing decisions use the two-stage hot-model affinity pipeline over the configured fleet (catalog presence + hardware suitability + calibrated scoring).", ollamaOptions.Targets.Count);
-    }
-
-    var nonDefaultModels = ollamaOptions.Models
-        .Where(pair => pair.Value.MaxLocalTokens != ModelThresholds.DefaultMaxLocalTokens ||
-                    pair.Value.MinRequiredVramMB != ModelThresholds.DefaultMinRequiredVramMB)
-        .Select(pair => pair.Key)
-        .ToList();
-    if (nonDefaultModels.Count > 0)
-    {
-        startupLogger.LogWarning(
-            "OllamaRouter:Models[{Models}]:MaxLocalTokens/MinRequiredVramMB are deprecated and will be superseded by hardware suitability rules; they are slated for removal after the transition release (the keys keep working in this release).", string.Join(", ", nonDefaultModels));
     }
 }
 

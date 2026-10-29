@@ -102,7 +102,18 @@ public static class MonitorEndpointsExtensions
             DisableLocalTarget(targetAvailability);
         }
 
-        var localUrl = options.Value.LocalUrl?.TrimEnd('/');
+        var effectiveTargets = options.Value.GetEffectiveTargets();
+        var localTarget = effectiveTargets.FirstOrDefault(t => string.Equals(t.Name, "Local", StringComparison.OrdinalIgnoreCase))
+            ?? effectiveTargets.FirstOrDefault(t => OllamaProcessLauncher.IsLoopback(t.Url));
+
+        var localUrl = localTarget?.Url?.TrimEnd('/');
+#pragma warning disable CS0618
+        if (string.IsNullOrWhiteSpace(localUrl))
+        {
+            localUrl = options.Value.LocalUrl?.TrimEnd('/');
+        }
+#pragma warning restore CS0618
+
         if (string.IsNullOrWhiteSpace(localUrl))
         {
             return Results.Ok(new ReclaimVramResponse(
@@ -114,7 +125,7 @@ public static class MonitorEndpointsExtensions
         }
 
         var result = await VramReclaimCore.ReclaimTargetAsync(
-            new OllamaTargetOptions { Name = "Local", Url = localUrl },
+            localTarget ?? new OllamaTargetOptions { Name = "Local", Url = localUrl },
             false, // Already disabled above (legacy pre-disable ordering).
             catalogClient,
             targetAvailability,

@@ -282,7 +282,7 @@ public class DynamicContextSizingTests
     // ================================================================================
 
     [Fact]
-    public void Options_Defaults_ShipOnlyMoeProfile()
+    public void Options_Defaults()
     {
         var options = new DynamicContextOptions();
 
@@ -290,123 +290,21 @@ public class DynamicContextSizingTests
         Assert.True(options.DenseClampEnabled);
         Assert.Equal(3, options.AutoShrinkCooldownTurns);
         Assert.Equal(60, options.AutoShrinkIdleTimeoutSeconds);
-
-        // Only the Moe profile is built-in (task #26).
-        Assert.Single(options.Profiles);
-        Assert.True(options.Profiles.ContainsKey("Moe"));
-
-        // Dense profiles are NOT restored.
-#pragma warning disable CS0618
-        Assert.False(options.Profiles.ContainsKey(DynamicContextOptions.DenseDesktop16gbProfileName));
-        Assert.False(options.Profiles.ContainsKey(DynamicContextOptions.DenseServer96gbProfileName));
-        Assert.False(options.Profiles.ContainsKey(DynamicContextOptions.SmallDenseProfileName));
-#pragma warning restore CS0618
     }
 
     [Fact]
-    public void Options_Normalize_RestoresOnlyMoeProfile()
+    public void Options_Normalize_ClampsNonPositiveValues()
     {
-        // Simulates config binding that replaced the dictionary with an empty one.
         var options = new DynamicContextOptions
         {
-            Profiles = new Dictionary<string, DynamicContextProfile>(StringComparer.OrdinalIgnoreCase)
+            AutoShrinkCooldownTurns = -1,
+            AutoShrinkIdleTimeoutSeconds = -10
         };
 
         options.Normalize();
 
-        // The Moe profile is restored.
-        Assert.True(options.Profiles.ContainsKey("Moe"));
-        Assert.Equal(184_320, options.Profiles["Moe"].DefaultContext);
-    }
-
-    [Fact]
-    public void Options_Normalize_LegacyDenseProfile_WarnsButKeeps()
-    {
-        var options = new DynamicContextOptions
-        {
-            Profiles = new Dictionary<string, DynamicContextProfile>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["Moe"] = new(184_320, null, 262_144),
-#pragma warning disable CS0618
-                ["DenseDesktop16gb"] = new(32_768, null, 49_152)
-#pragma warning restore CS0618
-            }
-        };
-
-        var warnings = new List<string>();
-        var logger = new TestLogger(warnings);
-        options.Normalize(logger);
-
-        // Warning logged naming the legacy profile.
-        Assert.Single(warnings);
-        Assert.Contains("DenseDesktop16gb", warnings[0]);
-
-        // The profile is still in the dictionary (bind-and-ignore).
-        Assert.True(options.Profiles.ContainsKey("DenseDesktop16gb"));
-        // Moe is also still there.
-        Assert.True(options.Profiles.ContainsKey("Moe"));
-    }
-
-    [Fact]
-    public void Options_Normalize_NoLegacyProfiles_NoWarning()
-    {
-        var options = new DynamicContextOptions();
-        var warnings = new List<string>();
-        var logger = new TestLogger(warnings);
-        options.Normalize(logger);
-
-        Assert.Empty(warnings);
-    }
-
-    [Fact]
-    public void Options_Normalize_MultipleLegacyProfiles_SingleWarning()
-    {
-        var options = new DynamicContextOptions
-        {
-            Profiles = new Dictionary<string, DynamicContextProfile>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["Moe"] = new(184_320, null, 262_144),
-#pragma warning disable CS0618
-                ["DenseDesktop16gb"] = new(32_768, null, 49_152),
-                ["SmallDense"] = new(32_768, null, 131_072)
-#pragma warning restore CS0618
-            }
-        };
-
-        var warnings = new List<string>();
-        var logger = new TestLogger(warnings);
-        options.Normalize(logger);
-
-        // ONE warning naming both profiles.
-        Assert.Single(warnings);
-        Assert.Contains("DenseDesktop16gb", warnings[0]);
-        Assert.Contains("SmallDense", warnings[0]);
-    }
-
-    [Fact]
-    public void Options_Normalize_ClampsNonPositiveBucketStep()
-    {
-        var options = new DynamicContextOptions();
-#pragma warning disable CS0618
-        options.BucketStepTokens = -5;
-#pragma warning restore CS0618
-
-        options.Normalize();
-
-#pragma warning disable CS0618
-        Assert.Equal(32_768, options.BucketStepTokens);
-#pragma warning restore CS0618
-    }
-
-    [Fact]
-    public void Options_Normalize_RepairsZeroValuedMoeProfile()
-    {
-        var options = new DynamicContextOptions();
-        options.Profiles["Moe"] = new DynamicContextProfile(0, null, 0);
-
-        options.Normalize();
-
-        Assert.Equal(262_144, options.GetProfile("Moe").MaxContext);
+        Assert.Equal(3, options.AutoShrinkCooldownTurns);
+        Assert.Equal(60, options.AutoShrinkIdleTimeoutSeconds);
     }
 
     [Fact]

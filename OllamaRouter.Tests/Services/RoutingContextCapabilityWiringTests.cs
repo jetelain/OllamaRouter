@@ -51,8 +51,6 @@ public class RoutingContextCapabilityWiringTests
             normalizedModelName: "m",
             thresholds,
             cacheService,
-            LocalUrl,
-            "http://remote:11434",
             CancellationToken.None,
             capabilityEngine,
             targets);

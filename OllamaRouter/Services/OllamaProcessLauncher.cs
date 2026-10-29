@@ -130,10 +130,13 @@ public sealed class OllamaProcessLauncher : IOllamaProcessLauncher
     /// </summary>
     internal static int? ResolveExpectedDaemonPort(OllamaRouterOptions? options)
     {
-        var url = options is null ? null
-            : options.Targets is { Count: > 0 } && IsLoopback(options.Targets[0].Url)
-                ? options.Targets[0].Url
-                : options.LocalUrl;
+        var url = options?.Targets?.FirstOrDefault(t => IsLoopback(t.Url))?.Url;
+#pragma warning disable CS0618
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            url = options?.LocalUrl;
+        }
+#pragma warning restore CS0618
 
         if (!string.IsNullOrWhiteSpace(url) && Uri.TryCreate(url, UriKind.Absolute, out var uri) &&
             uri.Port > 0)
@@ -144,7 +147,7 @@ public sealed class OllamaProcessLauncher : IOllamaProcessLauncher
         return PrimaryDefaultPort;
     }
 
-    private static bool IsLoopback(string? url)
+    internal static bool IsLoopback(string? url)
     {
         return !string.IsNullOrWhiteSpace(url) &&
             Uri.TryCreate(url, UriKind.Absolute, out var uri) &&

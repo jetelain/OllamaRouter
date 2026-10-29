@@ -224,7 +224,7 @@ public class ModelCapabilityEngineTests
     }
 
     [Fact]
-    public void DeriveCapability_NoNumCtx_27BDense_16gb_ReturnsDesktopCeiling()
+    public void DeriveCapability_NoNumCtx_27BDense_16gb_ReturnsFallbackContextWindow()
     {
         var engine = CreateEngine();
         var metadata = Metadata(27_800_000_000L, family: "qwen3", weightBytes: 16L * 1_048_576);

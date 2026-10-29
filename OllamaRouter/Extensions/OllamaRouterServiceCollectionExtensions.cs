@@ -138,7 +138,6 @@ public static class OllamaRouterServiceCollectionExtensions
             sp.GetRequiredService<ITargetAvailabilityService>(),
             sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
             sp.GetRequiredService<ILogger<CloudRoutingTargetHandler>>()));
-        services.AddTransient<IRoutingTargetHandler>(sp => sp.GetRequiredService<CloudRoutingTargetHandler>());
         services.AddTransient<IRoutingDecisionService>(sp => new RoutingDecisionService(
             sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
             sp.GetRequiredService<IModelCatalogCacheService>(),

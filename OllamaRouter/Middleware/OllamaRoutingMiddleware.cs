@@ -420,11 +420,6 @@ public sealed class OllamaRoutingMiddleware(
         return sessionId;
     }
 
-    // Session-aware decision dispatch: when a session ID is present the new
-    // DecideAsync(..., sessionId, ...) overload is used (Stage-2 SessionAffinityBonus +
-    // lease rebinding on the winner); when absent the exact legacy 3-arg overloads are used
-    // (byte-identical stateless behavior, and the 4-arg overload is never invoked — the
-    // response echoes no session header in that case).
     private Task<RoutingTarget> DecideWithSessionAsync(
         int tokenCount, string modelName, int? clientNumCtx, string? sessionId, HttpContext context)
     {
@@ -598,9 +593,7 @@ public sealed class OllamaRoutingMiddleware(
             }
         }
 
-        var pinnedUrl = pinnedOptions?.Url
-            ?? (pinned == RoutingTarget.Local ? options.Value.LocalUrl : null)
-            ?? (pinned == RoutingTarget.Remote ? options.Value.RemoteUrl : null);
+        var pinnedUrl = pinnedOptions?.Url;
         if (string.IsNullOrWhiteSpace(pinnedUrl) || string.Equals(modelName, "unknown", StringComparison.Ordinal))
         {
             return true; // nothing to check against: permissive.
@@ -663,7 +656,6 @@ public sealed class OllamaRoutingMiddleware(
         var tokenCount = 0;
         var rawTokenCount = 0;
         RoutingTarget target;
-        var isPinned = false;
         RoutingDecisionResult? detailedDecision = null;
 
         try
@@ -698,7 +690,6 @@ public sealed class OllamaRoutingMiddleware(
                         if (await IsPinnedTargetCapableAsync(requestedTarget, modelName, context))
                         {
                             target = requestedTarget;
-                            isPinned = true;
                             detailedDecision = new RoutingDecisionResult(target);
                             logger.LogInformation("Routing target explicitly pinned via request header: {Target}", target);
                             // Session stickiness (Q1 resolution): an HONORED pin explicitly
@@ -1462,9 +1453,7 @@ public sealed class OllamaRoutingMiddleware(
             }
         }
 
-        var targetUrl = targetOptions?.Url
-            ?? (target == RoutingTarget.Local ? options.Value.LocalUrl : null)
-            ?? (target == RoutingTarget.Remote ? options.Value.RemoteUrl : null);
+        var targetUrl = targetOptions?.Url;
 
         if (targetOptions is null || string.IsNullOrWhiteSpace(targetUrl) || string.Equals(modelName, "unknown", StringComparison.Ordinal))
         {

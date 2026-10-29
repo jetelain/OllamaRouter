@@ -9,7 +9,7 @@ using OllamaRouter.Options;
 public sealed class CloudRoutingTargetHandler(
     ITargetAvailabilityService targetAvailability,
     IOptions<OllamaRouterOptions>? options = null,
-    ILogger<CloudRoutingTargetHandler>? logger = null) : IRoutingTargetHandler
+    ILogger<CloudRoutingTargetHandler>? logger = null)
 {
     public RoutingTarget Target => RoutingTarget.Cloud;
 

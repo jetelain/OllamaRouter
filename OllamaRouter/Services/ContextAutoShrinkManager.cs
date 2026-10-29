@@ -86,7 +86,7 @@ public sealed class ContextAutoShrinkManager : IContextAutoShrinkManager
             // context carried by the engine decision (was the retired profile constant).
             var baseline = engineDecision.BaselineBucket > 0
                 ? engineDecision.BaselineBucket
-                : DynamicContextOptions.DefaultBucketStepTokens;
+                : DynamicContextOptions.DefaultBaselineTokens;
             var required = engineDecision.InjectedNumCtx;
             var ceiling = Math.Max(0, engineDecision.EffectiveCeiling);
             var normalizedName = RoutingDecisionService.NormalizeModelName(modelName);
