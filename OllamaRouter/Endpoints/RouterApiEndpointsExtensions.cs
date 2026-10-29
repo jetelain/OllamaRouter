@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
@@ -9,6 +10,7 @@ using OllamaRouter.Middleware;
 using OllamaRouter.Options;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services;
+using OllamaRouter.Services.Benchmarking;
 using OllamaRouter.Services.Hardware;
 
 namespace OllamaRouter.Endpoints;
@@ -117,6 +119,93 @@ public static class RouterApiEndpointsExtensions
             }
 
             return Results.Json(profile, OllamaRouterJsonSerializerContext.Default.NodeHardwareProfile);
+        });
+
+        // Model benchmarking (task #28): non-blocking run trigger (202), single-flight 409,
+        // results query (including in-flight Running rows) and result clearing.
+        app.MapPost("/api/router/benchmark", async (
+            HttpRequest request,
+            IMicroBenchmarkRunner benchmarkRunner,
+            CancellationToken cancellationToken) =>
+        {
+            // Null / empty body is valid = benchmark everything (fleet-wide zero-config flow).
+            RouterBenchmarkRequest? benchmarkRequest = null;
+            try
+            {
+                using var reader = new StreamReader(request.Body, Encoding.UTF8);
+                var body = await reader.ReadToEndAsync(cancellationToken).ConfigureAwait(false);
+                if (!string.IsNullOrWhiteSpace(body))
+                {
+                    benchmarkRequest = JsonSerializer.Deserialize(
+                        body, OllamaRouterJsonSerializerContext.Default.RouterBenchmarkRequest);
+                }
+            }
+            catch (JsonException)
+            {
+                // Malformed JSON body → 400 below.
+                return Results.Json(
+                    new OllamaErrorResponse("invalid or missing benchmark request body"),
+                    OllamaRouterJsonSerializerContext.Default.OllamaErrorResponse,
+                    statusCode: StatusCodes.Status400BadRequest);
+            }
+
+            var requestedTarget = benchmarkRequest?.Target;
+            if (!string.IsNullOrWhiteSpace(requestedTarget) &&
+                !benchmarkRunner.GetEffectiveTargetNames()
+                    .Any(n => string.Equals(n, requestedTarget, StringComparison.OrdinalIgnoreCase)))
+            {
+                return Results.Json(
+                    new OllamaErrorResponse($"target not found: {requestedTarget}"),
+                    OllamaRouterJsonSerializerContext.Default.OllamaErrorResponse,
+                    statusCode: StatusCodes.Status404NotFound);
+            }
+
+            // Null target (absent body or omitted field) → all effective targets. Build the
+            // struct explicitly and cast the null branch to RoutingTarget? — a bare `null`
+            // in a conditional with a struct other-branch adopts the struct type (yielding
+            // default(RoutingTarget), which lifts to a *non-null* value with an empty name).
+            RoutingTarget? target = string.IsNullOrWhiteSpace(requestedTarget)
+                ? (RoutingTarget?)null
+                : new RoutingTarget(requestedTarget);
+            var started = benchmarkRunner.TryStartRun(
+                target,
+                benchmarkRequest?.Roles,
+                benchmarkRequest?.Model);
+            if (!started)
+            {
+                return Results.Json(
+                    new OllamaErrorResponse("benchmark run already in progress"),
+                    OllamaRouterJsonSerializerContext.Default.OllamaErrorResponse,
+                    statusCode: StatusCodes.Status409Conflict);
+            }
+
+            var queuedTargets = string.IsNullOrWhiteSpace(requestedTarget)
+                ? benchmarkRunner.GetEffectiveTargetNames().ToList()
+                : [requestedTarget!];
+
+            // 202: accepted and queued, the run loop drains the targets sequentially in the
+            // background — this response never waits for the benchmarks to finish.
+            return Results.Json(
+                new RouterBenchmarkRunResponse(true, queuedTargets),
+                OllamaRouterJsonSerializerContext.Default.RouterBenchmarkRunResponse,
+                statusCode: StatusCodes.Status202Accepted);
+        });
+
+        app.MapGet("/api/router/benchmark/results", (IMicroBenchmarkRunner benchmarkRunner) =>
+        {
+            var response = new RouterBenchmarkResultsResponse(
+                benchmarkRunner.GetAllResults());
+            return Results.Json(response, OllamaRouterJsonSerializerContext.Default.RouterBenchmarkResultsResponse);
+        });
+
+        app.MapDelete("/api/router/benchmark/results", (IMicroBenchmarkRunner benchmarkRunner) =>
+        {
+            // In-flight runs keep their Running states: the delete applies to completed
+            // targets only and the background work continues for its remaining targets.
+            benchmarkRunner.ClearResults(keepRunning: true);
+            return Results.Json(
+                new RouterBenchmarkClearedResponse(true),
+                OllamaRouterJsonSerializerContext.Default.RouterBenchmarkClearedResponse);
         });
 
         app.MapGet("/api/router/models", async (
@@ -1654,3 +1743,38 @@ public sealed record RouterVramReclaimResponse(
     [property: JsonPropertyName("totalUnloaded")] int TotalUnloaded,
     [property: JsonPropertyName("targets")] IReadOnlyList<RouterVramReclaimTargetResult> Targets,
     [property: JsonPropertyName("message")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Message = null);
+
+/// <summary>
+/// Request body of <c>POST /api/router/benchmark</c> (a null/absent body is valid and means
+/// "benchmark all effective non-Cloud targets"): the optional target to queue (null → all
+/// effective targets in configuration order), the optional role filter and the optional
+/// single-model filter (both null/empty → all catalog candidates).
+/// </summary>
+public sealed record RouterBenchmarkRequest(
+    [property: JsonPropertyName("target")] string? Target = null,
+    [property: JsonPropertyName("roles")] IReadOnlyList<UsageRole>? Roles = null,
+    [property: JsonPropertyName("model")] string? Model = null);
+
+/// <summary>
+/// 202 response of <c>POST /api/router/benchmark</c>: the run was accepted and queued
+/// (non-blocking — the run loop drains the targets sequentially in the background).
+/// </summary>
+public sealed record RouterBenchmarkRunResponse(
+    [property: JsonPropertyName("started")] bool Started,
+    [property: JsonPropertyName("queuedTargets")] IReadOnlyList<string> QueuedTargets);
+
+/// <summary>
+/// 200 response of <c>GET /api/router/benchmark/results</c>: every known target result
+/// (persisted or in-flight; in-flight rows carry <c>status: "Running"</c>), empty when
+/// nothing ever ran.
+/// </summary>
+public sealed record RouterBenchmarkResultsResponse(
+    [property: JsonPropertyName("targets")] IReadOnlyList<BenchmarkTargetResult> Targets);
+
+/// <summary>
+/// 200 response of <c>DELETE /api/router/benchmark/results</c>: the results were cleared
+/// (in-memory + benchmarks.json + benchmark-seeded targets-speed.json entries; "learned"
+/// entries are never touched).
+/// </summary>
+public sealed record RouterBenchmarkClearedResponse(
+    [property: JsonPropertyName("cleared")] bool Cleared);

@@ -139,6 +139,28 @@ AI agent frameworks, orchestrators (such as [NightCodeForge](https://github.com/
 - `POST /monitor/reclaim-vram` unloads running models and accepts an optional query parameter `disableTarget` (defaults to `true` to disable Local for gaming/editing, or pass `?disableTarget=false` for non-destructive unloading).
 - Any other request is proxied as a catch-all to the instance selected by the routing decision.
 
+### Model benchmarking
+
+OllamaRouter can automatically determine which candidate models and context sizes are viable on each fleet node. A candidate is **viable** only if it sustains at least **20 tokens/second** decode throughput (measured as `eval_count / (eval_duration × 1e-9)` from a fixed 64-token generation).
+
+**Candidate catalog (code-defined in v1):** `gemma4:e4b` (Basic Model, ~4.5B dense), `qwen3.8:27b` (Agentic Chat / Software Architect / Senior Developer, ~27.8B dense), `qwen3.6:35b-a3b` (Junior Developer, 35B/3.3B-active MoE). Each candidate is tested across the context ladder `16k → 32k → 49k → 65k → 128k → 184k → 256k` (ascending, capped by the model's native context and the target's Modelfile `num_ctx`), with a deterministic real-text filler prompt sized to the context.
+
+**Pre-flight memory residency check:** before any `POST /api/pull` is issued, a pure sizing calculator verifies that weights + KV cache fit within **92% of the node's fast memory** (dedicated VRAM or unified RAM; MiB throughout). Candidates that would spill layers to DDR system RAM are pruned (`reason: "sizing-pruned"`) because 20 t/s is mathematically unreachable at system-RAM bandwidth. MoE models are sized on **active** parameters for the decode test (e.g. ~1.6 GB active buffer for `qwen3.6:35b-a3b` q4), while the full weights must still be resident in fast+system memory (fast-only on unified nodes). Nodes with an **unknown hardware profile fail open** (no pruning, `sizingSource: "assumed"`); an OOM at runtime is the empirical safety net and is recorded as an `oom` row.
+
+**Endpoints:**
+
+```http
+POST /api/router/benchmark            # body optional; {"target":"name","roles":["AgenticChat"],"model":"qwen3.8:27b"}
+                                       # omitted target → all effective non-Cloud targets, config order
+                                       # → 202 {"started":true,"queuedTargets":[...]}; 409 while a run is in flight;
+                                       #   404 for an unknown target; 400 for malformed JSON
+GET  /api/router/benchmark/results    # → 200 {"targets":[...]} including in-flight "Running" rows
+DELETE /api/router/benchmark/results  # → 200 {"cleared":true}; removes benchmarks.json and only
+                                       #   benchmark-seeded (source:"benchmark") speed entries
+```
+
+The ladder **stops at the first non-viable, OOM, or error row** (larger contexts only get worse). Results persist to the state directory (`%LOCALAPPDATA%\OllamaRouter\state` on Windows) as `benchmarks.json` (per-target rows incl. per-context tps, viable flag, sizing provenance) and seed `targets-speed.json` — a per-(target, model) tokens/sec snapshot (`tokensPerSecond`, `samples`, `source`, `updatedAt`) where `tokensPerSecond` is the measured speed of the **largest viable context**. Entries with `source: "learned"` (written by later routing-speed learning) are never overwritten by benchmark seeding. This task does not alter routing itself; routing still uses the static `SpeedFactor` hint today.
+
 ## Setup Ollama instances
 
 OllamaRouter expects both instances to expose the **same model names**, so that a request can be transparently routed to either one. The steps below set up a quantized model locally (to fit in limited VRAM) and a less-quantized (or full-precision) version of the same model remotely (to take advantage of the larger unified RAM/VRAM), both aliased under the same model name.

@@ -82,7 +82,7 @@ public sealed class FakeOllamaDaemon : IAsyncDisposable
     private readonly string _name;
     private readonly IReadOnlyList<DaemonModel> _models;
     private readonly int _capacity;
-    private readonly int _port;
+    private int _port;
 
     private WebApplication? _app;
     private readonly ConcurrentQueue<RecordedRequest> _requests = new();
@@ -182,14 +182,69 @@ public sealed class FakeOllamaDaemon : IAsyncDisposable
             return;
         }
 
+        // The ephemeral port allocated up front can be claimed by another socket between
+        // allocation and Kestrel's bind (a rare AddressInUseException race on shared machines).
+        // Retry with a freshly allocated port; once started the port stays stable.
+        WebApplication? app = null;
+        for (var attempt = 0; attempt < 5; attempt++)
+        {
+            if (attempt > 0)
+            {
+                _port = AllocateLoopbackPort();
+            }
+
+            app = BuildApp(Url);
+            try
+            {
+                await app.StartAsync(cancellationToken);
+                break;
+            }
+            catch (System.IO.IOException)
+            {
+                await app.DisposeAsync();
+                app = null;
+                if (attempt == 4)
+                {
+                    throw;
+                }
+            }
+        }
+
+        _app = app!;
+        IsRunning = true;
+
+        // Wait until the daemon actually answers liveness (the port is bound but Kestrel may take a moment).
+        using var probe = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
+        for (var i = 0; i < 200; i++)
+        {
+            try
+            {
+                var response = await probe.GetAsync($"{Url}/", cancellationToken);
+                if (response.IsSuccessStatusCode)
+                {
+                    return;
+                }
+            }
+            catch
+            {
+                // Not ready yet.
+            }
+
+            await Task.Delay(10, cancellationToken);
+        }
+    }
+
+    private WebApplication BuildApp(string url)
+    {
         var builder = WebApplication.CreateBuilder();
-        builder.WebHost.UseUrls(Url);
+        builder.WebHost.UseUrls(url);
         builder.Logging.ClearProviders();
 
         // Observation plane: record every inbound request (source endpoint + method + path + headers + body).
 
 
         var app = builder.Build();
+
 
         app.Use(async (context, next) =>
         {
@@ -207,7 +262,7 @@ public sealed class FakeOllamaDaemon : IAsyncDisposable
             {
                 context.Request.EnableBuffering();
                 using var reader = new StreamReader(context.Request.Body, Encoding.UTF8, leaveOpen: true);
-                body = await reader.ReadToEndAsync(cancellationToken);
+                body = await reader.ReadToEndAsync(context.RequestAborted);
                 context.Request.Body.Position = 0;
             }
 
@@ -266,33 +321,11 @@ public sealed class FakeOllamaDaemon : IAsyncDisposable
             await WriteChatSseAsync(context, model, context.RequestAborted);
         });
 
-        await app.StartAsync(cancellationToken);
-        _app = app;
-        IsRunning = true;
-
-        // Wait until the daemon actually answers liveness (the port is bound but Kestrel may take a moment).
-        using var probe = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
-        for (var i = 0; i < 200; i++)
-        {
-            try
-            {
-                var response = await probe.GetAsync($"{Url}/", cancellationToken);
-                if (response.IsSuccessStatusCode)
-                {
-                    return;
-                }
-            }
-            catch
-            {
-                // Not ready yet.
-            }
-
-            await Task.Delay(10, cancellationToken);
+        return app;
         }
-    }
 
-    public async Task StopAsync()
-    {
+        public async Task StopAsync()
+        {
         if (_app is not null)
         {
             var app = _app;

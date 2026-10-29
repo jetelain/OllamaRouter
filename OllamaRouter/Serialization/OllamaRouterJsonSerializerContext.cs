@@ -1,7 +1,9 @@
 using System.Text.Json.Serialization;
 using OllamaRouter.Endpoints;
 using OllamaRouter.Middleware;
+using OllamaRouter.Options;
 using OllamaRouter.Services;
+using OllamaRouter.Services.Benchmarking;
 using OllamaRouter.Services.Hardware;
 
 namespace OllamaRouter.Serialization;
@@ -43,6 +45,21 @@ namespace OllamaRouter.Serialization;
 [JsonSerializable(typeof(FleetHardwareNode))]
 [JsonSerializable(typeof(RouterFleetHardwareResponse))]
 [JsonSerializable(typeof(RouterVramReclaimResponse))]
+[JsonSerializable(typeof(CandidateModel))]
+[JsonSerializable(typeof(UsageRole))]
+[JsonSerializable(typeof(BenchmarkContextResult))]
+[JsonSerializable(typeof(BenchmarkTargetResult))]
+[JsonSerializable(typeof(BenchmarkTargetState))]
+[JsonSerializable(typeof(SpeedSnapshotEntry))]
+[JsonSerializable(typeof(CandidateSizingEstimate))]
+[JsonSerializable(typeof(MemoryFitStatus))]
+[JsonSerializable(typeof(BenchmarkRunStatus))]
+[JsonSerializable(typeof(Dictionary<string, BenchmarkTargetState>))]
+[JsonSerializable(typeof(Dictionary<string, Dictionary<string, SpeedSnapshotEntry>>))]
+[JsonSerializable(typeof(RouterBenchmarkRequest))]
+[JsonSerializable(typeof(RouterBenchmarkRunResponse))]
+[JsonSerializable(typeof(RouterBenchmarkResultsResponse))]
+[JsonSerializable(typeof(RouterBenchmarkClearedResponse))]
 public partial class OllamaRouterJsonSerializerContext : JsonSerializerContext
 {
 }

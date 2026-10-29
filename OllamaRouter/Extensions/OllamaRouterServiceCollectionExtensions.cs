@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using OllamaRouter.Endpoints;
@@ -10,6 +11,7 @@ using OllamaRouter.Options;
 using OllamaRouter.ReverseProxy;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services;
+using OllamaRouter.Services.Benchmarking;
 using OllamaRouter.Services.Hardware;
 using Yarp.ReverseProxy;
 using MsOptions = Microsoft.Extensions.Options.Options;
@@ -171,6 +173,35 @@ public static class OllamaRouterServiceCollectionExtensions
         services.AddHostedService(sp => sp.GetRequiredService<FleetHardwareService>());
         services.AddSingleton<ModelCapabilityEngine>();
         services.AddSingleton<IOllamaProcessLauncher, OllamaProcessLauncher>();
+
+        // Micro-benchmark engine (task #28): the candidate catalog is code-defined in v1
+        // (a config.json binding hook is out of scope), the "Benchmark" client carries no
+        // client-level timeout (pulls are legitimately long; per-request CTS budgets apply)
+        // and the runner persists <state>/benchmarks.json + <state>/targets-speed.json next
+        // to targets-hardware.json (machine-generated state, never config/).
+        services.AddSingleton<IOptions<CandidateModelCatalogOptions>>(
+            MsOptions.Create(new CandidateModelCatalogOptions()));
+        services.AddHttpClient("Benchmark", client =>
+        {
+            client.Timeout = System.Threading.Timeout.InfiniteTimeSpan;
+        })
+        .ConfigurePrimaryHttpMessageHandler(_ =>
+        {
+            return new SocketsHttpHandler { PooledConnectionLifetime = TimeSpan.FromSeconds(10) };
+        });
+        services.AddSingleton<IMicroBenchmarkRunner>(sp => new MicroBenchmarkRunner(
+            sp.GetRequiredService<IOptions<CandidateModelCatalogOptions>>(),
+            sp.GetRequiredService<IFleetHardwareService>(),
+            sp.GetRequiredService<ITokenEstimator>(),
+            sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
+            sp.GetRequiredService<IOllamaModelCatalogClient>(),
+            sp.GetRequiredService<IHttpClientFactory>().CreateClient("Benchmark"),
+            // Optional: test hosts without a full application host fall back to a token that
+            // is never cancelled (cancellation is an optimization, not a contract).
+            sp.GetService<IHostApplicationLifetime>() ?? NullHostApplicationLifetime.Instance,
+            sp.GetRequiredService<ILogger<MicroBenchmarkRunner>>(),
+            Path.Combine(effectiveStateDirectory, "benchmarks.json"),
+            Path.Combine(effectiveStateDirectory, "targets-speed.json")));
         services.AddSingleton<IActivityMonitorService, ActivityMonitorService>();
         services.AddSingleton<IInferenceRequestRecorder, InferenceRequestRecorder>();
         services.AddSingleton<IActivityStatisticsService>(sp =>
@@ -269,5 +300,23 @@ public static class OllamaRouterServiceCollectionExtensions
         }
 
         return list;
+    }
+
+    /// <summary>
+    /// Fallback <see cref="IHostApplicationLifetime"/> for bare ServiceCollection hosts (tests)
+    /// that have no application host: the stopping token is never cancelled, which is a
+    /// safe degradation (benchmark-run cancellation is an optimization, not a contract).
+    /// </summary>
+    private sealed class NullHostApplicationLifetime : IHostApplicationLifetime
+    {
+        public static readonly NullHostApplicationLifetime Instance = new();
+
+        public CancellationToken ApplicationStarted { get; } = CancellationToken.None;
+
+        public CancellationToken ApplicationStopping { get; } = CancellationToken.None;
+
+        public CancellationToken ApplicationStopped { get; } = CancellationToken.None;
+
+        public void StopApplication() { }
     }
 }
