@@ -14,6 +14,8 @@ Console.Title = "Ollama Router";
 
 var builder = WebApplication.CreateBuilder(args);
 
+Microsoft.Extensions.Logging.ILogger? appLogger = null;
+
 // User-owned configuration layer (config/config.json next to the executable), layered on top of
 // the read-only factory appsettings.json. Must run before the OllamaRouter options read below.
 // Fail-open: an invalid user file is reported and ignored, never prevents startup.
@@ -21,7 +23,8 @@ RouterConfigurationSources.AddUserConfiguration(
     builder.Configuration,
     builder.Environment.ContentRootPath,
     builder.Environment.EnvironmentName,
-    logger: null);
+    logger: null,
+    loggerAccessor: () => appLogger);
 
 // Configure Serilog file & console logging
 var rawLogsDir = builder.Configuration["Logging:LogsDirectory"] ?? "logs";
@@ -69,6 +72,7 @@ ollamaOptions.DynamicContext.Normalize();
 builder.Services.AddOllamaRouter(ollamaOptions, enableTui: !IsTuiDisabled(args));
 
 var app = builder.Build();
+appLogger = app.Logger;
 
 var disableTui = IsTuiDisabled(args);
 if (disableTui)

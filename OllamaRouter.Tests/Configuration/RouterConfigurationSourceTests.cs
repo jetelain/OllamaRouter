@@ -76,15 +76,35 @@ public class RouterConfigurationSourceTests : IDisposable
     private sealed class CapturingLogger : ILogger
     {
         private readonly List<(LogLevel Level, string Message)> _entries = [];
+        private readonly TaskCompletionSource _errorLogged = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        public IReadOnlyList<(LogLevel Level, string Message)> Entries => _entries;
+        public IReadOnlyList<(LogLevel Level, string Message)> Entries
+        {
+            get
+            {
+                lock (_entries)
+                {
+                    return [.. _entries];
+                }
+            }
+        }
+
+        public Task ErrorLogged => _errorLogged.Task;
 
         public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
         public bool IsEnabled(LogLevel logLevel) => true;
 
         public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
         {
-            _entries.Add((logLevel, formatter(state, exception)));
+            lock (_entries)
+            {
+                _entries.Add((logLevel, formatter(state, exception)));
+            }
+
+            if (logLevel == LogLevel.Error)
+            {
+                _errorLogged.TrySetResult();
+            }
         }
     }
 
@@ -386,5 +406,85 @@ public class RouterConfigurationSourceTests : IDisposable
         Assert.Equal("2", config["OllamaRouter:MaxConsecutiveFailures"]);
 
         await host.StopAsync();
+    }
+
+    [Theory]
+    [InlineData("[1, 2]")]
+    [InlineData("\"just a string\"")]
+    [InlineData("{ \"Key\": 1, \"key\": 2 }")]
+    public void AddUserConfiguration_WhenFileIsAcceptedByJsonButRejectedByProvider_FailsOpen(string content)
+    {
+        var (root, _) = CreateContentRoot(userConfigJson: content);
+        var builder = CreateFactoryBuilder(root);
+
+        var status = RouterConfigurationSources.AddUserConfiguration(builder, root, environment: null);
+
+        Assert.Equal(UserConfigLoadStatus.InvalidJson, status);
+        Assert.Equal("http://factory:11434/", builder.Build()["OllamaRouter:BindAddress"]);
+    }
+
+    [Fact]
+    public void AddUserConfiguration_OnConfigurationManager_PlacesUserLayerBetweenAppsettingsAndOtherSources()
+    {
+        var (root, _) = CreateContentRoot(
+            userConfigJson: """{ "OllamaRouter": { "BindAddress": "http://user:1234/" } }""",
+            factoryJson: """{ "OllamaRouter": { "BindAddress": "http://factory:11434/", "TokenEstimator": "factory" } }""");
+        File.WriteAllText(Path.Combine(root, "appsettings.Development.json"),
+            """{ "OllamaRouter": { "TokenEstimator": "dev" } }""");
+
+        var manager = new ConfigurationManager();
+        manager.SetBasePath(root);
+        manager.AddJsonFile("appsettings.json", optional: false);
+        manager.AddJsonFile("appsettings.Development.json", optional: false);
+        manager.AddInMemoryCollection(new Dictionary<string, string?> { ["OllamaRouter:TokenEstimator"] = "cli" });
+
+        var status = RouterConfigurationSources.AddUserConfiguration(manager, root, "Development", logger: null);
+
+        Assert.Equal(UserConfigLoadStatus.Loaded, status);
+        Assert.Equal("http://user:1234/", manager["OllamaRouter:BindAddress"]);
+        Assert.Equal("cli", manager["OllamaRouter:TokenEstimator"]);
+    }
+
+    [Fact]
+    public async Task AddUserConfiguration_WhenFileBecomesInvalidAfterLoad_LogsErrorAndDoesNotThrow()
+    {
+        var (root, userConfigPath) = CreateContentRoot(
+            userConfigJson: """{ "OllamaRouter": { "BindAddress": "http://initial:11434/" } }""");
+
+        var logger = new CapturingLogger();
+        var builder = CreateFactoryBuilder(root);
+        RouterConfigurationSources.AddUserConfiguration(builder, root, environment: null, logger);
+        var config = builder.Build();
+
+        await File.WriteAllTextAsync(userConfigPath, "{ broken");
+
+        await logger.ErrorLogged.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Error && e.Message.Contains("could not be reloaded"));
+    }
+
+    [Fact]
+    public async Task AddUserConfiguration_WhenFileBecomesInvalidAfterLoad_UsesDeferredLoggerAccessor()
+    {
+        var (root, userConfigPath) = CreateContentRoot(
+            userConfigJson: """{ "OllamaRouter": { "BindAddress": "http://initial:11434/" } }""");
+
+        var logger = new CapturingLogger();
+        ILogger? deferredLogger = null;
+
+        var builder = CreateFactoryBuilder(root);
+        RouterConfigurationSources.AddUserConfiguration(
+            builder,
+            root,
+            environment: null,
+            logger: null,
+            loggerAccessor: () => deferredLogger);
+
+        var config = builder.Build();
+        deferredLogger = logger;
+
+        await File.WriteAllTextAsync(userConfigPath, "{ broken");
+
+        await logger.ErrorLogged.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Error && e.Message.Contains("could not be reloaded"));
     }
 }

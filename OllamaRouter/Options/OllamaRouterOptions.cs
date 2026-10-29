@@ -70,12 +70,6 @@ public sealed class OllamaRouterOptions
     public string? StateDirectory { get; set; }
 
     /// <summary>
-    /// Directory for persisted config files (not yet used).
-    /// Defaults to null, which resolves to <c>%LOCALAPPDATA%\OllamaRouter\config</c> in production.
-    /// </summary>
-    public string? ConfigDirectory { get; set; }
-
-    /// <summary>
     /// Multiplicative correction factor applied to the estimated token count to compensate for
     /// the systematic underestimation of the generic tokenizer compared to the actual tokenizer
     /// used by the targeted models (different vocabulary, chat template overhead, etc.).

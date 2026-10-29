@@ -11,8 +11,6 @@
     Target runtime identifier (default: win-x64).
 .PARAMETER InstallDir
     Target installation folder (default: %LOCALAPPDATA%\OllamaRouter or ~/.ollamarouter).
-.PARAMETER ConfigDir
-    Persistent directory for configuration (default: <InstallDir>\config).
 .PARAMETER StateDir
     Persistent directory for runtime state (targets.json, activity-statistics.json) (default: <InstallDir>\state).
 .PARAMETER LogsDir
@@ -44,7 +42,6 @@ param(
             Join-Path $localApp "OllamaRouter"
         }
     ),
-    [string]$ConfigDir = "",
     [string]$StateDir = "",
     [string]$LogsDir = "",
     [string]$BinDir = "",
@@ -56,11 +53,8 @@ $ErrorActionPreference = "Stop"
 
 $InstallDir = [System.IO.Path]::GetFullPath($InstallDir)
 
-if ([string]::IsNullOrWhiteSpace($ConfigDir)) {
-    $ConfigDir = Join-Path $InstallDir "config"
-} else {
-    $ConfigDir = [System.IO.Path]::GetFullPath($ConfigDir)
-}
+# ConfigDir is imposed by runtime
+$ConfigDir = Join-Path $InstallDir "config"
 
 if ([string]::IsNullOrWhiteSpace($StateDir)) {
     $StateDir = Join-Path $InstallDir "state"
@@ -272,7 +266,6 @@ if (-not $prodSettings.PSObject.Properties['OllamaRouter']) {
     $prodSettings | Add-Member -MemberType NoteProperty -Name 'OllamaRouter' -Value ([PSCustomObject]@{}) -Force
 }
 $prodSettings.OllamaRouter | Add-Member -MemberType NoteProperty -Name 'StateDirectory' -Value $stateDirPath -Force
-$prodSettings.OllamaRouter | Add-Member -MemberType NoteProperty -Name 'ConfigDirectory' -Value $configDirPath -Force
 
 # Ensure Logging section
 if (-not $prodSettings.PSObject.Properties['Logging']) {
@@ -290,7 +283,6 @@ $prodSettings | ConvertTo-Json -Depth 10 | Set-Content -Path $prodConfigPath -En
 
 Write-Host "Configured directories:" -ForegroundColor Green
 Write-Host "  - StateDirectory    : $stateDirPath" -ForegroundColor Gray
-Write-Host "  - ConfigDirectory   : $configDirPath" -ForegroundColor Gray
 Write-Host "  - LogsDirectory     : $logsDirPath" -ForegroundColor Gray
 
 # 8. Launcher Commands & PATH configuration
