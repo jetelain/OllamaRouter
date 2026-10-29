@@ -129,13 +129,14 @@ public static class RouterApiEndpointsExtensions
             return Results.Json(response, OllamaRouterJsonSerializerContext.Default.RouterModelsResponse);
         });
 
-        app.MapGet("/api/router/models/{modelName}", async (
+        app.MapGet("/api/router/models/{*modelName}", async (
             IOptions<OllamaRouterOptions> options,
             IServiceProvider serviceProvider,
             HttpContext context,
             string modelName,
             CancellationToken cancellationToken) =>
         {
+            modelName = Uri.UnescapeDataString(modelName).TrimStart('/');
             var detail = await BuildModelDetailAsync(options, serviceProvider, context, modelName, cancellationToken);
             if (detail is null)
             {
@@ -675,7 +676,15 @@ public static class RouterApiEndpointsExtensions
         var resolved = ResolveModelName(modelName, names);
         if (resolved is null)
         {
-            return null;
+            if (opt.FilterNamespacedModels)
+            {
+                resolved = await ResolveModelOnFleetAsync(catalogCache, effectiveTargets, modelName, cancellationToken).ConfigureAwait(false);
+            }
+
+            if (resolved is null)
+            {
+                return null;
+            }
         }
 
         var summary = await BuildModelSummaryAsync(
@@ -742,7 +751,9 @@ public static class RouterApiEndpointsExtensions
                     BuildCloudTagSyntheses(opt, availability), context).ConfigureAwait(false);
                 foreach (var entry in merged)
                 {
-                    if (entry?["name"]?.ToString() is { Length: > 0 } name && !ContainsName(names, name))
+                    if (entry?["name"]?.ToString() is { Length: > 0 } name &&
+                        ShouldIncludeModel(name, opt) &&
+                        !ContainsName(names, name))
                     {
                         names.Add(name);
                     }
@@ -768,7 +779,7 @@ public static class RouterApiEndpointsExtensions
                 {
                     foreach (var name in await catalogCache.RefreshAsync(target.Url, cancellationToken).ConfigureAwait(false))
                     {
-                        if (!ContainsName(names, name))
+                        if (ShouldIncludeModel(name, opt) && !ContainsName(names, name))
                         {
                             names.Add(name);
                         }
@@ -782,7 +793,9 @@ public static class RouterApiEndpointsExtensions
 
             foreach (var synthesis in BuildCloudTagSyntheses(opt, availability) ?? [])
             {
-                if (synthesis?["name"]?.ToString() is { Length: > 0 } name && !ContainsName(names, name))
+                if (synthesis?["name"]?.ToString() is { Length: > 0 } name &&
+                    ShouldIncludeModel(name, opt) &&
+                    !ContainsName(names, name))
                 {
                     names.Add(name);
                 }
@@ -910,6 +923,139 @@ public static class RouterApiEndpointsExtensions
     }
 
     /// <summary>
+    /// Checks whether a model should be included in the fleet model listing.
+    /// When FilterNamespacedModels is true (default), models containing a namespace separator ('/' or '\')
+    /// are filtered out unless explicitly declared in <see cref="OllamaRouterOptions.Models"/> or
+    /// configured as a Cloud Overflow model.
+    /// </summary>
+    internal static bool ShouldIncludeModel(string name, OllamaRouterOptions opt)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+
+        if (!opt.FilterNamespacedModels)
+        {
+            return true;
+        }
+
+        // Native library models and local aliases do not contain a namespace separator ('/' or '\').
+        if (!name.Contains('/') && !name.Contains('\\'))
+        {
+            return true;
+        }
+
+        // Namespaced models (e.g. "jetelain/*") are filtered out unless explicitly configured.
+        return IsModelConfigured(name, opt);
+    }
+
+    /// <summary>
+    /// Returns true if the model is explicitly configured in <see cref="OllamaRouterOptions.Models"/>
+    /// or <see cref="OllamaRouterOptions.CloudOverflow"/>.
+    /// </summary>
+    internal static bool IsModelConfigured(string name, OllamaRouterOptions opt)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+
+        var normalized = RoutingDecisionService.NormalizeModelName(name);
+
+        if (opt.Models.Count > 0)
+        {
+            foreach (var key in opt.Models.Keys)
+            {
+                if (string.Equals(key, name, StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(key, normalized, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                var normalizedKey = RoutingDecisionService.NormalizeModelName(key);
+                if (string.Equals(normalizedKey, name, StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(normalizedKey, normalized, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            foreach (var threshold in opt.Models.Values)
+            {
+                if (!string.IsNullOrEmpty(threshold.CloudModel))
+                {
+                    var normalizedCloud = RoutingDecisionService.NormalizeModelName(threshold.CloudModel);
+                    if (string.Equals(threshold.CloudModel, name, StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(threshold.CloudModel, normalized, StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(normalizedCloud, name, StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(normalizedCloud, normalized, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        if (!string.IsNullOrEmpty(opt.CloudOverflow.DefaultModel))
+        {
+            var normalizedDefault = RoutingDecisionService.NormalizeModelName(opt.CloudOverflow.DefaultModel);
+            if (string.Equals(opt.CloudOverflow.DefaultModel, name, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(opt.CloudOverflow.DefaultModel, normalized, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(normalizedDefault, name, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(normalizedDefault, normalized, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Resolves a requested model name across all effective target catalogs without namespace filtering,
+    /// enabling direct lookup of specific models on /api/router/models/{name}.
+    /// </summary>
+    private static async Task<string?> ResolveModelOnFleetAsync(
+        IModelCatalogCacheService? catalogCache,
+        IReadOnlyList<OllamaTargetOptions> effectiveTargets,
+        string requested,
+        CancellationToken cancellationToken)
+    {
+        if (catalogCache is null)
+        {
+            return null;
+        }
+
+        var allNames = new List<string>();
+        foreach (var target in effectiveTargets)
+        {
+            if (string.IsNullOrWhiteSpace(target.Url))
+            {
+                continue;
+            }
+
+            try
+            {
+                var targetModels = await catalogCache.RefreshAsync(target.Url, cancellationToken).ConfigureAwait(false);
+                foreach (var name in targetModels)
+                {
+                    if (!ContainsName(allNames, name))
+                    {
+                        allNames.Add(name);
+                    }
+                }
+            }
+            catch
+            {
+                // A failing catalog check must never break the model detail lookup.
+            }
+        }
+
+        return ResolveModelName(requested, allNames);
+    }
+
+    /// <summary>
     /// Builds the per-model summary: discovers the metadata on the FIRST effective target
     /// (declaration order) that hosts the model — one /api/show + one /api/tags per model —
     /// reuses that single metadata for every target's pure VRAM-math ceiling derivation, and
@@ -941,68 +1087,48 @@ public static class RouterApiEndpointsExtensions
         var normalizedName = RoutingDecisionService.NormalizeModelName(name);
         var pinnedArchitecture = opt.Models.TryGetValue(normalizedName, out var thresholds) ? thresholds.Architecture : null;
 
-        // Source target: the FIRST effective target (declaration order) whose cached catalog
-        // contains the model.
-        OllamaTargetOptions? source = null;
+        // Fetch per-target metadata across all effective targets hosting the model.
+        // Also capture primaryMetadata from the first target with valid model info for general model properties.
+        ModelMetadata? primaryMetadata = null;
+        var rawTargetMetadata = new List<(OllamaTargetOptions Target, ModelMetadata Metadata)>();
+
         foreach (var target in effectiveTargets)
         {
-            if (string.IsNullOrWhiteSpace(target.Url))
+            var targetMetadata = await GetTargetMetadataAsync(target, name, catalogCache, capabilityEngine, cancellationToken).ConfigureAwait(false);
+            if (targetMetadata is not null)
             {
-                continue;
-            }
-
-            try
-            {
-                if (await catalogCache.ModelExistsAsync(target.Url, name, cancellationToken).ConfigureAwait(false))
+                if (primaryMetadata is null || (!primaryMetadata.HasModelInfo && targetMetadata.HasModelInfo))
                 {
-                    source = target;
-                    break;
+                    primaryMetadata = targetMetadata;
                 }
-            }
-            catch
-            {
-                // Skip the flaky target; the next candidate gets the discovery chance.
+                rawTargetMetadata.Add((target, targetMetadata));
             }
         }
 
-        if (source is null)
-        {
-            return BuildDegradedSummary(name, cloudOverflowAvailable, cloudOnly: false);
-        }
-
-        ModelMetadata? metadata = null;
-        try
-        {
-            var digest = await catalogCache.GetCurrentDigestAsync(source.Url, cancellationToken).ConfigureAwait(false);
-            if (!string.IsNullOrEmpty(digest))
-            {
-                metadata = await capabilityEngine.GetMetadataAsync(source.Url, name, digest, cancellationToken).ConfigureAwait(false);
-            }
-        }
-        catch
-        {
-            // A failing discovery must never 500 the endpoint.
-            metadata = null;
-        }
-
-        if (metadata is null)
+        if (primaryMetadata is null)
         {
             // Per-model discovery failure degrades to the conservative defaults.
             return BuildDegradedSummary(name, cloudOverflowAvailable, cloudOnly: false);
         }
 
-        var (architecture, _) = capabilityEngine.ClassifyArchitecture(metadata, pinnedArchitecture);
+        var (architecture, _) = capabilityEngine.ClassifyArchitecture(primaryMetadata, pinnedArchitecture);
 
-        // The same model file yields the same weights/num_ctx across nodes: reuse the single
-        // metadata for every target's pure VRAM-math ceiling derivation. recommendedContextWindow
-        // (task #26): dense models report the max pre-configured CMax (the optimal bucket is
-        // the whole capacity — dense is never expanded); MoE models report the max of the
-        // MoE-aware extensible capacity min(native ?? 128k, MaxContextTokens ?? ∞), which is
-        // the extensible ceiling beyond the node's pre-configured context.
+        // recommendedContextWindow (task #26): dense models report the max pre-configured CMax
+        // across hardware-capable targets (each target evaluated with its own Modelfile/GGUF metadata);
+        // MoE models report the max of the MoE-aware extensible capacity min(native ?? 128k, MaxContextTokens ?? ∞),
+        // which is the extensible ceiling beyond the node's pre-configured context.
         var recommended = ModelCapabilityEngine.OllamaDefaultContext;
-        foreach (var target in effectiveTargets)
+        long? maxNativeLength = null;
+
+        foreach (var (target, rawMeta) in rawTargetMetadata)
         {
-            var capability = capabilityEngine.DeriveCapability(metadata, target.Name!, target, pinnedArchitecture);
+            var effectiveMeta = MergeMetadata(rawMeta, primaryMetadata);
+            if (effectiveMeta.NativeContextLength is { } len)
+            {
+                maxNativeLength = Math.Max(maxNativeLength ?? 0, len);
+            }
+
+            var capability = capabilityEngine.DeriveCapability(effectiveMeta, target.Name!, target, pinnedArchitecture);
             if (capability.HardwareCapable)
             {
                 var capacity = capability.Architecture == ModelArchitectureKind.Moe
@@ -1012,11 +1138,15 @@ public static class RouterApiEndpointsExtensions
             }
         }
 
+        var nativeContext = maxNativeLength is { } maxNative
+            ? (int)Math.Min(maxNative, int.MaxValue)
+            : (primaryMetadata.NativeContextLength is { } pLen ? (int)Math.Min(pLen, int.MaxValue) : ModelCapabilityEngine.OllamaDefaultContext);
+
         return new RouterModelSummary(
             Name: name,
             Architecture: ModelCapabilityEngine.ArchitectureWireName(architecture),
-            ParameterCount: metadata.ParameterCount,
-            NativeContextWindow: metadata.NativeContextLength is { } nativeLen ? (int)Math.Min(nativeLen, int.MaxValue) : ModelCapabilityEngine.OllamaDefaultContext,
+            ParameterCount: primaryMetadata.ParameterCount,
+            NativeContextWindow: nativeContext,
             RecommendedContextWindow: recommended,
             CloudOverflowAvailable: cloudOverflowAvailable);
     }
@@ -1033,6 +1163,79 @@ public static class RouterApiEndpointsExtensions
             NativeContextWindow: native,
             RecommendedContextWindow: native,
             CloudOverflowAvailable: cloudOverflowAvailable);
+    }
+
+    /// <summary>
+    /// Merges target-specific metadata with primary fleet metadata: node-specific Modelfile parameters
+    /// (such as <c>num_ctx</c>) remain distinct per target, while model-intrinsic properties (such as
+    /// parameter count and architecture) fall back to primary metadata if the target daemon returned degraded info.
+    /// </summary>
+    private static ModelMetadata MergeMetadata(ModelMetadata targetMetadata, ModelMetadata? primaryMetadata)
+    {
+        if (primaryMetadata is null)
+        {
+            return targetMetadata;
+        }
+
+        // If targetMetadata has no model info (e.g. show was missing/failed), use primaryMetadata
+        // but preserve target's weight size if available.
+        if (!targetMetadata.HasModelInfo && primaryMetadata.HasModelInfo)
+        {
+            return primaryMetadata with
+            {
+                WeightSizeBytes = targetMetadata.WeightSizeBytes > 0 ? targetMetadata.WeightSizeBytes : primaryMetadata.WeightSizeBytes,
+                ModelfileNumCtx = targetMetadata.ModelfileNumCtx ?? primaryMetadata.ModelfileNumCtx
+            };
+        }
+
+        // Target has model info: target's ModelfileNumCtx wins for that target (even if null!),
+        // but intrinsic properties fall back to primary if missing.
+        return targetMetadata with
+        {
+            ParameterCount = targetMetadata.ParameterCount ?? primaryMetadata.ParameterCount,
+            ExpertCount = targetMetadata.ExpertCount > 0 ? targetMetadata.ExpertCount : primaryMetadata.ExpertCount,
+            ModelFamily = targetMetadata.ModelFamily ?? primaryMetadata.ModelFamily,
+            NativeContextLength = targetMetadata.NativeContextLength ?? primaryMetadata.NativeContextLength,
+            HasModelInfo = targetMetadata.HasModelInfo || primaryMetadata.HasModelInfo
+        };
+    }
+
+    /// <summary>
+    /// Fetches model metadata from a specific target's daemon. Returns null if the target does not host
+    /// the model, is unreachable, or metadata discovery fails.
+    /// </summary>
+    private static async Task<ModelMetadata?> GetTargetMetadataAsync(
+        OllamaTargetOptions target,
+        string modelName,
+        IModelCatalogCacheService? catalogCache,
+        ModelCapabilityEngine? capabilityEngine,
+        CancellationToken cancellationToken)
+    {
+        if (catalogCache is null || capabilityEngine is null || string.IsNullOrWhiteSpace(target.Url))
+        {
+            return null;
+        }
+
+        try
+        {
+            var present = await catalogCache.ModelExistsAsync(target.Url, modelName, cancellationToken).ConfigureAwait(false);
+            if (!present)
+            {
+                return null;
+            }
+
+            var digest = await catalogCache.GetCurrentDigestAsync(target.Url, cancellationToken).ConfigureAwait(false);
+            if (string.IsNullOrEmpty(digest))
+            {
+                return null;
+            }
+
+            return await capabilityEngine.GetMetadataAsync(target.Url, modelName, digest, cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     /// <summary>
@@ -1056,58 +1259,36 @@ public static class RouterApiEndpointsExtensions
         var normalizedName = RoutingDecisionService.NormalizeModelName(name);
         var pinnedArchitecture = opt.Models.TryGetValue(normalizedName, out var thresholds) ? thresholds.Architecture : null;
 
-        // Discover the metadata once (same single-source-target rule as the summary).
-        ModelMetadata? metadata = null;
+        // Discover primary metadata from the first target with model_info to serve as fallback.
+        ModelMetadata? primaryMetadata = null;
         if (catalogCache is not null && capabilityEngine is not null)
         {
             foreach (var target in effectiveTargets)
             {
-                if (string.IsNullOrWhiteSpace(target.Url))
+                var meta = await GetTargetMetadataAsync(target, name, catalogCache, capabilityEngine, cancellationToken).ConfigureAwait(false);
+                if (meta is not null)
                 {
-                    continue;
-                }
-
-                bool present;
-                try
-                {
-                    present = await catalogCache.ModelExistsAsync(target.Url, name, cancellationToken).ConfigureAwait(false);
-                }
-                catch
-                {
-                    present = false;
-                }
-
-                if (!present)
-                {
-                    continue;
-                }
-
-                try
-                {
-                    var digest = await catalogCache.GetCurrentDigestAsync(target.Url, cancellationToken).ConfigureAwait(false);
-                    if (!string.IsNullOrEmpty(digest))
+                    if (primaryMetadata is null || (!primaryMetadata.HasModelInfo && meta.HasModelInfo))
                     {
-                        metadata = await capabilityEngine.GetMetadataAsync(target.Url, name, digest, cancellationToken).ConfigureAwait(false);
+                        primaryMetadata = meta;
+                    }
+                    if (primaryMetadata.HasModelInfo)
+                    {
+                        break;
                     }
                 }
-                catch
-                {
-                    metadata = null;
-                }
-
-                break;
             }
         }
 
         return await Task.WhenAll(effectiveTargets.Select(target =>
-            BuildTargetRowAsync(name, target, metadata, pinnedArchitecture, catalogCache, capabilityEngine, executionTracker, cancellationToken)))
+            BuildTargetRowAsync(name, target, primaryMetadata, pinnedArchitecture, catalogCache, capabilityEngine, executionTracker, cancellationToken)))
             .ConfigureAwait(false);
     }
 
     private static async Task<RouterModelTargetCompatibility> BuildTargetRowAsync(
         string name,
         OllamaTargetOptions target,
-        ModelMetadata? metadata,
+        ModelMetadata? primaryMetadata,
         string? pinnedArchitecture,
         IModelCatalogCacheService? catalogCache,
         ModelCapabilityEngine? capabilityEngine,
@@ -1130,8 +1311,18 @@ public static class RouterApiEndpointsExtensions
             }
         }
 
-        TargetModelCapability? capability = metadata is not null && capabilityEngine is not null
-            ? capabilityEngine.DeriveCapability(metadata, targetName, target, pinnedArchitecture)
+        ModelMetadata? metadata = null;
+        if (present)
+        {
+            metadata = await GetTargetMetadataAsync(target, name, catalogCache, capabilityEngine, cancellationToken).ConfigureAwait(false);
+        }
+
+        var effectiveMetadata = metadata is not null
+            ? MergeMetadata(metadata, primaryMetadata)
+            : primaryMetadata;
+
+        TargetModelCapability? capability = effectiveMetadata is not null && capabilityEngine is not null
+            ? capabilityEngine.DeriveCapability(effectiveMetadata, targetName, target, pinnedArchitecture)
             : null;
 
         var capable = capability is not null && capability.HardwareCapable && present;

@@ -834,4 +834,249 @@ public class RouterModelApiEndpointsTests
             await app.DisposeAsync();
         }
     }
+
+    [Fact]
+    public async Task ModelsListAndDetail_DifferentModelfilesPerTarget_Local48k_ServerNative262k_EvaluatesAccuratePerTargetCeilingsAndMaxRecommended()
+    {
+        // Local has Dense 27B with a custom Modelfile "PARAMETER num_ctx 49152"
+        // Server has Dense 27B with native context length 262144 and NO num_ctx clamp
+        var modelName = "Qwen3.8-27B:latest";
+        var localShow = DenseShow(27_300_000_000, numCtx: 49_152);
+        ((JsonObject)localShow["model_info"]!)["qwen35.context_length"] = (JsonNode)262_144L;
+
+        var serverShow = DenseShow(27_300_000_000, numCtx: null);
+        ((JsonObject)serverShow["model_info"]!)["qwen35.context_length"] = (JsonNode)262_144L;
+
+        var tags = (modelName, 17L * 1024 * 1024 * 1024);
+        var catalog = CreateCatalogClientMock(
+            (LocalUrl, [tags], new Dictionary<string, JsonObject> { [modelName] = localShow }),
+            (ServerUrl, [tags], new Dictionary<string, JsonObject> { [modelName] = serverShow }));
+
+        var options = new OllamaRouterOptions
+        {
+            Targets =
+            [
+                new OllamaTargetOptions { Name = "Local", Url = LocalUrl, HardwareHint = "16gb" },
+                new OllamaTargetOptions { Name = "Remote", Url = ServerUrl, HardwareHint = "96gb" }
+            ]
+        };
+
+        await using var harness = await CreateTestAppAsync(options, catalog);
+
+        // 1. GET /api/router/models
+        using var listResponse = await harness.Client.GetAsync("/api/router/models");
+        Assert.Equal(HttpStatusCode.OK, listResponse.StatusCode);
+        var listRoot = (JsonObject?)JsonNode.Parse(await listResponse.Content.ReadAsStringAsync());
+        var summary = ModelNode(listRoot, modelName);
+        Assert.NotNull(summary);
+        Assert.Equal("262144", summary!["nativeContextWindow"]!.ToString());
+        Assert.Equal("262144", summary["recommendedContextWindow"]!.ToString()); // Max of capable fleet nodes
+
+        // 2. GET /api/router/models/{modelName}
+        using var detailResponse = await harness.Client.GetAsync("/api/router/models/" + Uri.EscapeDataString(modelName));
+        Assert.Equal(HttpStatusCode.OK, detailResponse.StatusCode);
+        var detailRoot = (JsonObject)JsonNode.Parse(await detailResponse.Content.ReadAsStringAsync())!;
+        Assert.Equal("262144", detailRoot["recommendedContextWindow"]!.ToString());
+
+        var localTarget = TargetNode(detailRoot, "Local")!;
+        Assert.Equal("true", localTarget["capable"]!.ToString());
+        Assert.Equal("49152", localTarget["contextCeiling"]!.ToString()); // Local Modelfile num_ctx clamp
+
+        var remoteTarget = TargetNode(detailRoot, "Remote")!;
+        Assert.Equal("true", remoteTarget["capable"]!.ToString());
+        Assert.Equal("262144", remoteTarget["contextCeiling"]!.ToString()); // Server native context without clamp
+    }
+
+    [Fact]
+    public void ShouldIncludeModel_FiltersNamespacedModelsByDefault_AllowsNativeAndConfigured()
+    {
+        var opt = new OllamaRouterOptions();
+        Assert.True(opt.FilterNamespacedModels);
+
+        // Native library models and local aliases (no namespace slash)
+        Assert.True(RouterApiEndpointsExtensions.ShouldIncludeModel("llama3:8b", opt));
+        Assert.True(RouterApiEndpointsExtensions.ShouldIncludeModel("Qwen3.8-27B:latest", opt));
+        Assert.True(RouterApiEndpointsExtensions.ShouldIncludeModel("qwen2.5-coder:32b", opt));
+
+        // Namespaced models: filtered out by default
+        Assert.False(RouterApiEndpointsExtensions.ShouldIncludeModel("jetelain/qwen3.6-35b-a3b:latest", opt));
+        Assert.False(RouterApiEndpointsExtensions.ShouldIncludeModel("user/custom-model:latest", opt));
+        Assert.False(RouterApiEndpointsExtensions.ShouldIncludeModel("registry.io/user/custom-model:tag", opt));
+
+        // Namespaced models: included if FilterNamespacedModels is disabled
+        opt.FilterNamespacedModels = false;
+        Assert.True(RouterApiEndpointsExtensions.ShouldIncludeModel("jetelain/qwen3.6-35b-a3b:latest", opt));
+
+        // Namespaced models: included if explicitly configured in Models
+        opt.FilterNamespacedModels = true;
+        opt.Models["jetelain/qwen3.6-35b-a3b"] = new ModelThresholds();
+        Assert.True(RouterApiEndpointsExtensions.ShouldIncludeModel("jetelain/qwen3.6-35b-a3b:latest", opt));
+        Assert.True(RouterApiEndpointsExtensions.ShouldIncludeModel("jetelain/qwen3.6-35b-a3b", opt));
+
+        // Namespaced models: included if configured as CloudOverflow DefaultModel
+        opt.Models.Clear();
+        opt.CloudOverflow.DefaultModel = "custom/cloud-model:latest";
+        Assert.True(RouterApiEndpointsExtensions.ShouldIncludeModel("custom/cloud-model:latest", opt));
+        Assert.True(RouterApiEndpointsExtensions.ShouldIncludeModel("custom/cloud-model", opt));
+
+        // Null / whitespace
+        Assert.False(RouterApiEndpointsExtensions.ShouldIncludeModel("", opt));
+        Assert.False(RouterApiEndpointsExtensions.ShouldIncludeModel("   ", opt));
+    }
+
+    [Fact]
+    public async Task ModelsList_NamespacedModel_FilteredOutByDefault_AndAvoidsCapabilityDiscoveryQueries()
+    {
+        var nativeModel = "llama3:8b";
+        var namespacedModel = "jetelain/qwen3.6-35b-a3b:latest";
+
+        var nativeShow = DenseShow(8_000_000_000, numCtx: 8192);
+        var namespacedShow = DenseShow(35_000_000_000, numCtx: 32768);
+
+        var nativeTag = (nativeModel, 4L * 1024 * 1024 * 1024);
+        var namespacedTag = (namespacedModel, 20L * 1024 * 1024 * 1024);
+
+        var catalog = CreateCatalogClientMock(
+            (LocalUrl, [nativeTag, namespacedTag], new Dictionary<string, JsonObject>
+            {
+                [nativeModel] = nativeShow,
+                [namespacedModel] = namespacedShow
+            }));
+
+        var options = new OllamaRouterOptions
+        {
+            Targets = [new OllamaTargetOptions { Name = "Local", Url = LocalUrl, HardwareHint = "16gb" }]
+        };
+
+        await using var harness = await CreateTestAppAsync(options, catalog);
+
+        using var response = await harness.Client.GetAsync("/api/router/models");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var root = (JsonObject?)JsonNode.Parse(await response.Content.ReadAsStringAsync());
+        Assert.NotNull(root);
+
+        // Native model is included
+        var nativeSummary = ModelNode(root, nativeModel);
+        Assert.NotNull(nativeSummary);
+
+        // Namespaced model is filtered out
+        var namespacedSummary = ModelNode(root, namespacedModel);
+        Assert.Null(namespacedSummary);
+
+        // STRICT VERIFICATION: The /api/show capability query was NEVER called for the namespaced model
+        catalog.Verify(c => c.GetShowAsync(It.IsAny<string>(), namespacedModel, It.IsAny<CancellationToken>()), Times.Never());
+    }
+
+    [Fact]
+    public async Task ModelsList_NamespacedModel_FilterDisabled_IncludesModelAndQueriesCapabilities()
+    {
+        var nativeModel = "llama3:8b";
+        var namespacedModel = "jetelain/qwen3.6-35b-a3b:latest";
+
+        var nativeShow = DenseShow(8_000_000_000, numCtx: 8192);
+        var namespacedShow = DenseShow(35_000_000_000, numCtx: 32768);
+
+        var nativeTag = (nativeModel, 4L * 1024 * 1024 * 1024);
+        var namespacedTag = (namespacedModel, 20L * 1024 * 1024 * 1024);
+
+        var catalog = CreateCatalogClientMock(
+            (LocalUrl, [nativeTag, namespacedTag], new Dictionary<string, JsonObject>
+            {
+                [nativeModel] = nativeShow,
+                [namespacedModel] = namespacedShow
+            }));
+
+        var options = new OllamaRouterOptions
+        {
+            FilterNamespacedModels = false,
+            Targets = [new OllamaTargetOptions { Name = "Local", Url = LocalUrl, HardwareHint = "16gb" }]
+        };
+
+        await using var harness = await CreateTestAppAsync(options, catalog);
+
+        using var response = await harness.Client.GetAsync("/api/router/models");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var root = (JsonObject?)JsonNode.Parse(await response.Content.ReadAsStringAsync());
+        Assert.NotNull(root);
+
+        // Both models are included
+        Assert.NotNull(ModelNode(root, nativeModel));
+        Assert.NotNull(ModelNode(root, namespacedModel));
+
+        // Capability discovery ran for both
+        catalog.Verify(c => c.GetShowAsync(It.IsAny<string>(), namespacedModel, It.IsAny<CancellationToken>()), Times.AtLeastOnce());
+    }
+
+    [Fact]
+    public async Task ModelsList_NamespacedModel_ExplicitlyConfiguredInModels_RetainedEvenWithFilterEnabled()
+    {
+        var namespacedModel = "jetelain/qwen3.6-35b-a3b:latest";
+        var namespacedShow = DenseShow(35_000_000_000, numCtx: 32768);
+        var namespacedTag = (namespacedModel, 20L * 1024 * 1024 * 1024);
+
+        var catalog = CreateCatalogClientMock(
+            (LocalUrl, [namespacedTag], new Dictionary<string, JsonObject>
+            {
+                [namespacedModel] = namespacedShow
+            }));
+
+        var options = new OllamaRouterOptions
+        {
+            FilterNamespacedModels = true,
+            Models =
+            {
+                ["jetelain/qwen3.6-35b-a3b"] = new ModelThresholds()
+            },
+            Targets = [new OllamaTargetOptions { Name = "Local", Url = LocalUrl, HardwareHint = "16gb" }]
+        };
+
+        await using var harness = await CreateTestAppAsync(options, catalog);
+
+        using var response = await harness.Client.GetAsync("/api/router/models");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var root = (JsonObject?)JsonNode.Parse(await response.Content.ReadAsStringAsync());
+        Assert.NotNull(root);
+
+        // Retained because explicitly declared in Models
+        Assert.NotNull(ModelNode(root, namespacedModel));
+    }
+
+    [Fact]
+    public async Task ModelDetail_NamespacedModel_DirectLookup_ResolvesEvenWhenFilteredFromList()
+    {
+        var namespacedModel = "jetelain/qwen3.6-35b-a3b:latest";
+        var namespacedShow = DenseShow(35_000_000_000, numCtx: 32768);
+        var namespacedTag = (namespacedModel, 20L * 1024 * 1024 * 1024);
+
+        var catalog = CreateCatalogClientMock(
+            (LocalUrl, [namespacedTag], new Dictionary<string, JsonObject>
+            {
+                [namespacedModel] = namespacedShow
+            }));
+
+        var options = new OllamaRouterOptions
+        {
+            FilterNamespacedModels = true,
+            Targets = [new OllamaTargetOptions { Name = "Local", Url = LocalUrl, HardwareHint = "16gb" }]
+        };
+
+        await using var harness = await CreateTestAppAsync(options, catalog);
+
+        // 1. Not in GET /api/router/models
+        using var listResponse = await harness.Client.GetAsync("/api/router/models");
+        var listRoot = (JsonObject?)JsonNode.Parse(await listResponse.Content.ReadAsStringAsync());
+        Assert.Null(ModelNode(listRoot, namespacedModel));
+
+        // 2. Direct lookup on GET /api/router/models/{name} resolves
+        using var detailResponse = await harness.Client.GetAsync("/api/router/models/" + Uri.EscapeDataString(namespacedModel));
+        Assert.Equal(HttpStatusCode.OK, detailResponse.StatusCode);
+
+        var detailRoot = (JsonObject?)JsonNode.Parse(await detailResponse.Content.ReadAsStringAsync());
+        Assert.NotNull(detailRoot);
+        Assert.Equal(namespacedModel, detailRoot!["name"]!.ToString());
+        Assert.Equal("32768", detailRoot["recommendedContextWindow"]!.ToString());
+    }
 }

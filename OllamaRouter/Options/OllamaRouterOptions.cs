@@ -99,6 +99,30 @@ public sealed class OllamaRouterOptions
     public bool DispatchToLargestCapacityOnOverflow { get; set; } = true;
 
     /// <summary>
+    /// When true (default), filters out models that are not native library models or local aliases
+    /// (i.e. names containing a namespace slash such as "jetelain/*") from the fleet model list.
+    /// This improves performance by skipping capability discovery for models not intended for fleet
+    /// routing. Models explicitly declared in <see cref="Models"/> or configured for Cloud Overflow
+    /// are never filtered out.
+    /// </summary>
+    public bool FilterNamespacedModels { get; set; } = true;
+
+    /// <summary>
+    /// Alias for <see cref="FilterNamespacedModels"/>.
+    /// </summary>
+    public bool? FilterNonNativeModels
+    {
+        get => FilterNamespacedModels;
+        set
+        {
+            if (value.HasValue)
+            {
+                FilterNamespacedModels = value.Value;
+            }
+        }
+    }
+
+    /// <summary>
     /// Token estimation strategy: "Heuristic" (default, zero heap memory overhead) or "Tiktoken" (Microsoft.ML.Tokenizers cl100k_base).
     /// </summary>
     public string TokenEstimator { get; set; } = "Heuristic";
