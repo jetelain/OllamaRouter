@@ -95,9 +95,14 @@ public static class HardwareMetrics
             return true;
         }
 
-        return ramType == SystemRamType.LpDdr5X &&
-               (gpus is null || gpus.Count == 0) &&
-               cpuBrand.Contains("AMD", StringComparison.OrdinalIgnoreCase);
+        if (ramType == SystemRamType.LpDdr5X && cpuBrand.Contains("AMD", StringComparison.OrdinalIgnoreCase))
+        {
+            // Discrete GPUs have substantial dedicated VRAM (> 2048 MB) and are not APU integrated graphics.
+            var hasDiscreteGpu = gpus is not null && gpus.Any(g => g.VramMB > 2048 || g.Vendor.Equals("Nvidia", StringComparison.OrdinalIgnoreCase));
+            return !hasDiscreteGpu;
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -137,12 +142,12 @@ public static class HardwareMetrics
                 return EstimateAppleUnifiedBandwidthGBs(cpuBrand);
             }
 
-            return EstimateRamBandwidthGBs(ramType, ramChannels);
+            return EstimateRamBandwidthGBs(ramType, ramChannels, cpuBrand);
         }
 
         if (gpus is null || gpus.Count == 0)
         {
-            return EstimateRamBandwidthGBs(ramType, ramChannels);
+            return EstimateRamBandwidthGBs(ramType, ramChannels, cpuBrand);
         }
 
         double max = 0;
@@ -162,12 +167,17 @@ public static class HardwareMetrics
     /// 25.6, DDR5-4800 dual ≈ 38.4 (2× multiplier for 4-channel servers), LPDDR5X-8533 ≈
     /// 85.3 GB/s per channel (× 4 channels default on Strix Halo ≈ 341 GB/s). Unknown → 0.
     /// </summary>
-    public static double EstimateRamBandwidthGBs(SystemRamType ramType, int channels)
+    public static double EstimateRamBandwidthGBs(SystemRamType ramType, int channels, string? cpuBrand = null)
     {
         if (ramType == SystemRamType.LpDdr5X)
         {
-            // 85.3 GB/s per channel; 4 channels by default on Strix Halo (≈ 341 GB/s).
-            return 85.3 * Math.Max(1, channels <= 0 ? 4 : channels);
+            // 85.3 GB/s per channel; 4 channels default on Strix Halo (≈ 341 GB/s).
+            var ch = channels;
+            if (ch < 4 && cpuBrand != null && (cpuBrand.Contains("MAX", StringComparison.OrdinalIgnoreCase) || cpuBrand.Contains("STRIX", StringComparison.OrdinalIgnoreCase)))
+            {
+                ch = 4;
+            }
+            return 85.3 * Math.Max(1, ch <= 0 ? 4 : ch);
         }
 
         if (ramType == SystemRamType.AppleUnified)

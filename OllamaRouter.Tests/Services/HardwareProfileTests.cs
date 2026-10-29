@@ -176,6 +176,21 @@ public class HardwareProfileTests
     }
 
     [Fact]
+    public void AmdLpDdr5XWithApuIntegratedGpu_IsDetectedAsUnified()
+    {
+        var gpus = new[] { new GpuDeviceProfile("AMD", "Strix Halo [Radeon Graphics / Radeon 8060S Graphics]", 0, "Unknown", 0, 0) };
+        var isUnified = HardwareMetrics.DetectUnifiedMemory(
+            "linux", "x64", "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S", SystemRamType.LpDdr5X, gpus);
+        var totalFast = HardwareMetrics.ComputeTotalFastMemoryMB(isUnified, 98304, gpus);
+        var bandwidth = HardwareMetrics.ComputeEffectiveBandwidthGBs(
+            isUnified, SystemRamType.LpDdr5X, "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S", 1, gpus);
+
+        Assert.True(isUnified);
+        Assert.Equal(98304, totalFast);
+        Assert.Equal(341.2, bandwidth, precision: 1);
+    }
+
+    [Fact]
     public void UnknownHardware_NeverProducesFabricatedBandwidth()
     {
         var bandwidth = HardwareMetrics.ComputeEffectiveBandwidthGBs(
