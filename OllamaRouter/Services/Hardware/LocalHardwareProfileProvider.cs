@@ -84,13 +84,16 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
         {
             if (OperatingSystem.IsWindows())
             {
+                cpuBrand = ProbeWindowsCpuBrand();
                 (systemRamMB, ramType, channels) = ProbeWindowsRam();
+                gpus = ProbeDiscreteGpus();
             }
             else if (OperatingSystem.IsLinux())
             {
+                cpuBrand = ProbeLinuxCpuBrand();
                 systemRamMB = ProbeLinuxRamMB();
                 (ramType, channels) = ProbeLinuxRamType();
-                gpus = ProbeLinuxGpus();
+                gpus = ProbeDiscreteGpus();
             }
             else if (OperatingSystem.IsMacOS())
             {
@@ -153,7 +156,16 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
             var gpus = new List<GpuDeviceProfile>(snapshot.Devices.Count);
             foreach (var device in snapshot.Devices)
             {
-                gpus.Add(new GpuDeviceProfile(vendor, ParseDeviceName(device), 0, "Unknown", 0, 0));
+                var modelName = CleanGpuModelName(vendor, ParseDeviceName(device));
+                var (vramType, bandwidth) = vendor switch
+                {
+                    "Nvidia" => ClassifyNvidiaGpu(modelName, 0),
+                    "AMD" => ClassifyAmdGpu(modelName, snapshot.TotalVramMB),
+                    "Intel" => ClassifyIntelGpu(modelName),
+                    _ => ("Unknown", 0.0)
+                };
+
+                gpus.Add(new GpuDeviceProfile(vendor, modelName, 0, vramType, 0, bandwidth));
             }
 
             // The snapshot only carries the SUMMED total VRAM; attribute it all to the
@@ -188,6 +200,20 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
         return name.Trim();
     }
 
+    private static string CleanGpuModelName(string vendor, string rawName)
+    {
+        var name = rawName.Trim();
+        while (name.StartsWith("NVIDIA ", StringComparison.OrdinalIgnoreCase))
+        {
+            name = name[7..].Trim();
+        }
+        while (name.StartsWith("AMD ", StringComparison.OrdinalIgnoreCase))
+        {
+            name = name[4..].Trim();
+        }
+        return name;
+    }
+
     // ------------------------------------------------------------------
     //  Windows probes (wmic + Get-CimInstance PowerShell fallback, mirroring
     //  WindowsVramProvider's pattern)
@@ -201,8 +227,28 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
 
         try
         {
+            var ps = _processRunner.Run(
+                "powershell",
+                "-NoProfile -NonInteractive -Command \"Get-CimInstance Win32_PhysicalMemory | Select-Object Capacity,MemoryType,SMBIOSMemoryType,Speed,DeviceLocator | Format-List\"",
+                PowerShellTimeoutMs);
+            if (ps.Succeeded && ps.StdOut.Length > 0)
+            {
+                var parsed = ParseWin32PhysicalMemory(ps.StdOut);
+                if (parsed.RamMB > 0 || parsed.Type != SystemRamType.Unknown)
+                {
+                    return parsed;
+                }
+            }
+        }
+        catch
+        {
+            // Fall through to wmic.
+        }
+
+        try
+        {
             var wmic = _processRunner.Run(
-                "wmic", "path win32_physicalmemory get Capacity,MemoryType,DataWidth,Speed,DeviceLocator /format:list", WmicTimeoutMs);
+                "wmic", "path win32_physicalmemory get Capacity,MemoryType,SMBIOSMemoryType,Speed,DeviceLocator /format:list", WmicTimeoutMs);
             if (wmic.Succeeded && wmic.StdOut.Length > 0)
             {
                 var parsed = ParseWin32PhysicalMemory(wmic.StdOut);
@@ -214,7 +260,7 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
         }
         catch
         {
-            // Fall through to the PowerShell fallback.
+            // Fall through to legacy PowerShell fallback.
         }
 
         try
@@ -233,18 +279,23 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
             // Fail-soft: unknown RAM type.
         }
 
-        return (ramMB, type, channels);
+        if (ramMB == 0 && OperatingSystem.IsWindows())
+        {
+            ramMB = GetWindowsPhysicalMemoryMB();
         }
 
-        /// <summary>
-        /// Parses <c>Get-CimInstance Win32_PhysicalMemory</c> fallback output: one
-        /// <c>MemoryType,Capacity</c> line per physical module (older CIM scripts may emit
-        /// a bare <c>MemoryType</c> line, which still updates the type). Accumulates the
-        /// incoming <paramref name="ramMB"/> baseline (bytes → MB) and returns the
-        /// highest-severity type code seen.
-        /// </summary>
-        internal static (long RamMB, SystemRamType Type) ParseCimInstanceMemoryOutput(string output, long ramMBBaseline = 0)
-        {
+        return (ramMB, type, channels);
+    }
+
+    /// <summary>
+    /// Parses <c>Get-CimInstance Win32_PhysicalMemory</c> fallback output: one
+    /// <c>MemoryType,Capacity</c> line per physical module (older CIM scripts may emit
+    /// a bare <c>MemoryType</c> line, which still updates the type). Accumulates the
+    /// incoming <paramref name="ramMB"/> baseline (bytes → MB) and returns the
+    /// highest-severity type code seen.
+    /// </summary>
+    internal static (long RamMB, SystemRamType Type) ParseCimInstanceMemoryOutput(string output, long ramMBBaseline = 0)
+    {
         var ramMB = ramMBBaseline;
         SystemRamType type = SystemRamType.Unknown;
 
@@ -256,7 +307,9 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
                 continue;
             }
 
-            type = MaxSeverity(type, ParseWmiMemoryType(parts[0].Trim()));
+            var typeCode = parts[0].Trim();
+            var parsedType = MaxSeverity(ParseWmiMemoryType(typeCode), ParseSmbiosMemoryType(typeCode));
+            type = MaxSeverity(type, parsedType);
             if (parts.Length == 2 && long.TryParse(parts[1].Trim(), out var bytes))
             {
                 ramMB += Math.Max(0, bytes / 1024 / 1024);
@@ -264,7 +317,7 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
         }
 
         return (ramMB, type);
-        }
+    }
 
     /// <summary>
     /// Parses <c>Win32_PhysicalMemory</c> WMI list-format output: RAM MB = Σ <c>Capacity</c>
@@ -277,24 +330,56 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
         SystemRamType type = SystemRamType.Unknown;
         var locators = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var currentLocator = "";
+        var maxSpeed = 0;
 
         foreach (var rawLine in wmicOutput.Split('\n'))
         {
             var line = rawLine.Trim();
-            if (line.StartsWith("Capacity=", StringComparison.OrdinalIgnoreCase) &&
-                long.TryParse(line.AsSpan(9), out var bytes))
+            if (line.Length == 0) continue;
+
+            string key;
+            string value;
+            var eq = line.IndexOf('=');
+            var colon = line.IndexOf(':');
+            if (eq >= 0 && (colon < 0 || eq < colon))
+            {
+                key = line[..eq].Trim();
+                value = line[(eq + 1)..].Trim();
+            }
+            else if (colon >= 0)
+            {
+                key = line[..colon].Trim();
+                value = line[(colon + 1)..].Trim();
+            }
+            else
+            {
+                continue;
+            }
+
+            if (key.Equals("Capacity", StringComparison.OrdinalIgnoreCase) &&
+                long.TryParse(value, out var bytes))
             {
                 ramMB += Math.Max(0, bytes / 1024 / 1024);
             }
-            else if (line.StartsWith("MemoryType=", StringComparison.OrdinalIgnoreCase))
+            else if (key.Equals("MemoryType", StringComparison.OrdinalIgnoreCase))
             {
-                type = MaxSeverity(type, ParseWmiMemoryType(line.AsSpan(11).ToString().Trim()));
+                type = MaxSeverity(type, ParseWmiMemoryType(value));
             }
-            else if (line.StartsWith("DeviceLocator=", StringComparison.OrdinalIgnoreCase))
+            else if (key.Equals("SMBIOSMemoryType", StringComparison.OrdinalIgnoreCase))
             {
-                currentLocator = line.AsSpan(14).ToString().Trim();
+                type = MaxSeverity(type, ParseSmbiosMemoryType(value));
+            }
+            else if (key.Equals("Speed", StringComparison.OrdinalIgnoreCase) &&
+                     int.TryParse(value, out var speed) && speed > 0)
+            {
+                maxSpeed = Math.Max(maxSpeed, speed);
+            }
+            else if (key.Equals("DeviceLocator", StringComparison.OrdinalIgnoreCase))
+            {
+                currentLocator = value;
                 // Channel = distinct bank prefix (strip the trailing DIMM slot digit):
                 // "DIMM A1" and "DIMM A2" share bank "A".
+                // "Controller0-DIMM1" and "Controller1-DIMM1" share "Controller0-DIMM" / "Controller1-DIMM".
                 var bank = currentLocator.TrimEnd();
                 var digitStart = bank.Length;
                 while (digitStart > 0 && char.IsDigit(bank[digitStart - 1]))
@@ -309,7 +394,38 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
             }
         }
 
+        if (type == SystemRamType.Unknown && maxSpeed > 0)
+        {
+            if (maxSpeed >= 4400)
+            {
+                type = SystemRamType.Ddr5;
+            }
+            else if (maxSpeed >= 1866)
+            {
+                type = SystemRamType.Ddr4;
+            }
+        }
+
         return (ramMB, type, locators.Count);
+    }
+
+    internal static SystemRamType ParseSmbiosMemoryType(string value)
+    {
+        if (!int.TryParse(value, out var code))
+        {
+            return SystemRamType.Unknown;
+        }
+
+        // DMTF SMBIOS DSP0134 Type 17 Memory Device - Memory Type codes:
+        // 24 = DDR3, 26 = DDR4, 34 = DDR5, 35 = LPDDR5
+        return code switch
+        {
+            24 => SystemRamType.Ddr3,
+            26 => SystemRamType.Ddr4,
+            34 => SystemRamType.Ddr5,
+            35 => SystemRamType.LpDdr5X,
+            _ => SystemRamType.Unknown
+        };
     }
 
     internal static SystemRamType ParseWmiMemoryType(string value)
@@ -460,18 +576,20 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
             : SystemRamType.Unknown;
     }
 
-    private IReadOnlyList<GpuDeviceProfile> ProbeLinuxGpus()
+    private IReadOnlyList<GpuDeviceProfile> ProbeLinuxGpus() => ProbeDiscreteGpus();
+
+    private IReadOnlyList<GpuDeviceProfile> ProbeDiscreteGpus()
     {
         var gpus = new List<GpuDeviceProfile>();
 
-        // NVIDIA: nvidia-smi (bus width + model name → GDDR6/GDDR6X class heuristic).
+        // NVIDIA: nvidia-smi (cross-platform on Windows and Linux).
         try
         {
             var nvidia = _processRunner.Run(
                 "nvidia-smi",
-                "--query-gpu=name,memory.total,memory.bus_width --format=csv,noheader",
+                "--query-gpu=name,memory.total --format=csv,noheader",
                 5000);
-            if (nvidia.Succeeded)
+            if (nvidia.Succeeded && nvidia.StdOut.Length > 0)
             {
                 foreach (var rawLine in nvidia.StdOut.Split('\n'))
                 {
@@ -481,11 +599,11 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
                         continue;
                     }
 
-                    var name = parts[0];
+                    var rawName = parts[0];
+                    var name = CleanGpuModelName("Nvidia", rawName);
                     var vram = ParseLeadingInt(parts[1]);
-                    var busWidth = parts.Length >= 3 ? ParseLeadingInt(parts[2]) : 0;
-                    var (vramType, bandwidth) = ClassifyNvidiaGpu(name, busWidth);
-                    gpus.Add(new GpuDeviceProfile("Nvidia", name, vram, vramType, busWidth, bandwidth));
+                    var (vramType, bandwidth) = ClassifyNvidiaGpu(name, 0);
+                    gpus.Add(new GpuDeviceProfile("Nvidia", name, vram, vramType, 0, bandwidth));
                 }
             }
         }
@@ -494,11 +612,16 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
             // Fail-soft: no NVIDIA GPUs.
         }
 
+        if (gpus.Count > 0)
+        {
+            return gpus;
+        }
+
         // AMD: rocm-smi JSON (VRAM total; no bus width → GDDR6 estimate when > 8 GB, else unknown).
         try
         {
             var rocm = _processRunner.Run("rocm-smi", "--showmeminfo vram --json", 5000);
-            if (rocm.Succeeded)
+            if (rocm.Succeeded && rocm.StdOut.Length > 0)
             {
                 var matches = Regex.Matches(rocm.StdOut, "\"vram_total\"\\s*:\\s*(\\d+)");
                 foreach (Match match in matches)
@@ -506,9 +629,8 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
                     if (long.TryParse(match.Groups[1].Value, out var totalKb))
                     {
                         var vramMB = (int)Math.Max(0, totalKb / 1024);
-                        var vramType = vramMB >= 8192 ? "GDDR6" : "Unknown";
-                        gpus.Add(new GpuDeviceProfile("AMD", "AMD GPU (rocm-smi)", vramMB, vramType, 0,
-                            vramType == "GDDR6" ? HardwareMetrics.EstimateGpuBandwidthGBs("GDDR6", 0) : 0));
+                        var (vramType, bandwidth) = ClassifyAmdGpu("AMD GPU (rocm-smi)", vramMB);
+                        gpus.Add(new GpuDeviceProfile("AMD", "AMD GPU (rocm-smi)", vramMB, vramType, 0, bandwidth));
                     }
                 }
             }
@@ -521,7 +643,7 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
         return gpus;
     }
 
-    private static (string VramType, double Bandwidth) ClassifyNvidiaGpu(string name, int busWidth)
+    internal static (string VramType, double Bandwidth) ClassifyNvidiaGpu(string name, int busWidth)
     {
         var upper = name.ToUpperInvariant();
         if (upper.Contains("H100") || upper.Contains("H200") || upper.Contains("HOPPER") || upper.Contains("BLACKWELL") || upper.Contains("B200") || upper.Contains("B100") || upper.Contains("B40"))
@@ -534,12 +656,40 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
             return ("HBM2E", HardwareMetrics.EstimateGpuBandwidthGBs("HBM2E", busWidth));
         }
 
-        if (upper.Contains("3090") || upper.Contains("4080") || upper.Contains("4090") || upper.Contains("RTX 4") || upper.Contains("RTX 309") || upper.Contains("4070"))
+        if (upper.Contains("3090") || upper.Contains("4080") || upper.Contains("4090") || upper.Contains("RTX 4") || upper.Contains("RTX 309") || upper.Contains("4070") || upper.Contains("3080") || upper.Contains("3070 TI"))
         {
             return ("GDDR6X", HardwareMetrics.EstimateGpuBandwidthGBs("GDDR6X", busWidth));
         }
 
         return ("GDDR6", HardwareMetrics.EstimateGpuBandwidthGBs("GDDR6", busWidth));
+    }
+
+    internal static (string VramType, double Bandwidth) ClassifyAmdGpu(string name, int vramMB)
+    {
+        var upper = name.ToUpperInvariant();
+        if (upper.Contains("MI300") || upper.Contains("MI325"))
+        {
+            return ("HBM3", HardwareMetrics.EstimateGpuBandwidthGBs("HBM3", 0));
+        }
+
+        if (upper.Contains("MI250") || upper.Contains("MI200") || upper.Contains("MI100"))
+        {
+            return ("HBM2E", HardwareMetrics.EstimateGpuBandwidthGBs("HBM2E", 0));
+        }
+
+        var vramType = vramMB >= 8192 || upper.Contains("7900") || upper.Contains("7800") || upper.Contains("6900") || upper.Contains("6800") ? "GDDR6" : "Unknown";
+        return (vramType, vramType == "GDDR6" ? HardwareMetrics.EstimateGpuBandwidthGBs("GDDR6", 0) : 0);
+    }
+
+    internal static (string VramType, double Bandwidth) ClassifyIntelGpu(string name)
+    {
+        var upper = name.ToUpperInvariant();
+        if (upper.Contains("ARC") || upper.Contains("A770") || upper.Contains("A750") || upper.Contains("B580") || upper.Contains("B570"))
+        {
+            return ("GDDR6", HardwareMetrics.EstimateGpuBandwidthGBs("GDDR6", 0));
+        }
+
+        return ("Unknown", 0);
     }
 
     private static int ParseLeadingInt(string value)
@@ -614,5 +764,96 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
         }
 
         return Array.Empty<GpuDeviceProfile>();
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MEMORYSTATUSEX
+    {
+        public uint dwLength;
+        public uint dwMemoryLoad;
+        public ulong ullTotalPhys;
+        public ulong ullAvailPhys;
+        public ulong ullTotalPageFile;
+        public ulong ullAvailPageFile;
+        public ulong ullTotalVirtual;
+        public ulong ullAvailVirtual;
+        public ulong ullAvailExtendedVirtual;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
+
+    private static long GetWindowsPhysicalMemoryMB()
+    {
+        try
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                var status = new MEMORYSTATUSEX();
+                status.dwLength = (uint)Marshal.SizeOf<MEMORYSTATUSEX>();
+                if (GlobalMemoryStatusEx(ref status) && status.ullTotalPhys > 0)
+                {
+                    return (long)(status.ullTotalPhys / 1024 / 1024);
+                }
+            }
+        }
+        catch
+        {
+            // Fail-soft
+        }
+
+        return 0;
+    }
+
+    private static string ProbeWindowsCpuBrand()
+    {
+        try
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                var brand = Microsoft.Win32.Registry.GetValue(
+                    @"HKEY_LOCAL_MACHINE\HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+                    "ProcessorNameString",
+                    null) as string;
+                if (!string.IsNullOrWhiteSpace(brand))
+                {
+                    return brand.Trim();
+                }
+            }
+        }
+        catch
+        {
+            // Fail-soft
+        }
+
+        return "";
+    }
+
+    private static string ProbeLinuxCpuBrand()
+    {
+        try
+        {
+            if (File.Exists("/proc/cpuinfo"))
+            {
+                foreach (var line in File.ReadLines("/proc/cpuinfo"))
+                {
+                    if (line.StartsWith("model name", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var colon = line.IndexOf(':');
+                        if (colon > 0)
+                        {
+                            return line[(colon + 1)..].Trim();
+                        }
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Fail-soft
+        }
+
+        return "";
     }
 }

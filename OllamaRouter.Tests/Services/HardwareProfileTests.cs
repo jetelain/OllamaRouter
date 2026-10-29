@@ -249,6 +249,29 @@ public class HardwareProfileTests
     }
 
     [Fact]
+    public async Task GetLocalProfile_LiveOnCurrentMachine_ProbesSensibleValues()
+    {
+        var runner = new ProcessRunner();
+        var gpu = new NvidiaSmiVramProvider(runner);
+        var provider = new LocalHardwareProfileProvider(runner, gpu, NullLogger<LocalHardwareProfileProvider>.Instance);
+
+        var profile = await provider.GetLocalProfileAsync();
+
+        Assert.NotNull(profile);
+        Assert.False(string.IsNullOrWhiteSpace(profile.NodeName));
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.True(profile.SystemRamMB > 0, $"Expected RAM > 0, got {profile.SystemRamMB}");
+            Assert.NotEqual(SystemRamType.Unknown, profile.SystemRamType);
+            if (profile.Gpus.Count > 0)
+            {
+                Assert.NotEqual("Unknown", profile.Gpus[0].VramType);
+                Assert.False(profile.Gpus[0].ModelName.StartsWith("NVIDIA NVIDIA"));
+            }
+        }
+    }
+
+    [Fact]
     public void GetLocalProfile_ThrowsWhenConstructorDepsMissing()
     {
         Assert.Throws<ArgumentNullException>(() => new LocalHardwareProfileProvider(
@@ -352,6 +375,102 @@ public class HardwareProfileTests
 
         Assert.Equal(2048, ramMB); // 1024 baseline + 1 GiB
         Assert.Equal(SystemRamType.Ddr4, type);
+    }
+
+    [Theory]
+    [InlineData("24", SystemRamType.Ddr3)]
+    [InlineData("26", SystemRamType.Ddr4)]
+    [InlineData("34", SystemRamType.Ddr5)]
+    [InlineData("35", SystemRamType.LpDdr5X)]
+    [InlineData("0", SystemRamType.Unknown)]
+    [InlineData("99", SystemRamType.Unknown)]
+    [InlineData("", SystemRamType.Unknown)]
+    public void ParseSmbiosMemoryType_MapsDocumentedCodes(string code, SystemRamType expected)
+    {
+        Assert.Equal(expected, LocalHardwareProfileProvider.ParseSmbiosMemoryType(code));
+    }
+
+    [Fact]
+    public void ParseWin32PhysicalMemory_FormatList_ParsesCapacity_SmbiosMemoryType_AndControllers()
+    {
+        const string psOutput = """
+            Capacity         : 34359738368
+            MemoryType       : 0
+            SMBIOSMemoryType : 34
+            Speed            : 6400
+            DeviceLocator    : Controller0-DIMM1
+
+            Capacity         : 34359738368
+            MemoryType       : 0
+            SMBIOSMemoryType : 34
+            Speed            : 6400
+            DeviceLocator    : Controller1-DIMM1
+            """;
+
+        var (ramMB, type, channels) = LocalHardwareProfileProvider.ParseWin32PhysicalMemory(psOutput);
+
+        Assert.Equal(65536, ramMB);
+        Assert.Equal(SystemRamType.Ddr5, type);
+        Assert.Equal(2, channels);
+    }
+
+    [Fact]
+    public void ParseWin32PhysicalMemory_SpeedFallback_WhenTypeCodesZero()
+    {
+        const string psOutput = """
+            Capacity: 17179869184
+            MemoryType: 0
+            SMBIOSMemoryType: 0
+            Speed: 6000
+            DeviceLocator: DIMM1
+            """;
+
+        var (ramMB, type, channels) = LocalHardwareProfileProvider.ParseWin32PhysicalMemory(psOutput);
+
+        Assert.Equal(16384, ramMB);
+        Assert.Equal(SystemRamType.Ddr5, type);
+    }
+
+    [Theory]
+    [InlineData("GeForce RTX 4080 SUPER", 0, "GDDR6X")]
+    [InlineData("GeForce RTX 4090", 384, "GDDR6X")]
+    [InlineData("GeForce RTX 3080", 320, "GDDR6X")]
+    [InlineData("GeForce RTX 3070", 256, "GDDR6")]
+    [InlineData("NVIDIA H100 80GB HBM3", 512, "HBM3")]
+    [InlineData("NVIDIA A100-PCIE-40GB", 512, "HBM2E")]
+    public void ClassifyNvidiaGpu_MapsGenerationsAndTiers(string name, int busWidth, string expectedType)
+    {
+        var (vramType, bandwidth) = LocalHardwareProfileProvider.ClassifyNvidiaGpu(name, busWidth);
+        Assert.Equal(expectedType, vramType);
+        Assert.True(bandwidth > 0);
+    }
+
+    [Theory]
+    [InlineData("AMD Radeon RX 7900 XTX", 24576, "GDDR6")]
+    [InlineData("AMD Instinct MI300X", 196608, "HBM3")]
+    [InlineData("AMD GPU (rocm-smi)", 4096, "Unknown")]
+    public void ClassifyAmdGpu_MapsGenerationsAndTiers(string name, int vramMB, string expectedType)
+    {
+        var (vramType, bandwidth) = LocalHardwareProfileProvider.ClassifyAmdGpu(name, vramMB);
+        Assert.Equal(expectedType, vramType);
+        if (expectedType != "Unknown")
+        {
+            Assert.True(bandwidth > 0);
+        }
+    }
+
+    [Theory]
+    [InlineData("Intel Arc A770 Graphics", "GDDR6")]
+    [InlineData("Intel Arc B580", "GDDR6")]
+    [InlineData("Intel UHD Graphics 770", "Unknown")]
+    public void ClassifyIntelGpu_MapsGenerationsAndTiers(string name, string expectedType)
+    {
+        var (vramType, bandwidth) = LocalHardwareProfileProvider.ClassifyIntelGpu(name);
+        Assert.Equal(expectedType, vramType);
+        if (expectedType != "Unknown")
+        {
+            Assert.True(bandwidth > 0);
+        }
     }
 
     [Fact]

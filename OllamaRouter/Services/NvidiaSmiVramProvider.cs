@@ -54,7 +54,8 @@ public sealed class NvidiaSmiVramProvider : IGpuVramProvider
                 }
                 if (numberEnd > 0 && int.TryParse(totalPart[..numberEnd], out var totalMB))
                 {
-                    devices.Add($"NVIDIA {name} ({totalMB} MB)");
+                    var displayName = name.StartsWith("NVIDIA", StringComparison.OrdinalIgnoreCase) ? name : $"NVIDIA {name}";
+                    devices.Add($"{displayName} ({totalMB} MB)");
                     totalVramMB += totalMB;
                 }
             }

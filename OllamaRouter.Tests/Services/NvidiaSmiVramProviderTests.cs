@@ -129,4 +129,21 @@ public class NvidiaSmiVramProviderTests
 
         Assert.Equal(LocalGpuSnapshot.Unknown, await provider.GetLocalGpuSnapshotAsync());
     }
+
+    [Fact]
+    public async Task GetLocalGpuSnapshot_DoesNotDuplicateVendorPrefix_WhenStdoutAlreadyIncludesNvidia()
+    {
+        var runner = new FakeProcessRunner().Succeeds(
+            "nvidia-smi",
+            "--query-gpu=name,memory.total --format=csv,noheader",
+            "NVIDIA GeForce RTX 4080 SUPER, 16376 MiB\n");
+
+        var provider = new NvidiaSmiVramProvider(runner);
+
+        var snapshot = await provider.GetLocalGpuSnapshotAsync();
+
+        Assert.Equal("Nvidia", snapshot.Vendor);
+        Assert.Equal(["NVIDIA GeForce RTX 4080 SUPER (16376 MB)"], snapshot.Devices);
+        Assert.Equal(16376, snapshot.TotalVramMB);
+    }
 }
