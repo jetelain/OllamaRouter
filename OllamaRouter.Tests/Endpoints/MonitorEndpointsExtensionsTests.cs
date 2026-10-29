@@ -479,14 +479,24 @@ public class MonitorEndpointsExtensionsTests
         var now = DateTimeOffset.UtcNow;
         var dynamic = new DynamicContextOptions();
 
-        // "Local" has an expanded lease (SmallDense profile: 32,768 baseline / 65,536 /
-        // 131,072 max; a 60,000-token prompt selects the 65,536 expanded bucket).
+        // "Local" has an expanded lease (MoE two-bucket ladder, task #26: the pre-configured
+        // baseline is 184,320 and the single extensible bucket is the native limit 262,144;
+        // a 195,000-token prompt exceeds the baseline so the engine expands to 262,144).
+        var moeCapability = new TargetModelCapability(
+            RoutingTarget.Local.Value,
+            ModelArchitectureKind.Moe,
+            ArchitectureDetectionSource.MoeExpertCount,
+            184_320,
+            262_144,
+            true,
+            null,
+            262_144);
         shrinkManager.Decide(
             RoutingTarget.Local,
             "llama3.2:latest",
-            DynamicContextSizingEngine.Decide(dynamic, ModelArchitectureKind.SmallDense, 16_384, 131_072, 60_000, null),
+            DynamicContextSizingEngine.Decide(dynamic, moeCapability, 195_000, null, 8_192, null),
             dynamic,
-            60_000,
+            195_000,
             now);
 
         var (app, client, _) = await CreateTestAppAsync(contextShrinkManager: shrinkManager);
@@ -501,7 +511,7 @@ public class MonitorEndpointsExtensionsTests
             // Expanded lease: "<bucket>k (expanded)".
             var localContext = fleet[0]!["contextAllocation"]?.GetValue<string>()!;
             Assert.EndsWith(" (expanded)", localContext);
-            Assert.StartsWith("65.5k", localContext);
+            Assert.StartsWith("262.1k", localContext);
 
             // No leases: baseline implied ("-"). Cloud: always "baseline".
             // (The legacy synthesized fleet only has Local in this test app.)

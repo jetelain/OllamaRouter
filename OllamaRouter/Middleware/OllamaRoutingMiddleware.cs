@@ -1491,21 +1491,54 @@ public sealed class OllamaRoutingMiddleware(
                 return (null, null);
             }
 
-            // Hierarchy level 1 (explicit Modelfile num_ctx) already caps CMax in
-            // DeriveCapability, so ceiling = CMax.
             var clientNumCtx = DynamicContextPayloadTransformer.ExtractClientNumCtx(body);
+            var margin = Math.Max(0, options.Value.ContextFitMarginTokens);
             var decision = DynamicContextSizingEngine.Decide(
                 dynamicOptions,
-                capability.Architecture,
-                targetOptions.GetEffectiveMaxVramMB(),
-                capability.CMax,
+                capability,
                 tokenCount,
-                clientNumCtx);
+                clientNumCtx,
+                margin,
+                thresholds?.MaxContextTokens);
 
-            // Auto-Shrink Manager (Phase 3, item 2): apply the KV-cache-hysteresis lease on
-            // top of the stateless engine decision - it may RETAIN an expanded bucket (KV
-            // prefix cache preserved) or fire a shrink back to the baseline bucket. When the
-            // manager is absent (null, pre-lease test pipeline) the engine decision stands.
+            // Dense clamp-only pass-through (task #26): the Auto-Shrink Manager is skipped
+            // entirely (dense is never bucketed or leased — a dense KV refill costs 300 s+).
+            // Clamped → rewrite options.num_ctx down to the pre-configured baseline exactly
+            // once; PassThrough → the payload is byte-identical, no mode header.
+            if (decision.Mode is ContextSizingMode.Clamped or ContextSizingMode.PassThrough)
+            {
+                if (decision.Mode == ContextSizingMode.Clamped)
+                {
+                    var (clampedBody, clampedInjected) = DynamicContextPayloadTransformer.ApplyExplicitNumCtx(body, decision.InjectedNumCtx);
+                    if (clampedInjected is null)
+                    {
+                        // Unparseable payload: permissive pass-through (never break the body).
+                        return (null, null);
+                    }
+
+                    var clampedBytes = System.Text.Encoding.UTF8.GetBytes(clampedBody);
+                    context.Request.Body = new MemoryStream(clampedBytes);
+                    context.Request.ContentLength = clampedBytes.Length;
+                    context.Request.Body.Position = 0; // Ready for the forwarder (and the recorder) to read.
+
+                    context.Response.Headers[OllamaReverseProxyConfig.TelemetryContextModeHeader] = decision.Mode.ToString();
+                    logger.LogInformation(
+                        "Dynamic context sizing (dense clamp-only): {Model} on {Target} - client num_ctx {ClientNumCtx} clamped down to the pre-configured context {Injected}.",
+                        modelName,
+                        target.Value,
+                        clientNumCtx?.ToString() ?? "none",
+                        clampedInjected.Value);
+                    return (clampedInjected, clampedBody);
+                }
+
+                return (null, null);
+            }
+
+            // MoE two-bucket ladder + Auto-Shrink Manager (Phase 3, item 2): apply the
+            // KV-cache-hysteresis lease on top of the stateless engine decision - it may
+            // RETAIN an expanded bucket (KV prefix cache preserved) or fire a shrink back
+            // to the pre-configured baseline bucket. When the manager is absent (null,
+            // pre-lease test pipeline) the engine decision stands.
             int injectedValue = decision.InjectedNumCtx;
             LeaseBucketState? leaseState = null;
             if (_contextShrinkManager is { } shrinkManager)
@@ -1537,21 +1570,22 @@ public sealed class OllamaRoutingMiddleware(
             context.Request.ContentLength = bodyBytes.Length;
             context.Request.Body.Position = 0; // Ready for the forwarder (and the recorder) to read.
 
-            // Informational response header: the lease mode of this request (retained vs
-            // fresh/shrunk vs baseline) when the Auto-Shrink Manager participates.
-            if (leaseState is { } mode)
-            {
-                context.Response.Headers[OllamaReverseProxyConfig.TelemetryContextModeHeader] = mode.ToString();
-            }
+            // Informational response header: the superset mode vocabulary (task #26) — the
+            // lease state when the Auto-Shrink Manager participates (Baseline/FreshExpand/
+            // RetainedExpanded/ShrunkToBaseline), otherwise the engine mode (Baseline for
+            // the MoE baseline bucket; Expanded when the engine expanded the context).
+            var mode = leaseState is { } leaseMode ? leaseMode.ToString() : decision.Mode.ToString();
+            context.Response.Headers[OllamaReverseProxyConfig.TelemetryContextModeHeader] = mode;
 
             logger.LogInformation(
-                "Dynamic context sizing: {Model} on {Target} - {Tokens} estimated tokens, client num_ctx {ClientNumCtx}, injected bucket {Injected} (profile {Profile}, ceiling {Ceiling}, clamped {Clamped}).",
+                "Dynamic context sizing: {Model} on {Target} - {Tokens} estimated tokens, client num_ctx {ClientNumCtx}, injected bucket {Injected} (mode {Mode}, baseline {Baseline}, ceiling {Ceiling}, clamped {Clamped}).",
                 modelName,
                 target.Value,
                 tokenCount,
                 clientNumCtx?.ToString() ?? "none",
                 injected.Value,
-                decision.ProfileName,
+                mode,
+                decision.BaselineBucket,
                 decision.EffectiveCeiling,
                 decision.ClientRequestedClamped);
 

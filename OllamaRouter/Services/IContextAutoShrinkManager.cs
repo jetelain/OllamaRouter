@@ -100,7 +100,7 @@ public interface IContextAutoShrinkManager
     /// <summary>
     /// Read-only snapshot of all currently held leases, for operator observability (monitor
     /// UI / TUI): per target (Cloud excluded), the active bucket per model and whether the
-    /// lease is currently expanded above its profile baseline. Never throws and never
+    /// lease is currently expanded above its pre-configured baseline. Never throws and never
     /// mutates lease state; callers may invoke it from any thread.
     /// </summary>
     IReadOnlyDictionary<RoutingTarget, IReadOnlyList<ContextLeaseView>> GetLeaseSnapshot();
@@ -110,6 +110,6 @@ public interface IContextAutoShrinkManager
 /// Immutable read-only view of a single (target, model) lease for monitoring:
 /// <see cref="ActiveBucket"/> is the context bucket (tokens) currently held by the lease
 /// (the last value injected into <c>options.num_ctx</c>); <see cref="IsExpanded"/> is true
-/// while the lease is retained above the profile baseline.
+/// while the lease is retained above the pre-configured baseline.
 /// </summary>
 public sealed record ContextLeaseView(string Model, int ActiveBucket, bool IsExpanded);

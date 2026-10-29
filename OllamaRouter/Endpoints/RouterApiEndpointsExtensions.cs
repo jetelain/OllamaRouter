@@ -876,14 +876,21 @@ public static class RouterApiEndpointsExtensions
         var (architecture, _) = capabilityEngine.ClassifyArchitecture(metadata, pinnedArchitecture);
 
         // The same model file yields the same weights/num_ctx across nodes: reuse the single
-        // metadata for every target's pure VRAM-math ceiling derivation.
+        // metadata for every target's pure VRAM-math ceiling derivation. recommendedContextWindow
+        // (task #26): dense models report the max pre-configured CMax (the optimal bucket is
+        // the whole capacity — dense is never expanded); MoE models report the max of the
+        // MoE-aware extensible capacity min(native ?? 128k, MaxContextTokens ?? ∞), which is
+        // the extensible ceiling beyond the node's pre-configured context.
         var recommended = ModelCapabilityEngine.OllamaDefaultContext;
         foreach (var target in effectiveTargets)
         {
             var capability = capabilityEngine.DeriveCapability(metadata, target.Name!, target, pinnedArchitecture);
             if (capability.HardwareCapable)
             {
-                recommended = Math.Max(recommended, capability.CMax);
+                var capacity = capability.Architecture == ModelArchitectureKind.Moe
+                    ? ModelCapabilityEngine.GetMoeExtensibleCapacity(capability, thresholds?.MaxContextTokens)
+                    : capability.CMax;
+                recommended = Math.Max(recommended, capacity);
             }
         }
 
@@ -1177,18 +1184,25 @@ public static class RouterApiEndpointsExtensions
 
         var sizing = DynamicContextSizingEngine.Decide(
             opt.DynamicContext,
-            capability.Architecture,
-            targetOptions.GetEffectiveMaxVramMB(),
-            capability.CMax,
+            capability,
             request.EstimatedTokens,
-            request.ClientRequestedNumCtx);
+            request.ClientRequestedNumCtx,
+            Math.Max(0, opt.ContextFitMarginTokens),
+            thresholds?.MaxContextTokens);
 
-        var profile = opt.DynamicContext.GetProfile(sizing.ProfileName);
-        var contextMode = sizing.InjectedNumCtx > profile.DefaultContext ? "expanded" : "baseline";
+        // contextMode vocabulary (task #26, lowercase engine modes): passthrough (dense,
+        // untouched — injectedNumCtx reports what would flow through, matching the existing
+        // degraded-preview convention), clamped (dense, down-clamped), baseline/expanded
+        // (MoE two-bucket ladder).
+        var (injectedNumCtx, contextMode) = sizing.Mode switch
+        {
+            ContextSizingMode.PassThrough => (request.ClientRequestedNumCtx ?? estimatedTokensWithMargin, "passthrough"),
+            _ => (sizing.InjectedNumCtx, sizing.Mode.ToString().ToLowerInvariant())
+        };
 
         return new RouterContextEvaluateResponse(
             SelectedTarget: selected.Value,
-            InjectedNumCtx: sizing.InjectedNumCtx,
+            InjectedNumCtx: injectedNumCtx,
             ContextMode: contextMode,
             EstimatedTokensWithMargin: estimatedTokensWithMargin,
             TargetMaxContext: sizing.EffectiveCeiling,
@@ -1246,7 +1260,11 @@ public sealed record RouterTargetExecution(
 /// Per-model capability summary of <c>GET /api/router/models</c>: the discovered
 /// architecture wire name ("Dense"/"Moe"/"Unknown"), the parameter count (null when unknown),
 /// the native Modelfile num_ctx (Ollama default when the Modelfile omits it), the
-/// router-calculated hardware-safe context ceiling and the cloud overflow hint.
+/// router-calculated context recommendation and the cloud overflow hint.
+/// <see cref="RecommendedContextWindow"/> is the node's pre-configured capacity (the optimal
+/// bucket) for DENSE models — dense contexts are never expanded (clamp-only pass-through);
+/// for MOE models it is the max extensible capacity min(native ?? 128k, MaxContextTokens ?? ∞)
+/// (the single extensible bucket of the two-bucket ladder).
 /// </summary>
 public sealed record RouterModelSummary(
     [property: JsonPropertyName("name")] string Name,
@@ -1296,9 +1314,12 @@ public sealed record RouterContextEvaluateRequest(
 
 /// <summary>
 /// Preview response of <c>POST /api/router/context/evaluate</c>: the predicted target, the
-/// quantized num_ctx bucket the sizing engine would inject, the context mode ("baseline" or
-/// "expanded" relative to the selected profile's baseline bucket), the margin-adjusted token
-/// estimate, the target's effective ceiling and the winner's affinity score.
+/// num_ctx the sizing engine would inject, the context mode — one of the four lowercase engine
+/// modes (task #26): <c>passthrough</c> (dense, payload untouched; <c>injectedNumCtx</c>
+/// reports what would flow through), <c>clamped</c> (dense, oversized client value clamped
+/// down to the pre-configured context), <c>baseline</c> / <c>expanded</c> (MoE two-bucket
+/// ladder) — the margin-adjusted token estimate, the target's effective capacity (MoE
+/// extensible limit / dense pre-configured CMax) and the winner's affinity score.
 /// </summary>
 public sealed record RouterContextEvaluateResponse(
     [property: JsonPropertyName("selectedTarget")] string SelectedTarget,

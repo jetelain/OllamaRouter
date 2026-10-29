@@ -146,16 +146,9 @@ public static class ModelMetadataParser
     {
         if (modelInfo?["general.parameter_count"] is { } node)
         {
-            if (node.GetValueKind() == JsonValueKind.Number)
+            if (TryGetNodeLong(node, out var parameterCount))
             {
-                try
-                {
-                    return node.GetValue<long>();
-                }
-                catch (Exception)
-                {
-                    // Overflow / conversion failure: fall through to the regex fallback.
-                }
+                return parameterCount;
             }
             else if (node is JsonValue jsonValue &&
                      jsonValue.TryGetValue<string>(out var text) &&
@@ -166,6 +159,42 @@ public static class ModelMetadataParser
         }
 
         return ParseParameterSize(parameterSize);
+    }
+
+    /// <summary>
+    /// Robustly reads a non-negative integer from a <c>JsonValueKind.Number</c> node, returning
+    /// true and the value on success. Unlike <c>JsonNode.GetValue&lt;long&gt;()</c> — which THROWS
+    /// when the node holds a narrower CLR type (e.g. a C# <c>int</c> produced by
+    /// <c>new JsonObject { ["k"] = 128 }</c>, as test fixtures and some Ollama payload shapes do)
+    /// — this helper tolerates any representable width, so MoE <c>expert_count</c> and native
+    /// <c>context_length</c> detection never miss a valid value.
+    /// </summary>
+    internal static bool TryGetNodeLong(JsonNode? node, out long value)
+    {
+        value = 0;
+        if (node is null || node.GetValueKind() != JsonValueKind.Number)
+        {
+            return false;
+        }
+
+        try
+        {
+            // The node may hold any narrower CLR numeric type (e.g. a C# int), so read the
+            // raw token text and parse — GetValue<T>() throws on type-mismatched boxed nodes.
+            var raw = node.ToJsonString();
+            if (!long.TryParse(raw, System.Globalization.NumberStyles.Integer,
+                    System.Globalization.CultureInfo.InvariantCulture, out value))
+            {
+                return false;
+            }
+
+            return value >= 0;
+        }
+        catch (Exception)
+        {
+            // Non-representable numeric value (e.g. NaN/Infinity): treat as absent.
+            return false;
+        }
     }
 
     /// <summary>
@@ -183,22 +212,14 @@ public static class ModelMetadataParser
         foreach (KeyValuePair<string, JsonNode?> property in modelInfo)
         {
             if (!property.Key.EndsWith("expert_count", StringComparison.Ordinal) ||
-                property.Value?.GetValueKind() != JsonValueKind.Number)
+                !TryGetNodeLong(property.Value, out var value))
             {
                 continue;
             }
 
-            try
+            if (value > max)
             {
-                var value = property.Value!.GetValue<long>();
-                if (value > max)
-                {
-                    max = value;
-                }
-            }
-            catch (Exception)
-            {
-                // Non-representable numeric value: ignore this key.
+                max = value;
             }
         }
 
@@ -221,22 +242,14 @@ public static class ModelMetadataParser
         foreach (KeyValuePair<string, JsonNode?> property in modelInfo)
         {
             if (!property.Key.EndsWith(".context_length", StringComparison.Ordinal) ||
-                property.Value?.GetValueKind() != JsonValueKind.Number)
+                !TryGetNodeLong(property.Value, out var value))
             {
                 continue;
             }
 
-            try
+            if (value > 0 && (max is null || value > max.Value))
             {
-                var value = property.Value!.GetValue<long>();
-                if (value > 0 && (max is null || value > max.Value))
-                {
-                    max = value;
-                }
-            }
-            catch (Exception)
-            {
-                // Non-representable numeric value: ignore this key.
+                max = value;
             }
         }
 

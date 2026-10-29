@@ -833,6 +833,99 @@ public class RoutingDecisionServiceTests
         ["parameters"] = modelfileNumCtx is { } n ? $"num_ctx {n}" : ""
     };
 
+    // MoE variant with an optional pre-configured Modelfile num_ctx and/or a discoverable native
+    // GGUF context length (task #26 two-bucket ladder fixture).
+    private static JsonObject PinnedMoeShow(long paramCount, int? modelfileNumCtx = null, int? nativeContextLength = null) => new()
+    {
+        ["model_info"] = new JsonObject
+        {
+            ["general.parameter_count"] = (JsonNode)paramCount,
+            ["general.expert_count"] = (JsonNode)64L,
+            ["qwen35.context_length"] = nativeContextLength is { } n ? (JsonNode)n : null
+        },
+        ["details"] = new JsonObject { ["family"] = "moe" },
+        ["parameters"] = modelfileNumCtx is { } m ? $"num_ctx {m}" : ""
+    };
+
+    // A fleet whose single model is pinned MoE on the 16 GB Desktop (pre-configured num_ctx) with
+    // a 262,144 native GGUF limit — the task-#26 §2.3 184,320 → 262,144 elastic scenario.
+    private static (MetaMap meta, OllamaRouterOptions options) BuildMoeElasticFleet()
+    {
+        var meta = new MetaMap();
+        meta.Add(DesktopUrl, "m", PinnedMoeShow(35_000_000_000, modelfileNumCtx: 184_320, nativeContextLength: 262_144), 16 * Gb);
+        meta.Add(LaptopUrl, "m", PinnedMoeShow(35_000_000_000, modelfileNumCtx: 184_320, nativeContextLength: 262_144), 16 * Gb);
+        meta.Add(ServerUrl, "m", PinnedMoeShow(35_000_000_000, modelfileNumCtx: 184_320, nativeContextLength: 262_144), 16 * Gb);
+        var options = FleetOptions("m");
+        return (meta, options);
+    }
+
+    [Fact]
+    public async Task Stage1_MoeQualifiesAtExtensibleLimit_NotPreConfiguredCap()
+    {
+        // AC1 / AC12 (task #26, Option A): a MoE node pre-configured at num_ctx 184,320 with a
+        // 262,144 native limit qualifies a 205k prompt (205,000 + 8,192 = 213,192 > 184,320) at
+        // the EXTENSIBLE limit (262,144), NOT the pre-configured CMax (184,320). The elastic
+        // 184,320 → 262,144 expansion is preserved — the pre-configured cap does not disqualify.
+        var (meta, options) = BuildMoeElasticFleet();
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|m", $"{LaptopUrl}|m", $"{ServerUrl}|m" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            meta: meta);
+
+        await h.Decide(205_000, "m");
+
+        // The pre-configured 184,320 nodes all qualify the 213,192 requirement via the
+        // extensible 262,144 limit (no context overflow) — the elastic 184,320 → 262,144
+        // expansion is preserved; the pre-configured cap does not disqualify.
+        Assert.True(h.Eval(TDesktop)!.Qualified);
+        Assert.True(h.Eval(TLaptop)!.Qualified);
+        Assert.True(h.Eval(TServer)!.Qualified);
+    }
+
+    [Fact]
+    public async Task Stage1_MoeBeyondNativeLimit_StillDisqualified()
+    {
+        // A MoE prompt beyond the native limit (300,000 + 8,192 = 308,192 > 262,144) is still
+        // disqualified at Stage 1: the extensible limit is a real ceiling, not an unbounded excuse.
+        var (meta, options) = BuildMoeElasticFleet();
+        options.DispatchToLargestCapacityOnOverflow = false; // reject rather than overflow-fallback
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|m", $"{LaptopUrl}|m", $"{ServerUrl}|m" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            meta: meta);
+
+        await Assert.ThrowsAsync<NoAvailableTargetException>(() => h.Decide(300_000, "m"));
+        Assert.False(h.Eval(TDesktop)!.Qualified);
+        Assert.StartsWith("context overflow", h.Eval(TDesktop)!.DisqualifiedReason);
+    }
+
+    [Fact]
+    public async Task Stage1_DenseLongPromptOnSmallPreConfiguredNode_NoElasticExcuse()
+    {
+        // AC12 dense half (task #25 regression): a dense 60k prompt (68,192 required) on a node
+        // pre-configured at 49,152 is disqualified — dense stays at the pre-configured CMax,
+        // there is NO elastic excuse (contrast with the MoE extensible limit above).
+        var meta = new MetaMap();
+        meta.Add(DesktopUrl, "qwen3.8-27B", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 49_152), 16 * Gb);
+        meta.Add(LaptopUrl, "qwen3.8-27B", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 49_152), 16 * Gb);
+        meta.Add(ServerUrl, "qwen3.8-27B", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 49_152), 16 * Gb);
+        var options = FleetOptions("qwen3.8-27B", dispatchToLargestCapacityOnOverflow: false);
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{LaptopUrl}|qwen3.8-27B", $"{ServerUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            meta: meta);
+
+        await Assert.ThrowsAsync<NoAvailableTargetException>(() => h.Decide(60_000, "qwen3.8-27B"));
+        Assert.False(h.Eval(TDesktop)!.Qualified);
+        Assert.StartsWith("context overflow", h.Eval(TDesktop)!.DisqualifiedReason);
+    }
+
     [Fact]
     public async Task Stage1_ClientNumCtxSmallerThanRequired_StillDisqualifiesOnOverflow()
     {

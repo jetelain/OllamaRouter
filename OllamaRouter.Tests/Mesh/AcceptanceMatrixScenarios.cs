@@ -107,16 +107,11 @@ public class AcceptanceMatrixScenarios
     }
 
     // ---- Row: Zero-Config Context. the desktop (16 GB, 49,152 Modelfile pin) wins the
-    //      Architect sweet spot; a prompt too large for the desktop's capacity spills to the
-    //      96 GB server (no Modelfile pin → the 131,072 assumed fallback CMax).
-    //      NOTE the ADDITIVE fit rule (task #25): a T-token prompt needs T + ContextFitMarginTokens
-    //      (default 8,192) context to be QUALIFIED on the desktop's 49,152 capacity, so T must be
-    //      ≤ 40,960. The sizing engine picks the SMALLEST bucket ≥ the RAW token count, so to land
-    //      the 40,960 intermediate bucket we need T > 32,768 (the baseline). 35k sits in
-    //      (32,768, 40,960] → desktop + 40,960; 120k (120,000 + 8,192 = 128,192 > 49,152)
-    //      is disqualified from the desktop but ≤ the server's 131,072 assumed fallback →
-    //      server + 131,072 intermediate bucket.
-    //      No Models overrides in the config (pure zero-config role/affinity routing).
+    //      Architect sweet spot for a small dense prompt; a prompt too large for the desktop's
+    //      pre-configured capacity spills to the 96 GB server (no Modelfile pin → the 131,072
+    //      assumed fallback CMax). Task #26 dense clamp-only: a dense payload is only rewritten
+    //      when the client static num_ctx EXCEEDS the node's pre-configured context (down-clamp);
+    //      with no client num_ctx the payload is untouched (PassThrough — no num_ctx header).
     [Fact]
     public async Task ZeroConfigContext_SmallRoutesDesktop_LargeRoutesServer()
     {
@@ -125,15 +120,20 @@ public class AcceptanceMatrixScenarios
         await MeshTestHelpers.WarmupAsync(router, MeshCatalog.DenseModel);
         await MeshTestHelpers.WaitAllOnlineAsync(router, TimeSpan.FromSeconds(5));
 
+        // 35k dense prompt (no client num_ctx): desktop (49,152 pre-configured) qualifies
+        // (35,000+8,192=43,192 ≤ 49,152) and wins; dense clamp-only pass-through leaves the
+        // payload untouched (no num_ctx injected), so ctx (the Context-Size header) is null.
         var (status35, _, served35, ctx35, _) = await MeshTestHelpers.ChatAsync(router, MeshCatalog.DenseModel, 35_000);
         Assert.Equal(HttpStatusCode.OK, status35);
         Assert.True(string.Equals(served35, "desktop", StringComparison.OrdinalIgnoreCase), $"a 35k dense prompt fits the desktop 49,152 capacity (35,000+8,192=43,192); got {served35}");
-        Assert.True(ctx35 == 40_960, $"desktop dense sizes at the 40,960 intermediate bucket; got {ctx35}");
+        Assert.True(ctx35 is null, $"dense pass-through (no client num_ctx) injects no num_ctx; got {ctx35}");
 
+        // 120k dense prompt (120,000+8,192=128,192 > 49,152): disqualified from the desktop,
+        // qualifies on the server (131,072 assumed fallback); dense pass-through → no num_ctx.
         var (status120, _, served120, ctx120, _) = await MeshTestHelpers.ChatAsync(router, MeshCatalog.DenseModel, 120_000);
         Assert.Equal(HttpStatusCode.OK, status120);
         Assert.True(string.Equals(served120, "server", StringComparison.OrdinalIgnoreCase), $"a 120k dense prompt (128,192 needed) exceeds the desktop 49,152 capacity → server; got {served120}");
-        Assert.True(ctx120 == 131_072, $"server dense sizes at the 131,072 intermediate bucket (assumed fallback); got {ctx120}");
+        Assert.True(ctx120 is null, $"dense pass-through (no client num_ctx) injects no num_ctx; got {ctx120}");
     }
 
     // ---- Row: Client Context Clamping. client 131072 + 2k prompt clamps to the desktop ceiling. ----
@@ -156,9 +156,10 @@ public class AcceptanceMatrixScenarios
         Assert.True(received! <= 49_152, $"the daemon must receive a rewritten num_ctx ≤ ceiling (got {received})");
     }
 
-    // ---- Row: Dynamic Context Expansion. a ~195k MoE prompt injects 221184 (intermediate bucket). ----
+    // ---- Row: Dynamic Context Expansion. a ~195k MoE prompt (195,000+8,192=203,192 > 184,320
+    //      pre-configured baseline) expands to the single extensible bucket 262,144. ----
     [Fact]
-    public async Task DynamicExpansion_195kMoePrompt_Injects221184()
+    public async Task DynamicExpansion_195kMoePrompt_InjectsExtensible262144()
     {
         await using var fleet = await InProcessMeshFleet.CreateAsync();
         var router = await fleet.CreateRouterAsync("R1");
@@ -167,14 +168,14 @@ public class AcceptanceMatrixScenarios
 
         var (status, _, served, ctx, _) = await MeshTestHelpers.ChatAsync(router, MeshCatalog.MoeModel, 195_000);
         Assert.Equal(HttpStatusCode.OK, status);
-        Assert.True(ctx == 221_184, $"a 195k MoE prompt sizes at the 221,184 intermediate bucket; got {ctx}");
+        Assert.True(ctx == 262_144, $"a 195k MoE prompt (above the 184,320 baseline) sizes at the 262,144 extensible bucket; got {ctx}");
 
         var servedTarget = fleet.Daemons.First(d => d.Name == served);
         var received = servedTarget.LastReceivedNumCtx(MeshCatalog.MoeModel);
-        Assert.True(received == 221_184, $"the served daemon must receive options.num_ctx == 221184; got {received}");
+        Assert.True(received == 262_144, $"the served daemon must receive options.num_ctx == 262144; got {received}");
     }
 
-    // ---- Row: Auto-Shrink Hysteresis. 195k → 221184; 175k → retained; 30k → shrunk to baseline. ----
+    // ---- Row: Auto-Shrink Hysteresis. 195k → 262144 (expanded); 175k → retained; 30k → shrunk to the 184,320 pre-configured baseline. ----
     [Fact]
     public async Task AutoShrinkHysteresis_195k_175k_30k_RetainsThenShrinks()
     {
@@ -183,24 +184,25 @@ public class AcceptanceMatrixScenarios
         await MeshTestHelpers.WarmupAsync(router, MeshCatalog.MoeModel);
         await MeshTestHelpers.WaitAllOnlineAsync(router, TimeSpan.FromSeconds(5));
 
-        // Pin every step to the laptop — the MoE model's native context (262,144) makes the
-        // laptop's CMax exceed the MoE baseline (184,320), so the expanded bucket is not
-        // clamped. A single target isolates the lease mechanism the §4 row is verifying
+        // Pin every step to the laptop — the MoE model is pinned at 184,320 (baseline) with a
+        // 262,144 native limit, so a prompt past the baseline expands to 262,144. A single
+        // target isolates the lease mechanism the §4 row is verifying
         // (expand → retain → shrink-to-baseline).
-        // 195k → fresh expansion to 221,184.
+        // 195k (195,000+8,192=203,192 > 184,320) → fresh expansion to 262,144.
         var (_, _, served1, ctx1, _) = await MeshTestHelpers.ChatAsync(router, MeshCatalog.MoeModel, 195_000, pin: "laptop");
-        Assert.Equal(221_184, ctx1);
+        Assert.Equal(262_144, ctx1);
         Assert.True(string.Equals(served1, "laptop", StringComparison.OrdinalIgnoreCase), $"the 195k MoE prompt must be served on the laptop; got {served1}");
 
-        // 175k → still above baseline; the lease RETAINS 221,184 (RetainedExpanded).
+        // 175k (175,000+8,192=183,192 ≤ 184,320 baseline) → the engine would drop to the
+        // baseline, but the lease RETAINS the expanded 262,144 bucket (RetainedExpanded).
         var (_, _, served2, ctx2, mode2) = await MeshTestHelpers.ChatAsync(router, MeshCatalog.MoeModel, 175_000, pin: "laptop");
-        Assert.True(ctx2 == 221_184, $"a 175k prompt still needs the expanded bucket (retained); got {ctx2}");
+        Assert.True(ctx2 == 262_144, $"a 175k prompt retains the expanded 262,144 bucket (retained); got {ctx2}");
         Assert.True(string.Equals(mode2, "RetainedExpanded", StringComparison.OrdinalIgnoreCase), $"mode expected RetainedExpanded; got {mode2}");
         Assert.True(string.Equals(served1, served2, StringComparison.OrdinalIgnoreCase), $"the lease must stay pinned to the same (hot) target; {served1} vs {served2}");
 
-        // 30k → below 50% of the 184,320 baseline → immediate shrink back to baseline.
+        // 30k → below 50% of the 184,320 baseline → immediate shrink back to the baseline.
         var (_, _, served3, ctx3, mode3) = await MeshTestHelpers.ChatAsync(router, MeshCatalog.MoeModel, 30_000, pin: "laptop");
-        Assert.True(ctx3 == 184_320, $"a 30k prompt (< 50% baseline) shrinks back to the baseline bucket; got {ctx3}");
+        Assert.True(ctx3 == 184_320, $"a 30k prompt (< 50% baseline) shrinks back to the pre-configured 184,320 baseline; got {ctx3}");
         Assert.True(string.Equals(mode3, "ShrunkToBaseline", StringComparison.OrdinalIgnoreCase), $"mode expected ShrunkToBaseline; got {mode3}");
         Assert.True(string.Equals(served2, served3, StringComparison.OrdinalIgnoreCase), $"the lease must stay on the same target through the shrink; {served2} vs {served3}");
         // The daemon proxy must have received the shrunk 184,320 in the outgoing options.num_ctx.
@@ -388,7 +390,7 @@ public class AcceptanceMatrixScenarios
         var before = fleet.Daemons.Sum(d => d.ChatHits().Count);
 
         var sw = Stopwatch.StartNew();
-        var tasks = new List<Task<(HttpStatusCode Status, string? Body, string Served, int? ContextSize, string ContextMode)>>
+        var tasks = new List<Task<(HttpStatusCode Status, string? Body, string? Served, int? ContextSize, string? ContextMode)>>
         {
             Task.Run(() => MeshTestHelpers.ChatAsync(r1, MeshCatalog.MoeModel, 16)),
             Task.Run(() => MeshTestHelpers.ChatAsync(r2, MeshCatalog.MoeModel, 16)),

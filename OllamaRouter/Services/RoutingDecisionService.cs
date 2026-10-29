@@ -283,7 +283,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
                 if (fallbackCandidates.Count > 0)
                 {
                     var fallbackRanked = fallbackCandidates
-                        .OrderByDescending(c => c.Capability.CMax)
+                        .OrderByDescending(c => ContextCapacityForFit(c.Capability, thresholds))
                         .ThenBy(c => c.InFlight)
                         .ThenBy(c => c.Index)
                         .ToList();
@@ -291,6 +291,11 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
                     var maxAvailableCandidate = fallbackRanked[0];
                     var winnerCandidate = maxAvailableCandidate;
                     var finalFallbackWinner = winnerCandidate.Target;
+
+                    // The true largest-capacity candidate (drives the warning header's
+                    // "Max available" figure) — the MoE-aware capacity for MoE candidates,
+                    // the pre-configured CMax for dense (task #26, Option A).
+                    var maxAvailableCapacity = ContextCapacityForFit(maxAvailableCandidate.Capability, thresholds);
 
                     var maxFailuresFallback = settings.MaxConsecutiveFailures;
                     if (maxFailuresFallback > 0 && _streakTracker.ShouldSkip(winnerCandidate.Target, maxFailuresFallback))
@@ -322,6 +327,12 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
                         fallbackAffinity.SetAffinity(sessionId, finalFallbackWinner);
                     }
 
+                    // The capacity actually served by the (possibly streak-switched) winner
+                    // (MoE: extensible limit; dense: pre-configured CMax) — drives the
+                    // middleware's explicit clamp and the warning header. Computed AFTER the
+                    // failure-streak switch so it reflects the final winner.
+                    var winnerCapacity = ContextCapacityForFit(winnerCandidate.Capability, thresholds);
+
                     var margin = Math.Max(0, settings.ContextFitMarginTokens);
                     var breakdown = BuildCandidateBreakdown(fleetTargets, evaluations, context);
 
@@ -333,16 +344,16 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
                         tokenCount,
                         margin,
                         maxAvailableCandidate.Options.Name,
-                        maxAvailableCandidate.Capability.CMax,
+                        maxAvailableCapacity,
                         winnerCandidate.Options.Name,
-                        winnerCandidate.Capability.CMax,
+                        winnerCapacity,
                         breakdown);
 
                     return new RoutingDecisionResult(
                         finalFallbackWinner,
                         IsFallback: true,
                         FallbackStrategy: "LargestCapacityOverflow",
-                        TargetCMax: winnerCandidate.Capability.CMax);
+                        TargetCMax: winnerCapacity);
                 }
             }
 
@@ -448,7 +459,11 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
 
         // 4. Hardware capable (capability engine + suitability rules) with the permissive
         //    fallback for unknown/degraded metadata (the config-pinned Dense veto still applies).
-        // 5. Context fit: min(estimated + ContextFitMarginTokens, clientNumCtx ?? ∞) ≤ CMax.
+        // 5. Context fit: min(estimated + ContextFitMarginTokens, clientNumCtx ?? ∞) ≤ capacity,
+        //    where capacity is MoE-aware (task #26, Option A): MoE targets qualify at the
+        //    extensible limit min(native ?? 128k, MaxContextTokens ?? ∞) — a 184,320-
+        //    preconfigured node can still serve a 205k prompt via the two-bucket expansion;
+        //    dense targets stay at the pre-configured CMax (no elastic excuse).
         var capability = await context.GetTargetCapabilityAsync(target, targetOptions.Url!, cancellationToken);
         if (capability is null)
         {
@@ -477,13 +492,15 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             effectiveRequired = Math.Min(effectiveRequired, context.ClientRequestedNumCtx.Value);
         }
 
+        var capacityForFit = ContextCapacityForFit(capability, context.Thresholds);
+
         if (!ModelCapabilityEngine.EvaluateClientContext(
                 context.TokenCount,
                 context.ClientRequestedNumCtx,
-                capability.CMax,
+                capacityForFit,
                 _options.Value.ContextFitMarginTokens).Qualified)
         {
-            return Disqualified(target, $"context overflow (CMax: {capability.CMax} < Required: {effectiveRequired})");
+            return Disqualified(target, $"context overflow (CMax: {capacityForFit} < Required: {effectiveRequired})");
         }
 
         // ---- Stage 2 scoring for the qualified candidate. ----
@@ -532,6 +549,22 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         }
 
         return maxVramMB is null || maxVramMB < ModelCapabilityEngine.SmallTargetVramThresholdMB;
+    }
+
+    /// <summary>
+    /// The MoE-aware capacity used for Stage-1 context fit and the Largest-Capacity overflow
+    /// ranking (task #26, Option A): MoE candidates qualify at the EXTENSIBLE limit
+    /// <c>min(native ?? 128k, MaxContextTokens ?? ∞)</c> (the two-bucket ladder's max bucket
+    /// — a pre-configured 184,320 node still serves 205k prompts via elastic expansion),
+    /// while dense candidates stay at the pre-configured <c>CMax</c> (no elastic excuse —
+    /// a dense long prompt on a small pre-configured node is disqualified, as in task #25).
+    /// The capability record's <c>CMax</c> itself is NOT modified.
+    /// </summary>
+    internal static int ContextCapacityForFit(TargetModelCapability capability, ModelThresholds? thresholds)
+    {
+        return capability.Architecture == ModelArchitectureKind.Moe
+            ? ModelCapabilityEngine.GetMoeExtensibleCapacity(capability, thresholds?.MaxContextTokens)
+            : capability.CMax;
     }
 
     /// <summary>

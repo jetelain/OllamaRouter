@@ -1,364 +1,405 @@
 using System.Text.Json;
+using Microsoft.Extensions.Logging.Abstractions;
 using OllamaRouter.Options;
 using OllamaRouter.Services;
 using OllamaRouter.Transforms;
 
 namespace OllamaRouter.Tests.Transforms;
 
+/// <summary>
+/// Two-bucket MoE ladder and dense clamp-only sizing tests (task #26).
+/// </summary>
 public class DynamicContextSizingTests
 {
     private static DynamicContextOptions DefaultOptions() => new();
 
-    // --- SelectProfile matrix ---------------------------------------------------------
+    // MoE capability helper: pre-configured (Modelfile) num_ctx, native context, CMax.
+    private static TargetModelCapability MoeCap(int? modelfileNumCtx, int? native, int? cMaxOverride = null)
+    {
+        var cDefault = modelfileNumCtx ?? 4_096;
+        var cMax = cMaxOverride ?? modelfileNumCtx ?? native ?? 131_072;
+        return new TargetModelCapability("t", ModelArchitectureKind.Moe, ArchitectureDetectionSource.MoeExpertCount,
+            cDefault, cMax, true, null, native);
+    }
+
+    private static TargetModelCapability DenseCap(int? modelfileNumCtx, int? native, ModelArchitectureKind kind = ModelArchitectureKind.LargeDense)
+    {
+        var cDefault = modelfileNumCtx ?? 4_096;
+        var cMax = modelfileNumCtx ?? native ?? 131_072;
+        return new TargetModelCapability("t", kind, ArchitectureDetectionSource.DenseParameterCount,
+            cDefault, cMax, true, null, native);
+    }
+
+    // ================================================================================
+    //  MoE two-bucket ladder (Decide)
+    // ================================================================================
 
     [Theory]
-    [InlineData(null, "Moe")]
-    [InlineData(8192, "Moe")]
-    [InlineData(98304, "Moe")]
-    public void SelectProfile_Moe_AlwaysReturnsMoeProfile(int? maxVramMB, string expected)
+    // Below baseline (184,320): requirement 100k+8,192=108,192 ≤ 184,320 → Baseline.
+    [InlineData(100_000, null, 184_320, 262_144, ContextSizingMode.Baseline, 184_320)]
+    // At baseline exactly: 176,128 + 8,192 = 184,320 ≤ 184,320 → Baseline.
+    [InlineData(176_128, null, 184_320, 262_144, ContextSizingMode.Baseline, 184_320)]
+    // Above baseline: 190k + 8,192 = 198,192 > 184,320 → Expanded to extensible 262,144.
+    [InlineData(190_000, null, 184_320, 262_144, ContextSizingMode.Expanded, 262_144)]
+    // Way above: 250k → Expanded.
+    [InlineData(250_000, null, 184_320, 262_144, ContextSizingMode.Expanded, 262_144)]
+    public void Decide_Moe_TwoBucketLadder(
+        long tokens, int? clientNumCtx, int modelfile, int native, ContextSizingMode expectedMode, int expectedInjected)
     {
-        Assert.Equal(expected, DynamicContextSizingEngine.SelectProfile(ModelArchitectureKind.Moe, maxVramMB));
+        var cap = MoeCap(modelfile, native);
+        var d = DynamicContextSizingEngine.Decide(DefaultOptions(), cap, tokens, clientNumCtx, 8_192, null);
+
+        Assert.Equal(expectedMode, d.Mode);
+        Assert.Equal(expectedInjected, d.InjectedNumCtx);
+        Assert.Equal("Moe", d.ProfileName);
+        Assert.Equal(native, d.EffectiveCeiling); // extensible = min(native, ∞)
+        Assert.Equal(modelfile, d.BaselineBucket);
+        Assert.False(d.ClientRequestedClamped);
     }
+
+    [Fact]
+    public void Decide_Moe_ClientNumCtx_LowersRequirement_ToBaseline()
+    {
+        // 190k prompt + 8,192 margin = 198,192 > 184,320, but client num_ctx 150,000
+        // lowers requirement to 150,000 ≤ 184,320 → Baseline.
+        var cap = MoeCap(184_320, 262_144);
+        var d = DynamicContextSizingEngine.Decide(DefaultOptions(), cap, 190_000, 150_000, 8_192, null);
+
+        Assert.Equal(ContextSizingMode.Baseline, d.Mode);
+        Assert.Equal(184_320, d.InjectedNumCtx);
+    }
+
+    [Fact]
+    public void Decide_Moe_ClientNumCtxAboveInjected_IsReportedClamped()
+    {
+        // 100k prompt → baseline 184,320, but client requested 200,000 → clamped flag.
+        var cap = MoeCap(184_320, 262_144);
+        var d = DynamicContextSizingEngine.Decide(DefaultOptions(), cap, 100_000, 200_000, 8_192, null);
+
+        Assert.Equal(ContextSizingMode.Baseline, d.Mode);
+        Assert.Equal(184_320, d.InjectedNumCtx);
+        Assert.True(d.ClientRequestedClamped);
+    }
+
+    [Fact]
+    public void Decide_Moe_NoModelfile_UsesNativeAsBaseline()
+    {
+        // No Modelfile num_ctx, native 262,144: baseline = 262,144, extensible = 262,144.
+        // Every request is Baseline (no expansion possible).
+        var cap = MoeCap(null, 262_144);
+        var d = DynamicContextSizingEngine.Decide(DefaultOptions(), cap, 100_000, null, 8_192, null);
+
+        Assert.Equal(ContextSizingMode.Baseline, d.Mode);
+        Assert.Equal(262_144, d.InjectedNumCtx);
+        Assert.Equal(262_144, d.BaselineBucket);
+        Assert.Equal(262_144, d.EffectiveCeiling);
+    }
+
+    [Fact]
+    public void Decide_Moe_NoModelfileNoNative_FallsBackTo128k()
+    {
+        // No Modelfile, no native: baseline = 128k, extensible = 128k.
+        var cap = MoeCap(null, null);
+        var d = DynamicContextSizingEngine.Decide(DefaultOptions(), cap, 50_000, null, 8_192, null);
+
+        Assert.Equal(ContextSizingMode.Baseline, d.Mode);
+        Assert.Equal(131_072, d.InjectedNumCtx);
+        Assert.Equal(131_072, d.BaselineBucket);
+        Assert.Equal(131_072, d.EffectiveCeiling);
+    }
+
+    [Fact]
+    public void Decide_Moe_MaxContextTokens_CapsExtensibleLimit()
+    {
+        // Modelfile 184,320, native 262,144, MaxContextTokens 200,000:
+        // extensible = min(262,144, 200,000) = 200,000.
+        // 190k + 8,192 = 198,192 > 184,320 → Expanded to 200,000.
+        var cap = MoeCap(184_320, 262_144);
+        var d = DynamicContextSizingEngine.Decide(DefaultOptions(), cap, 190_000, null, 8_192, 200_000);
+
+        Assert.Equal(ContextSizingMode.Expanded, d.Mode);
+        Assert.Equal(200_000, d.InjectedNumCtx);
+        Assert.Equal(200_000, d.EffectiveCeiling);
+    }
+
+    [Fact]
+    public void Decide_Moe_MaxContextTokensBelowModelfile_BaselineInjectsCap()
+    {
+        // Modelfile 200,000, native 262,144, MaxContextTokens 150,000:
+        // extensible = min(262,144, 150,000) = 150,000.
+        // baseline = 200,000. requirement 50k ≤ 200,000 → Baseline.
+        // injected = min(200,000, 150,000) = 150,000.
+        var cap = MoeCap(200_000, 262_144);
+        var d = DynamicContextSizingEngine.Decide(DefaultOptions(), cap, 50_000, null, 8_192, 150_000);
+
+        Assert.Equal(ContextSizingMode.Baseline, d.Mode);
+        Assert.Equal(150_000, d.InjectedNumCtx);
+        Assert.Equal(150_000, d.EffectiveCeiling);
+        Assert.Equal(200_000, d.BaselineBucket);
+    }
+
+    // ================================================================================
+    //  Dense clamp-only pass-through (Decide)
+    // ================================================================================
+
+    [Fact]
+    public void Decide_Dense_ClientAboveBaseline_Clamped()
+    {
+        // Dense, Modelfile 49,152, client num_ctx 131,072 → Clamped to 49,152.
+        var cap = DenseCap(49_152, 49_152);
+        var d = DynamicContextSizingEngine.Decide(DefaultOptions(), cap, 2_000, 131_072, 8_192, null);
+
+        Assert.Equal(ContextSizingMode.Clamped, d.Mode);
+        Assert.Equal(49_152, d.InjectedNumCtx);
+        Assert.Equal(49_152, d.EffectiveCeiling); // CMax
+        Assert.True(d.ClientRequestedClamped);
+        Assert.Equal(49_152, d.BaselineBucket);
+    }
+
+    [Fact]
+    public void Decide_Dense_ClientBelowBaseline_PassThrough()
+    {
+        // Dense, Modelfile 49,152, client num_ctx 40,000 (≤ 49,152) → PassThrough.
+        var cap = DenseCap(49_152, 49_152);
+        var d = DynamicContextSizingEngine.Decide(DefaultOptions(), cap, 2_000, 40_000, 8_192, null);
+
+        Assert.Equal(ContextSizingMode.PassThrough, d.Mode);
+        Assert.Equal(0, d.InjectedNumCtx); // sentinel: no rewrite
+        Assert.Equal(49_152, d.EffectiveCeiling);
+        Assert.False(d.ClientRequestedClamped);
+    }
+
+    [Fact]
+    public void Decide_Dense_NoClientNumCtx_PassThrough()
+    {
+        // Dense, Modelfile 49,152, no client num_ctx → PassThrough.
+        var cap = DenseCap(49_152, 49_152);
+        var d = DynamicContextSizingEngine.Decide(DefaultOptions(), cap, 2_000, null, 8_192, null);
+
+        Assert.Equal(ContextSizingMode.PassThrough, d.Mode);
+        Assert.Equal(0, d.InjectedNumCtx);
+    }
+
+    [Fact]
+    public void Decide_Dense_DenseClampDisabled_ClientAboveBaseline_PassThrough()
+    {
+        // DenseClampEnabled = false → even oversized client value → PassThrough.
+        var opts = new DynamicContextOptions { DenseClampEnabled = false };
+        var cap = DenseCap(49_152, 49_152);
+        var d = DynamicContextSizingEngine.Decide(opts, cap, 2_000, 131_072, 8_192, null);
+
+        Assert.Equal(ContextSizingMode.PassThrough, d.Mode);
+        Assert.Equal(0, d.InjectedNumCtx);
+    }
+
+    [Fact]
+    public void Decide_SmallDense_Clamped()
+    {
+        // SmallDense also gets clamp-only.
+        var cap = DenseCap(32_768, 32_768, ModelArchitectureKind.SmallDense);
+        var d = DynamicContextSizingEngine.Decide(DefaultOptions(), cap, 5_000, 131_072, 8_192, null);
+
+        Assert.Equal(ContextSizingMode.Clamped, d.Mode);
+        Assert.Equal(32_768, d.InjectedNumCtx);
+    }
+
+    // ================================================================================
+    //  SelectBucket (public two-bucket helper)
+    // ================================================================================
 
     [Theory]
-    [InlineData(8192, "DenseDesktop16gb")]
-    [InlineData(16384, "DenseDesktop16gb")]
-    [InlineData(32767, "DenseDesktop16gb")]
-    [InlineData(32768, "DenseServer96gb")]  // 32 GB boundary: now Server-class
-    [InlineData(65536, "DenseServer96gb")]   // 64 GB
-    [InlineData(98304, "DenseServer96gb")]   // 96 GB
-    [InlineData(null, "DenseDesktop16gb")] // Unknown VRAM is conservative.
-    public void SelectProfile_Dense_SplitAt32GBClass(int? maxVramMB, string expected)
+    [InlineData(100_000, null, ContextSizingMode.Baseline, 184_320)]
+    [InlineData(190_000, null, ContextSizingMode.Expanded, 262_144)]
+    [InlineData(250_000, null, ContextSizingMode.Expanded, 262_144)]
+    public void SelectBucket_Moe_TwoBucket(
+        long tokens, int? clientNumCtx, ContextSizingMode expectedMode, int expectedInjected)
     {
-        Assert.Equal(expected, DynamicContextSizingEngine.SelectProfile(ModelArchitectureKind.LargeDense, maxVramMB));
+        var cap = MoeCap(184_320, 262_144);
+        var (mode, injected, baseline, extensibleMax) =
+            DynamicContextSizingEngine.SelectBucket(cap, tokens, clientNumCtx, 8_192, null);
+
+        Assert.Equal(expectedMode, mode);
+        Assert.Equal(expectedInjected, injected);
+        Assert.Equal(184_320, baseline);
+        Assert.Equal(262_144, extensibleMax);
     }
+
+    [Fact]
+    public void SelectBucket_Moe_MaxContextTokens_CapsExtensible()
+    {
+        var cap = MoeCap(184_320, 262_144);
+        var (_, injected, _, extensibleMax) =
+            DynamicContextSizingEngine.SelectBucket(cap, 190_000, null, 8_192, 200_000);
+
+        Assert.Equal(200_000, injected);
+        Assert.Equal(200_000, extensibleMax);
+    }
+
+    // ================================================================================
+    //  BaselineBucket / ModelfileNumCtx / EffectiveNativeContext helpers
+    // ================================================================================
 
     [Theory]
-    [InlineData(null, "SmallDense")]
-    [InlineData(8192, "SmallDense")]
-    [InlineData(98304, "SmallDense")]
-    public void SelectProfile_SmallDense_AlwaysReturnsSmallDenseProfile(int? maxVramMB, string expected)
+    [InlineData(184_320, 262_144, 184_320)]  // Modelfile present → uses it.
+    [InlineData(null, 262_144, 262_144)]     // No Modelfile → native.
+    [InlineData(null, null, 131_072)]         // Neither → 128k fallback.
+    public void BaselineBucket_Resolution(int? modelfile, int? native, int expected)
     {
-        Assert.Equal(expected, DynamicContextSizingEngine.SelectProfile(ModelArchitectureKind.SmallDense, maxVramMB));
+        var cap = MoeCap(modelfile, native);
+        Assert.Equal(expected, DynamicContextSizingEngine.BaselineBucket(cap));
     }
 
-    [Fact]
-    public void SelectProfile_Dense_32GBAnd64GB_SelectServerProfile()
-    {
-        // The 32 GB threshold (task #21): 32768 and 65536 MB both select the server profile,
-        // while the boundary-minus-one (32767) still selects the desktop profile.
-        Assert.Equal("DenseServer96gb", DynamicContextSizingEngine.SelectProfile(ModelArchitectureKind.LargeDense, 32_768));
-        Assert.Equal("DenseServer96gb", DynamicContextSizingEngine.SelectProfile(ModelArchitectureKind.LargeDense, 65_536));
-        Assert.Equal("DenseDesktop16gb", DynamicContextSizingEngine.SelectProfile(ModelArchitectureKind.LargeDense, 32_767));
-    }
-
-    [Fact]
-    public void Decide_Dense32GBTarget_SetsServerProfileAndCeiling()
-    {
-        // A 32 GB target selects the server profile; with the hardware ceiling at 262,144
-        // (server class) the effective ceiling is 262,144.
-        var decision = DynamicContextSizingEngine.Decide(
-            DefaultOptions(), ModelArchitectureKind.LargeDense, 32_768, 262_144, estimatedTokens: 50_000, clientRequestedNumCtx: null);
-
-        Assert.Equal("DenseServer96gb", decision.ProfileName);
-        Assert.Equal(262_144, decision.EffectiveCeiling);
-        Assert.Equal(65_536, decision.InjectedNumCtx); // 50k → smallest bucket ≥ 50k
-    }
-
-    // --- SelectBucket: MoE table (184,320 / 221,184 / 262,144) ------------------------
-
-    [Theory]
-    // 200k/195k-token MoE prompts exceed the 221,184 intermediate bucket, but the effective
-    // ceiling (262,144) caps the requirement — the 221,184 bucket is selected (the required
-    // checklist value: 200k MoE prompt → options.num_ctx = 221184).
-    [InlineData(200_000, null, 262_144, 221_184)]
-    [InlineData(195_000, null, 262_144, 221_184)]
-    [InlineData(185_000, null, 262_144, 221_184)]
-    [InlineData(100_000, null, 262_144, 184_320)]
-    // A 200k-token MoE prompt (35B-A3B class) with the effective ceiling capped at 221,184
-    // (e.g. an explicit Modelfile num_ctx) stays at 221,184.
-    [InlineData(200_000, null, 221_184, 221_184)]
-    // A prompt beyond the ceiling is clamped to the ceiling (never rejected).
-    [InlineData(240_000, null, 262_144, 262_144)]
-    [InlineData(50_000, null, 262_144, 184_320)]
-    public void SelectBucket_Moe_PicksSmallestBucketAboveRequirement(
-        long tokens, int? clientNumCtx, int ceiling, int expected)
-    {
-        var options = DefaultOptions();
-
-        var injected = DynamicContextSizingEngine.SelectBucket(options, "Moe", tokens, clientNumCtx, ceiling);
-
-        Assert.Equal(expected, injected);
-    }
-
-    // --- SelectBucket: DenseDesktop16gb table (32,768 / 40,960 / 49,152) ---------------
-
-    [Theory]
-    // 2k prompt with a large static client num_ctx (131072, e.g. Continue/Zed): clamped
-    // down to the 48k desktop ceiling — upper-bound preference, never a disqualifier.
-    [InlineData(2_000, 131_072, 49_152, 49_152)]
-    [InlineData(33_000, null, 49_152, 40_960)]
-    [InlineData(2_000, null, 49_152, 32_768)]
-    // A SMALL static client value never truncates a larger prompt: the estimate wins.
-    [InlineData(100_000, 8_192, 49_152, 49_152)]
-    [InlineData(41_000, null, 49_152, 49_152)]
-    // Explicit Modelfile num_ctx BELOW the selected bucket clamps the injected value.
-    [InlineData(2_000, null, 24_576, 24_576)]
-    public void SelectBucket_DenseDesktop16gb_ClientValueIsUpperBoundPreference(
-        long tokens, int? clientNumCtx, int ceiling, int expected)
-    {
-        var options = DefaultOptions();
-
-        var injected = DynamicContextSizingEngine.SelectBucket(options, "DenseDesktop16gb", tokens, clientNumCtx, ceiling);
-
-        Assert.Equal(expected, injected);
-    }
-
-    // --- SelectBucket: DenseServer96gb and SmallDense tables --------------------------
-
-    [Theory]
-    [InlineData(70_000, null, 262_144, 131_072)]
-    [InlineData(200_000, null, 262_144, 262_144)]
-    [InlineData(50_000, null, 262_144, 65_536)]
-    public void SelectBucket_DenseServer96gb_FollowsProfileTable(long tokens, int? clientNumCtx, int ceiling, int expected)
-    {
-        var options = DefaultOptions();
-
-        var injected = DynamicContextSizingEngine.SelectBucket(options, "DenseServer96gb", tokens, clientNumCtx, ceiling);
-
-        Assert.Equal(expected, injected);
-    }
-
-    [Theory]
-    [InlineData(50_000, null, 131_072, 65_536)]
-    [InlineData(100_000, null, 131_072, 131_072)]
-    [InlineData(10_000, null, 131_072, 32_768)]
-    public void SelectBucket_SmallDense_FollowsProfileTable(long tokens, int? clientNumCtx, int ceiling, int expected)
-    {
-        var options = DefaultOptions();
-
-        var injected = DynamicContextSizingEngine.SelectBucket(options, "SmallDense", tokens, clientNumCtx, ceiling);
-
-        Assert.Equal(expected, injected);
-    }
-
-    // --- SelectBucket: custom profile with synthesized intermediate --------------------
-
-    [Fact]
-    public void SelectBucket_CustomProfile_SynthesizesIntermediateOnStepGrid()
-    {
-        // Custom profile: DefaultContext 32,768, MaxContext 131,072, no explicit
-        // intermediate → snapUpToStep(ceil((32768 + 131072) / 2), 32768)
-        // = snapUpToStep(81920, 32768) = 98,304.
-        var options = DefaultOptions();
-        options.Profiles["Custom"] = new DynamicContextProfile(32_768, null, 131_072);
-
-        Assert.Equal(98_304, DynamicContextSizingEngine.SelectBucket(options, "Custom", 50_000, null, 131_072));
-        // A requirement above the synthesized intermediate takes the next bucket up.
-        Assert.Equal(131_072, DynamicContextSizingEngine.SelectBucket(options, "Custom", 100_000, null, 131_072));
-        Assert.Equal(32_768, DynamicContextSizingEngine.SelectBucket(options, "Custom", 10_000, null, 131_072));
-        // The smallest bucket above 40,000 is the synthesized intermediate (98,304).
-        Assert.Equal(98_304, DynamicContextSizingEngine.SelectBucket(options, "Custom", 40_000, null, 131_072));
-    }
-
-    [Fact]
-    public void SelectBucket_CustomProfile_NonStepAlignedMidpoint_IsClampedToMax()
-    {
-        // (1000 + 3300) / 2 = 2150 → snapUpToStep(2150, 1000) = 3000; 3000 < max 3300.
-        var options = DefaultOptions();
-        options.BucketStepTokens = 1_000;
-        options.Profiles["Tiny"] = new DynamicContextProfile(1_000, null, 3_300);
-
-        Assert.Equal(3_000, DynamicContextSizingEngine.SelectBucket(options, "Tiny", 2_500, null, 3_300));
-
-        // (1000 + 2200) / 2 = 1600 → snapUpToStep(1600, 1000) = 2000 → clamped to max 2200?
-        // No: 2000 ≤ 2200, so the ladder is 1000 / 2000 / 2200.
-        options.Profiles["Tiny2"] = new DynamicContextProfile(1_000, null, 2_200);
-        Assert.Equal(2_000, DynamicContextSizingEngine.SelectBucket(options, "Tiny2", 1_500, null, 2_200));
-    }
-
-    [Fact]
-    public void SelectBucket_NonPositiveStep_FallsBackToDefaultGrid()
-    {
-        var options = DefaultOptions();
-        options.BucketStepTokens = 0; // Guard: clamped to the default 32,768 grid.
-        options.Profiles["Custom"] = new DynamicContextProfile(32_768, null, 131_072);
-
-        // Midpoint 81,920 snaps to 98,304 on the default 32,768 grid.
-        Assert.Equal(98_304, DynamicContextSizingEngine.SelectBucket(options, "Custom", 50_000, null, 131_072));
-    }
-
-    [Fact]
-    public void SelectBucket_UnknownProfileName_FallsBackToConservativeDefaults()
-    {
-        var options = DefaultOptions();
-
-        // Unknown profile name → the built-in conservative default (32,768 baseline).
-        Assert.Equal(32_768, DynamicContextSizingEngine.SelectBucket(options, "DoesNotExist", 10_000, null, 131_072));
-    }
-
-    // --- Decide (full decision per (target, model, prompt)) ----------------------------
-
-    [Fact]
-    public void Decide_Moe200k_96GBClass_Ceiling221184_Emits221184()
-    {
-        // 200k-token MoE prompt on a 96 GB-class target whose effective ceiling is capped at
-        // 221,184 (explicit Modelfile num_ctx): the bucket is clamped to the ceiling — the
-        // required checklist value (200k-token MoE prompt → options.num_ctx = 221184).
-        var decision = DynamicContextSizingEngine.Decide(
-            DefaultOptions(), ModelArchitectureKind.Moe, 98_304, 221_184, estimatedTokens: 200_000, clientRequestedNumCtx: null);
-
-        Assert.Equal("Moe", decision.ProfileName);
-        Assert.Equal(221_184, decision.InjectedNumCtx);
-        Assert.Equal(221_184, decision.EffectiveCeiling);
-        Assert.False(decision.ClientRequestedClamped);
-    }
-
-    [Fact]
-    public void Decide_Moe195k_96GBClass_FullCeiling_Emits221184()
-    {
-        var decision = DynamicContextSizingEngine.Decide(
-            DefaultOptions(), ModelArchitectureKind.Moe, 98_304, 262_144, estimatedTokens: 195_000, clientRequestedNumCtx: null);
-
-        Assert.Equal("Moe", decision.ProfileName);
-        Assert.Equal(221_184, decision.InjectedNumCtx);
-        Assert.Equal(262_144, decision.EffectiveCeiling);
-        Assert.False(decision.ClientRequestedClamped);
-    }
-    [Fact]
-    public void Decide_DenseDesktop2kClient131072_ClampedTo49152()
-    {
-        var decision = DynamicContextSizingEngine.Decide(
-            DefaultOptions(), ModelArchitectureKind.LargeDense, 16_384, 49_152, estimatedTokens: 2_000, clientRequestedNumCtx: 131_072);
-
-        Assert.Equal("DenseDesktop16gb", decision.ProfileName);
-        Assert.Equal(49_152, decision.InjectedNumCtx);
-        Assert.Equal(49_152, decision.EffectiveCeiling);
-        Assert.True(decision.ClientRequestedClamped);
-    }
-
-    [Fact]
-    public void Decide_CeilingBelowProfileMax_LimitsEffectiveCeiling()
-    {
-        // Hardware CMax (e.g. unknown-VRAM target → 4096) caps everything.
-        var decision = DynamicContextSizingEngine.Decide(
-            DefaultOptions(), ModelArchitectureKind.Moe, null, 4_096, estimatedTokens: 10_000, clientRequestedNumCtx: null);
-
-        Assert.Equal(4_096, decision.EffectiveCeiling);
-        Assert.Equal(4_096, decision.InjectedNumCtx);
-    }
-
-    // --- IsHardwareSuitable: Stage-1 hard filter ---------------------------------------
-
-    private static TargetModelCapability Capability(ModelArchitectureKind architecture, int cDefault, int cMax, bool hardwareCapable)
-    {
-        return new TargetModelCapability("t", architecture, ArchitectureDetectionSource.DenseParameterCount, cDefault, cMax, hardwareCapable, null);
-    }
+    // ================================================================================
+    //  IsHardwareSuitable: Stage-1 hard filter
+    // ================================================================================
 
     [Fact]
     public void IsHardwareSuitable_27BDenseOn8GB_IsExcludedEvenWhenIdle()
     {
-        // LargeDense (27 B) on an 8 GB target: the veto is encoded in HardwareCapable and
-        // ignores activity state entirely — the capability carries no notion of idle/loaded,
-        // so the model is strictly excluded at qualification EVEN WHEN IDLE.
-        var capability = Capability(ModelArchitectureKind.LargeDense, 4_096, 262_144, hardwareCapable: false);
-
+        var capability = new TargetModelCapability("t", ModelArchitectureKind.LargeDense,
+            ArchitectureDetectionSource.DenseParameterCount, 4_096, 262_144, false, null, null);
         Assert.False(DynamicContextSizingEngine.IsHardwareSuitable(capability));
     }
 
     [Fact]
     public void IsHardwareSuitable_27BDenseOn16GB_IsSuitable()
     {
-        var capability = Capability(ModelArchitectureKind.LargeDense, 4_096, 49_152, hardwareCapable: true);
-
+        var capability = new TargetModelCapability("t", ModelArchitectureKind.LargeDense,
+            ArchitectureDetectionSource.DenseParameterCount, 4_096, 49_152, true, null, null);
         Assert.True(DynamicContextSizingEngine.IsHardwareSuitable(capability));
     }
 
     [Fact]
     public void IsHardwareSuitable_MoeOn8GB_IsSuitable()
     {
-        // MoE is capable on all targets (plan §2.1): never VRAM-vetoed.
-        var capability = Capability(ModelArchitectureKind.Moe, 4_096, 262_144, hardwareCapable: true);
-
+        var capability = new TargetModelCapability("t", ModelArchitectureKind.Moe,
+            ArchitectureDetectionSource.MoeExpertCount, 4_096, 262_144, true, null, null);
         Assert.True(DynamicContextSizingEngine.IsHardwareSuitable(capability));
     }
 
-    // --- DynamicContextOptions ---------------------------------------------------------
+    // ================================================================================
+    //  DynamicContextOptions (task #26 changes)
+    // ================================================================================
 
     [Fact]
-    public void Options_Defaults_ShipBuiltInProfileTable()
+    public void Options_Defaults_ShipOnlyMoeProfile()
     {
         var options = new DynamicContextOptions();
 
         Assert.False(options.Enabled);
-        Assert.Equal(32_768, options.BucketStepTokens);
+        Assert.True(options.DenseClampEnabled);
         Assert.Equal(3, options.AutoShrinkCooldownTurns);
         Assert.Equal(60, options.AutoShrinkIdleTimeoutSeconds);
 
-        var moe = options.GetProfile("Moe");
-        Assert.Equal(184_320, moe.DefaultContext);
-        Assert.Equal(221_184, moe.IntermediateContext);
-        Assert.Equal(262_144, moe.MaxContext);
+        // Only the Moe profile is built-in (task #26).
+        Assert.Single(options.Profiles);
+        Assert.True(options.Profiles.ContainsKey("Moe"));
 
-        var desktop = options.GetProfile("DenseDesktop16gb");
-        Assert.Equal(32_768, desktop.DefaultContext);
-        Assert.Equal(40_960, desktop.IntermediateContext);
-        Assert.Equal(49_152, desktop.MaxContext);
-
-        var server = options.GetProfile("DenseServer96gb");
-        Assert.Equal(65_536, server.DefaultContext);
-        Assert.Equal(131_072, server.IntermediateContext);
-        Assert.Equal(262_144, server.MaxContext);
-
-        var small = options.GetProfile("SmallDense");
-        Assert.Equal(32_768, small.DefaultContext);
-        Assert.Equal(65_536, small.IntermediateContext);
-        Assert.Equal(131_072, small.MaxContext);
+        // Dense profiles are NOT restored.
+#pragma warning disable CS0618
+        Assert.False(options.Profiles.ContainsKey(DynamicContextOptions.DenseDesktop16gbProfileName));
+        Assert.False(options.Profiles.ContainsKey(DynamicContextOptions.DenseServer96gbProfileName));
+        Assert.False(options.Profiles.ContainsKey(DynamicContextOptions.SmallDenseProfileName));
+#pragma warning restore CS0618
     }
 
     [Fact]
-    public void Options_GetProfile_IsCaseInsensitive()
+    public void Options_Normalize_RestoresOnlyMoeProfile()
     {
-        var options = new DynamicContextOptions();
-
-        Assert.Equal(262_144, options.GetProfile("moe").MaxContext);
-        Assert.Equal(49_152, options.GetProfile("denseDESKTOP16GB").MaxContext);
-    }
-
-    [Fact]
-    public void Options_Normalize_RestoresMissingBuiltInProfiles()
-    {
-        // Simulates config binding that replaced the dictionary with a partial override.
+        // Simulates config binding that replaced the dictionary with an empty one.
         var options = new DynamicContextOptions
         {
             Profiles = new Dictionary<string, DynamicContextProfile>(StringComparer.OrdinalIgnoreCase)
-            {
-                ["Moe"] = new(184_320, 221_184, 300_000)
-            }
         };
 
         options.Normalize();
 
-        // The operator override is preserved...
-        Assert.Equal(300_000, options.Profiles["Moe"].MaxContext);
-        // ...and the missing built-in profiles are restored.
-        Assert.Equal(49_152, options.Profiles["DenseDesktop16gb"].MaxContext);
-        Assert.Equal(262_144, options.Profiles["DenseServer96gb"].MaxContext);
-        Assert.Equal(131_072, options.Profiles["SmallDense"].MaxContext);
+        // The Moe profile is restored.
+        Assert.True(options.Profiles.ContainsKey("Moe"));
+        Assert.Equal(184_320, options.Profiles["Moe"].DefaultContext);
+    }
+
+    [Fact]
+    public void Options_Normalize_LegacyDenseProfile_WarnsButKeeps()
+    {
+        var options = new DynamicContextOptions
+        {
+            Profiles = new Dictionary<string, DynamicContextProfile>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Moe"] = new(184_320, null, 262_144),
+#pragma warning disable CS0618
+                ["DenseDesktop16gb"] = new(32_768, null, 49_152)
+#pragma warning restore CS0618
+            }
+        };
+
+        var warnings = new List<string>();
+        var logger = new TestLogger(warnings);
+        options.Normalize(logger);
+
+        // Warning logged naming the legacy profile.
+        Assert.Single(warnings);
+        Assert.Contains("DenseDesktop16gb", warnings[0]);
+
+        // The profile is still in the dictionary (bind-and-ignore).
+        Assert.True(options.Profiles.ContainsKey("DenseDesktop16gb"));
+        // Moe is also still there.
+        Assert.True(options.Profiles.ContainsKey("Moe"));
+    }
+
+    [Fact]
+    public void Options_Normalize_NoLegacyProfiles_NoWarning()
+    {
+        var options = new DynamicContextOptions();
+        var warnings = new List<string>();
+        var logger = new TestLogger(warnings);
+        options.Normalize(logger);
+
+        Assert.Empty(warnings);
+    }
+
+    [Fact]
+    public void Options_Normalize_MultipleLegacyProfiles_SingleWarning()
+    {
+        var options = new DynamicContextOptions
+        {
+            Profiles = new Dictionary<string, DynamicContextProfile>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Moe"] = new(184_320, null, 262_144),
+#pragma warning disable CS0618
+                ["DenseDesktop16gb"] = new(32_768, null, 49_152),
+                ["SmallDense"] = new(32_768, null, 131_072)
+#pragma warning restore CS0618
+            }
+        };
+
+        var warnings = new List<string>();
+        var logger = new TestLogger(warnings);
+        options.Normalize(logger);
+
+        // ONE warning naming both profiles.
+        Assert.Single(warnings);
+        Assert.Contains("DenseDesktop16gb", warnings[0]);
+        Assert.Contains("SmallDense", warnings[0]);
     }
 
     [Fact]
     public void Options_Normalize_ClampsNonPositiveBucketStep()
     {
-        var options = new DynamicContextOptions { BucketStepTokens = -5 };
+        var options = new DynamicContextOptions();
+#pragma warning disable CS0618
+        options.BucketStepTokens = -5;
+#pragma warning restore CS0618
 
         options.Normalize();
 
+#pragma warning disable CS0618
         Assert.Equal(32_768, options.BucketStepTokens);
+#pragma warning restore CS0618
     }
 
     [Fact]
-    public void Options_Normalize_RepairsZeroValuedBuiltInProfile()
+    public void Options_Normalize_RepairsZeroValuedMoeProfile()
     {
         var options = new DynamicContextOptions();
         options.Profiles["Moe"] = new DynamicContextProfile(0, null, 0);
@@ -368,44 +409,55 @@ public class DynamicContextSizingTests
         Assert.Equal(262_144, options.GetProfile("Moe").MaxContext);
     }
 
-    // --- ExtractClientNumCtx -----------------------------------------------------------
+    [Fact]
+    public void ModelThresholds_MaxContextTokens_DefaultsToNull()
+    {
+        var thresholds = new ModelThresholds();
+        Assert.Null(thresholds.MaxContextTokens);
+    }
+
+    // ================================================================================
+    //  ExtractClientNumCtx
+    // ================================================================================
 
     [Theory]
-    [InlineData("{\"model\":\"x\",\"options\":{\"num_ctx\":131072}}", 131072)]
-    [InlineData("{\"model\":\"x\",\"options\":{\"num_ctx\":8192,\"temperature\":0.2}}", 8192)]
-    [InlineData("{\"model\":\"x\"}", null)]
-    [InlineData("{\"model\":\"x\",\"options\":{}}", null)]
-    [InlineData("{\"model\":\"x\",\"options\":{\"num_ctx\":\"8192\"}}", null)]   // Non-numeric.
-    [InlineData("{\"model\":\"x\",\"options\":{\"num_ctx\":0}}", null)]        // Non-positive.
+    [InlineData("{ \"model\":\"x\",\"options\":{\"num_ctx\":131072}}", 131072)]
+    [InlineData("{ \"model\":\"x\",\"options\":{\"num_ctx\":8192,\"temperature\":0.2}}", 8192)]
+    [InlineData("{ \"model\":\"x\"}", null)]
+    [InlineData("{ \"model\":\"x\",\"options\":{}}", null)]
+    [InlineData("{ \"model\":\"x\",\"options\":{\"num_ctx\":\"8192\"}}", null)]   // Non-numeric.
+    [InlineData("{ \"model\":\"x\",\"options\":{\"num_ctx\":0}}", null)]        // Non-positive.
     [InlineData("not-json", null)]
-    [InlineData("[1,2,3]", null)]                                                 // Non-object root.
+    [InlineData("[1,2,3]", null)]                                              // Non-object root.
     public void ExtractClientNumCtx_ReadsTolerantly(string body, int? expected)
     {
         Assert.Equal(expected, DynamicContextPayloadTransformer.ExtractClientNumCtx(body));
     }
 
-    // --- Transformer Apply -------------------------------------------------------------
+    // ================================================================================
+    //  Transformer Apply
+    // ================================================================================
 
     [Fact]
     public void Apply_InjectsNumCtx_WhenOptionsAbsent()
     {
         const string body = """{"model":"qwen3.6-35b-a3b","messages":[{"role":"user","content":"hi"}]}""";
-        var decision = new ContextSizingDecision("Moe", 221_184, 262_144, false);
+        var decision = new ContextSizingDecision("Moe", 262_144, 262_144, false, ContextSizingMode.Expanded, 184_320);
 
         var (newBody, injected) = DynamicContextPayloadTransformer.Apply(body, decision, new DynamicContextOptions { Enabled = true });
 
-        Assert.Equal(221_184, injected);
+        Assert.Equal(262_144, injected);
         using var doc = JsonDocument.Parse(newBody);
         Assert.Equal("qwen3.6-35b-a3b", doc.RootElement.GetProperty("model").GetString());
         Assert.Equal(1, doc.RootElement.GetProperty("messages").GetArrayLength());
-        Assert.Equal(221_184, doc.RootElement.GetProperty("options").GetProperty("num_ctx").GetInt32());
+        Assert.Equal(262_144, doc.RootElement.GetProperty("options").GetProperty("num_ctx").GetInt32());
     }
 
     [Fact]
     public void Apply_OverwritesExistingNumCtx_PreservesOtherOptionKeys()
     {
         const string body = """{"model":"m","options":{"num_ctx":131072,"temperature":0.1}}""";
-        var decision = new ContextSizingDecision("DenseDesktop16gb", 49_152, 49_152, true);
+        var decision = new ContextSizingDecision("Moe", 49_152, 49_152, true, ContextSizingMode.Clamped, 49_152);
 
         var (newBody, injected) = DynamicContextPayloadTransformer.Apply(body, decision, new DynamicContextOptions { Enabled = true });
 
@@ -421,7 +473,7 @@ public class DynamicContextSizingTests
     public void Apply_Disabled_ReturnsBodyUnchanged()
     {
         const string body = """{"model":"m"}""";
-        var decision = new ContextSizingDecision("Moe", 221_184, 262_144, false);
+        var decision = new ContextSizingDecision("Moe", 262_144, 262_144, false, ContextSizingMode.Expanded, 184_320);
         var options = new DynamicContextOptions { Enabled = false };
 
         var (newBody, injected) = DynamicContextPayloadTransformer.Apply(body, decision, options);
@@ -431,10 +483,23 @@ public class DynamicContextSizingTests
     }
 
     [Fact]
+    public void Apply_PassThroughZeroInjected_ReturnsBodyUnchanged()
+    {
+        // InjectedNumCtx = 0 (PassThrough sentinel): body is untouched.
+        const string body = """{"model":"m","options":{"num_ctx":131072}}""";
+        var decision = new ContextSizingDecision("Moe", 0, 49_152, false, ContextSizingMode.PassThrough, 49_152);
+
+        var (newBody, injected) = DynamicContextPayloadTransformer.Apply(body, decision, new DynamicContextOptions { Enabled = true });
+
+        Assert.Same(body, newBody);
+        Assert.Null(injected);
+    }
+
+    [Fact]
     public void Apply_UnparseableBody_ReturnsBodyUnchanged()
     {
         const string body = "this is not json";
-        var decision = new ContextSizingDecision("Moe", 221_184, 262_144, false);
+        var decision = new ContextSizingDecision("Moe", 262_144, 262_144, false, ContextSizingMode.Expanded, 184_320);
 
         var (newBody, injected) = DynamicContextPayloadTransformer.Apply(body, decision, new DynamicContextOptions());
 
@@ -446,7 +511,7 @@ public class DynamicContextSizingTests
     public void Apply_NonObjectRoot_ReturnsBodyUnchanged()
     {
         const string body = "[1,2,3]";
-        var decision = new ContextSizingDecision("Moe", 221_184, 262_144, false);
+        var decision = new ContextSizingDecision("Moe", 262_144, 262_144, false, ContextSizingMode.Expanded, 184_320);
 
         var (newBody, injected) = DynamicContextPayloadTransformer.Apply(body, decision, new DynamicContextOptions());
 
@@ -454,17 +519,9 @@ public class DynamicContextSizingTests
         Assert.Null(injected);
     }
 
-    [Fact]
-    public void Apply_NonPositiveInjectedValue_ReturnsBodyUnchanged()
-    {
-        const string body = """{"model":"m"}""";
-        var decision = new ContextSizingDecision("Moe", 0, 0, false);
-
-        var (newBody, injected) = DynamicContextPayloadTransformer.Apply(body, decision, new DynamicContextOptions());
-
-        Assert.Same(body, newBody);
-        Assert.Null(injected);
-    }
+    // ================================================================================
+    //  ApplyExplicitNumCtx
+    // ================================================================================
 
     [Fact]
     public void ApplyExplicitNumCtx_InjectsOptionsAndNumCtx_WhenOptionsMissing()
@@ -476,7 +533,6 @@ public class DynamicContextSizingTests
         Assert.Equal(65_536, injected);
         using var doc = JsonDocument.Parse(newBody);
         Assert.Equal(65_536, doc.RootElement.GetProperty("options").GetProperty("num_ctx").GetInt32());
-        Assert.Equal("qwen3.8-27b", doc.RootElement.GetProperty("model").GetString());
     }
 
     [Fact]
@@ -499,55 +555,52 @@ public class DynamicContextSizingTests
     public void ApplyExplicitNumCtx_NonPositiveValue_ReturnsBodyUnchanged(int invalidVal)
     {
         const string body = """{"model":"m"}""";
-
         var (newBody, injected) = DynamicContextPayloadTransformer.ApplyExplicitNumCtx(body, invalidVal);
-
         Assert.Same(body, newBody);
         Assert.Null(injected);
     }
 
-    [Fact]
-    public void ApplyExplicitNumCtx_UnparseableBody_ReturnsBodyUnchanged()
-    {
-        const string body = "invalid-json";
-
-        var (newBody, injected) = DynamicContextPayloadTransformer.ApplyExplicitNumCtx(body, 65_536);
-
-        Assert.Same(body, newBody);
-        Assert.Null(injected);
-    }
-
-    [Fact]
-    public void ApplyExplicitNumCtx_NonObjectRoot_ReturnsBodyUnchanged()
-    {
-        const string body = "[1, 2, 3]";
-
-        var (newBody, injected) = DynamicContextPayloadTransformer.ApplyExplicitNumCtx(body, 65_536);
-
-        Assert.Same(body, newBody);
-        Assert.Null(injected);
-    }
+    // ================================================================================
+    //  GetMoeExtensibleCapacity
+    // ================================================================================
 
     [Theory]
-    [InlineData(null)]
-    [InlineData("")]
-    [InlineData("   ")]
-    public void ApplyExplicitNumCtx_NullOrWhiteSpaceBody_ReturnsBodyUnchanged(string? body)
+    [InlineData(262_144, null, 262_144)]   // native, no cap
+    [InlineData(262_144, 200_000, 200_000)] // cap below native
+    [InlineData(262_144, 300_000, 262_144)] // cap above native → native wins
+    [InlineData(null, null, 131_072)]       // no native → 128k fallback
+    [InlineData(null, 100_000, 100_000)]    // no native, cap → cap
+    [InlineData(262_144, 0, 262_144)]       // cap ≤ 0 ignored
+    [InlineData(262_144, -1, 262_144)]      // cap ≤ 0 ignored
+    public void GetMoeExtensibleCapacity_Cases(int? native, int? cap, int expected)
     {
-        var (newBody, injected) = DynamicContextPayloadTransformer.ApplyExplicitNumCtx(body!, 65_536);
-
-        Assert.Same(body, newBody);
-        Assert.Null(injected);
+        var cap2 = new TargetModelCapability("t", ModelArchitectureKind.Moe,
+            ArchitectureDetectionSource.MoeExpertCount, 4_096, native ?? 131_072, true, null, native);
+        Assert.Equal(expected, ModelCapabilityEngine.GetMoeExtensibleCapacity(cap2, cap));
     }
 
-    [Theory]
-    [InlineData(null)]
-    [InlineData("")]
-    [InlineData("   ")]
-    public void ExtractClientNumCtx_NullOrWhiteSpaceBody_ReturnsNull(string? body)
-    {
-        var result = DynamicContextPayloadTransformer.ExtractClientNumCtx(body!);
+    // ================================================================================
+    //  Test helper logger
+    // ================================================================================
 
-        Assert.Null(result);
+    private sealed class TestLogger : Microsoft.Extensions.Logging.ILogger
+    {
+        private readonly List<string> _messages;
+        public TestLogger(List<string> messages) => _messages = messages;
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+        public void Log<TState>(
+            Microsoft.Extensions.Logging.LogLevel logLevel,
+            Microsoft.Extensions.Logging.EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (logLevel == Microsoft.Extensions.Logging.LogLevel.Warning)
+            {
+                _messages.Add(formatter(state, exception));
+            }
+        }
     }
 }

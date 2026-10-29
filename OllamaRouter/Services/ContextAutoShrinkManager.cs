@@ -72,9 +72,20 @@ public sealed class ContextAutoShrinkManager : IContextAutoShrinkManager
                 return new AutoShrinkLeaseDecision(engineDecision.InjectedNumCtx, LeaseBucketState.Baseline, false, null);
             }
 
-            var profile = dynamic?.GetProfile(engineDecision.ProfileName) ?? new DynamicContextProfile(32_768, null, 32_768);
-            var baseline = profile.DefaultContext > 0
-                ? profile.DefaultContext
+            // MoE-only guard (task #26): dense decisions (Clamped/PassThrough) NEVER create
+            // or retain an expanded lease — the engine only returns Expanded/Baseline for MoE
+            // (dense KV refills cost 300 s+, so dense is clamp-only pass-through), but a
+            // crafted non-MoE decision is defended against defensively: return the engine
+            // decision statelessly, touching no lease state.
+            if (engineDecision.Mode is not (ContextSizingMode.Expanded or ContextSizingMode.Baseline))
+            {
+                return new AutoShrinkLeaseDecision(engineDecision.InjectedNumCtx, LeaseBucketState.Baseline, false, null);
+            }
+
+            // The two-bucket ladder (task #26): the baseline is the node's pre-configured
+            // context carried by the engine decision (was the retired profile constant).
+            var baseline = engineDecision.BaselineBucket > 0
+                ? engineDecision.BaselineBucket
                 : DynamicContextOptions.DefaultBucketStepTokens;
             var required = engineDecision.InjectedNumCtx;
             var ceiling = Math.Max(0, engineDecision.EffectiveCeiling);
@@ -235,7 +246,7 @@ public sealed class ContextAutoShrinkManager : IContextAutoShrinkManager
 
     /// <summary>
     /// Mutable lease state for one (target, model): the active (last injected) context bucket,
-    /// whether it is expanded above the profile baseline, the last activity time, and the
+    /// whether it is expanded above the pre-configured baseline, the last activity time, and the
     /// count of consecutive normal-size turns since the last spike (bucket raise).
     /// Guarded exclusively by the manager-wide <c>_gate</c> lock.
     /// </summary>

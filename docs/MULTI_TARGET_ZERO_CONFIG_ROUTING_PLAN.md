@@ -162,40 +162,47 @@ For **MoE models** (such as `Qwen3.6-35B-A3B-Code:latest`):
 
 ```mermaid
 flowchart TD
-    req["Incoming Request<br/>Estimated Tokens: T"] --> check{"T + Margin vs C_default"}
-    check -->|"≤ 180k (Normal)"| normal{"Was Target<br/>Expanded?"}
-    normal -->|"No"| pass["Pass default context<br/>(No reallocation needed)"]
-    normal -->|"Yes"| hyst{"Cooldown Expired OR<br/>Tokens < 50% baseline?"}
-    hyst -->|"Yes"| shrink["<b>Auto-Shrink Turn</b><br/>Inject <code>options.num_ctx = 184,320</code><br/><i>Ollama frees KV cache memory</i>"]
+    req["Incoming Request<br/>Estimated Tokens: T"] --> dense{"Dense Model?"}
+    dense -->|"Yes"| denseclamp{"Client num_ctx<br/>&gt; pre-configured?"}
+    denseclamp -->|"No (absent or ≤)"| passthrough["<b>Pass-Through</b><br/>Payload untouched<br/><i>No reallocation, no lease</i>"]
+    denseclamp -->|"Yes (clamp-only)"| clampdown["<b>Clamped</b><br/>Down-clamp <code>options.num_ctx</code> to pre-configured<br/><i>One-time KV reallocation, OOM guard</i>"]
+    dense -->|"No (MoE)"| check{"T + Margin ≤<br/>pre-configured baseline?"}
+    check -->|"Yes (Normal)"| normal{"Was Target<br/>Expanded?"}
+    normal -->|"No"| baseline["<b>Baseline Bucket</b><br/>Inject pre-configured <code>num_ctx</code><br/><i>No reallocation needed</i>"]
+    normal -->|"Yes"| hyst{"Cooldown Expired OR<br/>Tokens &lt; 50% baseline?"}
+    hyst -->|"Yes"| shrink["<b>Auto-Shrink Turn</b><br/>Inject <code>options.num_ctx = baseline</code><br/><i>Ollama frees KV cache memory</i>"]
     hyst -->|"No (Active Lease)"| keep["<b>Preserve KV Cache</b><br/>Keep current expanded bucket<br/><i>Retains prompt prefix caching</i>"]
-    check -->|"> 180k and ≤ 256k"| expand["<b>Elastic Expansion Turn</b><br/>Quantize to Next Bucket (e.g. 216k, 256k)<br/>Inject <code>options.num_ctx = Bucket</code><br/>Reset Cooldown Timer"]
-    check -->|"> 256k"| spill["Exceeds Hardware Max<br/>Route to AI Server or Cloud Overflow"]
+    check -->|"&gt; baseline and ≤ native limit"| expand["<b>Expanded Bucket</b><br/>Inject <code>options.num_ctx = native limit</code><br/>Reset Cooldown Timer"]
+    check -->|"&gt; native limit"| spill["Exceeds Hardware Max<br/>Route to AI Server or Cloud Overflow"]
 ```
 
-#### 2. Quantized Context Buckets
-Arbitrary token-by-token context resizing causes continuous memory buffer reallocation and heap fragmentation in llama.cpp. To avoid jitter, the router steps context up using **quantized buckets**:
+#### 2. Two-Bucket Context Ladder (MoE only) & Clamp-Only Dense Pass-Through
+The dynamic context system is **MoE-only**: a context change forces a llama.cpp KV-cache reallocation, and on a dense model that refill costs 300 s+, so rewriting dense payloads is never worth it. Dense models are handled by a clamp-only pass-through (see below), never bucketed.
 
-| Architecture & Hardware | Baseline Context ($C_{\text{default}}$) | Intermediate Bucket | Maximum Elastic Ceiling ($C_{\text{max}}$) |
-| :--- | :--- | :--- | :--- |
-| **Qwen3.6-35B-A3B (MoE on Laptop / Desktop)** | **180k** (`184,320`) | **216k** (`221,184`) | **256k** (`262,144`) |
-| **Qwen3.6-35B-A3B (MoE on Server 96 GB)** | **180k** (`184,320`) | **216k** (`221,184`) | **256k** (`262,144`) *(Q8 lossless)* |
-| **Qwen3.8-27B (Dense on Desktop 16 GB)** | **32k** (`32,768`) | **40k** (`40,960`) | **48k** (`49,152`) *(Hard VRAM boundary)* |
-| **Qwen3.8-27B (Dense on Server 96 GB)** | **64k** (`65,536`) | **128k** (`131,072`) | **256k** (`262,144`) |
-| **Small Dense ($< 14\text{B}$, e.g. 4B / 9B)** | **32k** (`32,768`) | **64k** (`65,536`) | **128k** (`131,072`) |
+For **MoE** models the ladder collapses to exactly **two buckets**:
+
+| Bucket | Value | Meaning |
+| :--- | :--- | :--- |
+| **Optimal (baseline)** | The node's pre-configured `num_ctx` (its Modelfile `num_ctx`; fallback: native context, then `131,072`) | The optimal operating point (e.g. `184,320`). Request qualifies on this bucket when `min(T + Margin, client num_ctx) ≤ baseline`. |
+| **Extensible** | The model's native context length (fallback `131,072`), optionally capped by the operator key `Models:{model}:MaxContextTokens` as `min(native, override)` | The single elastic ceiling (e.g. `262,144` on the 35B MoE; `200,000` for a VRAM-tuned node). Used when the requirement exceeds the baseline bucket. |
+
+The intermediate-bucket machinery (explicit hand-tuned intermediates + `BucketStepTokens` midpoint synthesis) and the Dense/VRAM-class profile table are retired. For the reference 35B MoE, the ladder is: **`184,320` (baseline) → `262,144` (extensible)** — e.g. a 205k prompt on a `184,320`-preconfigured laptop node expands to the `262,144` native limit instead of failing over to the server.
+
+**Dense = clamp-only pass-through.** A dense request rewrites `options.num_ctx` *only* when the client's static value **exceeds** the node's pre-configured context, clamping it **down** to that value (one-time KV reallocation; OOM protection from static 131,072 requests on 49,152 nodes). When the client value is absent or ≤ pre-configured the payload is untouched. Dense values are never raised, never bucketed, never leased; the operator can disable even the clamp via `DynamicContext:DenseClampEnabled = false`.
 
 #### 3. The "Size-Back" (Auto-Shrink) Mechanism & KV Cache Preservation
 In Ollama (`llama.cpp`), changing `options.num_ctx` destroys and reallocates the context memory buffer, which **invalidates any cached prompt prefix tokens**. If an agent session oscillates near the baseline boundary (e.g. 175k $\leftrightarrow$ 195k), shrinking context down on every single turn causes continuous KV cache thrashing and prompt re-evaluation delays (costing 15–30s per turn).
 
 To balance memory reclamation against prompt cache retention, the Auto-Shrink Manager implements a **hysteresis cooldown**:
-1. **Expansion Phase**: If a prompt demands 205k tokens, the router calculates the quantized bucket (216k = 221,184) and rewrites the request JSON body to inject `options: { "num_ctx": 221184 }`. The target node's active context state is recorded as `221184`, and the cooldown counter is reset.
-2. **Hysteresis Retention Phase**: When subsequent prompts with $T_{\text{est}} + \text{Margin} \le 184,320$ arrive during an active coding session:
-   - The target remains at `221184` for up to `AutoShrinkCooldownTurns` (default: 3) consecutive normal turns or until `AutoShrinkIdleTimeoutSeconds` (default: 60s) has elapsed.
-   - This preserves Ollama's prompt prefix cache and prevents re-evaluating 180k tokens on every turn.
+1. **Expansion Phase**: If a MoE prompt exceeds the pre-configured baseline (e.g. 205k on a `184,320` node), the router rewrites the request JSON body to inject `options: { "num_ctx": <extensible bucket> }` — the model's native context length (e.g. `262,144`). The target node's active context state is recorded, and the cooldown counter is reset.
+2. **Hysteresis Retention Phase**: When subsequent prompts with $T_{\text{est}} + \text{Margin} \le \text{baseline}$ arrive during an active coding session:
+   - The target remains at the expanded bucket for up to `AutoShrinkCooldownTurns` (default: 3) consecutive normal turns or until `AutoShrinkIdleTimeoutSeconds` (default: 60s) has elapsed.
+   - This preserves Ollama's prompt prefix cache and prevents re-evaluating the baseline tokens on every turn.
 3. **Shrink Execution Phase**: Auto-shrink executes when:
    - The cooldown turn counter expires without new spike requests, **OR**
    - The idle timeout expires, **OR**
-   - Prompt token count drops below $50\%$ of baseline ($< 92,160$ tokens), signaling that a new task or conversation has started.
-   When triggered, the router explicitly injects `options: { "num_ctx": 184320 }`, prompting Ollama to reallocate back to the 180k sweet spot and release excess memory.
+   - Prompt token count drops below $50\%$ of baseline, signaling that a new task or conversation has started.
+   When triggered, the router explicitly injects `options: { "num_ctx": <baseline> }` (e.g. `184,320`), prompting Ollama to reallocate back to the pre-configured optimal bucket and release excess memory.
 
 #### 4. Configuration Schema
 Declared under `DynamicContext` in `appsettings.json`:
@@ -204,26 +211,19 @@ Declared under `DynamicContext` in `appsettings.json`:
 "OllamaRouter": {
   "DynamicContext": {
     "Enabled": true,
-    "BucketStepTokens": 32768,
+    "DenseClampEnabled": true,
     "AutoShrinkCooldownTurns": 3,
-    "AutoShrinkIdleTimeoutSeconds": 60,
-    "Profiles": {
-      "Moe": {
-        "DefaultContext": 184320,
-        "MaxContext": 262144
-      },
-      "DenseDesktop16gb": {
-        "DefaultContext": 32768,
-        "MaxContext": 49152
-      },
-      "DenseServer96gb": {
-        "DefaultContext": 65536,
-        "MaxContext": 262144
-      }
+    "AutoShrinkIdleTimeoutSeconds": 60
+  },
+  "Models": {
+    "Qwen3.6-35B-A3B-Code:latest": {
+      "MaxContextTokens": 200000
     }
   }
 }
 ```
+
+Notes: `DenseClampEnabled` (default `true`) enables the dense clamp-only pass-through; set `false` for pure dense pass-through. `Models:{model}:MaxContextTokens` optionally caps the model's extensible context across all nodes (applied as `min(native, override)`; MoE dynamic sizing and Stage-1 MoE qualification only). The retired keys `BucketStepTokens`, `Profiles` (all dense profile names and the `Moe` profile constants), and `IntermediateContext` still bind for config compatibility but are ignored, with a one-time startup warning.
 
 ---
 
@@ -455,7 +455,7 @@ gantt
    - Classify model architecture: `MoE`, `SmallDense` ($< 14\text{B}$), or `LargeDense` ($\ge 14\text{B}$).
 3. **Dynamic Context Sizing Engine & Request Payload Transformer:**
    - Detect when prompt requires context beyond baseline $C_{\text{default}}$.
-   - Compute quantized context bucket.
+   - Compute the two-bucket MoE context (baseline or extensible) and dense clamp-only pass-through.
    - Inject or overwrite `options.num_ctx` in the outgoing JSON payload in `OllamaRoutingMiddleware`.
 4. **Hardware Suitability Rules:**
    - Blacklist `LargeDense` ($\ge 14\text{B}$) on targets with `HardwareHint == "8gb"` or `MaxVramMB < 12000`.
@@ -464,7 +464,7 @@ gantt
 #### Test Deliverables:
 - Unit tests for architecture classification across various Ollama Modelfile outputs (Dense 4B/9B/27B, MoE 35B A3B, DBRX).
 - Tests verifying that 27B Dense is strictly excluded from 8 GB targets.
-- Tests verifying dynamic context expansion: prompt of 200k tokens results in `options.num_ctx = 221184` injected into the outgoing payload.
+- Tests verifying dynamic context expansion: MoE prompt of 200k tokens results in `options.num_ctx = 262144` injected into the outgoing payload.
 - Tests verifying context clamping: a 2k prompt with client `options.num_ctx = 131072` runs on Desktop (48k ceiling) without disqualification.
 
 ---
@@ -493,7 +493,7 @@ gantt
 
 #### Test Deliverables:
 - Simulation tests of Architect $\leftrightarrow$ Developer interleaved turns: verify zero model evictions when two compatible targets are online.
-- Auto-shrink tests: verify prompt sequence 195k $\rightarrow$ 175k retains 221,184 (preserving KV cache), and subsequent 30k prompt triggers auto-shrink to 184,320.
+- Auto-shrink tests: verify MoE prompt sequence 195k $\rightarrow$ 175k retains 262,144 (preserving KV cache), and subsequent 30k prompt triggers auto-shrink to 184,320.
 - High-concurrency routing tests verifying parallel requests spill to Server instead of queueing on Desktop due to the $-140$ single-GPU busy penalty.
 - Tests verifying uncommitted request retry (Target A connection refused $\rightarrow$ retried on Target B $\rightarrow$ 200 OK).
 
@@ -546,9 +546,9 @@ gantt
 | **Liveness & Probing** | Stop Laptop Ollama service or disconnect Laptop from network. | Router marks Laptop offline within 2 probe intervals or immediate socket error; zero request hangs; subsequent requests route immediately to Desktop/Server. When Laptop daemon resumes, it rejoins the fleet within 10s. |
 | **Parallel Tag Aggregation** | Stop Laptop daemon while IDE is polling. | `GET /api/tags` returns combined catalog from Desktop/Server in <100ms via parallel queries and cached fallback; zero IDE UI hang. |
 | **Zero-Config Context** | Send a 40k prompt for un-aliased `Qwen3.8-27B:latest` and an 80k prompt. | 40k prompt routes to Desktop; 80k prompt automatically routes to AI Server based on physical memory headroom without manual `MaxLocalTokens` configuration in `appsettings.json`. |
-| **Client Context Clamping** | Send 2k prompt for `Qwen3.8-27B:latest` with client `options.num_ctx = 131072`. | Request routes to Desktop (capped at 48k) without disqualification; `options.num_ctx` is clamped to safe bucket. |
-| **Dynamic Context Expansion** | Send a 195k prompt for `Qwen3.6-35B-A3B-Code:latest` on Laptop. | Router dynamically rewrites request payload to inject `options.num_ctx: 221184`. Request runs on Laptop at full speed without spilling to Server. Telemetry returns `X-OllamaRouter-Context-Size: 221184`. |
-| **Context Auto-Shrink Hysteresis** | Follow 195k prompt with 175k prompt, then a 30k prompt for `Qwen3.6-35B-A3B-Code:latest`. | The 175k prompt retains 221,184 to preserve KV cache prefix; the subsequent 30k prompt (<50% threshold) triggers auto-shrink, injecting baseline `options.num_ctx: 184320` and freeing memory. |
+| **Client Context Clamping** | Send 2k prompt for `Qwen3.8-27B:latest` with client `options.num_ctx = 131072`. | Request routes to Desktop (capped at 48k) without disqualification; `options.num_ctx` is clamped down to the node's pre-configured context (dense clamp-only). |
+| **Dynamic Context Expansion** | Send a 195k prompt for `Qwen3.6-35B-A3B-Code:latest` on Laptop. | Router dynamically rewrites request payload to inject `options.num_ctx: 262144` (the extensible bucket). Request runs on Laptop at full speed without spilling to Server. Telemetry returns `X-OllamaRouter-Context-Size: 262144`. |
+| **Context Auto-Shrink Hysteresis** | Follow 195k prompt with 175k prompt, then a 30k prompt for `Qwen3.6-35B-A3B-Code:latest`. | The 175k prompt retains 262,144 to preserve KV cache prefix; the subsequent 30k prompt (<50% threshold) triggers auto-shrink, injecting baseline `options.num_ctx: 184320` and freeing memory. |
 | **Model Incompatibility** | Send request for `Qwen3.8-27B:latest` with Desktop busy or offline. | Request routes to AI Server or Cloud Overflow. It **never** routes to Laptop. |
 | **Hot-Model Affinity** | Keep `Qwen3.8-27B:latest` loaded on Desktop and `Qwen3.6-35B-A3B-Code:latest` on Laptop. Send interleaved Architect and Developer requests. | Zero model unloads or weight reloads occur. Architect runs on Desktop; Developer runs on Laptop concurrently. |
 | **Standalone MoE Speed** | Send `Qwen3.6-35B-A3B-Code:latest` request when Desktop is idle and no 27B model is hot. | Request routes to Desktop for 100–118 t/s execution; does not handicap execution to Laptop (35 t/s). |

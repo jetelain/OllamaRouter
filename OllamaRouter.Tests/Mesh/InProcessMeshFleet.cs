@@ -17,6 +17,12 @@ namespace OllamaRouter.Tests.Mesh;
 /// Modelfile-pinned <c>num_ctx</c> of 49,152) and on the server, plus a MoE model hosted on
 /// every daemon. The dense model is intentionally ABSENT from the laptop, so the laptop doubles
 /// as the catalog-gate / LargeDense-incompatibility fixture (8 GB &lt; 12,000 MB threshold).
+/// <para>
+/// Task #26: the MoE model is pinned at a 184,320 Modelfile <c>num_ctx</c> (the two-bucket
+/// "optimal" baseline) with a 262,144 native GGUF context limit (the single "extensible"
+/// bucket) — the plan's §2.3 184,320 → 262,144 elastic scenario, so the Auto-Shrink hysteresis
+/// row (expand past baseline → retain → shrink back to 184,320) is meaningful.
+/// </para>
 /// </summary>
 public static class MeshCatalog
 {
@@ -45,7 +51,8 @@ public static class MeshCatalog
             SizeBytes = MoeBytes,
             ParameterCount = MoeParams,
             ExpertCount = 16, // MoE signal (expert_count > 0).
-            NativeContextLength = 262_144, // native GGUF context → CMax 262,144 (no Modelfile pin) so the 195k/175k rows qualify.
+            ModelfileNumCtx = 184_320, // task #26 two-bucket baseline (pre-configured optimal bucket).
+            NativeContextLength = 262_144, // native GGUF context → the single extensible bucket (task #26).
             Family = "llama"
         }
     ];
@@ -58,6 +65,7 @@ public static class MeshCatalog
             SizeBytes = MoeBytes,
             ParameterCount = MoeParams,
             ExpertCount = 16,
+            ModelfileNumCtx = 184_320, // task #26 two-bucket baseline (laptop = the hysteresis fixture).
             NativeContextLength = 262_144,
             Family = "llama"
         }
@@ -80,6 +88,7 @@ public static class MeshCatalog
             SizeBytes = MoeBytes,
             ParameterCount = MoeParams,
             ExpertCount = 16,
+            ModelfileNumCtx = 184_320, // task #26 two-bucket baseline.
             NativeContextLength = 262_144,
             Family = "llama"
         }

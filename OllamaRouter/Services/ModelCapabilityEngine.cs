@@ -63,8 +63,9 @@ public enum ArchitectureDetectionSource
 
 /// <summary>
 /// Per-target derived capability for one (target, model) pair: the architecture
-/// classification plus the baseline context (<see cref="CDefault"/>) and the maximum elastic
-/// context ceiling (<see cref="CMax"/>) for requests routed to that target.
+/// classification plus the baseline context (<see cref="CDefault"/>), the maximum pre-configured
+/// context ceiling (<see cref="CMax"/>) and the model's native GGUF context limit
+/// (<see cref="NativeContextLimit"/>) for requests routed to that target.
 /// </summary>
 public sealed record TargetModelCapability(
     string Target,
@@ -73,7 +74,8 @@ public sealed record TargetModelCapability(
     int CDefault,
     int CMax,
     bool HardwareCapable,
-    int? AvailableVramForKVCacheMB);
+    int? AvailableVramForKVCacheMB,
+    int? NativeContextLimit = null);
 
 /// <summary>
 /// Discovers model capabilities per target by inspecting the target's /api/tags entry and
@@ -244,6 +246,7 @@ public sealed class ModelCapabilityEngine(
         // outright; otherwise the model's native GGUF context length; otherwise the assumed
         // 128k fallback (hardware-derived ceilings are no longer capacity sources).
         var cMax = metadata.ModelfileNumCtx ?? AsContextInt(metadata.NativeContextLength) ?? FallbackContextWindow;
+        var nativeContextLimit = AsContextInt(metadata.NativeContextLength);
 
         // 8gb / &lt;12000 MB hard veto for LargeDense only: MoE and SmallDense are NEVER
         // VRAM-vetoed (MoE is capable on all targets; see the zero-config routing plan §2.1).
@@ -257,7 +260,8 @@ public sealed class ModelCapabilityEngine(
             CDefault: metadata.ModelfileNumCtx ?? OllamaDefaultContext,
             CMax: cMax,
             HardwareCapable: hardwareCapable,
-            AvailableVramForKVCacheMB: availableMB);
+            AvailableVramForKVCacheMB: availableMB,
+            NativeContextLimit: nativeContextLimit);
     }
 
     /// <summary>
@@ -285,6 +289,32 @@ public sealed class ModelCapabilityEngine(
         var injected = (int)Math.Min(clientRequestedNumCtx ?? effectiveRequired, cMax);
         return (qualified, injected);
     }
+
+        /// <summary>
+        /// Pure MoE extensible-capacity helper (task #26, Option A): the capacity a MoE target
+        /// QUALIFIES at in Stage 1 and the sizing engine's single extensible (max) bucket:
+        /// <c>min(max(baseline, native GGUF context limit ?? 128k assumed fallback),
+        /// MaxContextTokens ?? ∞)</c>, where the baseline is the node's pre-configured context
+        /// (Modelfile num_ctx ?? native ?? 128k, see
+        /// <see cref="DynamicContextSizingEngine.BaselineBucket"/>). The baseline floor keeps a
+        /// Modelfile-pinned node from being capped below its own pre-configured pin when the
+        /// GGUF native length is undiscoverable. A null or non-positive
+        /// <paramref name="maxContextTokensOverride"/> means "no operator cap". This does NOT
+        /// modify the capability record's <see cref="TargetModelCapability.CMax"/> (which stays
+        /// the pre-configured hierarchy value); the MoE-vs-dense split lives in the
+        /// qualification/sizing comparison, not in the capability.
+        /// </summary>
+        public static int GetMoeExtensibleCapacity(TargetModelCapability capability, int? maxContextTokensOverride)
+        {
+            var capacity = Math.Max(DynamicContextSizingEngine.BaselineBucket(capability),
+                capability.NativeContextLimit ?? FallbackContextWindow);
+            if (maxContextTokensOverride is { } cap and > 0 && cap < capacity)
+            {
+                capacity = cap;
+            }
+
+            return capacity;
+        }
 
     private (ModelArchitectureKind, ArchitectureDetectionSource) DenseByParamCount(ModelMetadata metadata)
     {

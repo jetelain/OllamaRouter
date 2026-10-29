@@ -54,9 +54,11 @@ builder.Services.ConfigureHttpJsonOptions(options =>
 });
 
 // Resolved + normalized options (Normalize() clamps the additive context fit margin; the
-// DynamicContext.Normalize() step restores missing or zero-valued built-in profiles; .NET
-// config binding would otherwise replace the whole Profiles dictionary on partial overrides).
-// The exact same instance is registered by AddOllamaRouter.
+// DynamicContext.Normalize(logger) step — invoked once the startup logger is available
+// below — restores the built-in Moe profile entry, clamps the obsolete BucketStepTokens,
+// and warns once per legacy dense profile a pre-task-#26 config still declares; .NET config
+// binding would otherwise replace the whole Profiles dictionary on partial overrides). The
+// exact same instance is registered by AddOllamaRouter.
 var ollamaOptions = builder.Configuration.GetSection(OllamaRouterOptions.SectionName).Get<OllamaRouterOptions>()
     ?? new OllamaRouterOptions();
 ollamaOptions.Normalize();
@@ -78,6 +80,13 @@ static bool IsTuiDisabled(string[] args) => args.Any(a => string.Equals(a, "--no
 
 // Effective fleet targets plus the Cloud pseudo-target (deduplicated, case-insensitively).
 var startupLogger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("OllamaRouter.Startup");
+
+// DynamicContext post-binding normalization with startup logging (task #26): restores the
+// built-in Moe profile entry, clamps the obsolete BucketStepTokens, and warns once per
+// legacy dense profile (DenseDesktop16gb/DenseServer96gb/SmallDense) a pre-task-#26 config
+// still declares — those profiles bind but are ignored by the two-bucket ladder.
+ollamaOptions.DynamicContext.Normalize(startupLogger);
+
 var fleetTargets = OllamaRouterServiceCollectionExtensions.BuildFleetTargets(ollamaOptions, startupLogger);
 
 // Startup fleet log line + deprecation warnings.

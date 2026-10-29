@@ -170,9 +170,13 @@ public sealed class OllamaRouterOptions
     public AggregationOptions Aggregation { get; set; } = new();
 
     /// <summary>
-    /// Dynamic context sizing configuration (Phase 2): when enabled, the router selects a
-    /// quantized context bucket per (target, model, prompt) triple and injects/overwrites
-    /// <c>options.num_ctx</c> in the outgoing inference payload. Disabled by default.
+    /// Dynamic context sizing configuration (Phase 2, MoE only after task #26): when
+    /// enabled, MoE requests are sized on a two-bucket ladder (the node's pre-configured
+    /// context as the optimal baseline bucket, the model's native context limit as the
+    /// single extensible bucket) and <c>options.num_ctx</c> is injected accordingly; dense
+    /// requests get clamp-only pass-through (an oversized static client <c>num_ctx</c> is
+    /// clamped DOWN to the node's pre-configured context, never raised). Disabled by
+    /// default.
     /// </summary>
     public DynamicContextOptions DynamicContext { get; set; } = new();
 
@@ -359,78 +363,101 @@ public sealed class AggregationOptions
 }
 
 /// <summary>
-/// A quantized elastic context bucket profile: the baseline bucket (<see cref="DefaultContext"/>),
-/// an optional hand-tuned intermediate bucket (<see cref="IntermediateContext"/>) and the
-/// elastic ceiling bucket (<see cref="MaxContext"/>). For operator-defined custom profiles that
-/// only set <see cref="DefaultContext"/> and <see cref="MaxContext"/> (null intermediate), the
-/// intermediate bucket is synthesized on the <c>BucketStepTokens</c> grid as
-/// <c>snapUpToStep(ceil((baseline + max) / 2), step)</c>, clamped to ≤ max.
+/// A quantized elastic context bucket profile — RETIRED by the two-bucket MoE ladder
+/// (task #26). Kept bindable (and the <c>Profiles:*</c> config keys still bind) for
+/// configuration compatibility, but the sizing engine no longer consults any profile
+/// values: buckets now derive from the node's pre-configured context (optimal baseline)
+/// and the model's native context limit (single extensible bucket).
 /// </summary>
 public sealed class DynamicContextProfile
 {
     /// <summary>
-    /// Creates a bucket profile from its three explicit bucket values (the built-in defaults
-    /// ship hand-tuned values that are NOT on the step grid, e.g. MoE 221,184).
+    /// Creates a bucket profile from its three explicit bucket values (retired bucket
+    /// triple; kept for configuration compatibility only).
     /// </summary>
     public DynamicContextProfile(int defaultContext, int? intermediateContext, int maxContext)
     {
         DefaultContext = defaultContext;
+    #pragma warning disable CS0618 // Obsolete IntermediateContext is written for binding compatibility only.
         IntermediateContext = intermediateContext;
+    #pragma warning restore CS0618
         MaxContext = maxContext;
     }
 
     /// <summary>
-    /// Parameterless constructor for config binding of custom (operator-defined) profiles,
-    /// which typically only set <see cref="DefaultContext"/> and <see cref="MaxContext"/>.
+    /// Parameterless constructor for config binding of custom (operator-defined) profiles.
     /// </summary>
     public DynamicContextProfile()
     {
     }
 
     /// <summary>
-    /// Baseline bucket (in tokens): the smallest context the profile can serve. A request whose
-    /// requirement is ≤ this value is sized at the baseline bucket.
+    /// Baseline bucket (in tokens). RETIRED: the two-bucket ladder takes the baseline from
+    /// the node's pre-configured context, never from a profile constant. Bound but ignored.
     /// </summary>
     public int DefaultContext { get; set; }
 
     /// <summary>
-    /// Optional explicit intermediate bucket (in tokens). When null (custom profiles), the
-    /// intermediate is synthesized from <c>BucketStepTokens</c>; when set outside the
-    /// (baseline, max) range it is ignored.
+    /// Optional explicit intermediate bucket (in tokens). Obsolete (task #26): the
+    /// two-bucket ladder has no intermediate bucket — the key still binds for
+    /// configuration compatibility but is IGNORED by the sizing engine.
     /// </summary>
+    [Obsolete("The two-bucket MoE ladder (task #26) has no intermediate bucket; this key is bound but ignored. The extensible bucket is the model's native context limit.")]
     public int? IntermediateContext { get; set; }
 
     /// <summary>
-    /// Elastic ceiling bucket (in tokens): the largest context the profile can serve. The
-    /// injected value never exceeds the minimum of this value and the target's effective
-    /// hardware ceiling.
+    /// Elastic ceiling bucket (in tokens). RETIRED: the two-bucket ladder takes the
+    /// extensible limit from the model's native context length (optionally capped by
+    /// <see cref="ModelThresholds.MaxContextTokens"/>), never from a profile constant.
+    /// Bound but ignored.
     /// </summary>
     public int MaxContext { get; set; }
 }
 
 /// <summary>
 /// Dynamic context sizing configuration (Phase 2, items 3-4 of the Multi-Target Zero-Config
-/// Routing Plan): per-request quantized elastic context bucketing with
-/// <c>options.num_ctx</c> injection. Base sizing is stateless per request; the Auto-Shrink
+/// Routing Plan; MoE-only two-bucket ladder after task #26): MoE requests pick between
+/// EXACTLY two buckets — the node's pre-configured context (the "optimal" baseline bucket)
+/// and the model's native context limit (the single "extensible" bucket, optionally capped
+/// by <c>Models:{model}:MaxContextTokens</c>) — and <c>options.num_ctx</c> is injected
+/// accordingly; dense requests get clamp-only pass-through (see
+/// <see cref="DenseClampEnabled"/>). Base sizing is stateless per request; the Auto-Shrink
 /// hysteresis options below are bound and stored here and CONSUMED in this release by the
 /// Auto-Shrink Manager (<c>IContextAutoShrinkManager</c>, Phase 3 item 2), which retains an
 /// expanded bucket across cooldown/idle windows before injecting a shrink turn.
 /// </summary>
 public sealed class DynamicContextOptions
 {
-    /// <summary>Default <see cref="BucketStepTokens"/> value (32,768).</summary>
+    /// <summary>Default <see cref="BucketStepTokens"/> value (32,768; the grid is retired).</summary>
     public const int DefaultBucketStepTokens = 32_768;
 
     /// <summary>Built-in profile name for Mixture-of-Experts models (any VRAM class).</summary>
     public const string MoeProfileName = "Moe";
 
-    /// <summary>Built-in profile name for large dense models on desktop-class (16 GB) targets.</summary>
+    /// <summary>
+    /// RETIRED (task #26): built-in profile name for large dense models on desktop-class
+    /// (16 GB) targets. Dense models are no longer profiled (clamp-only pass-through); a
+    /// legacy config still declaring this profile binds but is ignored with a startup
+    /// warning.
+    /// </summary>
+    [Obsolete("Dense models use clamp-only pass-through (task #26); dense profiles are retired. The key still binds but is ignored.")]
     public const string DenseDesktop16gbProfileName = "DenseDesktop16gb";
 
-    /// <summary>Built-in profile name for large dense models on server-class (96 GB) targets.</summary>
+    /// <summary>
+    /// RETIRED (task #26): built-in profile name for large dense models on server-class
+    /// (96 GB) targets. Dense models are no longer profiled (clamp-only pass-through); a
+    /// legacy config still declaring this profile binds but is ignored with a startup
+    /// warning.
+    /// </summary>
+    [Obsolete("Dense models use clamp-only pass-through (task #26); dense profiles are retired. The key still binds but is ignored.")]
     public const string DenseServer96gbProfileName = "DenseServer96gb";
 
-    /// <summary>Built-in profile name for small dense models.</summary>
+    /// <summary>
+    /// RETIRED (task #26): built-in profile name for small dense models. Dense models are
+    /// no longer profiled (clamp-only pass-through); a legacy config still declaring this
+    /// profile binds but is ignored with a startup warning.
+    /// </summary>
+    [Obsolete("Dense models use clamp-only pass-through (task #26); dense profiles are retired. The key still binds but is ignored.")]
     public const string SmallDenseProfileName = "SmallDense";
 
     /// <summary>
@@ -440,12 +467,24 @@ public sealed class DynamicContextOptions
     public bool Enabled { get; set; } = false;
 
     /// <summary>
-    /// Grid step (in tokens) used to synthesize the intermediate bucket of custom profiles
-    /// (operator-defined profiles that omit <see cref="DynamicContextProfile.IntermediateContext"/>).
-    /// The built-in profiles ship explicit hand-tuned buckets and are not affected by this grid.
-    /// Must be &gt; 0; values ≤ 0 are clamped to <see cref="DefaultBucketStepTokens"/> by
-    /// <see cref="Normalize"/>. Defaults to 32,768.
+    /// When true (default), a request landing on a target for a DENSE model rewrites
+    /// <c>options.num_ctx</c> ONLY when the client's static value exceeds the node's
+    /// pre-configured context, clamping it DOWN to that pre-configured value (one-time KV
+    /// reallocation; prevents OOM from e.g. static 131,072 requests on 49,152 nodes). When
+    /// the client value is absent or ≤ the pre-configured context the payload is untouched
+    /// (no injection, no reallocation, no lease). Dense values are never raised, never
+    /// bucketed, never leased. Set to false to make dense requests pure pass-through.
     /// </summary>
+    public bool DenseClampEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Grid step (in tokens) — OBSOLETE (task #26): the intermediate-bucket step grid was
+    /// retired along with the profile table. The key still binds (legacy configs) but is
+    /// IGNORED by the sizing engine; values ≤ 0 are still clamped to
+    /// <see cref="DefaultBucketStepTokens"/> by <see cref="Normalize"/> for binding
+    /// compatibility.
+    /// </summary>
+    [Obsolete("The two-bucket MoE ladder (task #26) removed the intermediate-bucket step grid; this key is bound but ignored.")]
     public int BucketStepTokens { get; set; } = DefaultBucketStepTokens;
 
     /// <summary>
@@ -466,25 +505,50 @@ public sealed class DynamicContextOptions
     public int AutoShrinkIdleTimeoutSeconds { get; set; } = 60;
 
     /// <summary>
-    /// Bucket profiles keyed by profile name (case-insensitive). The built-in defaults (see
-    /// <see cref="DefaultProfileNames"/>) ship the plan's explicit bucket triples verbatim;
-    /// operators may override built-ins or add custom profiles (DefaultContext + MaxContext are
-    /// sufficient; the intermediate is synthesized). .NET config binding replaces the whole
-    /// dictionary when any "Profiles:*" key is set, so a partial override drops the other
-    /// built-ins — <see cref="Normalize"/> (invoked via PostConfigure) restores them.
+    /// Bucket profiles keyed by profile name (case-insensitive). RETIRED by the two-bucket
+    /// MoE ladder (task #26): kept bindable for configuration compatibility (the
+    /// <c>Profiles:*</c> keys still bind), but the sizing engine never consults profile
+    /// values — buckets derive from the node's pre-configured context (baseline) and the
+    /// model's native context limit (extensible). .NET config binding replaces the whole
+    /// dictionary when any "Profiles:*" key is set, so a partial override drops the
+    /// built-in — <see cref="Normalize"/> (invoked via PostConfigure/startup) restores the
+    /// single built-in <see cref="MoeProfileName"/> entry.
     /// </summary>
     public Dictionary<string, DynamicContextProfile> Profiles { get; set; } = DefaultProfiles();
 
     /// <summary>
     /// The built-in profile names (case-insensitive) restored by <see cref="Normalize"/>.
+    /// After task #26 only the <see cref="MoeProfileName"/> profile is built-in; the
+    /// former dense profiles are no longer restored (legacy configs that still declare
+    /// them bind but are ignored with a startup warning).
     /// </summary>
     public static IReadOnlyList<string> DefaultProfileNames { get; } =
-        new[] { MoeProfileName, DenseDesktop16gbProfileName, DenseServer96gbProfileName, SmallDenseProfileName };
+        new[] { MoeProfileName };
+
+    /// <summary>
+    /// The legacy dense profile names retired by the two-bucket MoE ladder (task #26):
+    /// used by <see cref="Normalize(ILogger?)"/> to detect and warn about legacy configs
+    /// that still declare them.
+    /// </summary>
+    public static IReadOnlyList<string> LegacyRetiredProfileNames { get; } = BuildLegacyRetiredProfileNames();
+
+    private static IReadOnlyList<string> BuildLegacyRetiredProfileNames()
+    {
+#pragma warning disable CS0618 // Legacy dense profile names are obsolete (referenced for the startup warning only).
+        return new[]
+        {
+            DynamicContextOptions.DenseDesktop16gbProfileName,
+            DynamicContextOptions.DenseServer96gbProfileName,
+            DynamicContextOptions.SmallDenseProfileName
+        };
+#pragma warning restore CS0618
+    }
 
     /// <summary>
     /// Looks up a profile by name (case-insensitive). Returns a stateless conservative
-    /// fallback profile (baseline 32,768 / max 32,768) for unknown names, so a miss can never
-    /// inflate the context or throw at request time.
+    /// fallback profile (baseline 32,768 / max 32,768) for unknown names. RETIRED bucket
+    /// source (task #26): kept for configuration compatibility only — the sizing engine
+    /// does not consult this lookup at request time.
     /// </summary>
     public DynamicContextProfile GetProfile(string profileName)
     {
@@ -500,17 +564,33 @@ public sealed class DynamicContextOptions
     }
 
     /// <summary>
-    /// Normalizes the section after config binding: clamps a non-positive
+    /// Normalizes the section after config binding (no warnings): clamps a non-positive
     /// <see cref="BucketStepTokens"/> to <see cref="DefaultBucketStepTokens"/> and restores
-    /// missing or zero-valued built-in profiles from the defaults, so a config that overrides
-    /// only "Profiles:Moe:MaxContext" keeps the other built-in profiles intact. Never throws.
+    /// the missing or zero-valued built-in <see cref="MoeProfileName"/> profile. Never throws.
     /// </summary>
     public void Normalize()
     {
+        Normalize(logger: null);
+    }
+
+    /// <summary>
+    /// Normalizes the section after config binding, with optional startup logging:
+    /// clamps a non-positive <see cref="BucketStepTokens"/> to
+    /// <see cref="DefaultBucketStepTokens"/>, restores the missing or zero-valued built-in
+    /// <see cref="MoeProfileName"/> profile, and — when <paramref name="logger"/> is
+    /// provided — logs ONE warning naming any legacy dense profile
+    /// (<see cref="LegacyRetiredProfileNames"/>) that a pre-task-#26 config still declares
+    /// (they bind but are ignored by the two-bucket ladder; no behavior change). Never
+    /// throws.
+    /// </summary>
+    public void Normalize(ILogger? logger)
+    {
+    #pragma warning disable CS0618 // BucketStepTokens is obsolete (bind-and-ignore, kept for compatibility).
         if (BucketStepTokens <= 0)
         {
             BucketStepTokens = DefaultBucketStepTokens;
         }
+    #pragma warning restore CS0618
 
         Profiles ??= new Dictionary<string, DynamicContextProfile>(StringComparer.OrdinalIgnoreCase);
 
@@ -521,27 +601,36 @@ public sealed class DynamicContextOptions
                 Profiles[name] = GetDefaultProfile(name);
             }
         }
+
+        if (logger is not null)
+        {
+            var legacy = Profiles.Keys
+                .Where(name => LegacyRetiredProfileNames.Contains(name, StringComparer.OrdinalIgnoreCase))
+                .ToList();
+            if (legacy.Count > 0)
+            {
+                logger.LogWarning(
+                    "DynamicContext: legacy dense profile(s) '{Profiles}' are retired by the two-bucket MoE ladder (task #26) and will be ignored; dense models use clamp-only pass-through. Remove the legacy DenseDesktop16gb / DenseServer96gb / SmallDense profile keys to silence this warning.",
+                    string.Join(", ", legacy));
+            }
+        }
     }
 
     private static bool IsInvalid(DynamicContextProfile? profile) =>
         profile is null || profile.DefaultContext <= 0 || profile.MaxContext <= 0;
 
-    private static DynamicContextProfile GetDefaultProfile(string name) => name switch
-    {
-        // Plan §2.3 profile table (hand-tuned buckets, not on the step grid).
-        MoeProfileName => new DynamicContextProfile(184_320, 221_184, 262_144),
-        DenseDesktop16gbProfileName => new DynamicContextProfile(32_768, 40_960, 49_152),
-        DenseServer96gbProfileName => new DynamicContextProfile(65_536, 131_072, 262_144),
-        _ => new DynamicContextProfile(32_768, 65_536, 131_072)
-    };
+    private static DynamicContextProfile GetDefaultProfile(string name) =>
+    #pragma warning disable CS0618 // Obsolete IntermediateContext is written for binding compatibility only.
+        // The bucket triple is RETIRED (task #26): the ladder no longer reads these
+        // constants. The entry is restored so legacy 'GetProfile("Moe")' callers keep
+        // a bound, non-null profile; values are historical (former Moe profile table).
+        new DynamicContextProfile(184_320, 221_184, 262_144);
+    #pragma warning restore CS0618
 
     private static Dictionary<string, DynamicContextProfile> DefaultProfiles() =>
         new(StringComparer.OrdinalIgnoreCase)
         {
-            [MoeProfileName] = GetDefaultProfile(MoeProfileName),
-            [DenseDesktop16gbProfileName] = GetDefaultProfile(DenseDesktop16gbProfileName),
-            [DenseServer96gbProfileName] = GetDefaultProfile(DenseServer96gbProfileName),
-            [SmallDenseProfileName] = GetDefaultProfile(SmallDenseProfileName)
+            [MoeProfileName] = GetDefaultProfile(MoeProfileName)
         };
 }
 
@@ -671,6 +760,16 @@ public sealed class ModelThresholds
     /// parameter count (unknown count ⇒ LargeDense). Unknown values are ignored.
     /// </summary>
     public string? Architecture { get; set; }
+
+    /// <summary>
+    /// Optional operator cap (in tokens) on this model's effective capacity / MoE extensible
+    /// limit across ALL nodes (e.g. a VRAM-tuned or Q8-lossless ceiling): the sizing engine
+    /// and the Stage-1 MoE qualification use <c>min(native context ?? 128k, MaxContextTokens
+    /// ?? ∞)</c>. Null (default) means "no cap". Non-positive values are ignored. This cap
+    /// does NOT modify the per-target <c>TargetModelCapability.CMax</c> record — the
+    /// MoE-vs-dense split lives in the sizing/qualification comparison, not in the capability.
+    /// </summary>
+    public int? MaxContextTokens { get; set; }
 }
 
 /// <summary>

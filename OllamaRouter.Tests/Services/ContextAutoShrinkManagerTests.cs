@@ -6,17 +6,19 @@ namespace OllamaRouter.Tests.Services;
 
 /// <summary>
 /// Hysteresis sequence tests for the Auto-Shrink Manager (Phase 3, item 2 of the
-/// Multi-Target Zero-Config Routing Plan). All sequences drive a mutable fake clock —
-/// no sleeps, no background timers, no network. The MoE profile ships the plan's
-/// explicit buckets: 184,320 (baseline) / 221,184 (intermediate) / 262,144 (max).
+/// Multi-Target Zero-Config Routing Plan; two-bucket ladder after task #26). All sequences
+/// drive a mutable fake clock — no sleeps, no background timers, no network. The two-bucket
+/// MoE ladder (pre-configured baseline 184,320 / extensible 262,144): a prompt whose
+/// margin-adjusted requirement exceeds the baseline injects the single extensible bucket
+/// (262,144); a shrink returns to the pre-configured baseline (184,320).
 /// </summary>
 /// <remarks>
 /// <para>
-/// Token-to-bucket mapping used below (MoE profile, full 262,144 ceiling): a prompt of 195k
-/// (or 200k) needs the 221,184 intermediate bucket; 240k needs the 262,144 max bucket; a
-/// prompt of 100k (or 92,160, or 30k) selects the 184,320 baseline bucket. Crucially, a
-/// prompt is a "normal turn" (cooldown/idle-eligible) only when it selects the baseline bucket
-/// AND is NOT below 50% of baseline (92,160 tokens) — a sub-92,160 prompt is an immediate
+/// Token-to-bucket mapping used below (two-bucket ladder, baseline 184,320, extensible 262,144):
+/// a prompt of 195k (or 200k, or 240k) requires the extensible bucket (262,144); a prompt of
+/// 100k (or 92,160, or 30k) selects the 184,320 baseline bucket. Crucially, a prompt is a
+/// "normal turn" (cooldown/idle-eligible) only when it selects the baseline bucket AND is NOT
+/// below 50% of baseline (92,160 tokens) — a sub-92,160 prompt is an immediate
 /// drop-triggered shrink and never reaches the cooldown/idle logic. The tests therefore use
 /// <b>100,000</b> tokens as the canonical "normal turn" (baseline bucket, above the drop
 /// threshold) so the cooldown and idle triggers are exercised in isolation, and use
@@ -26,8 +28,11 @@ namespace OllamaRouter.Tests.Services;
 public class ContextAutoShrinkManagerTests
 {
     private const int MoEBaseline = 184_320;
-    private const int MoEIntermediate = 221_184;
     private const int MoEMax = 262_144;
+
+    // The two-bucket ladder has no intermediate bucket (task #26): every expansion goes
+    // straight to the extensible limit.
+    private const int MoEIntermediate = MoEMax;
 
     // 100k tokens select the baseline bucket but sit above the 50%-of-baseline drop threshold
     // (92,160), so they are the canonical "normal turn" that exercises the cooldown/idle logic.
@@ -44,20 +49,42 @@ public class ContextAutoShrinkManagerTests
     {
         _now = _t0;
         _sut = new ContextAutoShrinkManager(NullLogger<ContextAutoShrinkManager>.Instance, () => _now);
-        _options = new DynamicContextOptions(); // Defaults: 3 turns / 60 s, MoE 184,320/221,184/262,144.
+        _options = new DynamicContextOptions(); // Defaults: 3 turns / 60 s, DenseClampEnabled true.
     }
 
-    // Runs the stateless engine for a MoE prompt on a 96 GB-class target (ceiling 262,144) and
-    // feeds the result through the lease manager.
-    private AutoShrinkLeaseDecision DecideAt(long tokens, string model = "qwen3", int? clientNumCtx = null, int ceiling = MoEMax)
+    // MoE capability for the two-bucket ladder: pre-configured 184,320 (Modelfile num_ctx),
+    // native 262,144 — the plan's §2.3 scenario.
+    private static TargetModelCapability MoeCapability() => new(
+        Target.Value,
+        ModelArchitectureKind.Moe,
+        ArchitectureDetectionSource.MoeExpertCount,
+        184_320,
+        262_144,
+        HardwareCapable: true,
+        null,
+        262_144);
+
+    // Dense capability (49,152 pre-configured) for the MoE-only guard tests.
+    private static TargetModelCapability DenseCapability() => new(
+        Target.Value,
+        ModelArchitectureKind.LargeDense,
+        ArchitectureDetectionSource.DenseParameterCount,
+        49_152,
+        49_152,
+        HardwareCapable: true,
+        null,
+        49_152);
+
+    // Runs the stateless engine for a MoE prompt and feeds the result through the lease manager.
+    private AutoShrinkLeaseDecision DecideAt(long tokens, string model = "qwen3", int? clientNumCtx = null, int? maxContextTokens = null)
     {
         var engine = DynamicContextSizingEngine.Decide(
             _options,
-            ModelArchitectureKind.Moe,
-            98_304,
-            ceiling,
+            MoeCapability(),
             tokens,
-            clientNumCtx);
+            clientNumCtx,
+            8_192,
+            maxContextTokens);
         return _sut.Decide(Target, model, engine, _options, tokens, _now);
     }
 
@@ -69,14 +96,14 @@ public class ContextAutoShrinkManagerTests
     [Fact]
     public void Moe_Sequence_195k_Then_175k_Then_30k_RetainsThenShrinks()
     {
-        // 195k prompt -> engine bucket 221,184 (above baseline) -> fresh expansion.
+        // 195k prompt -> engine extensible bucket 262,144 (above baseline) -> fresh expansion.
         var d1 = DecideAt(195_000);
         Assert.Equal(MoEIntermediate, d1.InjectedNumCtx);
         Assert.Equal(LeaseBucketState.FreshExpand, d1.State);
         Assert.False(d1.ShrinkExecuted);
 
         // +5 s, 175k prompt: the engine selects the baseline bucket for 175k, but the LEASE
-        // retains the expanded 221,184 bucket (KV prefix cache preserved; no shrink injection)
+        // retains the expanded 262,144 bucket (KV prefix cache preserved; no shrink injection)
         // because the cooldown counter (turn 1) and the idle window have not elapsed.
         Advance(5);
         var d2 = DecideAt(175_000);
@@ -96,7 +123,7 @@ public class ContextAutoShrinkManagerTests
     [Fact]
     public void FourthConsecutiveNormalTurn_AfterSpike_TriggersShrink()
     {
-        DecideAt(195_000); // Expand (bucket 221,184).
+        DecideAt(195_000); // Expand (extensible bucket 262,144).
         Advance(5);
         var n1 = DecideAt(NormalTurnTokens); // Normal turn 1 (retained, counter 1).
         Advance(5);
@@ -173,14 +200,14 @@ public class ContextAutoShrinkManagerTests
     [Fact]
     public void CooldownCounter_Resets_WhenSpikeRecurs()
     {
-        DecideAt(195_000); // Expand to 221,184.
+        DecideAt(195_000); // Expand to 262,144.
         Advance(5);
         DecideAt(NormalTurnTokens); // Normal 1 (counter 1).
         Advance(5);
         DecideAt(NormalTurnTokens); // Normal 2 (counter 2).
 
-        // Spike again (240k -> bucket 262,144): the lease is re-raised and the cooldown counter
-        // resets to 0.
+        // Spike again (240k -> extensible bucket 262,144): the lease is retained at the same
+        // bucket and the cooldown counter resets to 0.
         Advance(5);
         var spike = DecideAt(240_000);
         Assert.Equal(MoEMax, spike.InjectedNumCtx);
@@ -250,10 +277,10 @@ public class ContextAutoShrinkManagerTests
     [Fact]
     public void NormalTurn_NeverTruncatesRequiredBucket()
     {
-        DecideAt(195_000); // Expand to 221,184.
+        DecideAt(195_000); // Expand to 262,144.
 
-        // Requests that still NEED the expanded bucket (200k -> 221,184) are always retained at
-        // 221,184 — even far past the 3-normal-turn threshold — because a shrink may never
+        // Requests that still NEED the expanded bucket (200k -> 262,144) are always retained at
+        // 262,144 — even far past the 3-normal-turn threshold — because a shrink may never
         // truncate a prompt that requires the expanded bucket, and such turns reset (not accrue)
         // the cooldown counter.
         for (var i = 0; i < 6; i++)
@@ -278,7 +305,7 @@ public class ContextAutoShrinkManagerTests
     public void CloudTarget_NeverLeased()
     {
         var engine = DynamicContextSizingEngine.Decide(
-            _options, ModelArchitectureKind.Moe, 98_304, MoEMax, 195_000, null);
+            _options, MoeCapability(), 195_000, null, 8_192, null);
         var d1 = _sut.Decide(RoutingTarget.Cloud, "qwen3", engine, _options, 195_000, _now);
         Assert.Equal(MoEIntermediate, d1.InjectedNumCtx);
         Assert.Equal(LeaseBucketState.Baseline, d1.State);
@@ -341,19 +368,19 @@ public class ContextAutoShrinkManagerTests
     }
 
     [Fact]
-    public void ShrinkInjection_NeverExceedsModelfilePinnedCeiling()
+    public void ShrinkInjection_NeverExceedsOperatorCappedExtensibleLimit()
     {
-        // A Modelfile pins num_ctx to 200,000: the engine's effective ceiling is 200,000, so the
-        // expansion is clamped to 200,000 (not the profile's 221,184). A subsequent 30k prompt
-        // (below the drop threshold) must shrink to min(baseline, ceiling) = 184,320, which is
-        // never above the Modelfile-pinned ceiling.
-        var expand = DecideAt(195_000, ceiling: 200_000);
+        // MaxContextTokens caps the extensible limit at 200,000: the expansion is clamped to
+        // 200,000 (not the full native 262,144). A subsequent 30k prompt (below the drop
+        // threshold) shrinks to the pre-configured baseline 184,320, which is never above
+        // the operator cap.
+        var expand = DecideAt(195_000, maxContextTokens: 200_000);
         Assert.Equal(200_000, expand.InjectedNumCtx);
         Assert.Equal(LeaseBucketState.FreshExpand, expand.State);
 
         Advance(5);
-        var d = DecideAt(30_000, ceiling: 200_000);
-        Assert.Equal(MoEBaseline, d.InjectedNumCtx); // min(184,320, 200,000) = 184,320 <= ceiling.
+        var d = DecideAt(30_000, maxContextTokens: 200_000);
+        Assert.Equal(MoEBaseline, d.InjectedNumCtx); // min(baseline, required, ceiling) = 184,320 <= 200,000.
         Assert.Equal(LeaseBucketState.ShrunkToBaseline, d.State);
         Assert.True(d.ShrinkExecuted);
     }
@@ -363,96 +390,114 @@ public class ContextAutoShrinkManagerTests
     {
         var other = new RoutingTarget("Beta");
         DecideAt(195_000); // Alpha expanded.
-        var engine = DynamicContextSizingEngine.Decide(_options, ModelArchitectureKind.Moe, 98_304, MoEMax, 195_000, null);
+        var engine = DynamicContextSizingEngine.Decide(_options, MoeCapability(), 195_000, null, 8_192, null);
         _sut.Decide(other, "qwen3", engine, _options, 195_000, _now); // Beta expanded.
 
-        _sut.ResetTargetLeases(Target); // Alpha only.
+        _sut.ResetTargetLeases(Target);
 
-        // Beta's lease survives the Alpha reset: a normal turn retains its (still active) bucket.
+        // Alpha is reset; Beta still retains its expanded bucket for a normal turn.
         Advance(5);
-        var beta = _sut.Decide(other, "qwen3", engine, _options, NormalTurnTokens, _now);
-        Assert.Equal(MoEIntermediate, beta.InjectedNumCtx);
-        Assert.Equal(LeaseBucketState.RetainedExpanded, beta.State);
-
-        // Alpha starts fresh.
         var alpha = DecideAt(NormalTurnTokens);
         Assert.Equal(MoEBaseline, alpha.InjectedNumCtx);
         Assert.Equal(LeaseBucketState.Baseline, alpha.State);
+
+        Advance(5);
+        var beta = _sut.Decide(other, "qwen3",
+            DynamicContextSizingEngine.Decide(_options, MoeCapability(), 100_000, null, 8_192, null),
+            _options, 100_000, _now);
+        Assert.Equal(MoEIntermediate, beta.InjectedNumCtx);
+        Assert.Equal(LeaseBucketState.RetainedExpanded, beta.State);
     }
 
     [Fact]
-    public void GetLeaseSnapshot_Empty_ManagerReturnsEmptySnapshot()
+    public void GetLeaseSnapshot_Empty_WhenNoLeases()
     {
-        var snapshot = _sut.GetLeaseSnapshot();
-        Assert.Empty(snapshot);
+        Assert.Empty(_sut.GetLeaseSnapshot());
     }
 
     [Fact]
     public void GetLeaseSnapshot_ExpandedLease_ExposesModelBucketAndExpandedFlag()
     {
-        DecideAt(195_000); // Fresh expansion to the 221,184 intermediate bucket.
+        DecideAt(195_000); // Fresh expansion to the extensible bucket 262,144.
 
         var snapshot = _sut.GetLeaseSnapshot();
+        var leases = snapshot[Target];
 
-        var leases = snapshot.Single().Value;
         var lease = leases.Single();
         Assert.Equal("qwen3", lease.Model);
-        Assert.Equal(MoEIntermediate, lease.ActiveBucket);
+        Assert.Equal(MoEMax, lease.ActiveBucket);
         Assert.True(lease.IsExpanded);
-    }
-
-    [Fact]
-    public void GetLeaseSnapshot_BaselineTurn_ExposesBaselineLeaseWithoutExpansion()
-    {
-        DecideAt(100_000); // Baseline bucket (184,320), no expansion.
-
-        var snapshot = _sut.GetLeaseSnapshot();
-
-        var lease = snapshot.Single().Value.Single();
-        Assert.Equal("qwen3", lease.Model);
-        Assert.Equal(MoEBaseline, lease.ActiveBucket);
-        Assert.False(lease.IsExpanded);
-    }
-
-    [Fact]
-    public void GetLeaseSnapshot_AfterShrink_LeaseIsNoLongerExpanded()
-    {
-        DecideAt(195_000); // Expand.
-        Advance(5);
-        Advance(5);
-        DecideAt(30_000); // Drop below 50% of baseline: immediate shrink.
-
-        var snapshot = _sut.GetLeaseSnapshot();
-
-        var lease = snapshot.Single().Value.Single();
-        Assert.Equal(MoEBaseline, lease.ActiveBucket);
-        Assert.False(lease.IsExpanded);
-    }
-
-    [Fact]
-    public void GetLeaseSnapshot_CloudNeverCarriesALease()
-    {
-        var engine = DynamicContextSizingEngine.Decide(_options, ModelArchitectureKind.Moe, 98_304, MoEMax, 195_000, null);
-        _sut.Decide(RoutingTarget.Cloud, "gpt-4o", engine, _options, 195_000, _now);
-
-        var snapshot = _sut.GetLeaseSnapshot();
-
-        Assert.DoesNotContain(RoutingTarget.Cloud, snapshot.Keys);
     }
 
     [Fact]
     public void GetLeaseSnapshot_MultipleModels_ExposesOneLeasePerModel()
     {
         DecideAt(195_000, model: "model-a");
-        var engine = DynamicContextSizingEngine.Decide(_options, ModelArchitectureKind.Moe, 98_304, MoEMax, 240_000, null);
-        _sut.Decide(Target, "model-b", engine, _options, 240_000, _now); // 240k -> max bucket.
+        var engine = DynamicContextSizingEngine.Decide(_options, MoeCapability(), 240_000, null, 8_192, null);
+        _sut.Decide(Target, "model-b", engine, _options, 240_000, _now); // 240k -> extensible bucket.
 
         var snapshot = _sut.GetLeaseSnapshot();
+        var leases = snapshot[Target];
 
-        var leases = snapshot.Single().Value;
         Assert.Equal(2, leases.Count);
-        Assert.Equal(MoEIntermediate, leases.Single(l => l.Model == "model-a").ActiveBucket);
-        Assert.Equal(MoEMax, leases.Single(l => l.Model == "model-b").ActiveBucket);
+        Assert.All(leases, l => Assert.Equal(MoEMax, l.ActiveBucket));
         Assert.All(leases, l => Assert.True(l.IsExpanded));
+    }
+
+    [Fact]
+    public void DenseRequests_NeverCreateOrRetainLeases()
+    {
+        // Dense decisions are Clamped or PassThrough (never Expanded/Baseline): the MoE-only
+        // guard makes the manager stateless and no lease slot is ever created.
+        var dense = DenseCapability();
+
+        var clamped = DynamicContextSizingEngine.Decide(_options, dense, 2_000, 131_072, 8_192, null);
+        Assert.Equal(ContextSizingMode.Clamped, clamped.Mode);
+        var d1 = _sut.Decide(Target, "dense-model", clamped, _options, 2_000, _now);
+        Assert.Equal(49_152, d1.InjectedNumCtx);
+        Assert.Equal(LeaseBucketState.Baseline, d1.State);
+        Assert.False(d1.ShrinkExecuted);
+
+        var passThrough = DynamicContextSizingEngine.Decide(_options, dense, 2_000, null, 8_192, null);
+        Assert.Equal(ContextSizingMode.PassThrough, passThrough.Mode);
+        var d2 = _sut.Decide(Target, "dense-model", passThrough, _options, 2_000, _now);
+        Assert.Equal(0, d2.InjectedNumCtx);
+        Assert.Equal(LeaseBucketState.Baseline, d2.State);
+
+        // AC8: no lease slot for the dense model exists, expanded or otherwise.
+        var snapshot = _sut.GetLeaseSnapshot();
+        Assert.Empty(snapshot.Values.SelectMany(v => v));
+    }
+
+    [Fact]
+    public void DenseModeDecision_AfterPriorLease_NeverRetainsExpandedSlot()
+    {
+        // A MoE lease exists for the model, then a dense-mode decision (Clamped) for the same
+        // (target, model) never retains the expanded lease — it is handled statelessly.
+        DecideAt(195_000, model: "shared"); // MoE expansion creates a lease.
+
+        var dense = DenseCapability();
+        var clamped = DynamicContextSizingEngine.Decide(_options, dense, 2_000, 131_072, 8_192, null);
+        var d = _sut.Decide(Target, "shared", clamped, _options, 2_000, _now);
+        Assert.Equal(49_152, d.InjectedNumCtx);
+        Assert.Equal(LeaseBucketState.Baseline, d.State);
+        Assert.False(d.ShrinkExecuted);
+    }
+
+    [Fact]
+    public void BaselineTurn_WithoutLease_IsStateless_ButSlotRecordsBaselineBucket()
+    {
+        // A baseline-bucket MoE request with no active lease: stateless baseline decision,
+        // but a non-expanded slot is recorded so the read-only snapshot can report the
+        // active baseline bucket for monitoring.
+        var d = DecideAt(100_000);
+        Assert.Equal(MoEBaseline, d.InjectedNumCtx);
+        Assert.Equal(LeaseBucketState.Baseline, d.State);
+        Assert.False(d.ShrinkExecuted);
+
+        // The snapshot shows the baseline (non-expanded) slot, never an expanded one.
+        var snapshot = _sut.GetLeaseSnapshot();
+        var leases = snapshot.Values.SelectMany(v => v).ToList();
+        Assert.DoesNotContain(leases, l => l.IsExpanded);
     }
 }

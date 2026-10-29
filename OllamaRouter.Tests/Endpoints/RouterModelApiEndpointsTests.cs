@@ -605,7 +605,7 @@ public class RouterModelApiEndpointsTests
     }
 
     [Fact]
-    public async Task Evaluate_MoeRequest_MatchesProductionDecision_AndReportsBaselineBucket()
+    public async Task Evaluate_MoeRequest_MatchesProductionDecision_AndReportsBaselineMode()
     {
         var options = ThreeTargetOptions(cloudEnabled: false);
         var catalog = DefaultFleetCatalog(moeOnAllTargets: true);
@@ -622,7 +622,9 @@ public class RouterModelApiEndpointsTests
         var expectedTarget = await decisionService.DecideAsync(45000, MoeModel);
         Assert.Equal(expectedTarget.Value, root!["selectedTarget"]!.ToString());
 
-        // Recomputed sizing: MoE on the winner's VRAM with the winner's CMax.
+        // Recomputed two-bucket sizing: no Modelfile num_ctx and no discoverable native length
+        // (MoeShowMetadata), so baseline = extensible = 128k fallback; a 53,192-token requirement
+        // fits the baseline bucket.
         var target = options.GetEffectiveTargets()
             .Single(t => string.Equals(t.Name, root!["selectedTarget"]!.ToString(), StringComparison.OrdinalIgnoreCase));
         var capability = new ModelCapabilityEngine(
@@ -632,13 +634,14 @@ public class RouterModelApiEndpointsTests
                 (IModelCatalogCacheService)harness.App.Services.GetRequiredService<IModelCatalogCacheService>())
             .DeriveCapability(MoeShowMetadata(), target.Name!, target, pinnedArchitecture: null);
         var expected = DynamicContextSizingEngine.Decide(
-            options.DynamicContext, ModelArchitectureKind.Moe, target.GetEffectiveMaxVramMB(), capability.CMax, 45000, null);
+            options.DynamicContext, capability, 45000, null, 8_192, null);
         Assert.Equal(expected.InjectedNumCtx, (int)root!["injectedNumCtx"]!.GetValue<int>());
         Assert.Equal(expected.EffectiveCeiling, (int)root["targetMaxContext"]!.GetValue<int>());
-
-        var profile = options.DynamicContext.GetProfile(expected.ProfileName);
-        var expectedMode = expected.InjectedNumCtx > profile.DefaultContext ? "expanded" : "baseline";
-        Assert.Equal(expectedMode, root["contextMode"]!.ToString());
+        Assert.Equal(expected.Mode.ToString().ToLowerInvariant(), root["contextMode"]!.ToString());
+        Assert.Equal(ContextSizingMode.Baseline, expected.Mode);
+        Assert.Equal(131_072, (int)root["injectedNumCtx"]!.GetValue<int>());
+        Assert.Equal(131_072, (int)root["targetMaxContext"]!.GetValue<int>());
+        Assert.Equal("baseline", root["contextMode"]!.ToString());
         Assert.Equal(53_192, (int)root["estimatedTokensWithMargin"]!.GetValue<int>()); // 45,000 + 8,192 additive margin
 
         // The winner's evaluation score is reported as the affinity score.
@@ -661,15 +664,16 @@ public class RouterModelApiEndpointsTests
         NativeContextLength: null);
 
     [Fact]
-    public async Task Evaluate_SmallDenseCrossingBaselineBucket_ReportsExpandedMode()
+    public async Task Evaluate_DenseRequest_NoClientNumCtx_ReportsPassthroughMode()
     {
         var options = ThreeTargetOptions(cloudEnabled: false);
         var catalog = DefaultFleetCatalog(moeOnAllTargets: true);
         await using var harness = await CreateTestAppAsync(options, catalog);
 
-        // 40000 tokens: Local (CMax 131,072 Modelfile pin) qualifies (40,000 + 8,192 = 48,192 ≤
-        // 131,072) and wins; the SmallDense requirement 40000 crosses the 32768 baseline →
-        // the intermediate 65536 bucket ("expanded").
+        // Dense model (SmallDense, 8B) with no client num_ctx: task #26 clamp-only pass-through
+        // leaves the payload untouched — contextMode "passthrough" and injectedNumCtx reports
+        // what would flow through (the margin-adjusted requirement, per the degraded-preview
+        // convention).
         var (status, root) = await PostEvaluateAsync(harness.Client,
             new { model = SmallModel, estimatedTokens = 40000, clientRequestedNumCtx = (object?)null });
         Assert.Equal(200, status);
@@ -690,25 +694,28 @@ public class RouterModelApiEndpointsTests
                 (IModelCatalogCacheService)harness.App.Services.GetRequiredService<IModelCatalogCacheService>())
             .DeriveCapability(smallMetadata, target.Name!, target, pinnedArchitecture: null);
         var expected = DynamicContextSizingEngine.Decide(
-            options.DynamicContext, capability.Architecture, target.GetEffectiveMaxVramMB(), capability.CMax, 40000, null);
-        Assert.Equal(expected.InjectedNumCtx, (int)root!["injectedNumCtx"]!.GetValue<int>());
+            options.DynamicContext, capability, 40000, null, 8_192, null);
+        Assert.Equal(ContextSizingMode.PassThrough, expected.Mode);
 
-        var profile = options.DynamicContext.GetProfile(expected.ProfileName);
-        Assert.True((int)root!["injectedNumCtx"]!.GetValue<int>() > profile.DefaultContext);
-        Assert.Equal("expanded", root["contextMode"]!.ToString());
+        // passthrough: injectedNumCtx = margin-adjusted requirement (degraded-preview convention),
+        // targetMaxContext = dense CMax (pre-configured 131,072).
+        Assert.Equal(48_192, (int)root!["injectedNumCtx"]!.GetValue<int>());
+        Assert.Equal(131_072, (int)root["targetMaxContext"]!.GetValue<int>());
+        Assert.Equal("passthrough", root["contextMode"]!.ToString());
         Assert.Equal(48_192, (int)root["estimatedTokensWithMargin"]!.GetValue<int>()); // 40,000 + 8,192 additive margin
     }
 
     [Fact]
-    public async Task Evaluate_ClientNumCtxClampedToTargetCeiling()
+    public async Task Evaluate_DenseRequest_ClientNumCtxAtCeiling_ReportsPassthroughMode()
     {
         var options = ThreeTargetOptions(cloudEnabled: false);
         var catalog = DefaultFleetCatalog(moeOnAllTargets: true);
         await using var harness = await CreateTestAppAsync(options, catalog);
 
-        // Small prompt on the desktop-class Local target: the client's static 131072 is an
-        // upper-bound preference; the requirement 1,000 + 8,192 = 9,192 qualifies and the
-        // injected value stays within Local's CMax (131,072 Modelfile pin).
+        // Dense model whose pre-configured context is 131,072 (Modelfile pin) and a client static
+        // num_ctx of 131,072: the client value is NOT above the pre-configured baseline, so
+        // task #26 clamp-only pass-through leaves the payload untouched ("passthrough");
+        // injectedNumCtx reports the client value that would flow through.
         var (status, root) = await PostEvaluateAsync(harness.Client,
             new { model = SmallModel, estimatedTokens = 1000, clientRequestedNumCtx = 131072 });
         Assert.Equal(200, status);
@@ -725,13 +732,12 @@ public class RouterModelApiEndpointsTests
                 (IModelCatalogCacheService)harness.App.Services.GetRequiredService<IModelCatalogCacheService>())
             .DeriveCapability(smallMetadata, "Local", target, pinnedArchitecture: null);
         var expected = DynamicContextSizingEngine.Decide(
-            options.DynamicContext, capability.Architecture, target.GetEffectiveMaxVramMB(), capability.CMax, 1000, 131072);
-        Assert.Equal(expected.InjectedNumCtx, (int)root!["injectedNumCtx"]!.GetValue<int>());
-        Assert.True((int)root!["injectedNumCtx"]!.GetValue<int>() <= capability.CMax);
+            options.DynamicContext, capability, 1000, 131072, 8_192, null);
+        Assert.Equal(ContextSizingMode.PassThrough, expected.Mode);
 
-        var profile = options.DynamicContext.GetProfile(expected.ProfileName);
-        Assert.Equal(expected.InjectedNumCtx > profile.DefaultContext ? "expanded" : "baseline",
-            root["contextMode"]!.ToString());
+        Assert.Equal(131_072, (int)root!["injectedNumCtx"]!.GetValue<int>());
+        Assert.Equal(131_072, (int)root["targetMaxContext"]!.GetValue<int>());
+        Assert.Equal("passthrough", root["contextMode"]!.ToString());
         Assert.Equal(9_192, (int)root["estimatedTokensWithMargin"]!.GetValue<int>()); // 1,000 + 8,192
     }
 

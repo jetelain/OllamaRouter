@@ -3,173 +3,240 @@ using OllamaRouter.Options;
 namespace OllamaRouter.Services;
 
 /// <summary>
-/// The chosen (profile, bucket, effective ceiling) for one (target, model, request) triple.
+/// Sizing mode of one (target, model, request) triple (task #26, two-bucket MoE ladder):
+/// <list type="bullet">
+/// <item><see cref="Baseline"/> - MoE: the request fits the node's pre-configured context
+/// (the "optimal" baseline bucket); the injected value is the baseline (clamped to the
+/// extensible limit when the operator cap is below it).</item>
+/// <item><see cref="Expanded"/> - MoE: the request exceeds the baseline; the single
+/// extensible bucket (the model's native context limit, optionally capped by
+/// <see cref="ModelThresholds.MaxContextTokens"/>) is injected.</item>
+/// <item><see cref="Clamped"/> - dense: the client's static <c>num_ctx</c> exceeded the
+/// node's pre-configured context and was clamped DOWN to it (one-time KV reallocation;
+/// never raised, never bucketed, never leased).</item>
+/// <item><see cref="PassThrough"/> - dense: the payload is untouched (no client
+/// <c>num_ctx</c>, client value ≤ pre-configured, or clamping disabled by
+/// <see cref="DynamicContextOptions.DenseClampEnabled"/>) — <see cref="ContextSizingDecision.InjectedNumCtx"/>
+/// carries the 0 sentinel meaning "no rewrite".</item>
+/// </list>
+/// </summary>
+public enum ContextSizingMode
+{
+    Baseline,
+    Expanded,
+    Clamped,
+    PassThrough
+}
+
+/// <summary>
+/// The chosen bucket and sizing mode for one (target, model, request) triple (task #26).
 /// <see cref="InjectedNumCtx"/> is the value to write into the outgoing payload's
-/// <c>options.num_ctx</c>; <see cref="EffectiveCeiling"/> is the effective ceiling
-/// (min(profile max, Modelfile num_ctx, hardware CMax)); <see cref="ClientRequestedClamped"/>
-/// is true when the client's static <c>num_ctx</c> exceeded the injected value (it was an
-/// upper-bound preference, never a disqualifier).
+/// <c>options.num_ctx</c> (0 for <see cref="ContextSizingMode.PassThrough"/>: the payload is
+/// left untouched); <see cref="EffectiveCeiling"/> is the effective capacity of the target for
+/// this request (MoE: the extensible limit <c>min(native ?? 128k, MaxContextTokens ?? ∞)</c>;
+/// dense: the pre-configured <c>CMax</c>); <see cref="BaselineBucket"/> is the two-bucket
+/// baseline (the node's pre-configured context, also the Auto-Shrink shrink target);
+/// <see cref="ClientRequestedClamped"/> is true when the client's static <c>num_ctx</c> was
+/// rewritten downward (MoE requirement clamp or dense clamp-only).
 /// </summary>
 public sealed record ContextSizingDecision(
     string ProfileName,
     int InjectedNumCtx,
     int EffectiveCeiling,
-    bool ClientRequestedClamped);
+    bool ClientRequestedClamped,
+    ContextSizingMode Mode,
+    int BaselineBucket);
 
 /// <summary>
 /// Stateless dynamic context sizing engine (Phase 2, items 3-4 of the Multi-Target
-/// Zero-Config Routing Plan): maps an architecture + target hardware pair to a bucket
-/// profile, selects the quantized elastic context bucket for a request, and evaluates the
-/// Stage-1 hardware suitability hard filter. Sizing is a pure function of (options,
-/// capability, request facts) - lease/cooldown hysteresis state is maintained by the
-/// Auto-Shrink Manager (<c>IContextAutoShrinkManager</c>, Phase 3 item 2), which consumes
-/// this engine's decision per request.
+/// Zero-Config Routing Plan; MoE-only two-bucket ladder after task #26): MoE requests pick
+/// between EXACTLY two buckets — the node's pre-configured context (the "optimal" baseline
+/// bucket) and the model's native context limit (the single "extensible" bucket, optionally
+/// capped by <c>Models:{model}:MaxContextTokens</c>) — while dense requests get clamp-only
+/// pass-through (a dense KV refill costs 300 s+, so dense payloads are never expanded or
+/// bucketed; an oversized static client <c>num_ctx</c> is merely clamped down to the
+/// pre-configured value). Sizing is a pure function of (options, capability, request facts) -
+/// lease/cooldown hysteresis state is maintained by the Auto-Shrink Manager
+/// (<c>IContextAutoShrinkManager</c>, Phase 3 item 2, MoE only), which consumes this
+/// engine's decision per request.
 /// </summary>
 public static class DynamicContextSizingEngine
 {
     /// <summary>
-    /// Minimum effective VRAM (in MB) of a server-class target (≥ 32 GB): dense models at or
-    /// above this budget use the <see cref="DynamicContextOptions.DenseServer96gbProfileName"/>
-    /// profile (the "96gb" in its name is a historical artifact; 32 GB targets select it
-    /// too, and operators may override the profile via <c>OllamaRouter:DynamicContext:Profiles</c>).
-    /// This constant is the single source of truth for the server-class boundary used for
-    /// PROFILE BUCKETING (<see cref="SelectProfile"/>) and the routing decision service's
-    /// <c>GetTargetClass</c> / hardware role-slot rules. It is NOT a capacity/ceiling source:
-    /// context capacities (C_max) derive from the node's pre-configured num_ctx, the model's
-    /// native GGUF context length, or the assumed 128k fallback (task #25).
+    /// Minimum effective VRAM (in MB) of a server-class target (≥ 32 GB). After the
+    /// profile-based bucketing was retired (task #26) this constant is the single source of
+    /// truth ONLY for the routing decision service's <c>GetTargetClass</c> / hardware
+    /// role-slot rules (Stage-2 scoring). It is NOT a capacity/ceiling source: context
+    /// capacities derive from the node's pre-configured num_ctx, the model's native GGUF
+    /// context length, or the assumed 128k fallback (tasks #25/#26).
     /// </summary>
     public const int ServerClassVramThresholdMB = 32_768;
 
     /// <summary>
-    /// Selects the bucket profile name for a (architecture, target VRAM) pair:
-    /// MoE -&gt; <c>Moe</c> (any VRAM class); LargeDense -&gt; 96 GB-class (≥
-    /// <see cref="ServerClassVramThresholdMB"/> MB) ? <c>DenseServer96gb</c> :
-    /// <c>DenseDesktop16gb</c>; SmallDense -&gt; <c>SmallDense</c>. Unknown VRAM
-    /// (<c>null</c>) for dense models falls back to the conservative
-    /// <c>DenseDesktop16gb</c> profile.
+    /// The node's pre-configured Modelfile <c>num_ctx</c> from a derived capability: presence
+    /// is detected through the CDefault vs CMax distinction (task #25's
+    /// <c>DeriveCapability</c> sets <c>CDefault = ModelfileNumCtx ?? 4096</c> while
+    /// <c>CMax = ModelfileNumCtx ?? native ?? 128k</c>, so a pre-configured num_ctx is the
+    /// only case where CDefault is not the Ollama 4096 default). Returns null when the
+    /// Modelfile sets no explicit num_ctx.
     /// </summary>
-    public static string SelectProfile(ModelArchitectureKind architecture, int? maxVramMB)
+    internal static int? ModelfileNumCtx(TargetModelCapability capability)
     {
-        return architecture switch
-        {
-            ModelArchitectureKind.Moe => DynamicContextOptions.MoeProfileName,
-            ModelArchitectureKind.LargeDense => (maxVramMB is not null && maxVramMB >= ServerClassVramThresholdMB)
-                ? DynamicContextOptions.DenseServer96gbProfileName
-                : DynamicContextOptions.DenseDesktop16gbProfileName,
-            _ => DynamicContextOptions.SmallDenseProfileName
-        };
+        return capability.CDefault > ModelCapabilityEngine.OllamaDefaultContext ? capability.CDefault : null;
     }
 
     /// <summary>
-    /// Pure bucket selection over one profile. The injected value is the smallest profile
-    /// bucket that is ≥ min(max(rawEstimatedTokens, clientRequestedNumCtx ?? 0), ceiling)
-    /// (the approved "LargestAffordableBucket, capped at Ceiling" formula),
-    /// with a final clamp to <paramref name="ceiling"/>. The client's static
-    /// <c>num_ctx</c> is an upper-bound preference and NEVER a disqualifier: a large static
-    /// value (e.g. 131072 from Continue/Zed) is clamped down to the target's hardware-safe
-    /// bucket, while a small static value (e.g. 8192) can never truncate a larger prompt
-    /// (the estimate wins and selects a bigger bucket). A prompt larger than the ceiling is
-    /// clamped to the ceiling rather than rejected.
+    /// The model's effective native context length for capacity math: the discovered native
+    /// GGUF context limit, or — when a Modelfile pre-configures an explicit num_ctx ABOVE the
+    /// native length (e.g. an explicit 131,072 pin on a 32k-native model) — that larger
+    /// pre-configured value (the operator declared a larger capacity than the GGUF default).
+    /// Returns null when neither is known.
     /// </summary>
-    /// <param name="dynamicOptions">The <c>DynamicContext</c> options section (profiles + step grid).</param>
-    /// <param name="profileName">Profile to bucket over (see <see cref="SelectProfile"/>).</param>
-    /// <param name="rawEstimatedTokens">Overhead-corrected estimated prompt token count.</param>
-    /// <param name="clientRequestedNumCtx">The client's static <c>options.num_ctx</c>, if any.</param>
-    /// <param name="ceiling">
-    /// Effective ceiling in tokens (min(profile max, explicit Modelfile num_ctx when set,
-    /// hardware CMax)). The injected value never exceeds it.
-    /// </param>
-    public static int SelectBucket(
-        DynamicContextOptions dynamicOptions,
-        string profileName,
-        long rawEstimatedTokens,
-        int? clientRequestedNumCtx,
-        int ceiling)
+    internal static int? EffectiveNativeContext(TargetModelCapability capability)
     {
-        var profile = dynamicOptions.GetProfile(profileName);
-        var step = dynamicOptions.BucketStepTokens > 0
-            ? dynamicOptions.BucketStepTokens
-            : DynamicContextOptions.DefaultBucketStepTokens;
-
-        var max = Math.Max(1, profile.MaxContext);
-        var baseline = profile.DefaultContext > 0
-            ? profile.DefaultContext
-            : Math.Min(ModelCapabilityEngine.OllamaDefaultContext, max);
-
-        // Assemble the ascending bucket ladder: baseline, (intermediate), max. The
-        // intermediate is either the profile's explicit (hand-tuned) value or - for custom
-        // profiles with no explicit value - synthesized on the BucketStepTokens grid as
-        // snapUpToStep(ceil((baseline + max) / 2), step), clamped ≤ max.
-        var buckets = new List<int>(3)
+        var native = capability.NativeContextLimit;
+        var modelfile = ModelfileNumCtx(capability);
+        if (native is null)
         {
-            baseline
-        };
-
-        if (profile.IntermediateContext is { } explicitIntermediate && explicitIntermediate > baseline && explicitIntermediate < max)
-        {
-            buckets.Add(explicitIntermediate);
-        }
-        else if (profile.IntermediateContext is null && max > baseline)
-        {
-            var midpoint = (int)Math.Ceiling((baseline + (double)max) / 2.0);
-            var snapped = SnapUpToStep(midpoint, step);
-            if (snapped > baseline && snapped <= max)
-            {
-                buckets.Add(snapped);
-            }
+            return modelfile;
         }
 
-        if (max > baseline)
+        if (modelfile is { } pin && pin > native.Value)
         {
-            buckets.Add(max);
+            return pin;
         }
 
-        // The client value is an upper-bound preference: the requirement is
-        // max(rawEstimatedTokens, clientRequestedNumCtx ?? 0), capped at the effective
-        // ceiling (clamping, never rejection — a client value above the ceiling never
-        // disqualifies the target).
-        var requirement = Math.Max(rawEstimatedTokens, clientRequestedNumCtx ?? 0);
-        requirement = Math.Min(requirement, Math.Max(0, ceiling));
-
-        // Smallest bucket ≥ requirement (requirement ≤ baseline ⇒ baseline bucket; a
-        // requirement above the max bucket takes the max bucket).
-        int selected = max;
-        foreach (var bucket in buckets)
-        {
-            if (bucket >= requirement)
-            {
-                selected = bucket;
-                break;
-            }
-        }
-
-        // Final ceiling clamp (covers a Modelfile num_ctx BELOW the selected bucket, and an
-        // explicit Modelfile pin that caps CMax at an off-bucket value such as 221,184).
-        return (int)Math.Min(selected, Math.Max(0, ceiling));
+        return native;
     }
 
     /// <summary>
-    /// Computes the full sizing decision for one (target, model, request) triple:
-    /// <c>EffectiveCeiling = min(profile MaxContext, ceiling)</c> where
-    /// <paramref name="ceiling"/> is the target's <c>CMax</c> (which already honors the
-    /// hierarchy: explicit Modelfile num_ctx &gt; hardware-derived safe ceiling), followed by
-    /// bucket selection.
+    /// The two-bucket baseline (the "optimal" bucket): the node's pre-configured Modelfile
+    /// num_ctx when present, else the model's effective native context limit, else the
+    /// assumed 128k fallback (human-approved correction: the fallback is 128k, NOT the
+    /// Ollama 4,096 default).
+    /// </summary>
+    internal static int BaselineBucket(TargetModelCapability capability)
+    {
+        return ModelfileNumCtx(capability)
+            ?? EffectiveNativeContext(capability)
+            ?? ModelCapabilityEngine.FallbackContextWindow;
+    }
+
+    /// <summary>
+    /// Pure bucket selection over the two-bucket MoE ladder (task #26). The baseline bucket
+    /// is the node's pre-configured context (the Modelfile num_ctx when present, else the
+    /// model's effective native context limit, else the assumed 128k fallback); the single
+    /// extensible bucket is <c>min(native ?? 128k, maxContextTokensOverride ?? ∞)</c>.
+    /// The requirement is <c>min(estimatedTokens + contextFitMarginTokens, clientNumCtx ?? ∞)</c>
+    /// (the client's static value is an upper-bound preference that can only LOWER the
+    /// requirement); it is clamped to the extensible limit. Requirement ≤ baseline selects the
+    /// baseline bucket (injected = <c>min(baseline, extensibleMax)</c> — a Modelfile pin ABOVE
+    /// the operator cap injects the cap and still reports <see cref="ContextSizingMode.Baseline"/>);
+    /// otherwise the extensible bucket is injected. No intermediate bucket, no step-grid
+    /// snapping.
+    /// </summary>
+    public static (ContextSizingMode Mode, int Injected, int Baseline, int ExtensibleMax) SelectBucket(
+        TargetModelCapability capability,
+        long estimatedTokens,
+        int? clientNumCtx,
+        int contextFitMarginTokens,
+        int? maxContextTokensOverride)
+    {
+        var baseline = BaselineBucket(capability);
+        var extensibleMax = ModelCapabilityEngine.GetMoeExtensibleCapacity(capability, maxContextTokensOverride);
+
+        var requirement = (long)estimatedTokens + Math.Max(0, contextFitMarginTokens);
+        if (clientNumCtx is { } client && client > 0)
+        {
+            requirement = Math.Min(requirement, client);
+        }
+
+        requirement = Math.Min(requirement, extensibleMax);
+
+        if (requirement <= baseline)
+        {
+            // Baseline bucket: inject the baseline, clamped to the extensible limit (covers
+            // a Modelfile pin ABOVE the operator cap: inject the cap, report Baseline).
+            var injected = Math.Min(baseline, extensibleMax);
+            return (ContextSizingMode.Baseline, injected, baseline, extensibleMax);
+        }
+
+        // Expanded bucket: the single extensible limit (the final clamp is inherent — the
+        // requirement was already clamped to it).
+        return (ContextSizingMode.Expanded, extensibleMax, baseline, extensibleMax);
+    }
+
+    /// <summary>
+    /// Computes the full sizing decision for one (target, model, request) triple (task #26,
+    /// MoE-only dynamic sizing):
+    /// <list type="bullet">
+    /// <item><b>MoE</b> — two-bucket ladder: requirement
+    /// <c>min(estimated + ContextFitMarginTokens, clientNumCtx ?? ∞)</c> ≤ baseline
+    /// (Modelfile num_ctx ?? native ?? 128k) → <see cref="ContextSizingMode.Baseline"/> with
+    /// injected <c>min(baseline, extensibleMax)</c>; otherwise
+    /// <see cref="ContextSizingMode.Expanded"/> with injected
+    /// <c>extensibleMax = min(native ?? 128k, MaxContextTokens ?? ∞)</c> (which doubles as
+    /// the Stage-1 MoE qualification capacity).</item>
+    /// <item><b>Dense</b> — clamp-only: a client <c>num_ctx</c> ABOVE the pre-configured
+    /// baseline is clamped down to it (<see cref="ContextSizingMode.Clamped"/>, injected =
+    /// baseline); otherwise the payload is untouched
+    /// (<see cref="ContextSizingMode.PassThrough"/>, injected = 0 sentinel). Dense values are
+    /// never raised, never bucketed, never leased (a dense KV refill costs 300 s+).</item>
+    /// </list>
+    /// The retired profile table is NOT consulted (profiles remain bindable but are
+    /// ignored). <paramref name="maxContextTokensOverride"/> is the model's
+    /// <see cref="ModelThresholds.MaxContextTokens"/> (applied to MoE only).
     /// </summary>
     public static ContextSizingDecision Decide(
         DynamicContextOptions dynamicOptions,
-        ModelArchitectureKind architecture,
-        int? maxVramMB,
-        int ceiling,
+        TargetModelCapability capability,
         long estimatedTokens,
-        int? clientRequestedNumCtx)
+        int? clientNumCtx,
+        int contextFitMarginTokens,
+        int? maxContextTokensOverride)
     {
-        var profileName = SelectProfile(architecture, maxVramMB);
-        var profile = dynamicOptions.GetProfile(profileName);
-        var effectiveCeiling = Math.Min(profile.MaxContext, Math.Max(0, ceiling));
-        var injected = SelectBucket(dynamicOptions, profileName, estimatedTokens, clientRequestedNumCtx, effectiveCeiling);
-        var clamped = clientRequestedNumCtx is { } clientValue && clientValue > injected;
+        if (capability.Architecture == ModelArchitectureKind.Moe)
+        {
+            var (mode, injected, baseline, extensibleMax) = SelectBucket(
+                capability,
+                estimatedTokens,
+                clientNumCtx,
+                contextFitMarginTokens,
+                maxContextTokensOverride);
 
-        return new ContextSizingDecision(profileName, injected, effectiveCeiling, clamped);
+            var clamped = clientNumCtx is { } requestedValue && requestedValue > injected;
+            return new ContextSizingDecision(
+                DynamicContextOptions.MoeProfileName,
+                injected,
+                extensibleMax,
+                clamped,
+                mode,
+                baseline);
+        }
+
+        // Dense: clamp-only pass-through (no profile consulted, no lease ever).
+        var denseBaseline = BaselineBucket(capability);
+
+        if (dynamicOptions.DenseClampEnabled &&
+            clientNumCtx is { } denseClientValue &&
+            denseClientValue > denseBaseline)
+        {
+            return new ContextSizingDecision(
+                DynamicContextOptions.MoeProfileName,
+                denseBaseline,
+                capability.CMax,
+                true,
+                ContextSizingMode.Clamped,
+                denseBaseline);
+        }
+
+        return new ContextSizingDecision(
+            DynamicContextOptions.MoeProfileName,
+            0, // Sentinel: "no rewrite" — the payload is left untouched.
+            capability.CMax,
+            false,
+            ContextSizingMode.PassThrough,
+            denseBaseline);
     }
 
     /// <summary>
@@ -177,23 +244,14 @@ public static class DynamicContextSizingEngine
     /// <see cref="ModelArchitectureKind.LargeDense"/> model (≥ 14 B) is INCAPABLE on targets
     /// with effective <c>MaxVramMB &lt; 12000</c> (hard veto, already encoded in
     /// <see cref="TargetModelCapability.HardwareCapable"/>); Dense ≤ 27 B is allowed on 16 GB
-    /// up to the 49,152 ceiling; all models up to 256k are allowed on 96 GB. The veto ignores
-    /// activity state entirely - the capability carries no notion of "loaded/idle", so a
-    /// LargeDense model is excluded from a small target EVEN WHEN IDLE. Used by the fleet
-    /// qualification stage; a thin, well-documented wrapper for pure, unit-testable behavior.
+    /// up to its pre-configured capacity; all models up to the native limit are allowed on
+    /// 96 GB. The veto ignores activity state entirely - the capability carries no notion of
+    /// "loaded/idle", so a LargeDense model is excluded from a small target EVEN WHEN IDLE.
+    /// Used by the fleet qualification stage; a thin, well-documented wrapper for pure,
+    /// unit-testable behavior.
     /// </summary>
     public static bool IsHardwareSuitable(TargetModelCapability capability)
     {
         return capability.HardwareCapable;
-    }
-
-    private static int SnapUpToStep(int value, int step)
-    {
-        if (value <= 0)
-        {
-            return step;
-        }
-
-        return (int)(((long)value + step - 1) / step * step);
     }
 }

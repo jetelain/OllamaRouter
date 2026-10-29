@@ -169,8 +169,7 @@ Invoke-RestMethod -Uri 'http://localhost:11435/api/create' -Method Post -Content
 ```
 
 > With `num_ctx` set to `49152`, the corresponding `Models:Qwen3.8-27B:MaxLocalTokens` setting should be around `36864` (75% of `num_ctx`, see [Configuration](#configuration)).
->
-> **This local/remote alias `num_ctx` is the source of truth for the router's context capacity.** Each target's maximum context (`CMax`) is exactly the `num_ctx` pre-configured on its alias — the router does *not* invent a ceiling from the hardware. A request of T estimated tokens is qualified for a target only when `T + ContextFitMarginTokens ≤ CMax` (the default margin is `8192`; see [Configuration](#configuration)). Only when a node's alias sets **no** `num_ctx` does the router fall back to the model's native GGUF context length, then to an assumed 128,000 tokens.
+> **This local/remote alias `num_ctx` is the source of truth for the router's context capacity.** Each target's maximum context (`CMax`) is exactly the `num_ctx` pre-configured on its alias — the router does *not* invent a ceiling from the hardware. A dense request of T estimated tokens is qualified for a target only when `T + ContextFitMarginTokens ≤ CMax` (the default margin is `8192`; see [Configuration](#configuration)). Only when a node's alias sets **no** `num_ctx` does the router fall back to the model's native GGUF context length, then to an assumed 128,000 tokens. For **MoE** models the pre-configured `num_ctx` is the *optimal baseline bucket*; when the request exceeds it, the router may elastically expand up to the model's native context limit (the *extensible* bucket, optionally capped by `Models:{model}:MaxContextTokens`) — see [Dynamic context sizing (MoE only)](#dynamic-context-sizing-moe-only).
 
 ### Remote Ollama
 
@@ -248,6 +247,9 @@ appsettings.json  <  config/config.json  <  user secrets  <  environment variabl
 | `TokenEstimationOverheadFactor` | Multiplicative correction applied to the estimated token count, to compensate for the systematic underestimation of the generic tokenizer versus the actual tokenizer and chat template of targeted models. Defaults to `1.0` (no correction); see [recommendations below](#token-estimation-overhead-recommendations). |
 | `ContextFitMarginTokens` | Additive **reasoning-fit margin** (in tokens) added to the estimated prompt token count before qualifying a target: a prompt of T tokens is routed to a target only when `T + ContextFitMarginTokens ≤ CMax` (the target's [pre-configured node context](#setup-ollama-instances)). The margin reserves a typical high-reasoning/generation budget so the model's output never overflows the node's context. Defaults to `8192`; for long-thinking agent models a larger value (e.g. `10240`) is recommended. Negative values are clamped to `0`. Applied even when `DynamicContext:Enabled` is `false`. |
 | `DispatchToLargestCapacityOnOverflow` | When `true` and all enabled fleet targets fail Stage-1 context qualification due to context overflow, the router dispatches the request to the online, capable target with the largest context capacity (`Max(CMax)`) with `options.num_ctx` clamped to that ceiling, rather than rejecting with a 503 error. Defaults to `true`. |
+| `DynamicContext:Enabled` | Enables dynamic context sizing (MoE two-bucket ladder + dense clamp-only). Defaults to `false`. See [Dynamic context sizing (MoE only)](#dynamic-context-sizing-moe-only). |
+| `DynamicContext:DenseClampEnabled` | When `true` (default), a request on a **dense** model rewrites `options.num_ctx` only when the client's static value exceeds the node's pre-configured context, clamping it down (one-time KV reallocation; OOM protection). Set to `false` for pure dense pass-through. Dense values are never raised, bucketed, or leased. |
+| `Models:*:MaxContextTokens` | Optional operator cap (in tokens) on a model's **extensible** context limit, applied across all nodes as `min(native context ?? 128k, MaxContextTokens)`. Affects MoE dynamic sizing and Stage-1 MoE qualification only (it does not change a node's pre-configured `CMax`). Example: a VRAM-tuned or Q8-lossless ceiling. Defaults to unset (no cap). |
 | `MaxConsecutiveFailures` | Number of consecutive failures on a target for adjacent requests within `ConsecutiveFailuresTokenTolerance` before switching to the next target in the chain (`Local` → `Remote` → `Cloud`). Defaults to `3`. Set to `0` to disable automatic target switching. |
 | `ConsecutiveFailuresTokenTolerance` | Maximum difference in estimated prompt tokens between adjacent requests to consider them part of the same retry streak. Defaults to `4000`. Set to `0` to require an exact match. |
 | `Recording:Enabled` | Enables the optional [inference request recording](#inference-request-recording-optional), saving each request's metadata and full request body for investigation of estimated vs actual token counts. Defaults to `false`. |
@@ -259,6 +261,21 @@ appsettings.json  <  config/config.json  <  user secrets  <  environment variabl
 | `Pricing:Currency` | Currency symbol or label to display in the monitoring UI (e.g. `$`, `€`, `USD`). Defaults to `$`. |
 | `TerminalMonitoring:Enabled` | Enables the in-terminal live activity monitor in the server console (zero VRAM consumption). Defaults to `true`. Can also be disabled via `--no-tui`. |
 | `TerminalMonitoring:RefreshIntervalSeconds` | Refresh interval in seconds for the in-terminal live monitor. Defaults to `2.0`. |
+
+### Dynamic context sizing (MoE only)
+
+When `DynamicContext:Enabled` is `true`, the router sizes the outgoing `options.num_ctx` per request. The system is **MoE-only**: dense models are never bucketed or expanded because a dense KV-cache refill costs 300 s+ — rewriting dense payloads is never worth it.
+
+**MoE — a two-bucket ladder.** A MoE request is sized between exactly two buckets:
+
+1. the node's **pre-configured context** (its Modelfile `num_ctx`) — the *optimal* baseline bucket; and
+2. the model's **native context length** — the single *extensible* bucket, optionally capped across all nodes by an operator `Models:{model}:MaxContextTokens` (e.g. a VRAM-tuned or Q8-lossless ceiling), applied as `min(native, override)`.
+
+If the margin-adjusted requirement (`min(estimatedTokens + ContextFitMarginTokens, clientNumCtx)`) fits the baseline bucket, the baseline is injected; otherwise the extensible bucket is. Stage-1 qualification uses the same extensible limit, so a node pre-configured at 184,320 can still elastically serve a 205k prompt by expanding to its 262,144 native limit (one cheap MoE KV reallocation) instead of failing over. The **Auto-Shrink Manager** then retains the expanded bucket across a cooldown of normal turns (preserving the KV prefix cache) before shrinking back to the pre-configured baseline on a 50%-token drop or idle timeout.
+
+**Dense — clamp-only pass-through.** For a dense model the router rewrites `options.num_ctx` *only* when the client's static value **exceeds** the node's pre-configured context, clamping it **down** to that value (one-time KV reallocation; protects against OOM from static 131,072 requests on a 49,152 node). When the client value is absent or ≤ pre-configured, the payload is left byte-identical. Dense values are never raised, never bucketed, never leased. Set `DynamicContext:DenseClampEnabled` to `false` for pure dense pass-through (no clamping).
+
+Retired configuration keys (task #26 — still bind but are ignored, with a one-time startup warning): `DynamicContext:BucketStepTokens`, `DynamicContext:Profiles:*:IntermediateContext`, and the dense profile names `DenseDesktop16gb` / `DenseServer96gb` / `SmallDense`.
 
 ### Token estimation overhead recommendations
 

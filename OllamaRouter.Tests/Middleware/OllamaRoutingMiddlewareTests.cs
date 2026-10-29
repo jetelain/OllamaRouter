@@ -98,7 +98,7 @@ public class OllamaRoutingMiddlewareTests
 
         return new OllamaRoutingMiddleware(
             next,
-            tokenEstimator.Object,
+            tokenEstimator,
             routingDecisionService.Object,
             (modelCatalogCache ?? new Mock<IModelCatalogCacheService>()).Object,
             (activityMonitor ?? new Mock<IActivityMonitorService>()).Object,
@@ -1394,7 +1394,7 @@ public class OllamaRoutingMiddlewareTests
     }
 
     [Fact]
-    public async Task Sizing_Moe200kPrompt_96GBTarget_ModelfilePin221184_Injects221184_AndEmitsContextSizeHeader()
+    public async Task Sizing_MoePrompt_ModelfilePin221184_Injects221184_AndEmitsBaselineMode()
     {
         var context = BuildContext("/api/chat", """{ "model": "qwen3.6-35b-a3b", "messages": [ { "role": "user", "content": "a long prompt" } ] }""");
 
@@ -1408,7 +1408,9 @@ public class OllamaRoutingMiddlewareTests
 
         var capabilityEngine = CreateCapabilityEngine(out var catalogClient);
         // 35B-A3B MoE: expert_count present; the Modelfile pins num_ctx 221184 (hierarchy
-        // level 1), capping the effective ceiling at the 221,184 bucket.
+        // level 1). No GGUF context_length is discoverable, so the two-bucket ladder (task #26)
+        // uses the pre-configured 221,184 as BOTH the baseline and (floored) the extensible
+        // limit — the engine expands to 221,184 (never below the node's own pin).
         catalogClient
             .Setup(c => c.GetShowAsync("http://localhost:11435", "qwen3.6-35b-a3b", It.IsAny<CancellationToken>()))
             .ReturnsAsync(new JsonObject
@@ -1439,6 +1441,153 @@ public class OllamaRoutingMiddlewareTests
         Assert.Equal("221184", context.Response.Headers["X-OllamaRouter-Context-Size"]);
         // The estimated-tokens telemetry header matches the estimator output (overhead factor 1.0).
         Assert.Equal("200000", context.Response.Headers["X-OllamaRouter-Estimated-Tokens"]);
+        // Task #26 superset mode vocabulary: no Auto-Shrink manager in this pipeline, so the
+        // engine mode is emitted (Baseline: 200k + 8,192 = 208,192 still fits the 221,184
+        // pre-configured baseline bucket, so the baseline is injected).
+        Assert.Equal("Baseline", context.Response.Headers["X-OllamaRouter-Context-Mode"]);
+    }
+
+    [Fact]
+    public async Task Sizing_MoePromptAboveBaseline_NativeContext_ExpandsToExtensibleBucket()
+    {
+        // AC1 scenario: Modelfile num_ctx 184,320 (pre-configured baseline) with a 262,144
+        // native GGUF context limit; a 205k prompt (205,000 + 8,192 = 213,192 > 184,320)
+        // expands to the single extensible bucket (262,144).
+        var context = BuildContext("/api/chat", """{ "model": "moe-262k", "messages": [ { "role": "user", "content": "a long prompt" } ] }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(205_000);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(205_000, "moe-262k", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var capabilityEngine = CreateCapabilityEngine(out var catalogClient);
+        catalogClient
+            .Setup(c => c.GetShowAsync("http://localhost:11435", "moe-262k", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new JsonObject
+            {
+                ["parameters"] = "num_ctx 184320",
+                ["model_info"] = new JsonObject
+                {
+                    ["qwen35.expert_count"] = 128,
+                    ["qwen35.context_length"] = 262_144
+                }
+            });
+
+        var options = new OllamaRouterOptions { LocalUrl = "http://localhost:11435" };
+        options.Targets.Add(new OllamaTargetOptions { Name = "Local", Url = "http://localhost:11435", HardwareHint = "96gb" });
+
+        var captured = new string[1];
+        var sut = CreateSizingSut(
+            CaptureBodyDelegate(captured),
+            tokenEstimator,
+            routingDecisionService,
+            options,
+            capabilityEngine,
+            DigestCache("digest-1"));
+
+        await sut.InvokeAsync(context);
+
+        Assert.NotNull(captured[0]);
+        using var doc = JsonDocument.Parse(captured[0]!);
+        // Expanded to the extensible bucket: the model's native 262,144 context limit.
+        Assert.Equal(262_144, doc.RootElement.GetProperty("options").GetProperty("num_ctx").GetInt32());
+        Assert.Equal("262144", context.Response.Headers["X-OllamaRouter-Context-Size"]);
+        // No Auto-Shrink manager in this pipeline: the engine mode (Expanded) is emitted.
+        Assert.Equal("Expanded", context.Response.Headers["X-OllamaRouter-Context-Mode"]);
+    }
+
+    [Fact]
+    public async Task Sizing_DensePrompt_NoClientNumCtx_PayloadUntouched_NoModeHeader()
+    {
+        // AC6: dense model, no client num_ctx (and client value ≤ pre-configured) → the
+        // payload is byte-identical, no num_ctx injected, no mode header, no lease.
+        const string body = """{ "model": "dense-49k", "messages": [ { "role": "user", "content": "hi" } ] }""";
+        var context = BuildContext("/api/chat", body);
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(5_000);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(5_000, "dense-49k", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var capabilityEngine = CreateCapabilityEngine(out var catalogClient);
+        catalogClient
+            .Setup(c => c.GetShowAsync("http://localhost:11435", "dense-49k", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new JsonObject
+            {
+                ["parameters"] = "num_ctx 49152",
+                ["model_info"] = new JsonObject { ["general.parameter_count"] = 27_800_000_000L }
+            });
+
+        var options = new OllamaRouterOptions { LocalUrl = "http://localhost:11435" };
+        options.Targets.Add(new OllamaTargetOptions { Name = "Local", Url = "http://localhost:11435", HardwareHint = "16gb" });
+
+        var captured = new string[1];
+        var sut = CreateSizingSut(
+            CaptureBodyDelegate(captured),
+            tokenEstimator,
+            routingDecisionService,
+            options,
+            capabilityEngine,
+            DigestCache("digest-1"));
+
+        await sut.InvokeAsync(context);
+
+        // Byte-identical payload: dense pass-through never touches options.num_ctx.
+        Assert.Equal(body, captured[0]);
+        Assert.False(context.Response.Headers.ContainsKey("X-OllamaRouter-Context-Size"));
+        Assert.False(context.Response.Headers.ContainsKey("X-OllamaRouter-Context-Mode"));
+    }
+
+    [Fact]
+    public async Task Sizing_DenseClampDisabled_OversizedClientNumCtx_PayloadUntouched()
+    {
+        // AC7: DenseClampEnabled = false → even an oversized static client num_ctx leaves the
+        // payload untouched (pure dense pass-through).
+        var context = BuildContext("/api/chat", """{ "model": "dense-49k", "messages": [ { "role": "user", "content": "hi" } ], "options": { "num_ctx": 131072 } }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(5_000);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(5_000, "dense-49k", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var capabilityEngine = CreateCapabilityEngine(out var catalogClient);
+        catalogClient
+            .Setup(c => c.GetShowAsync("http://localhost:11435", "dense-49k", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new JsonObject
+            {
+                ["parameters"] = "num_ctx 49152",
+                ["model_info"] = new JsonObject { ["general.parameter_count"] = 27_800_000_000L }
+            });
+
+        var options = new OllamaRouterOptions { LocalUrl = "http://localhost:11435" };
+        options.Targets.Add(new OllamaTargetOptions { Name = "Local", Url = "http://localhost:11435", HardwareHint = "16gb" });
+        options.DynamicContext.DenseClampEnabled = false;
+
+        var captured = new string[1];
+        var sut = CreateSizingSut(
+            CaptureBodyDelegate(captured),
+            tokenEstimator,
+            routingDecisionService,
+            options,
+            capabilityEngine,
+            DigestCache("digest-1"));
+
+        await sut.InvokeAsync(context);
+
+        Assert.NotNull(captured[0]);
+        using var doc = JsonDocument.Parse(captured[0]!);
+        // The client's 131,072 is preserved (clamping disabled).
+        Assert.Equal(131_072, doc.RootElement.GetProperty("options").GetProperty("num_ctx").GetInt32());
+        Assert.False(context.Response.Headers.ContainsKey("X-OllamaRouter-Context-Mode"));
     }
 
     [Fact]
@@ -1455,11 +1604,13 @@ public class OllamaRoutingMiddlewareTests
             .ReturnsAsync(RoutingTarget.Local);
 
         var capabilityEngine = CreateCapabilityEngine(out var catalogClient);
-        // 27B dense: parameter count above the 14B threshold, no experts.
+        // 27B dense: parameter count above the 14B threshold, no experts. The Modelfile pins
+        // num_ctx 49152 — the pre-configured context that the task-#26 clamp targets.
         catalogClient
             .Setup(c => c.GetShowAsync("http://localhost:11435", "qwen3.8-27b", It.IsAny<CancellationToken>()))
             .ReturnsAsync(new JsonObject
             {
+                ["parameters"] = "num_ctx 49152\nnum_predict 4096",
                 ["model_info"] = new JsonObject { ["general.parameter_count"] = 27_800_000_000L }
             });
 
@@ -1479,7 +1630,8 @@ public class OllamaRoutingMiddlewareTests
 
         Assert.NotNull(captured[0]);
         using var doc = JsonDocument.Parse(captured[0]!);
-        // The large static client value is clamped to the 48k desktop ceiling — never disqualified.
+        // Task #26 dense clamp-only: the oversized static client value is clamped DOWN to the
+        // node's pre-configured 49,152 context (one-time KV reallocation; never raised).
         Assert.Equal(49_152, doc.RootElement.GetProperty("options").GetProperty("num_ctx").GetInt32());
         Assert.Equal("49152", context.Response.Headers["X-OllamaRouter-Context-Size"]);
         // Routing is unchanged: still the Desktop-equivalent 16 GB target.
@@ -1654,12 +1806,11 @@ public class OllamaRoutingMiddlewareTests
 
         Assert.NotNull(captured[0]);
         using var doc = JsonDocument.Parse(captured[0]!);
-        // 100k tokens on the 16 GB target: the fixture's expert_count (128) classifies it as
-        // MoE, so the MoE profile's 184,320 baseline is selected, then clamped to the
-        // 49,152 max bucket of the 16 GB DenseDesktop16gb-class profile. CMax is now the
-        // 131,072 assumed fallback (no node pin), but the effective ceiling is the smaller
-        // profile max bucket (49,152), so the injected value clamps to 49,152.
-        Assert.Equal(49_152, doc.RootElement.GetProperty("options").GetProperty("num_ctx").GetInt32());
+        // 100k tokens on the MoE target (expert_count 128): no Modelfile num_ctx and no
+        // discoverable GGUF context_length, so the two-bucket ladder (task #26) uses the
+        // assumed 128k fallback as BOTH baseline and extensible limit; the 108,192 requirement
+        // fits the baseline bucket, so 131,072 is injected.
+        Assert.Equal(131_072, doc.RootElement.GetProperty("options").GetProperty("num_ctx").GetInt32());
     }
 
     [Fact]
@@ -1829,9 +1980,12 @@ public class OllamaRoutingMiddlewareTests
     }
 
     [Fact]
-    public async Task Sizing_ModelfileNumCtxBelowBucket_ClampsInjectedValueToModelfile()
+    public async Task Sizing_DenseLowModelfilePin_ClientNumCtx_ClampedToPreConfiguredContext()
     {
-        var context = BuildContext("/api/chat", """{ "model": "pinned", "prompt": "hello there" }""");
+        // Task #26 dense clamp-only: a dense model whose Modelfile pre-configures num_ctx 24576
+        // (a low, e.g. VRAM-tuned pin) with a client static num_ctx of 131,072 — the oversized
+        // client value is clamped DOWN to the pre-configured 24,576.
+        var context = BuildContext("/api/chat", """{ "model": "pinned", "prompt": "hello there", "options": { "num_ctx": 131072 } }""");
 
         var tokenEstimator = new Mock<ITokenEstimator>();
         tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(3_000);
@@ -1842,7 +1996,7 @@ public class OllamaRoutingMiddlewareTests
             .ReturnsAsync(RoutingTarget.Local);
 
         var capabilityEngine = CreateCapabilityEngine(out var catalogClient);
-        // The Modelfile pins num_ctx 24576: hierarchy level 1 caps CMax below any bucket.
+        // The Modelfile pins num_ctx 24576: the pre-configured context the dense clamp targets.
         catalogClient
             .Setup(c => c.GetShowAsync(It.IsAny<string?>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(new JsonObject
@@ -1867,7 +2021,7 @@ public class OllamaRoutingMiddlewareTests
         Assert.NotNull(captured[0]);
         using var doc = JsonDocument.Parse(captured[0]!);
         Assert.Equal(24_576, doc.RootElement.GetProperty("options").GetProperty("num_ctx").GetInt32());
-        }
+    }
 
     // ================================================================================
     // Per-target failover, streak tracking, and the uncommitted retry loop (Phase 3, task 8).
