@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Mvc;
@@ -8,6 +9,7 @@ using OllamaRouter.Middleware;
 using OllamaRouter.Options;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services;
+using OllamaRouter.Services.Hardware;
 
 namespace OllamaRouter.Endpoints;
 
@@ -65,6 +67,56 @@ public static class RouterApiEndpointsExtensions
         {
             var response = await BuildFleetResponseAsync(options, targetAvailability, serviceProvider, cancellationToken);
             return Results.Json(response, OllamaRouterJsonSerializerContext.Default.RouterFleetResponse);
+        });
+
+        // Fleet hardware profiling engine: the local node's own profile (cached after the
+        // first probe), the full fleet topology (parallel peer probes, fail-soft per node),
+        // and the manual profile push (for bare Ollama targets without a router daemon).
+        app.MapGet("/api/router/hardware", async (IHardwareProfileProvider provider, CancellationToken cancellationToken) =>
+        {
+            var profile = await provider.GetLocalProfileAsync(cancellationToken).ConfigureAwait(false);
+            return Results.Json(profile, OllamaRouterJsonSerializerContext.Default.NodeHardwareProfile);
+        });
+
+        app.MapGet("/api/router/fleet/hardware", async (IFleetHardwareService fleetHardware, CancellationToken cancellationToken) =>
+        {
+            var nodes = await fleetHardware.GetFleetHardwareAsync(cancellationToken).ConfigureAwait(false);
+            return Results.Json(new RouterFleetHardwareResponse(nodes), OllamaRouterJsonSerializerContext.Default.RouterFleetHardwareResponse);
+        });
+
+        app.MapPut("/api/router/fleet/hardware/{targetName}", async (HttpRequest request, string targetName, IFleetHardwareService fleetHardware, CancellationToken cancellationToken) =>
+        {
+            NodeHardwareProfile? profile = null;
+            try
+            {
+                profile = await JsonSerializer.DeserializeAsync(
+                    request.Body,
+                    OllamaRouterJsonSerializerContext.Default.NodeHardwareProfile,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (JsonException)
+            {
+                // Malformed JSON body → 400 below.
+            }
+
+            if (profile is null || string.IsNullOrWhiteSpace(profile.NodeName))
+            {
+                return Results.Json(
+                    new OllamaErrorResponse("invalid or missing hardware profile body"),
+                    OllamaRouterJsonSerializerContext.Default.OllamaErrorResponse,
+                    statusCode: StatusCodes.Status400BadRequest);
+            }
+
+            var stored = await fleetHardware.UpsertProfileAsync(targetName, profile, cancellationToken).ConfigureAwait(false);
+            if (!stored)
+            {
+                return Results.Json(
+                    new OllamaErrorResponse($"target not found: {targetName}"),
+                    OllamaRouterJsonSerializerContext.Default.OllamaErrorResponse,
+                    statusCode: StatusCodes.Status404NotFound);
+            }
+
+            return Results.Json(profile, OllamaRouterJsonSerializerContext.Default.NodeHardwareProfile);
         });
 
         app.MapGet("/api/router/models", async (
@@ -344,6 +396,8 @@ public static class RouterApiEndpointsExtensions
         var leaseSnapshot = serviceProvider.GetService<IContextAutoShrinkManager>()?.GetLeaseSnapshot();
         var gpuVramProvider = serviceProvider.GetService<IGpuVramProvider>();
         var modelCatalogCache = serviceProvider.GetService<IModelCatalogCacheService>();
+        var hardwareProvider = serviceProvider.GetService<IHardwareProfileProvider>();
+        var fleetHardware = serviceProvider.GetService<IFleetHardwareService>();
 
         // The local workstation target (URL host 127.0.0.1/localhost or name "Local") gets the
         // live local GPU snapshot; only the FIRST such target receives it.
@@ -401,6 +455,29 @@ public static class RouterApiEndpointsExtensions
             // consistent with maxVramMB's nullable semantics.
             var speedFactor = target.GetEffectiveSpeedFactor();
 
+            // Memory-tier enrichment from the fleet hardware store: the local workstation
+            // target gets the local profile (cached after the first probe); other targets
+            // get their stored profile (manual/peer/persisted). Missing profile → all
+            // defaults (fail-soft, additive/backward-compatible fields).
+            NodeHardwareProfile? nodeProfile = null;
+            try
+            {
+                if (isLocalWorkstation)
+                {
+                    nodeProfile = hardwareProvider is not null
+                        ? await hardwareProvider.GetLocalProfileAsync(cancellationToken).ConfigureAwait(false)
+                        : null;
+                }
+                else
+                {
+                    nodeProfile = fleetHardware?.GetProfile(name);
+                }
+            }
+            catch
+            {
+                nodeProfile = null;
+            }
+
             targets.Add(new RouterTargetItem(
                 Name: name,
                 Url: target.Url,
@@ -413,7 +490,11 @@ public static class RouterApiEndpointsExtensions
                     Devices: isLocalWorkstation ? localGpuSnapshot.Devices : Array.Empty<string>(),
                     MaxVramMB: target.GetEffectiveMaxVramMB(),
                     MaxParallel: target.MaxParallel,
-                    SpeedFactor: speedFactor == 1.0 ? null : speedFactor),
+                    SpeedFactor: speedFactor == 1.0 ? null : speedFactor,
+                    IsUnifiedMemory: nodeProfile?.IsUnifiedMemory ?? false,
+                    SystemRamMB: nodeProfile?.SystemRamMB is { } ram ? ram : null,
+                    MemoryType: nodeProfile is null ? null : DescribeMemoryTier(nodeProfile),
+                    BandwidthGBs: nodeProfile?.EffectiveBandwidthGBs is { } bw and > 0 ? bw : null),
                 Execution: new RouterTargetExecution(
                     InFlightRequests: inFlight,
                     ActiveModel: activeModel,
@@ -461,6 +542,43 @@ public static class RouterApiEndpointsExtensions
                Uri.TryCreate(target.Url, UriKind.Absolute, out var uri) &&
                (string.Equals(uri.Host, "127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(uri.Host, "localhost", StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// Human-readable memory tier label for the fleet view: the system RAM tier wins
+    /// ("DDR5", "LPDDR5X", "AppleUnified"), falling back to the fastest GPU VRAM tier
+    /// ("GDDR6X", "HBM3") and finally "Unknown".
+    /// </summary>
+    private static string DescribeMemoryTier(NodeHardwareProfile profile)
+    {
+        // Canonical tier labels (spec examples: "DDR5", "LPDDR5X", "AppleUnified", "GDDR6X").
+        var ramLabel = profile.SystemRamType switch
+        {
+            SystemRamType.Ddr3 => "DDR3",
+            SystemRamType.Ddr4 => "DDR4",
+            SystemRamType.Ddr5 => "DDR5",
+            SystemRamType.LpDdr5X => "LPDDR5X",
+            SystemRamType.AppleUnified => "AppleUnified",
+            _ => null
+        };
+        if (ramLabel is not null)
+        {
+            return ramLabel;
+        }
+
+        if (profile.Gpus is { Count: > 0 })
+        {
+            var types = profile.Gpus.Select(g => g.VramType)
+                .Where(t => !string.IsNullOrWhiteSpace(t) && !string.Equals(t, "Unknown", StringComparison.OrdinalIgnoreCase))
+                .Distinct()
+                .ToList();
+            if (types.Count > 0)
+            {
+                return string.Join("/", types);
+            }
+        }
+
+        return "Unknown";
     }
 
     // Renders the current context allocation for one fleet target from the lease snapshot:
@@ -1249,7 +1367,11 @@ public sealed record RouterTargetHardware(
     [property: JsonPropertyName("devices")] IReadOnlyList<string> Devices,
     [property: JsonPropertyName("maxVramMB")] int? MaxVramMB,
     [property: JsonPropertyName("maxParallel")] int MaxParallel,
-    [property: JsonPropertyName("speedFactor")] double? SpeedFactor);
+    [property: JsonPropertyName("speedFactor")] double? SpeedFactor,
+    [property: JsonPropertyName("isUnifiedMemory")] bool IsUnifiedMemory = false,
+    [property: JsonPropertyName("systemRamMB")] long? SystemRamMB = null,
+    [property: JsonPropertyName("memoryType")] string? MemoryType = null,
+    [property: JsonPropertyName("bandwidthGBs")] double? BandwidthGBs = null);
 
 public sealed record RouterTargetExecution(
     [property: JsonPropertyName("inFlightRequests")] int InFlightRequests,

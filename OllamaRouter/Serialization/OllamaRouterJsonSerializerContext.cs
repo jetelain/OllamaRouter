@@ -2,6 +2,7 @@ using System.Text.Json.Serialization;
 using OllamaRouter.Endpoints;
 using OllamaRouter.Middleware;
 using OllamaRouter.Services;
+using OllamaRouter.Services.Hardware;
 
 namespace OllamaRouter.Serialization;
 
@@ -35,6 +36,12 @@ namespace OllamaRouter.Serialization;
 [JsonSerializable(typeof(RouterContextEvaluateResponse))]
 [JsonSerializable(typeof(RouterVramReclaimRequest))]
 [JsonSerializable(typeof(RouterVramReclaimTargetResult))]
+[JsonSerializable(typeof(Dictionary<string, HardwareProfileState>))]
+[JsonSerializable(typeof(NodeHardwareProfile))]
+[JsonSerializable(typeof(GpuDeviceProfile))]
+[JsonSerializable(typeof(SystemRamType))]
+[JsonSerializable(typeof(FleetHardwareNode))]
+[JsonSerializable(typeof(RouterFleetHardwareResponse))]
 [JsonSerializable(typeof(RouterVramReclaimResponse))]
 public partial class OllamaRouterJsonSerializerContext : JsonSerializerContext
 {

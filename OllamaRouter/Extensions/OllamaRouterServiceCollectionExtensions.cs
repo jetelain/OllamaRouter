@@ -10,6 +10,7 @@ using OllamaRouter.Options;
 using OllamaRouter.ReverseProxy;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services;
+using OllamaRouter.Services.Hardware;
 using Yarp.ReverseProxy;
 using MsOptions = Microsoft.Extensions.Options.Options;
 
@@ -107,6 +108,18 @@ public static class OllamaRouterServiceCollectionExtensions
         });
         services.AddMemoryCache();
 
+        // Dedicated fleet hardware probe client: 3 s timeout + 10 s pooled-connection lifetime
+        // (same shape as the liveness probe client) so an unreachable peer daemon never stalls
+        // the fleet hardware endpoint beyond the per-probe budget.
+        services.AddHttpClient("HardwareProbe", client =>
+        {
+            client.Timeout = TimeSpan.FromSeconds(3);
+        })
+        .ConfigurePrimaryHttpMessageHandler(_ =>
+        {
+            return new SocketsHttpHandler { PooledConnectionLifetime = TimeSpan.FromSeconds(10) };
+        });
+
         if (string.Equals(options.TokenEstimator, "Tiktoken", StringComparison.OrdinalIgnoreCase))
         {
             services.AddSingleton<ITokenEstimator, TiktokenTokenEstimator>();
@@ -144,6 +157,14 @@ public static class OllamaRouterServiceCollectionExtensions
         services.AddSingleton<IContextAutoShrinkManager>(sp => new ContextAutoShrinkManager(
             sp.GetRequiredService<ILogger<ContextAutoShrinkManager>>()));
         services.AddSingleton<IFleetAggregationService, FleetAggregationService>();
+
+        // Fleet hardware topology store (singleton + targets-hardware.json persistence).
+        services.AddSingleton<IFleetHardwareService>(sp => new FleetHardwareService(
+            sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
+            sp.GetRequiredService<IHardwareProfileProvider>(),
+            sp.GetRequiredService<IHttpClientFactory>().CreateClient("HardwareProbe"),
+            sp.GetRequiredService<ILogger<FleetHardwareService>>(),
+            Path.Combine(effectiveStateDirectory, "targets-hardware.json")));
         services.AddSingleton<ModelCapabilityEngine>();
         services.AddSingleton<IOllamaProcessLauncher, OllamaProcessLauncher>();
         services.AddSingleton<IActivityMonitorService, ActivityMonitorService>();
