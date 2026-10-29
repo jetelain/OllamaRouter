@@ -295,6 +295,13 @@ public sealed class OllamaTargetOptions
     public string? Url { get; set; }
 
     /// <summary>
+    /// Optional base address of the OllamaRouter instance running on this node (e.g. <c>http://192.168.1.25:11434</c>).
+    /// Used for router-to-router management operations such as hardware discovery (<c>/api/router/hardware</c>).
+    /// When not set, falls back by convention to the same host on port 11434 only if <see cref="Url"/> is on port 11435.
+    /// </summary>
+    public string? RouterUrl { get; set; }
+
+    /// <summary>
     /// Explicit maximum VRAM (in MB) available on this target. When not set, the effective
     /// VRAM is resolved dynamically from <see cref="Services.Hardware.IFleetHardwareService"/>.
     /// </summary>
@@ -343,6 +350,38 @@ public sealed class OllamaTargetOptions
         if (fleetHardware is not null)
         {
             return fleetHardware.GetEffectiveMaxVramMB(this);
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Resolves the base URL of the OllamaRouter instance running on this target node.
+    /// <para>
+    /// Router-to-router management operations (such as hardware discovery via <c>/api/router/hardware</c>)
+    /// must reach the OllamaRouter instance rather than the physical Ollama daemon.
+    /// Priority:
+    /// <list type="number">
+    /// <item>Explicit <see cref="RouterUrl"/> if provided.</item>
+    /// <item>Convention-based fallback: if <see cref="Url"/> is on port 11435 (the daemon port),
+    /// the router is expected on port 11434 on the same host and scheme.</item>
+    /// <item>Returns <c>null</c> if neither applies (e.g. standard Ollama daemon on port 11434 without a router).</item>
+    /// </list>
+    /// </para>
+    /// </summary>
+    public string? ResolveRouterUrl()
+    {
+        if (!string.IsNullOrWhiteSpace(RouterUrl))
+        {
+            return RouterUrl.TrimEnd('/');
+        }
+
+        if (!string.IsNullOrWhiteSpace(Url) &&
+            Uri.TryCreate(Url, UriKind.Absolute, out var uri) &&
+            uri.Port == 11435)
+        {
+            var builder = new UriBuilder(uri) { Port = 11434, Path = string.Empty, Query = string.Empty };
+            return builder.Uri.ToString().TrimEnd('/');
         }
 
         return null;

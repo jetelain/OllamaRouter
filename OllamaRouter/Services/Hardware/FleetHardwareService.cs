@@ -247,9 +247,15 @@ public sealed class FleetHardwareService : IFleetHardwareService, IHostedService
 
     private async Task<ProbeResult> ProbePeerAsync(OllamaTargetOptions target)
     {
+        var routerUrl = target.ResolveRouterUrl();
+        if (routerUrl is null)
+        {
+            return new ProbeResult(null, false);
+        }
+
         try
         {
-            var url = target.Url!.TrimEnd('/') + HardwarePath;
+            var url = routerUrl + HardwarePath;
             using var response = await _probeClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
             {
@@ -264,7 +270,7 @@ public sealed class FleetHardwareService : IFleetHardwareService, IHostedService
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "Peer hardware probe of {Target} ({Url}) failed.", target.Name, target.Url);
+            _logger.LogDebug(ex, "Peer hardware probe of {Target} ({Url}) failed.", target.Name, routerUrl);
             return new ProbeResult(null, false);
         }
     }

@@ -575,7 +575,7 @@ public class HardwareProfileTests
         Targets =
         [
             new OllamaTargetOptions { Name = "Local", Url = "http://127.0.0.1:11435" },
-            new OllamaTargetOptions { Name = "Peer", Url = "http://192.168.1.50:11434" }
+            new OllamaTargetOptions { Name = "Peer", Url = "http://192.168.1.50:11435" }
         ]
     };
 
@@ -957,5 +957,113 @@ public class HardwareProfileTests
         // must survive (GetProfile keeps the manual value, never overwritten by local).
         Assert.Same(manual, service.GetProfile("Local"));
         Assert.NotNull(localNode.Profile);
+    }
+
+    [Theory]
+    [InlineData("http://192.168.1.20:11435", null, "http://192.168.1.20:11434")]
+    [InlineData("http://192.168.1.20:11435/", null, "http://192.168.1.20:11434")]
+    [InlineData("https://laptop.local:11435", null, "https://laptop.local:11434")]
+    [InlineData("http://192.168.1.20:11435", "http://custom-router:9090", "http://custom-router:9090")]
+    [InlineData("http://192.168.1.20:11435", "http://custom-router:9090/", "http://custom-router:9090")]
+    [InlineData("http://aiserver:11434", null, null)]
+    [InlineData("http://custom:12345", null, null)]
+    [InlineData("", null, null)]
+    public void ResolveRouterUrl_HonorsRouterUrlAndPort11435Fallback(string targetUrl, string? routerUrl, string? expected)
+    {
+        var target = new OllamaTargetOptions
+        {
+            Name = "TestTarget",
+            Url = targetUrl,
+            RouterUrl = routerUrl
+        };
+
+        var resolved = target.ResolveRouterUrl();
+        Assert.Equal(expected, resolved);
+    }
+
+    [Fact]
+    public async Task GetFleetHardware_Non11435WithoutRouterUrl_DoesNotProbe()
+    {
+        using var state = new TempStateDir();
+        var options = new OllamaRouterOptions
+        {
+            Targets =
+            [
+                new OllamaTargetOptions { Name = "Local", Url = "http://127.0.0.1:11435" },
+                new OllamaTargetOptions { Name = "DaemonOnly", Url = "http://aiserver:11434" }
+            ]
+        };
+
+        var handler = new CannedHandler(new NodeHardwareProfile(
+            "unreachable-server", "linux", "x64", false, 32768, SystemRamType.Ddr4,
+            Array.Empty<GpuDeviceProfile>(), 32768, 25.6));
+
+        var localMock = new Mock<IHardwareProfileProvider>();
+        localMock
+            .Setup(l => l.GetLocalProfileAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new NodeHardwareProfile("local", "linux", "x64", false, 8192, SystemRamType.Ddr4,
+                Array.Empty<GpuDeviceProfile>(), 8192, 25.6));
+
+        var service = new FleetHardwareService(
+            MsOptions.Create(options),
+            localMock.Object,
+            new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(3) },
+            NullLogger<FleetHardwareService>.Instance,
+            Path.Combine(state.Path, "targets-hardware.json"));
+
+        var nodes = await service.GetFleetHardwareAsync();
+        var serverNode = nodes.First(n => n.Target == "DaemonOnly");
+
+        // The handler was never queried because DaemonOnly has no RouterUrl and port != 11435
+        Assert.Equal(0, handler.RequestCount);
+        Assert.False(serverNode.Reachable);
+        Assert.Null(serverNode.Profile);
+        Assert.Equal("none", serverNode.Source);
+    }
+
+    [Fact]
+    public async Task GetFleetHardware_ExplicitRouterUrl_QueriesSpecifiedEndpoint()
+    {
+        using var state = new TempStateDir();
+        var options = new OllamaRouterOptions
+        {
+            Targets =
+            [
+                new OllamaTargetOptions { Name = "Local", Url = "http://127.0.0.1:11435" },
+                new OllamaTargetOptions
+                {
+                    Name = "ServerWithRouter",
+                    Url = "http://aiserver:11434",
+                    RouterUrl = "http://aiserver:9999"
+                }
+            ]
+        };
+
+        var servedProfile = new NodeHardwareProfile(
+            "server-node", "linux", "x64", false, 65536, SystemRamType.Ddr5,
+            Array.Empty<GpuDeviceProfile>(), 65536, 38.4);
+        var handler = new CannedHandler(servedProfile);
+
+        var localMock = new Mock<IHardwareProfileProvider>();
+        localMock
+            .Setup(l => l.GetLocalProfileAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new NodeHardwareProfile("local", "linux", "x64", false, 8192, SystemRamType.Ddr4,
+                Array.Empty<GpuDeviceProfile>(), 8192, 25.6));
+
+        var service = new FleetHardwareService(
+            MsOptions.Create(options),
+            localMock.Object,
+            new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(3) },
+            NullLogger<FleetHardwareService>.Instance,
+            Path.Combine(state.Path, "targets-hardware.json"));
+
+        var nodes = await service.GetFleetHardwareAsync();
+        var serverNode = nodes.First(n => n.Target == "ServerWithRouter");
+
+        // The handler was queried exactly once via RouterUrl
+        Assert.Equal(1, handler.RequestCount);
+        Assert.True(serverNode.Reachable);
+        Assert.Equal("peer", serverNode.Source);
+        Assert.Equal("server-node", serverNode.Profile!.NodeName);
     }
 }
