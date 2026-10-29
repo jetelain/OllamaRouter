@@ -1420,7 +1420,7 @@ public class OllamaRoutingMiddlewareTests
             });
 
         var options = new OllamaRouterOptions { LocalUrl = "http://localhost:11435" };
-        options.Targets.Add(new OllamaTargetOptions { Name = "Local", Url = "http://localhost:11435", HardwareHint = "96gb" });
+        options.Targets.Add(new OllamaTargetOptions { Name = "Local", Url = "http://localhost:11435", MaxVramMB = 98304 });
 
         var captured = new string[1];
         var sut = CreateSizingSut(
@@ -1477,7 +1477,7 @@ public class OllamaRoutingMiddlewareTests
             });
 
         var options = new OllamaRouterOptions { LocalUrl = "http://localhost:11435" };
-        options.Targets.Add(new OllamaTargetOptions { Name = "Local", Url = "http://localhost:11435", HardwareHint = "96gb" });
+        options.Targets.Add(new OllamaTargetOptions { Name = "Local", Url = "http://localhost:11435", MaxVramMB = 98304 });
 
         var captured = new string[1];
         var sut = CreateSizingSut(
@@ -1525,7 +1525,7 @@ public class OllamaRoutingMiddlewareTests
             });
 
         var options = new OllamaRouterOptions { LocalUrl = "http://localhost:11435" };
-        options.Targets.Add(new OllamaTargetOptions { Name = "Local", Url = "http://localhost:11435", HardwareHint = "16gb" });
+        options.Targets.Add(new OllamaTargetOptions { Name = "Local", Url = "http://localhost:11435", MaxVramMB = 16384 });
 
         var captured = new string[1];
         var sut = CreateSizingSut(
@@ -1569,7 +1569,7 @@ public class OllamaRoutingMiddlewareTests
             });
 
         var options = new OllamaRouterOptions { LocalUrl = "http://localhost:11435" };
-        options.Targets.Add(new OllamaTargetOptions { Name = "Local", Url = "http://localhost:11435", HardwareHint = "16gb" });
+        options.Targets.Add(new OllamaTargetOptions { Name = "Local", Url = "http://localhost:11435", MaxVramMB = 16384 });
         options.DynamicContext.DenseClampEnabled = false;
 
         var captured = new string[1];
@@ -1614,8 +1614,7 @@ public class OllamaRoutingMiddlewareTests
                 ["model_info"] = new JsonObject { ["general.parameter_count"] = 27_800_000_000L }
             });
 
-        // Legacy configuration: the synthesized "Local" target carries HardwareHint "16gb".
-        var options = new OllamaRouterOptions { LocalUrl = "http://localhost:11435" };
+        var options = new OllamaRouterOptions { Targets = [ new () { Name = "Local", Url = "http://localhost:11435",  MaxVramMB = 16384 }] };
 
         var captured = new string[1];
         var sut = CreateSizingSut(
@@ -1657,7 +1656,7 @@ public class OllamaRoutingMiddlewareTests
 
         var capabilityEngine = CreateCapabilityEngine(out _);
         var options = new OllamaRouterOptions { RemoteUrl = "http://remoteserver:11434" };
-        options.Targets.Add(new OllamaTargetOptions { Name = "Remote", Url = "http://remoteserver:11434", HardwareHint = "96gb" });
+        options.Targets.Add(new OllamaTargetOptions { Name = "Remote", Url = "http://remoteserver:11434", MaxVramMB = 98304 });
 
         var captured = new string[1];
         var sut = CreateSizingSut(

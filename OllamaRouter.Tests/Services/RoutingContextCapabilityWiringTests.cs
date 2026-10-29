@@ -77,7 +77,7 @@ public class RoutingContextCapabilityWiringTests
     [Fact]
     public async Task GetTargetCapabilityAsync_UnpinnedTarget_UsesFallbackContextWindow()
     {
-        var (context, _) = CreateContext(targets: [new OllamaTargetOptions { Name = "Local", Url = LocalUrl, HardwareHint = "16gb" }]);
+        var (context, _) = CreateContext(targets: [new OllamaTargetOptions { Name = "Local", Url = LocalUrl, MaxVramMB = 16384 }]);
 
         var capability = await context.GetTargetCapabilityAsync(new RoutingTarget("Local"), LocalUrl);
 

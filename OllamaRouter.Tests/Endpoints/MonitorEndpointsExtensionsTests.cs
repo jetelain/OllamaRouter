@@ -271,7 +271,7 @@ public class MonitorEndpointsExtensionsTests
             Assert.True(local["enabled"]?.GetValue<bool>());
             Assert.Equal("Offline", local["liveness"]?.GetValue<string>()); // no models in the cache mock
             Assert.Equal(0, local["inFlightRequests"]?.GetValue<int>());
-            Assert.Equal("16gb", local["hardwareProfile"]?.GetValue<string>()); // legacy synthesized hint
+            Assert.Equal("-", local["hardwareProfile"]?.GetValue<string>()); // legacy synthesized hint
             Assert.Equal("-", local["contextAllocation"]?.GetValue<string>()); // no leases
 
             var cloud = fleet[1]!;
@@ -314,8 +314,8 @@ public class MonitorEndpointsExtensionsTests
             {
                 Targets =
                 [
-                    new OllamaTargetOptions { Name = "Local", Url = "http://127.0.0.1:11435", HardwareHint = "16gb" },
-                    new OllamaTargetOptions { Name = "desktop", Url = "http://127.0.0.1:11436", HardwareHint = "16gb" }
+                    new OllamaTargetOptions { Name = "Local", Url = "http://127.0.0.1:11435", MaxVramMB = 16384 },
+                    new OllamaTargetOptions { Name = "desktop", Url = "http://127.0.0.1:11436", MaxVramMB = 16384 }
                 ]
             },
             liveness: liveness.Object);
@@ -349,7 +349,7 @@ public class MonitorEndpointsExtensionsTests
             {
                 Targets =
                 [
-                    new OllamaTargetOptions { Name = "Local", Url = "http://127.0.0.1:11435", HardwareHint = "16gb" }
+                    new OllamaTargetOptions { Name = "Local", Url = "http://127.0.0.1:11435", MaxVramMB = 16384 }
                 ],
                 CloudOverflow = new CloudOverflowOptions
                 {
@@ -384,7 +384,7 @@ public class MonitorEndpointsExtensionsTests
             {
                 Targets =
                 [
-                    new OllamaTargetOptions { Name = "Local", Url = "http://127.0.0.1:11435", HardwareHint = "16gb" }
+                    new OllamaTargetOptions { Name = "Local", Url = "http://127.0.0.1:11435", MaxVramMB = 16384 }
                 ],
                 CloudOverflow = new CloudOverflowOptions
                 {

@@ -14,9 +14,17 @@ public interface IFleetHardwareService
     NodeHardwareProfile? GetProfile(string targetName);
 
     /// <summary>
+    /// Returns the effective maximum VRAM (in MB) for the specified target: uses the target's
+    /// explicit <see cref="Options.OllamaTargetOptions.MaxVramMB"/> when set, otherwise the cached
+    /// <see cref="NodeHardwareProfile.TotalFastMemoryMB"/> from the fleet store.
+    /// Returns null when unknown.
+    /// </summary>
+    int? GetEffectiveMaxVramMB(Options.OllamaTargetOptions target);
+
+    /// <summary>
     /// The full fleet hardware topology: one row per effective configured target (Cloud
     /// excluded, configuration order), always fail-soft with per-node reachability
-    /// flags. Peer targets are probed in parallel (3 s per probe, 5 min per-target TTL);
+    /// flags. Peer targets are probed in parallel (3 s per probe, 24 h per-target TTL);
     /// the local workstation target is served from the local provider.
     /// </summary>
     Task<IReadOnlyList<FleetHardwareNode>> GetFleetHardwareAsync(CancellationToken ct = default);

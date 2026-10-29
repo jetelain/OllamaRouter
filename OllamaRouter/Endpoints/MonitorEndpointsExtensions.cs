@@ -5,6 +5,7 @@ using Microsoft.Extensions.Options;
 using OllamaRouter.Options;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services;
+using OllamaRouter.Services.Hardware;
 
 namespace OllamaRouter.Endpoints;
 
@@ -41,7 +42,8 @@ public static class MonitorEndpointsExtensions
                 includeOverhead: true,
                 liveness: serviceProvider.GetService<ITargetLivenessService>(),
                 executionTracker: serviceProvider.GetService<ITargetExecutionTracker>(),
-                contextShrinkManager: serviceProvider.GetService<IContextAutoShrinkManager>());
+                contextShrinkManager: serviceProvider.GetService<IContextAutoShrinkManager>(),
+                fleetHardware: serviceProvider.GetService<IFleetHardwareService>());
 
             return Results.Json(monitorResponse, OllamaRouterJsonSerializerContext.Default.MonitorStateResponse);
         });
@@ -721,7 +723,8 @@ setInterval(refresh, 2000);
         bool includeOverhead = true,
         ITargetLivenessService? liveness = null,
         ITargetExecutionTracker? executionTracker = null,
-        IContextAutoShrinkManager? contextShrinkManager = null)
+        IContextAutoShrinkManager? contextShrinkManager = null,
+        IFleetHardwareService? fleetHardware = null)
     {
         var snapshot = activityMonitor.GetSnapshot();
         var statistics = activityStatistics.GetSnapshot();
@@ -768,9 +771,10 @@ setInterval(refresh, 2000);
             var activeModel = executionState?.LoadedModels.FirstOrDefault()?.Name;
             var inFlight = executionState?.InFlightRequests ?? 0;
 
-            var hardwareProfile = target.MaxVramMB.HasValue
-                ? $"{target.MaxVramMB.Value} MB"
-                : target.HardwareHint;
+            var effectiveVram = target.GetEffectiveMaxVramMB(fleetHardware);
+            var hardwareProfile = effectiveVram.HasValue
+                ? (effectiveVram.Value % 1024 == 0 ? $"{effectiveVram.Value / 1024}gb" : $"{effectiveVram.Value} MB")
+                : "-";
 
             // Append the configured speed factor to the HW cell (e.g. "16gb,2.0x") only when it
             // is above the fleet baseline (1.0); the TUI HW column is 9-wide to hold "16gb,2.0x".

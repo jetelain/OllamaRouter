@@ -23,9 +23,9 @@ public class RoutingDecisionServiceTests
     private const string ServerUrl = "http://server:11434";
 
     // Fleet fixture (declaration order matters — Desktop first, then Laptop, then Server).
-    private static readonly OllamaTargetOptions Desktop = new() { Name = "Desktop", Url = DesktopUrl, HardwareHint = "16gb", MaxParallel = 1 };
-    private static readonly OllamaTargetOptions Laptop = new() { Name = "Laptop", Url = LaptopUrl, HardwareHint = "8gb", MaxParallel = 1 };
-    private static readonly OllamaTargetOptions Server = new() { Name = "Server", Url = ServerUrl, HardwareHint = "96gb", MaxParallel = 2 };
+    private static readonly OllamaTargetOptions Desktop = new() { Name = "Desktop", Url = DesktopUrl, MaxVramMB = 16384, MaxParallel = 1 };
+    private static readonly OllamaTargetOptions Laptop = new() { Name = "Laptop", Url = LaptopUrl, MaxVramMB = 8192, MaxParallel = 1 };
+    private static readonly OllamaTargetOptions Server = new() { Name = "Server", Url = ServerUrl, MaxVramMB = 98304, MaxParallel = 2 };
 
     private static readonly RoutingTarget TDesktop = new("Desktop");
     private static readonly RoutingTarget TLaptop = new("Laptop");
@@ -813,7 +813,7 @@ public class RoutingDecisionServiceTests
     {
         // The fleet entry's Enabled flag is false (not the availability state file): the
         // candidate is admin-disabled before any liveness/catalog check runs.
-        var off = new OllamaTargetOptions { Name = "Desktop", Url = DesktopUrl, HardwareHint = "16gb", MaxParallel = 1, Enabled = false };
+        var off = new OllamaTargetOptions { Name = "Desktop", Url = DesktopUrl, MaxVramMB = 16384, MaxParallel = 1, Enabled = false };
         var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { off } };
         options.Models["mystery"] = new ModelThresholds();
 
@@ -1028,7 +1028,7 @@ public class RoutingDecisionServiceTests
         // disqualified on a node pre-configured at 49,152 (Desktop) AND on an unpinned node
         // (the assumed 128k fallback CMax 131,072), but served by a node pre-configured at
         // 196,608.
-        var big = new OllamaTargetOptions { Name = "BigCtx", Url = "http://bigctx:11434", HardwareHint = "96gb", MaxParallel = 2 };
+        var big = new OllamaTargetOptions { Name = "BigCtx", Url = "http://bigctx:11434", MaxVramMB = 98304, MaxParallel = 2 };
         var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { Desktop, big } };
         options.Models["qwen3.8-27B"] = new ModelThresholds();
 
@@ -1151,8 +1151,8 @@ public class RoutingDecisionServiceTests
     {
         // Two small-class targets with a busy Desktop: only the FIRST declared small-class
         // target receives the +20 offload bonus (the role slot is single per decision).
-        var s1 = new OllamaTargetOptions { Name = "S1", Url = "http://s1:11434", HardwareHint = "8gb", MaxParallel = 1 };
-        var s2 = new OllamaTargetOptions { Name = "S2", Url = "http://s2:11434", HardwareHint = "8gb", MaxParallel = 1 };
+        var s1 = new OllamaTargetOptions { Name = "S1", Url = "http://s1:11434", MaxVramMB = 8192, MaxParallel = 1 };
+        var s2 = new OllamaTargetOptions { Name = "S2", Url = "http://s2:11434", MaxVramMB = 8192, MaxParallel = 1 };
         var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { Desktop, s1, s2 } };
         options.Models["moe1"] = new ModelThresholds();
 
@@ -1493,7 +1493,7 @@ public class RoutingDecisionServiceTests
     {
         // The concurrency penalty is (InFlight × 40) + (InFlight ≥ MaxParallel ? 100 : 0). A
         // single-target fleet isolates the term under test (nothing else scores).
-        var single = new OllamaTargetOptions { Name = "S", Url = "http://s:11434", HardwareHint = "96gb", MaxParallel = maxParallel };
+        var single = new OllamaTargetOptions { Name = "S", Url = "http://s:11434", MaxVramMB = 98304, MaxParallel = maxParallel };
         var ts = new RoutingTarget("S");
         var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { single } };
         options.Models["mystery"] = new ModelThresholds();
@@ -1604,8 +1604,8 @@ public class RoutingDecisionServiceTests
         // turn 1 wins aiserver1 (declaration order, score 0). Turn 2 the model is now HOT on
         // aiserver2 (+100) while aiserver1 is idle — agent-1 must STILL win aiserver1 with
         // the SessionAffinityBonus (+150), beating +100.
-        var s1 = new OllamaTargetOptions { Name = "aiserver1", Url = "http://as1:11434", HardwareHint = "96gb", MaxParallel = 2 };
-        var s2 = new OllamaTargetOptions { Name = "aiserver2", Url = "http://as2:11434", HardwareHint = "96gb", MaxParallel = 2 };
+        var s1 = new OllamaTargetOptions { Name = "aiserver1", Url = "http://as1:11434", MaxVramMB = 98304, MaxParallel = 2 };
+        var s2 = new OllamaTargetOptions { Name = "aiserver2", Url = "http://as2:11434", MaxVramMB = 98304, MaxParallel = 2 };
         var t1 = new RoutingTarget("aiserver1");
         var t2 = new RoutingTarget("aiserver2");
         var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { s1, s2 } };
@@ -1652,8 +1652,8 @@ public class RoutingDecisionServiceTests
         // concurrency: agent-2's best is still aiserver2 (the pinned target of agent-1 does
         // NOT leak its bonus to agent-2; aiserver1's −140 concurrency makes aiserver2 win).
         // Interleaved turns keep each session on its own bound target.
-        var s1 = new OllamaTargetOptions { Name = "aiserver1", Url = "http://as1:11434", HardwareHint = "96gb", MaxParallel = 1 };
-        var s2 = new OllamaTargetOptions { Name = "aiserver2", Url = "http://as2:11434", HardwareHint = "96gb", MaxParallel = 1 };
+        var s1 = new OllamaTargetOptions { Name = "aiserver1", Url = "http://as1:11434", MaxVramMB = 98304, MaxParallel = 1 };
+        var s2 = new OllamaTargetOptions { Name = "aiserver2", Url = "http://as2:11434", MaxVramMB = 98304, MaxParallel = 1 };
         var t1 = new RoutingTarget("aiserver1");
         var t2 = new RoutingTarget("aiserver2");
         var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { s1, s2 } };
@@ -1706,8 +1706,8 @@ public class RoutingDecisionServiceTests
         // agent-1 is bound to aiserver1; aiserver1 then goes OFFLINE (Stage-1 disqualified —
         // no affinity rescue): the session earns 0 there, wins aiserver2, and the lease is
         // rebound to aiserver2 on the same decision.
-        var s1 = new OllamaTargetOptions { Name = "aiserver1", Url = "http://as1:11434", HardwareHint = "96gb", MaxParallel = 2 };
-        var s2 = new OllamaTargetOptions { Name = "aiserver2", Url = "http://as2:11434", HardwareHint = "96gb", MaxParallel = 2 };
+        var s1 = new OllamaTargetOptions { Name = "aiserver1", Url = "http://as1:11434", MaxVramMB = 98304, MaxParallel = 2 };
+        var s2 = new OllamaTargetOptions { Name = "aiserver2", Url = "http://as2:11434", MaxVramMB = 98304, MaxParallel = 2 };
         var t1 = new RoutingTarget("aiserver1");
         var t2 = new RoutingTarget("aiserver2");
         var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { s1, s2 } };
@@ -1765,8 +1765,8 @@ public class RoutingDecisionServiceTests
         // agent-1 is bound to aiserver1 (the score winner), but aiserver1's uncommitted
         // failure streak exceeds MaxConsecutiveFailures: the streak switch-over takes the
         // next-ranked target AND the lease is written on the FINAL (switched) winner.
-        var s1 = new OllamaTargetOptions { Name = "aiserver1", Url = "http://as1:11434", HardwareHint = "96gb", MaxParallel = 2 };
-        var s2 = new OllamaTargetOptions { Name = "aiserver2", Url = "http://as2:11434", HardwareHint = "96gb", MaxParallel = 2 };
+        var s1 = new OllamaTargetOptions { Name = "aiserver1", Url = "http://as1:11434", MaxVramMB = 98304, MaxParallel = 2 };
+        var s2 = new OllamaTargetOptions { Name = "aiserver2", Url = "http://as2:11434", MaxVramMB = 98304, MaxParallel = 2 };
         var t1 = new RoutingTarget("aiserver1");
         var t2 = new RoutingTarget("aiserver2");
         var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { s1, s2 } };
@@ -1802,7 +1802,7 @@ public class RoutingDecisionServiceTests
         // All fleet offline + Cloud configured + session present: the winner is the Cloud
         // pseudo-target and NO lease is created (the session re-decides next turn and rejoins
         // the fleet as soon as a node recovers).
-        var s1 = new OllamaTargetOptions { Name = "aiserver1", Url = "http://as1:11434", HardwareHint = "96gb", MaxParallel = 2 };
+        var s1 = new OllamaTargetOptions { Name = "aiserver1", Url = "http://as1:11434", MaxVramMB = 98304, MaxParallel = 2 };
         var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { s1 } };
         options.Models["qwen3.8-27B"] = new ModelThresholds { CloudModel = "deepseek-v3.1:671b-cloud" };
 
@@ -1827,7 +1827,7 @@ public class RoutingDecisionServiceTests
     {
         // sessionId: null ⇒ byte-identical legacy behavior: the SessionAffinityBonus field
         // is 0 on every candidate even when a lease exists for some other session.
-        var s1 = new OllamaTargetOptions { Name = "aiserver1", Url = "http://as1:11434", HardwareHint = "96gb", MaxParallel = 2 };
+        var s1 = new OllamaTargetOptions { Name = "aiserver1", Url = "http://as1:11434", MaxVramMB = 98304, MaxParallel = 2 };
         var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { s1 } };
         options.Models["qwen3.8-27B"] = new ModelThresholds();
 
@@ -1932,8 +1932,8 @@ public class RoutingDecisionServiceTests
         {
             Targets = new List<OllamaTargetOptions>
             {
-                new() { Name = "Desktop", Url = DesktopUrl, HardwareHint = "16gb", MaxParallel = 1, SpeedFactor = desktopSpeed },
-                new() { Name = "Server", Url = ServerUrl, HardwareHint = "96gb", MaxParallel = 2, SpeedFactor = serverSpeed }
+                new() { Name = "Desktop", Url = DesktopUrl, MaxVramMB = 16384, MaxParallel = 1, SpeedFactor = desktopSpeed },
+                new() { Name = "Server", Url = ServerUrl, MaxVramMB = 98304, MaxParallel = 2, SpeedFactor = serverSpeed }
             },
             Models = new Dictionary<string, ModelThresholds> { [model] = new ModelThresholds() }
         };

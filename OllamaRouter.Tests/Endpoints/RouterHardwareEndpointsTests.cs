@@ -116,14 +116,14 @@ public class RouterHardwareEndpointsTests
             {
                 Name = "Local",
                 Url = "http://127.0.0.1:11435",
-                HardwareHint = "16gb",
+                MaxVramMB = 16384,
                 MaxParallel = 1
             },
             new OllamaTargetOptions
             {
                 Name = "Peer",
                 Url = "http://192.168.1.50:11434",
-                HardwareHint = "96gb",
+                MaxVramMB = 98304,
                 MaxParallel = 4
             }
         ],
@@ -347,7 +347,7 @@ public class RouterHardwareEndpointsTests
         Assert.Equal("http://127.0.0.1:11435", local["url"]!.ToString());
         Assert.Equal("true", local["enabled"]!.ToString());
         Assert.False(string.IsNullOrEmpty(local["liveness"]!.ToString()));
-        Assert.Equal("16gb", local["hardware"]!["hardwareHint"]!.ToString());
+        Assert.Equal("16384", local["hardware"]!["maxVramMB"]!.ToString());
         Assert.Equal("Nvidia", local["hardware"]!["gpuVendor"]!.ToString());
         Assert.Equal("1", local["hardware"]!["maxParallel"]!.ToString());
         Assert.NotNull(local["execution"]!["inFlightRequests"]);

@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging;
 using OllamaRouter.Options;
+using OllamaRouter.Services.Hardware;
 
 namespace OllamaRouter.Services;
 
@@ -90,7 +91,8 @@ public sealed class ModelCapabilityEngine(
     IOllamaModelCatalogClient catalogClient,
     IMemoryCache memoryCache,
     ILogger<ModelCapabilityEngine> logger,
-    IModelCatalogCacheService? keyRegistry = null)
+    IModelCatalogCacheService? keyRegistry = null,
+    IFleetHardwareService? fleetHardware = null)
 {
     /// <summary>
     /// Default Ollama context window when the Modelfile omits an explicit num_ctx.
@@ -221,7 +223,7 @@ public sealed class ModelCapabilityEngine(
     {
         var (architecture, source) = ClassifyArchitecture(metadata, pinnedArchitecture);
 
-        var maxVram = target.GetEffectiveMaxVramMB();
+        var maxVram = target.GetEffectiveMaxVramMB(fleetHardware);
         var weightMB = (int)(metadata.WeightSizeBytes / 1_048_576);
         var availableMB = maxVram.HasValue ? (int?)(maxVram.Value - weightMB) : null;
 

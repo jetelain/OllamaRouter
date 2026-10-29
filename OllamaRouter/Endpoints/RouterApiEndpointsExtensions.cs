@@ -395,35 +395,13 @@ public static class RouterApiEndpointsExtensions
         var livenessEntries = liveness?.GetEntries();
         var executionTracker = serviceProvider.GetService<ITargetExecutionTracker>();
         var leaseSnapshot = serviceProvider.GetService<IContextAutoShrinkManager>()?.GetLeaseSnapshot();
-        var gpuVramProvider = serviceProvider.GetService<IGpuVramProvider>();
         var modelCatalogCache = serviceProvider.GetService<IModelCatalogCacheService>();
-        var hardwareProvider = serviceProvider.GetService<IHardwareProfileProvider>();
         var fleetHardware = serviceProvider.GetService<IFleetHardwareService>();
-
-        // The local workstation target (URL host 127.0.0.1/localhost or name "Local") gets the
-        // live local GPU snapshot; only the FIRST such target receives it.
-        var localGpuSnapshot = LocalGpuSnapshot.Unknown;
-        var localTargetAssigned = false;
 
         var targets = new List<RouterTargetItem>(effectiveTargets.Count + 1);
         foreach (var target in effectiveTargets)
         {
             var name = target.Name!;
-            var isLocalWorkstation = !localTargetAssigned && IsLocalWorkstationTarget(target);
-            if (isLocalWorkstation && gpuVramProvider is not null)
-            {
-                try
-                {
-                    localGpuSnapshot = await gpuVramProvider.GetLocalGpuSnapshotAsync(cancellationToken).ConfigureAwait(false);
-                }
-                catch
-                {
-                    // A failing CLI probe must never break the fleet view.
-                    localGpuSnapshot = LocalGpuSnapshot.Unknown;
-                }
-            }
-            localTargetAssigned |= isLocalWorkstation;
-
             var routingTarget = (RoutingTarget)name;
             var enabled = availability.Flags.TryGetValue(routingTarget, out var targetEnabled) ? targetEnabled : true;
 
@@ -456,27 +434,38 @@ public static class RouterApiEndpointsExtensions
             // consistent with maxVramMB's nullable semantics.
             var speedFactor = target.GetEffectiveSpeedFactor();
 
-            // Memory-tier enrichment from the fleet hardware store: the local workstation
-            // target gets the local profile (cached after the first probe); other targets
-            // get their stored profile (manual/peer/persisted). Missing profile → all
-            // defaults (fail-soft, additive/backward-compatible fields).
+            // Hardware details served directly from the cached fleet hardware store
+            // (all targets, including local, without initiating redundant local probes).
             NodeHardwareProfile? nodeProfile = null;
             try
             {
-                if (isLocalWorkstation)
-                {
-                    nodeProfile = hardwareProvider is not null
-                        ? await hardwareProvider.GetLocalProfileAsync(cancellationToken).ConfigureAwait(false)
-                        : null;
-                }
-                else
-                {
-                    nodeProfile = fleetHardware?.GetProfile(name);
-                }
+                nodeProfile = fleetHardware?.GetProfile(name);
             }
             catch
             {
                 nodeProfile = null;
+            }
+
+            string gpuVendor = "Unknown";
+            string? gpuName = null;
+            IReadOnlyList<string> devices = Array.Empty<string>();
+
+            if (nodeProfile is not null)
+            {
+                if (nodeProfile.Gpus.Count > 0)
+                {
+                    gpuVendor = nodeProfile.Gpus[0].Vendor;
+                    gpuName = nodeProfile.Gpus[0].ModelName;
+                    devices = nodeProfile.Gpus.Select(FormatGpuDevice).ToArray();
+                }
+                else if (nodeProfile.IsUnifiedMemory)
+                {
+                    gpuVendor = string.Equals(nodeProfile.Architecture, "arm64", StringComparison.OrdinalIgnoreCase)
+                        ? "Apple"
+                        : "Unified";
+                    gpuName = $"{nodeProfile.Architecture} Unified Memory";
+                    devices = [nodeProfile.SystemRamMB > 0 ? $"{gpuName} ({nodeProfile.SystemRamMB} MB)" : gpuName];
+                }
             }
 
             targets.Add(new RouterTargetItem(
@@ -486,16 +475,16 @@ public static class RouterApiEndpointsExtensions
                 Liveness: livenessText,
                 LatencyMs: latencyMs,
                 Hardware: new RouterTargetHardware(
-                    HardwareHint: target.HardwareHint,
-                    GpuVendor: isLocalWorkstation ? localGpuSnapshot.Vendor : "Unknown",
-                    Devices: isLocalWorkstation ? localGpuSnapshot.Devices : Array.Empty<string>(),
-                    MaxVramMB: target.GetEffectiveMaxVramMB(),
+                    GpuVendor: gpuVendor,
+                    Devices: devices,
+                    MaxVramMB: target.GetEffectiveMaxVramMB(fleetHardware),
                     MaxParallel: target.MaxParallel,
                     SpeedFactor: speedFactor == 1.0 ? null : speedFactor,
                     IsUnifiedMemory: nodeProfile?.IsUnifiedMemory ?? false,
-                    SystemRamMB: nodeProfile?.SystemRamMB is { } ram ? ram : null,
+                    SystemRamMB: nodeProfile?.SystemRamMB is { } ram and > 0 ? ram : null,
                     MemoryType: nodeProfile is null ? null : DescribeMemoryTier(nodeProfile),
-                    BandwidthGBs: nodeProfile?.EffectiveBandwidthGBs is { } bw and > 0 ? bw : null),
+                    BandwidthGBs: nodeProfile?.EffectiveBandwidthGBs is { } bw and > 0 ? bw : null,
+                    GpuName: gpuName),
                 Execution: new RouterTargetExecution(
                     InFlightRequests: inFlight,
                     ActiveModel: activeModel,
@@ -514,12 +503,12 @@ public static class RouterApiEndpointsExtensions
             Liveness: cloudEnabled ? "Online" : "Offline",
             LatencyMs: null,
             Hardware: new RouterTargetHardware(
-                HardwareHint: "cloud",
                 GpuVendor: "Cloud",
                 Devices: new[] { "Cloud Overflow" },
                 MaxVramMB: null,
                 MaxParallel: 10,
-                SpeedFactor: null),
+                SpeedFactor: null,
+                GpuName: "Cloud Overflow"),
             Execution: new RouterTargetExecution(
                 InFlightRequests: 0,
                 ActiveModel: null,
@@ -528,21 +517,12 @@ public static class RouterApiEndpointsExtensions
         return new RouterFleetResponse(targets);
     }
 
-    /// <summary>
-    /// A target IS this workstation iff its configured URL host is <c>127.0.0.1</c>/<c>localhost</c>
-    /// (case-insensitive) or its <c>Name</c> equals <c>"Local"</c> (case-insensitive).
-    /// </summary>
-    private static bool IsLocalWorkstationTarget(OllamaTargetOptions target)
+    private static string FormatGpuDevice(GpuDeviceProfile gpu)
     {
-        if (string.Equals(target.Name, "Local", StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-
-        return !string.IsNullOrWhiteSpace(target.Url) &&
-               Uri.TryCreate(target.Url, UriKind.Absolute, out var uri) &&
-               (string.Equals(uri.Host, "127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(uri.Host, "localhost", StringComparison.OrdinalIgnoreCase));
+        var displayName = gpu.ModelName.StartsWith(gpu.Vendor, StringComparison.OrdinalIgnoreCase)
+            ? gpu.ModelName
+            : $"{gpu.Vendor} {gpu.ModelName}";
+        return gpu.VramMB > 0 ? $"{displayName} ({gpu.VramMB} MB)" : displayName;
     }
 
     /// <summary>
@@ -1553,7 +1533,6 @@ public sealed record RouterTargetItem(
     [property: JsonPropertyName("execution")] RouterTargetExecution Execution);
 
 public sealed record RouterTargetHardware(
-    [property: JsonPropertyName("hardwareHint")] string? HardwareHint,
     [property: JsonPropertyName("gpuVendor")] string GpuVendor,
     [property: JsonPropertyName("devices")] IReadOnlyList<string> Devices,
     [property: JsonPropertyName("maxVramMB")] int? MaxVramMB,
@@ -1562,7 +1541,8 @@ public sealed record RouterTargetHardware(
     [property: JsonPropertyName("isUnifiedMemory")] bool IsUnifiedMemory = false,
     [property: JsonPropertyName("systemRamMB")] long? SystemRamMB = null,
     [property: JsonPropertyName("memoryType")] string? MemoryType = null,
-    [property: JsonPropertyName("bandwidthGBs")] double? BandwidthGBs = null);
+    [property: JsonPropertyName("bandwidthGBs")] double? BandwidthGBs = null,
+    [property: JsonPropertyName("gpuName")] string? GpuName = null);
 
 public sealed record RouterTargetExecution(
     [property: JsonPropertyName("inFlightRequests")] int InFlightRequests,

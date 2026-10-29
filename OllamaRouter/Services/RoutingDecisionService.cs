@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using OllamaRouter.Options;
+using OllamaRouter.Services.Hardware;
 
 namespace OllamaRouter.Services;
 
@@ -64,6 +65,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
     private readonly ILogger<RoutingDecisionService> _logger;
     private readonly ITargetFailureStreakService _streakTracker;
     private readonly ISessionAffinityService? _sessionAffinity;
+    private readonly IFleetHardwareService? _fleetHardware;
 
     /// <summary>
     /// Creates the routing decision pipeline over the configured fleet. The Cloud terminal
@@ -71,6 +73,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
     /// (including the legacy Local/Remote synthesis) and evaluated in declaration order.
     /// <paramref name="sessionAffinity"/> enables the multi-agent sticky-session Stage-2 bonus;
     /// when null (e.g. existing test constructions) the pipeline is fully stateless.
+    /// <paramref name="fleetHardware"/> supplies dynamic hardware profiles when targets omit explicit <c>MaxVramMB</c>.
     /// </summary>
     public RoutingDecisionService(
         IOptions<OllamaRouterOptions> options,
@@ -82,7 +85,8 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         CloudRoutingTargetHandler cloudHandler,
         ILogger<RoutingDecisionService> logger,
         ITargetFailureStreakService? streakTracker = null,
-        ISessionAffinityService? sessionAffinity = null)
+        ISessionAffinityService? sessionAffinity = null,
+        IFleetHardwareService? fleetHardware = null)
     {
         _options = options;
         _modelCatalogCacheService = modelCatalogCacheService;
@@ -96,7 +100,11 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         // singleton via the factory registration so all decision requests share one streak table.
         _streakTracker = streakTracker ?? new TargetFailureStreakService();
         _sessionAffinity = sessionAffinity;
+        _fleetHardware = fleetHardware;
     }
+
+    private int? GetEffectiveMaxVramMB(OllamaTargetOptions target) =>
+        target.GetEffectiveMaxVramMB(_fleetHardware);
 
     public Task<RoutingTarget> DecideAsync(int tokenCount, string modelName, CancellationToken cancellationToken = default)
     {
@@ -433,7 +441,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         CancellationToken cancellationToken)
     {
         var target = new RoutingTarget(targetOptions.Name!);
-        var maxVramMB = targetOptions.GetEffectiveMaxVramMB();
+        var maxVramMB = GetEffectiveMaxVramMB(targetOptions);
 
         // 1. Admin enabled (configuration flag AND availability state file).
         if (!targetOptions.Enabled || !_availability.IsEnabled(target))
@@ -622,8 +630,8 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         return offloadJustified ? HardwareBonus : 0;
     }
 
-    private static bool IsSmallClass(OllamaTargetOptions target) =>
-        GetTargetClass(target.GetEffectiveMaxVramMB()) == TargetClass.Small;
+    private bool IsSmallClass(OllamaTargetOptions target) =>
+        GetTargetClass(GetEffectiveMaxVramMB(target)) == TargetClass.Small;
 
     /// <summary>
     /// Returns true when any desktop/server-class fleet target (a) holds a loaded model
@@ -637,7 +645,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         var fleetTargets = _options.Value.GetEffectiveTargets(_logger);
         foreach (var candidate in fleetTargets)
         {
-            var maxVram = candidate.GetEffectiveMaxVramMB();
+            var maxVram = GetEffectiveMaxVramMB(candidate);
             var candidateClass = GetTargetClass(maxVram);
             if (candidateClass != TargetClass.Desktop && candidateClass != TargetClass.Server)
             {

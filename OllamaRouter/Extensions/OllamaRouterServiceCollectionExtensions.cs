@@ -148,7 +148,8 @@ public static class OllamaRouterServiceCollectionExtensions
             sp.GetRequiredService<CloudRoutingTargetHandler>(),
             sp.GetRequiredService<ILogger<RoutingDecisionService>>(),
             sp.GetRequiredService<ITargetFailureStreakService>(),
-            sp.GetRequiredService<ISessionAffinityService>()));
+            sp.GetRequiredService<ISessionAffinityService>(),
+            sp.GetRequiredService<IFleetHardwareService>()));
         // Multi-agent session/agent sticky-routing lease store: thread-safe singleton with a
         // sliding TTL (OllamaRouterOptions.SessionAffinityTtlMinutes, default 30 min) and a
         // bounded lazy sweep — shared by the decision service (Stage-2 bonus + rebinding) and
@@ -159,13 +160,15 @@ public static class OllamaRouterServiceCollectionExtensions
             sp.GetRequiredService<ILogger<ContextAutoShrinkManager>>()));
         services.AddSingleton<IFleetAggregationService, FleetAggregationService>();
 
-        // Fleet hardware topology store (singleton + targets-hardware.json persistence).
-        services.AddSingleton<IFleetHardwareService>(sp => new FleetHardwareService(
+        // Fleet hardware topology store (singleton + targets-hardware.json persistence + hosted service).
+        services.AddSingleton<FleetHardwareService>(sp => new FleetHardwareService(
             sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
             sp.GetRequiredService<IHardwareProfileProvider>(),
             sp.GetRequiredService<IHttpClientFactory>().CreateClient("HardwareProbe"),
             sp.GetRequiredService<ILogger<FleetHardwareService>>(),
             Path.Combine(effectiveStateDirectory, "targets-hardware.json")));
+        services.AddSingleton<IFleetHardwareService>(sp => sp.GetRequiredService<FleetHardwareService>());
+        services.AddHostedService(sp => sp.GetRequiredService<FleetHardwareService>());
         services.AddSingleton<ModelCapabilityEngine>();
         services.AddSingleton<IOllamaProcessLauncher, OllamaProcessLauncher>();
         services.AddSingleton<IActivityMonitorService, ActivityMonitorService>();

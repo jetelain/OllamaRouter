@@ -23,8 +23,8 @@ Standard .NET configuration keys for the `OllamaRouter` section — the same JSO
     "TokenEstimationOverheadFactor": 1.11,
     "MaxConsecutiveFailures": 3,
     "Targets": [
-      { "Name": "desktop", "Url": "http://127.0.0.1:11435", "HardwareHint": "16gb", "SpeedFactor": 2.0 }, // fast local workstation hint (relative throughput; 1.0 = default)
-      { "Name": "laptop", "Url": "http://192.168.1.20:11435", "HardwareHint": "8gb" }
+      { "Name": "desktop", "Url": "http://127.0.0.1:11435", "SpeedFactor": 2.0 }, // fast local workstation hint (relative throughput; 1.0 = default)
+      { "Name": "laptop", "Url": "http://192.168.1.20:11435" }
     ]
   }
 }

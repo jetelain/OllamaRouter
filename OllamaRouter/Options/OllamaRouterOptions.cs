@@ -194,7 +194,7 @@ public sealed class OllamaRouterOptions
     /// (skipping invalid entries with a null/empty <c>Name</c> or <c>Url</c>, logging a warning
     /// for each skipped entry), or — when no targets are configured — a synthesized legacy list
     /// containing a "Local" target (from <see cref="LocalUrl"/>) and/or a "Remote" target (from
-    /// <see cref="RemoteUrl"/>), each with <c>HardwareHint = "16gb"</c> and <c>MaxParallel = 1</>.
+    /// <see cref="RemoteUrl"/>), each with <c>MaxParallel = 1</>.
     /// Only non-empty URLs synthesize a target. The <c>Cloud</c> pseudo-target is NOT part of
     /// this list; it is always appended in code where needed.
     /// </summary>
@@ -233,7 +233,6 @@ public sealed class OllamaRouterOptions
             {
                 Name = "Local",
                 Url = LocalUrl,
-                HardwareHint = "16gb",
                 MaxParallel = 1,
                 Enabled = true
             });
@@ -245,7 +244,6 @@ public sealed class OllamaRouterOptions
             {
                 Name = "Remote",
                 Url = RemoteUrl,
-                HardwareHint = "16gb",
                 MaxParallel = 1,
                 Enabled = true
             });
@@ -297,15 +295,8 @@ public sealed class OllamaTargetOptions
     public string? Url { get; set; }
 
     /// <summary>
-    /// Coarse hardware class hint used to derive a default <c>MaxVramMB</c> when
-    /// <see cref="MaxVramMB"/> is not set: "8gb" (8192 MB), "16gb" (16384 MB) or "96gb" (98304 MB),
-    /// matched case-insensitively. Unknown or missing hints leave the effective VRAM unknown.
-    /// </summary>
-    public string? HardwareHint { get; set; }
-
-    /// <summary>
-    /// Explicit maximum VRAM (in MB) available on this target. Overrides the preset implied by
-    /// <see cref="HardwareHint"/> when set.
+    /// Explicit maximum VRAM (in MB) available on this target. When not set, the effective
+    /// VRAM is resolved dynamically from <see cref="Services.Hardware.IFleetHardwareService"/>.
     /// </summary>
     public int? MaxVramMB { get; set; }
 
@@ -338,24 +329,23 @@ public sealed class OllamaTargetOptions
 
     /// <summary>
     /// Returns the effective maximum VRAM (in MB) of this target: the explicit
-    /// <see cref="MaxVramMB"/> override, or the preset implied by <see cref="HardwareHint"/>
-    /// ("8gb" → 8192, "16gb" → 16384, "96gb" → 98304, case-insensitive). Returns null when no
-    /// override is set and the hint is missing or unknown ("unknown/no preset").
+    /// <see cref="MaxVramMB"/> override, or the <see cref="Services.Hardware.NodeHardwareProfile.TotalFastMemoryMB"/>
+    /// from <paramref name="fleetHardware"/> if available. Returns null when no override is set
+    /// and no profile is found.
     /// </summary>
-    public int? GetEffectiveMaxVramMB()
+    public int? GetEffectiveMaxVramMB(Services.Hardware.IFleetHardwareService? fleetHardware = null)
     {
         if (MaxVramMB.HasValue)
         {
             return MaxVramMB;
         }
 
-        return HardwareHint?.Trim().ToLowerInvariant() switch
+        if (fleetHardware is not null)
         {
-            "8gb" => 8192,
-            "16gb" => 16384,
-            "96gb" => 98304,
-            _ => null
-        };
+            return fleetHardware.GetEffectiveMaxVramMB(this);
+        }
+
+        return null;
     }
 }
 

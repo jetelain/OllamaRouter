@@ -26,7 +26,14 @@ public class ModelCapabilityEngineTests
 
     private static OllamaTargetOptions Target(string? hint, int? maxVram = null)
     {
-        return new OllamaTargetOptions { Name = "t", Url = TargetUrl, HardwareHint = hint, MaxVramMB = maxVram };
+        var vram = maxVram ?? hint?.Trim().ToLowerInvariant() switch
+        {
+            "8gb" => 8192,
+            "16gb" => 16384,
+            "96gb" => 98304,
+            _ => (int?)null
+        };
+        return new OllamaTargetOptions { Name = "t", Url = TargetUrl, MaxVramMB = vram };
     }
 
     // --- Architecture classification matrix -------------------------------------------

@@ -114,8 +114,8 @@ public sealed class FakeOllamaDaemon : IAsyncDisposable
     /// <summary>The daemon's loopback port (the loop-free config-invariant checks target only these).</summary>
     public int Port => _port;
 
-    /// <summary>Hardware class hint surfaced to the router ("8gb"/"16gb"/"96gb"); set by the fleet fixture.</summary>
-    public string? HardwareHint { get; set; }
+    /// <summary>Hardware class VRAM in MB surfaced to the router; set by the fleet fixture.</summary>
+    public int? MaxVramMB { get; set; }
 
     /// <summary>Max concurrent requests surfaced to the router; set by the fleet fixture.</summary>
     public int MaxParallel { get; set; } = 1;

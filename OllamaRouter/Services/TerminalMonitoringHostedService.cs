@@ -2,6 +2,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 using OllamaRouter.Endpoints;
 using OllamaRouter.Options;
+using OllamaRouter.Services.Hardware;
 
 namespace OllamaRouter.Services;
 
@@ -20,6 +21,7 @@ public sealed class TerminalMonitoringHostedService : BackgroundService
     private readonly IContextAutoShrinkManager _contextAutoShrinkManager;
     private readonly IOptions<OllamaRouterOptions> _options;
     private readonly IHostApplicationLifetime _lifetime;
+    private readonly IFleetHardwareService? _fleetHardware;
 
     public TerminalMonitoringHostedService(
         IActivityMonitorService activityMonitor,
@@ -30,7 +32,8 @@ public sealed class TerminalMonitoringHostedService : BackgroundService
         ITargetExecutionTracker targetExecutionTracker,
         IContextAutoShrinkManager contextAutoShrinkManager,
         IOptions<OllamaRouterOptions> options,
-        IHostApplicationLifetime lifetime)
+        IHostApplicationLifetime lifetime,
+        IFleetHardwareService? fleetHardware = null)
     {
         _activityMonitor = activityMonitor;
         _activityStatistics = activityStatistics;
@@ -41,6 +44,7 @@ public sealed class TerminalMonitoringHostedService : BackgroundService
         _contextAutoShrinkManager = contextAutoShrinkManager;
         _options = options;
         _lifetime = lifetime;
+        _fleetHardware = fleetHardware;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -124,7 +128,8 @@ public sealed class TerminalMonitoringHostedService : BackgroundService
                         includeOverhead: false,
                         liveness: _targetLiveness,
                         executionTracker: _targetExecutionTracker,
-                        contextShrinkManager: _contextAutoShrinkManager).ConfigureAwait(false);
+                        contextShrinkManager: _contextAutoShrinkManager,
+                        fleetHardware: _fleetHardware).ConfigureAwait(false);
 
                     var monitorUrl = _options.Value.BindAddress.TrimEnd('/').Replace("+", "localhost") + "/monitor";
 

@@ -152,7 +152,7 @@ public sealed class MeshRouter : IAsyncDisposable
             {
                 Name = d.Name,
                 Url = d.Url,
-                HardwareHint = d.HardwareHint,
+                MaxVramMB = d.MaxVramMB,
                 MaxParallel = d.MaxParallel
             })
             .ToList();
@@ -236,25 +236,25 @@ public sealed class InProcessMeshFleet : IAsyncDisposable
             ?? throw new InvalidOperationException($"Unknown daemon '{name}'.");
 
     public static async Task<InProcessMeshFleet> CreateAsync(
-        string desktopHardwareHint = "16gb",
+        int? desktopMaxVramMB = 16384,
         int desktopMaxParallel = 1,
-        string laptopHardwareHint = "8gb",
+        int? laptopMaxVramMB = 8192,
         int laptopMaxParallel = 1,
-        string serverHardwareHint = "96gb",
+        int? serverMaxVramMB = 98304,
         int serverMaxParallel = 2)
     {
         var fleet = new InProcessMeshFleet();
 
         var desktop = new FakeOllamaDaemon("desktop", MeshCatalog.DesktopModels(), capacity: desktopMaxParallel);
-        desktop.HardwareHint = desktopHardwareHint;
+        desktop.MaxVramMB = desktopMaxVramMB;
         desktop.MaxParallel = desktopMaxParallel;
 
         var laptop = new FakeOllamaDaemon("laptop", MeshCatalog.LaptopModels(), capacity: laptopMaxParallel);
-        laptop.HardwareHint = laptopHardwareHint;
+        laptop.MaxVramMB = laptopMaxVramMB;
         laptop.MaxParallel = laptopMaxParallel;
 
         var server = new FakeOllamaDaemon("server", MeshCatalog.ServerModels(), capacity: serverMaxParallel);
-        server.HardwareHint = serverHardwareHint;
+        server.MaxVramMB = serverMaxVramMB;
         server.MaxParallel = serverMaxParallel;
 
         fleet._daemons.AddRange([desktop, laptop, server]);

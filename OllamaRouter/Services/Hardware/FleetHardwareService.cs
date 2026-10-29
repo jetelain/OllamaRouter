@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using OllamaRouter.Options;
@@ -25,10 +26,10 @@ namespace OllamaRouter.Services.Hardware;
 /// wins even when a disk write fails.
 /// </para>
 /// </summary>
-public sealed class FleetHardwareService : IFleetHardwareService
+public sealed class FleetHardwareService : IFleetHardwareService, IHostedService
 {
     private const string HardwarePath = "/api/router/hardware";
-    private static readonly TimeSpan PeerProbeTtl = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan PeerProbeTtl = TimeSpan.FromDays(1);
 
     private readonly IOptions<OllamaRouterOptions> _options;
     private readonly IHardwareProfileProvider _localProvider;
@@ -41,6 +42,9 @@ public sealed class FleetHardwareService : IFleetHardwareService
     private readonly ConcurrentDictionary<string, (DateTime Utc, bool Reachable)> _lastPeerProbeUtc =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly object _gate = new();
+
+    private CancellationTokenSource? _cts;
+    private Task? _loopTask;
 
     public FleetHardwareService(
         IOptions<OllamaRouterOptions> options,
@@ -65,7 +69,57 @@ public sealed class FleetHardwareService : IFleetHardwareService
             return null;
         }
 
-        return _profiles.TryGetValue(targetName, out var state) ? state.Profile : null;
+        if (_profiles.TryGetValue(targetName, out var state) && state.Profile is not null)
+        {
+            return state.Profile;
+        }
+
+        // Cache miss: check if this is the local workstation target
+        var match = _options.Value.GetEffectiveTargets()
+            .FirstOrDefault(t => string.Equals(t.Name, targetName, StringComparison.OrdinalIgnoreCase));
+
+        if (match is not null && IsLocalWorkstationTarget(match))
+        {
+            try
+            {
+                var localTask = _localProvider.GetLocalProfileAsync();
+                if (localTask.IsCompletedSuccessfully && localTask.Result is { } localProfile)
+                {
+                    StoreProfile(match.Name!, localProfile, "local", persist: false);
+                    return localProfile;
+                }
+            }
+            catch
+            {
+                // Degrade safely on exception
+            }
+        }
+
+        return null;
+    }
+
+    public int? GetEffectiveMaxVramMB(OllamaTargetOptions target)
+    {
+        if (target is null)
+        {
+            return null;
+        }
+
+        if (target.MaxVramMB.HasValue)
+        {
+            return target.MaxVramMB.Value;
+        }
+
+        if (!string.IsNullOrEmpty(target.Name))
+        {
+            var profile = GetProfile(target.Name);
+            if (profile is not null && profile.TotalFastMemoryMB > 0)
+            {
+                return (int)profile.TotalFastMemoryMB;
+            }
+        }
+
+        return null;
     }
 
     public async Task<IReadOnlyList<FleetHardwareNode>> GetFleetHardwareAsync(CancellationToken ct = default)
@@ -324,4 +378,75 @@ public sealed class FleetHardwareService : IFleetHardwareService
                (string.Equals(uri.Host, "127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(uri.Host, "localhost", StringComparison.OrdinalIgnoreCase));
     }
+
+    public Task StartAsync(CancellationToken cancellationToken)
+    {
+        _cts = new CancellationTokenSource();
+        var token = _cts.Token;
+
+        // Asynchronous boot refresh to prime the hardware cache (non-blocking)
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await GetFleetHardwareAsync(token).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogDebug(ex, "Initial fleet hardware probe encountered an error.");
+            }
+        }, CancellationToken.None);
+
+        _loopTask = Task.Run(() => RunPeriodicLoopAsync(token), CancellationToken.None);
+
+        _logger.LogInformation("Fleet hardware service started (peer probe TTL: {Ttl}).", PeerProbeTtl);
+        return Task.CompletedTask;
+    }
+
+    private async Task RunPeriodicLoopAsync(CancellationToken token)
+    {
+        using var timer = new PeriodicTimer(PeerProbeTtl);
+        while (!token.IsCancellationRequested)
+        {
+            try
+            {
+                await timer.WaitForNextTickAsync(token).ConfigureAwait(false);
+                await GetFleetHardwareAsync(token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Periodic fleet hardware refresh encountered an error.");
+            }
+        }
+    }
+
+    public async Task StopAsync(CancellationToken cancellationToken)
+    {
+        if (_cts is not null)
+        {
+            try
+            {
+                _cts.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        }
+
+        if (_loopTask is not null)
+        {
+            try
+            {
+                await _loopTask.WaitAsync(TimeSpan.FromSeconds(2), cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+            }
+        }
+    }
 }
+

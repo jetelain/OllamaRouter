@@ -70,14 +70,13 @@ public class RouterModelApiEndpointsTests
                 {
                     Name = "Local",
                     Url = LocalUrl,
-                    HardwareHint = "16gb",
+                    MaxVramMB = 16384,
                     MaxParallel = 1
                 },
                 new OllamaTargetOptions
                 {
                     Name = "Server",
                     Url = ServerUrl,
-                    HardwareHint = "96gb",
                     MaxVramMB = 98304,
                     MaxParallel = 4
                 },
@@ -85,7 +84,7 @@ public class RouterModelApiEndpointsTests
                 {
                     Name = "Laptop",
                     Url = LaptopUrl,
-                    HardwareHint = "8gb",
+                    MaxVramMB = 8192,
                     MaxParallel = 1
                 }
             ],
@@ -798,7 +797,7 @@ public class RouterModelApiEndpointsTests
         {
             Targets =
             [
-                new OllamaTargetOptions { Name = "Local", Url = LocalUrl, HardwareHint = "16gb" }
+                new OllamaTargetOptions { Name = "Local", Url = LocalUrl, MaxVramMB = 16384 }
             ]
         };
 
@@ -856,8 +855,8 @@ public class RouterModelApiEndpointsTests
         {
             Targets =
             [
-                new OllamaTargetOptions { Name = "Local", Url = LocalUrl, HardwareHint = "16gb" },
-                new OllamaTargetOptions { Name = "Remote", Url = ServerUrl, HardwareHint = "96gb" }
+                new OllamaTargetOptions { Name = "Local", Url = LocalUrl, MaxVramMB = 16384 },
+                new OllamaTargetOptions { Name = "Remote", Url = ServerUrl, MaxVramMB = 98304 }
             ]
         };
 
@@ -945,7 +944,7 @@ public class RouterModelApiEndpointsTests
 
         var options = new OllamaRouterOptions
         {
-            Targets = [new OllamaTargetOptions { Name = "Local", Url = LocalUrl, HardwareHint = "16gb" }]
+            Targets = [new OllamaTargetOptions { Name = "Local", Url = LocalUrl, MaxVramMB = 16384 }]
         };
 
         await using var harness = await CreateTestAppAsync(options, catalog);
@@ -990,7 +989,7 @@ public class RouterModelApiEndpointsTests
         var options = new OllamaRouterOptions
         {
             FilterNamespacedModels = false,
-            Targets = [new OllamaTargetOptions { Name = "Local", Url = LocalUrl, HardwareHint = "16gb" }]
+            Targets = [new OllamaTargetOptions { Name = "Local", Url = LocalUrl, MaxVramMB = 16384 }]
         };
 
         await using var harness = await CreateTestAppAsync(options, catalog);
@@ -1029,7 +1028,7 @@ public class RouterModelApiEndpointsTests
             {
                 ["jetelain/qwen3.6-35b-a3b"] = new ModelThresholds()
             },
-            Targets = [new OllamaTargetOptions { Name = "Local", Url = LocalUrl, HardwareHint = "16gb" }]
+            Targets = [new OllamaTargetOptions { Name = "Local", Url = LocalUrl, MaxVramMB = 16384 }]
         };
 
         await using var harness = await CreateTestAppAsync(options, catalog);
@@ -1060,7 +1059,7 @@ public class RouterModelApiEndpointsTests
         var options = new OllamaRouterOptions
         {
             FilterNamespacedModels = true,
-            Targets = [new OllamaTargetOptions { Name = "Local", Url = LocalUrl, HardwareHint = "16gb" }]
+            Targets = [new OllamaTargetOptions { Name = "Local", Url = LocalUrl, MaxVramMB = 16384 }]
         };
 
         await using var harness = await CreateTestAppAsync(options, catalog);

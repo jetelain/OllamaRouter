@@ -52,8 +52,7 @@ public class OllamaRouterOptionsTests
         Assert.Equal(["Local", "Remote"], effective.Select(t => t.Name).ToList());
         foreach (var target in effective)
         {
-            Assert.Equal("16gb", target.HardwareHint);
-            Assert.Equal(16384, target.GetEffectiveMaxVramMB());
+            Assert.Null(target.MaxVramMB);
             Assert.Equal(1, target.MaxParallel);
             Assert.True(target.Enabled);
         }
@@ -90,37 +89,32 @@ public class OllamaRouterOptionsTests
         Assert.Equal("Remote", effective[0].Name);
     }
 
-    [Theory]
-    [InlineData("8gb", 8192)]
-    [InlineData("16gb", 16384)]
-    [InlineData("96gb", 98304)]
-    [InlineData("8GB", 8192)]
-    [InlineData(" 16Gb ", 16384)]
-    public void GetEffectiveMaxVramMB_HardwareHint_NormalizesPresetsCaseInsensitively(string hint, int expected)
-    {
-        var target = new OllamaTargetOptions { Name = "t", Url = "http://x", HardwareHint = hint };
-
-        Assert.Equal(expected, target.GetEffectiveMaxVramMB());
-    }
-
     [Fact]
-    public void GetEffectiveMaxVramMB_UnknownOrMissingHint_ReturnsNull()
-    {
-        Assert.Null(new OllamaTargetOptions().GetEffectiveMaxVramMB());
-        Assert.Null(new OllamaTargetOptions { HardwareHint = "48gb" }.GetEffectiveMaxVramMB());
-        Assert.Null(new OllamaTargetOptions { HardwareHint = " " }.GetEffectiveMaxVramMB());
-    }
-
-    [Fact]
-    public void GetEffectiveMaxVramMB_ExplicitMaxVramMB_OverridesHardwareHint()
+    public void GetEffectiveMaxVramMB_ExplicitMaxVramMB_ReturnsConfiguredValue()
     {
         var target = new OllamaTargetOptions
         {
-            HardwareHint = "8gb",
             MaxVramMB = 12288
         };
 
         Assert.Equal(12288, target.GetEffectiveMaxVramMB());
+    }
+
+    [Fact]
+    public void GetEffectiveMaxVramMB_MissingMaxVramMB_DelegatesToFleetHardware()
+    {
+        var target = new OllamaTargetOptions { Name = "NodeA", Url = "http://x" };
+        var mockFleet = new Moq.Mock<OllamaRouter.Services.Hardware.IFleetHardwareService>();
+        mockFleet.Setup(f => f.GetEffectiveMaxVramMB(target)).Returns(24576);
+
+        Assert.Equal(24576, target.GetEffectiveMaxVramMB(mockFleet.Object));
+    }
+
+    [Fact]
+    public void GetEffectiveMaxVramMB_MissingMaxVramMBAndNoFleetHardware_ReturnsNull()
+    {
+        var target = new OllamaTargetOptions { Name = "NodeA", Url = "http://x" };
+        Assert.Null(target.GetEffectiveMaxVramMB(null));
     }
 
     [Fact]

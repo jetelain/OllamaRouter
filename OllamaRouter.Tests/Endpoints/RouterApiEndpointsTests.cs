@@ -9,6 +9,7 @@ using OllamaRouter.Endpoints;
 using OllamaRouter.Options;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services;
+using OllamaRouter.Services.Hardware;
 
 namespace OllamaRouter.Tests.Endpoints;
 
@@ -72,7 +73,8 @@ public class RouterApiEndpointsTests
         bool registerTracker = true,
         bool registerShrinkManager = true,
         bool registerGpuVramProvider = true,
-        bool registerCatalogCache = false)
+        bool registerCatalogCache = false,
+        IFleetHardwareService? fleetHardware = null)
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseUrls("http://127.0.0.1:0");
@@ -148,6 +150,35 @@ public class RouterApiEndpointsTests
             builder.Services.AddSingleton(catalogCache.Object);
         }
 
+        if (fleetHardware is not null)
+        {
+            builder.Services.AddSingleton(fleetHardware);
+        }
+        else if (localGpuSnapshot is not null && localGpuSnapshot != LocalGpuSnapshot.Unknown)
+        {
+            var mockFleet = new Mock<IFleetHardwareService>();
+            var gpus = localGpuSnapshot.Devices.Select(d =>
+            {
+                var open = d.IndexOf('(');
+                var name = open > 0 ? d[..open].Trim() : d.Trim();
+                return new GpuDeviceProfile(localGpuSnapshot.Vendor, name, localGpuSnapshot.TotalVramMB, "GDDR6X", 256, 716.8);
+            }).ToList();
+            var profile = new NodeHardwareProfile(
+                "workstation",
+                "windows",
+                "x64",
+                false,
+                65536,
+                SystemRamType.Ddr5,
+                gpus,
+                localGpuSnapshot.TotalVramMB,
+                716.8);
+            mockFleet.Setup(f => f.GetProfile("Local")).Returns(profile);
+            mockFleet.Setup(f => f.GetEffectiveMaxVramMB(It.Is<OllamaTargetOptions>(t => string.Equals(t.Name, "Local", StringComparison.OrdinalIgnoreCase))))
+                .Returns(localGpuSnapshot.TotalVramMB);
+            builder.Services.AddSingleton(mockFleet.Object);
+        }
+
         var app = builder.Build();
         app.MapOllamaRouterApiEndpoints();
         await app.StartAsync();
@@ -175,14 +206,13 @@ public class RouterApiEndpointsTests
                 {
                     Name = "Local",
                     Url = "http://127.0.0.1:11435",
-                    HardwareHint = "16gb",
+                    MaxVramMB = 16384,
                     MaxParallel = 1
                 },
                 new OllamaTargetOptions
                 {
                     Name = "Server",
                     Url = "http://192.168.1.100:11434",
-                    HardwareHint = "96gb",
                     MaxVramMB = 98304,
                     MaxParallel = 4
                 },
@@ -190,7 +220,7 @@ public class RouterApiEndpointsTests
                 {
                     Name = "Laptop",
                     Url = "http://192.168.1.105:11435",
-                    HardwareHint = "8gb",
+                    MaxVramMB = 8192,
                     MaxParallel = 1
                 }
             ],
@@ -388,7 +418,6 @@ public class RouterApiEndpointsTests
         Assert.Equal("true", local["enabled"]!.ToString());
         Assert.Equal("Online", local["liveness"]!.ToString());
         Assert.Equal("1", local["latencyMs"]!.ToString());
-        Assert.Equal("16gb", local["hardware"]!["hardwareHint"]!.ToString());
         Assert.Equal("Nvidia", local["hardware"]!["gpuVendor"]!.ToString());
         Assert.Equal("NVIDIA GeForce RTX 4080 (16384 MB)", local["hardware"]!["devices"]!.AsArray()[0]!.ToString());
         Assert.Equal("16384", local["hardware"]!["maxVramMB"]!.ToString());
@@ -403,7 +432,6 @@ public class RouterApiEndpointsTests
         Assert.Equal("false", server["enabled"]!.ToString());
         Assert.Equal("Online", server["liveness"]!.ToString());
         Assert.Equal("4", server["latencyMs"]!.ToString());
-        Assert.Equal("96gb", server["hardware"]!["hardwareHint"]!.ToString());
         Assert.Equal("Unknown", server["hardware"]!["gpuVendor"]!.ToString());
         Assert.Empty(server["hardware"]!["devices"]!.AsArray());
         Assert.Equal("98304", server["hardware"]!["maxVramMB"]!.ToString());
@@ -426,7 +454,6 @@ public class RouterApiEndpointsTests
         Assert.Equal("true", cloud["enabled"]!.ToString());
         Assert.Equal("Online", cloud["liveness"]!.ToString());
         Assert.Null(cloud["latencyMs"]);
-        Assert.Equal("cloud", cloud["hardware"]!["hardwareHint"]!.ToString());
         Assert.Equal("Cloud", cloud["hardware"]!["gpuVendor"]!.ToString());
         Assert.Equal("Cloud Overflow", cloud["hardware"]!["devices"]!.AsArray()[0]!.ToString());
         Assert.Null(cloud["hardware"]!["maxVramMB"]);
@@ -443,8 +470,8 @@ public class RouterApiEndpointsTests
         {
             Targets =
             [
-                new OllamaTargetOptions { Name = "Local", Url = "http://127.0.0.1:11435", HardwareHint = "16gb", SpeedFactor = 2.0 },
-                new OllamaTargetOptions { Name = "Server", Url = "http://192.168.1.100:11434", HardwareHint = "96gb" }
+                new OllamaTargetOptions { Name = "Local", Url = "http://127.0.0.1:11435", MaxVramMB = 16384, SpeedFactor = 2.0 },
+                new OllamaTargetOptions { Name = "Server", Url = "http://192.168.1.100:11434", MaxVramMB = 98304 }
             ]
         };
         await using var harness = await CreateTestAppAsync(options);
@@ -497,7 +524,7 @@ public class RouterApiEndpointsTests
     }
 
     [Fact]
-    public async Task RouterFleet_LocalGpuAttachedToFirstLocalTargetOnly_RemotesUnknown()
+    public async Task RouterFleet_ReturnsCachedHardwareFromFleetHardware_ForAllTargets()
     {
         var options = new OllamaRouterOptions
         {
@@ -505,11 +532,22 @@ public class RouterApiEndpointsTests
             [
                 // Named "Local" (host not loopback): still the local workstation by name.
                 new OllamaTargetOptions { Name = "Local", Url = "http://10.0.0.5:11435" },
-                // Second loopback-named target: must NOT get the snapshot (first one wins).
+                // Second loopback-named target without profile.
                 new OllamaTargetOptions { Name = "Workbench", Url = "http://127.0.0.1:11436" },
                 new OllamaTargetOptions { Name = "Server", Url = "http://192.168.1.100:11434" }
             ]
         };
+        var mockFleet = new Mock<IFleetHardwareService>();
+        var localProfile = new NodeHardwareProfile(
+            "workstation", "windows", "x64", false, 65536, SystemRamType.Ddr5,
+            [new GpuDeviceProfile("Nvidia", "GeForce RTX 4080", 16384, "GDDR6X", 256, 716.8)], 16384, 716.8);
+        var serverProfile = new NodeHardwareProfile(
+            "server", "linux", "x64", false, 131072, SystemRamType.Ddr5,
+            [new GpuDeviceProfile("Nvidia", "RTX 4090", 24576, "GDDR6X", 384, 1008.0)], 98304, 1008.0);
+        mockFleet.Setup(f => f.GetProfile("Local")).Returns(localProfile);
+        mockFleet.Setup(f => f.GetProfile("Server")).Returns(serverProfile);
+        mockFleet.Setup(f => f.GetProfile("Workbench")).Returns((NodeHardwareProfile?)null);
+
         await using var harness = await CreateTestAppAsync(
             options,
             livenessEntries: new Dictionary<RoutingTarget, TargetLivenessEntry>
@@ -518,27 +556,30 @@ public class RouterApiEndpointsTests
                 [(RoutingTarget)"Workbench"] = Entry((RoutingTarget)"Workbench", TargetLivenessState.Online),
                 [(RoutingTarget)"Server"] = Entry((RoutingTarget)"Server", TargetLivenessState.Online)
             },
-            localGpuSnapshot: new LocalGpuSnapshot("Nvidia", ["NVIDIA GeForce RTX 4080 (16384 MB)"], 16384));
+            fleetHardware: mockFleet.Object);
 
         using var response = await harness.Client.GetAsync("/api/router/fleet");
         var node = JsonNode.Parse(await response.Content.ReadAsStringAsync());
 
         var local = TargetItem(node, "Local");
         Assert.Equal("Nvidia", local["hardware"]!["gpuVendor"]!.ToString());
+        Assert.Equal("GeForce RTX 4080", local["hardware"]!["gpuName"]!.ToString());
         Assert.Equal(1, local["hardware"]!["devices"]!.AsArray().Count);
 
         var workbench = TargetItem(node, "Workbench");
         Assert.Equal("Unknown", workbench["hardware"]!["gpuVendor"]!.ToString());
+        Assert.Null(workbench["hardware"]!["gpuName"]);
         Assert.Empty(workbench["hardware"]!["devices"]!.AsArray());
 
         var server = TargetItem(node, "Server");
-        Assert.Equal("Unknown", server["hardware"]!["gpuVendor"]!.ToString());
-        Assert.Empty(server["hardware"]!["devices"]!.AsArray());
+        Assert.Equal("Nvidia", server["hardware"]!["gpuVendor"]!.ToString());
+        Assert.Equal("RTX 4090", server["hardware"]!["gpuName"]!.ToString());
+        Assert.Equal(1, server["hardware"]!["devices"]!.AsArray().Count);
 
-        // The GPU snapshot is probed exactly once (only for the first local target).
+        // The GPU CLI snapshot is NEVER probed during /api/router/fleet.
         harness.GpuVramProvider!.Verify(
             g => g.GetLocalGpuSnapshotAsync(It.IsAny<CancellationToken>()),
-            Times.Once);
+            Times.Never);
     }
 
     [Fact]
