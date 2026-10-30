@@ -204,6 +204,7 @@ public static class OllamaRouterServiceCollectionExtensions
             Path.Combine(effectiveStateDirectory, "targets-speed.json")));
         services.AddSingleton<IActivityMonitorService, ActivityMonitorService>();
         services.AddSingleton<IInferenceRequestRecorder, InferenceRequestRecorder>();
+        services.AddSingleton<ITokenMetricsRecorder, TokenMetricsRecorder>();
         services.AddSingleton<IActivityStatisticsService>(sp =>
             new ActivityStatisticsService(
                 Path.Combine(effectiveStateDirectory, "activity-statistics.json"),

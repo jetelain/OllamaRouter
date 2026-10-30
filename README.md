@@ -280,6 +280,11 @@ appsettings.json  <  config/config.json  <  user secrets  <  environment variabl
 | `Recording:Enabled` | Enables the optional [inference request recording](#inference-request-recording-optional), saving each request's metadata and full request body for investigation of estimated vs actual token counts. Defaults to `false`. |
 | `Recording:OutputDirectory` | Directory where the records are stored: a `requests.jsonl` manifest plus one pretty-printed payload file per request. Defaults to the `inference-requests` folder in the local application data folder (`%LOCALAPPDATA%\OllamaRouter\inference-requests` on Windows). |
 | `Recording:MaxFiles` | Maximum number of payload files to keep in the output directory; the oldest records are deleted once this count is exceeded (and the manifest is trimmed to match). Defaults to `500`. Set to `0` to keep all files. |
+| `Recording:TokenMetricsCsv:Enabled` | Enables the optional [token metrics CSV export](#token-metrics-csv-export-optional): each recorded request produces one aggregate CSV row pairing the prompt's structural text metrics (words, symbols, non-ASCII, char count) with the actual prompt/response token counts reported by Ollama. Defaults to `false`. Independent of `Recording:Enabled` (the full JSON payload mode). |
+| `Recording:TokenMetricsCsv:OutputDirectory` | Directory where the CSV files are written. Defaults to the `token-metrics` folder in the local application data folder (`%LOCALAPPDATA%\OllamaRouter\token-metrics` on Windows). |
+| `Recording:TokenMetricsCsv:MaxFiles` | Maximum number of per-request `*_metrics.csv` files to keep; the oldest are deleted once the count is exceeded (the consolidated `token-metrics.csv` is never pruned). Defaults to `1000`. Set to `0` to keep all files. |
+| `Recording:TokenMetricsCsv:GenerateIndividualFiles` | When `true` (default), each recorded request produces an individual CSV file (header + one row) named `{timestamp}_{sequence}_{model}_metrics.csv`. |
+| `Recording:TokenMetricsCsv:AppendConsolidatedFile` | When `true` (default), each recorded request appends one row to the consolidated `token-metrics.csv` dataset (header written once at file creation). |
 | `Pricing:PromptPricePerMillion` | Optional price per 1,000,000 prompt / input tokens. Used to calculate 7-day estimated savings and cloud overflow cost. Alias: `InputPricePerMillion`. |
 | `Pricing:CompletionPricePerMillion` | Optional price per 1,000,000 completion / output tokens. Used to calculate 7-day estimated savings and cloud overflow cost. Alias: `OutputPricePerMillion`. |
 | `Pricing:PricePerMillion` | Optional flat price per 1,000,000 tokens when prompt and completion rates are not differentiated. |
@@ -334,6 +339,30 @@ Each recorded request then produces, in the output directory (default `%LOCALAPP
 With both numbers and the exact payload of each request, you can tokenize locally with the model's actual tokenizer and pinpoint what drives the gap (chat template overhead, non-Latin scripts, code indentation, …) before tuning `TokenEstimationOverheadFactor`.
 
 The output directory is capped at `Recording:MaxFiles` payload files (default `500`); when the cap is exceeded, the oldest records are deleted and the manifest is rewritten so it only references still-existing payloads. The recorder is best-effort: an I/O failure only produces a log entry and never affects routing.
+
+### Token metrics CSV export (optional)
+
+To calibrate the heuristic estimator's model-family coefficients (`WordFactor`, `SymbolFactor`, `NonAsciiFactor`, `CharFloorFactor`, `SafetyMargin`), OllamaRouter can export an empirical training dataset: for each completion request it records the prompt's **structural text metrics** (`Words`, `Symbols`, `NonAscii`, `CharCount`, from `HeuristicTokenEstimator.Analyze`) paired with the **actual token counts** evaluated by Ollama (`prompt_eval_count`/`eval_count` from the native NDJSON final line, or `usage.prompt_tokens`/`usage.completion_tokens` from OpenAI-compatible SSE). This export is **disabled by default** and independent of the full JSON payload recording mode above:
+
+```json
+"Recording": {
+  "TokenMetricsCsv": {
+    "Enabled": true,
+    "MaxFiles": 1000,
+    "GenerateIndividualFiles": true,
+    "AppendConsolidatedFile": true
+  }
+}
+```
+
+Two output modes (both on by default, both one aggregate row per request) write to the output directory (default `%LOCALAPPDATA%\OllamaRouter\token-metrics\` on Windows):
+
+- **Per-request files**: one file per request named `{yyyyMMdd-HHmmss-fff}_{sequence}_{model}_metrics.csv`, containing a header row plus the single data row;
+- **Consolidated dataset**: `token-metrics.csv`, one appended row per request (the header is written once at file creation), ready to load directly in Pandas / Excel / R without merging individual files.
+
+Both files share the fixed RFC 4180 column order (CRLF line endings, quote-escaped fields): `timestamp_utc,request_id,model,target,endpoint,words,symbols,non_ascii,char_count,prior_context_tokens,estimated_prompt_tokens,actual_prompt_tokens,actual_response_tokens,elapsed_ms,status_code,success`. The `actual_*` columns are empty when the captured response tail carried no usage data; `estimated_prompt_tokens` is the raw pre-overhead estimate (estimator + prior context token ids). Only requests that entered the dispatch loop are recorded (pre-dispatch 503 short-circuits are excluded).
+
+Per-request files are capped at `Recording:TokenMetricsCsv:MaxFiles` (default `1000`); the oldest are deleted first (the consolidated file is never pruned). The exporter runs after the response completes, is fail-soft (any I/O failure only produces a log entry), and has zero disk I/O when disabled.
 
 ## Dual-Router Mesh (Desktop + Laptop)
 

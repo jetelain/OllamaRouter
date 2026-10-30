@@ -39,8 +39,9 @@ public class OllamaRoutingMiddlewareTests
         ModelCapabilityEngine? capabilityEngine = null,
         Mock<IHttpForwarder>? forwarder = null,
         ITargetFailureStreakService? streakTracker = null,
-        ISessionAffinityService? sessionAffinity = null) =>
-        CreateSut(next, tokenEstimator.Object, routingDecisionService, modelCatalogCache, activityMonitor, activityStatistics, inferenceRequestRecorder, targetAvailability, targetLiveness, capabilityEngine, forwarder, streakTracker, sessionAffinity);
+        ISessionAffinityService? sessionAffinity = null,
+        ITokenMetricsRecorder? tokenMetricsRecorder = null) =>
+        CreateSut(next, tokenEstimator.Object, routingDecisionService, modelCatalogCache, activityMonitor, activityStatistics, inferenceRequestRecorder, targetAvailability, targetLiveness, capabilityEngine, forwarder, streakTracker, sessionAffinity, tokenMetricsRecorder);
 
     private static OllamaRoutingMiddleware CreateSut(
         RequestDelegate next,
@@ -55,7 +56,8 @@ public class OllamaRoutingMiddlewareTests
         ModelCapabilityEngine? capabilityEngine = null,
         Mock<IHttpForwarder>? forwarder = null,
         ITargetFailureStreakService? streakTracker = null,
-        ISessionAffinityService? sessionAffinity = null)
+        ISessionAffinityService? sessionAffinity = null,
+        ITokenMetricsRecorder? tokenMetricsRecorder = null)
         {
         var effectiveTargetAvailability = targetAvailability ?? new Mock<ITargetAvailabilityService>();
         if (targetAvailability is null)
@@ -113,8 +115,9 @@ public class OllamaRoutingMiddlewareTests
             streakTracker ?? new TargetFailureStreakService(),
             new Mock<ITargetExecutionTracker>().Object,
             contextShrinkManager: null,
-            sessionAffinity);
-            }
+            sessionAffinity,
+            tokenMetricsRecorder);
+    }
 
             // Builds the forwarder used by the middleware. When the caller does not supply an explicit
             // mock (most pre-existing completion-path tests), a transparent proxy is returned whose
@@ -3087,5 +3090,142 @@ public class OllamaRoutingMiddlewareTests
 
         modelAwareMock.Verify(e => e.EstimateTokens(It.IsAny<IReadOnlyList<string>>(), "qwen3.5:32b"), Times.Once);
         routingDecisionService.Verify(r => r.DecideAsync(77, "qwen3.5:32b", It.IsAny<int?>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_NdjsonResponse_RecordsTokenMetricsCsvWithActualTokens()
+    {
+        const string requestBody = """{ "model": "qwen", "messages": [ { "role": "user", "content": "hello" } ] }""";
+        var context = BuildContext("/api/chat", requestBody);
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator
+            .Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>()))
+            .Returns(42);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), "qwen", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var requestId = Guid.NewGuid();
+        var activityMonitor = new Mock<IActivityMonitorService>();
+        activityMonitor.Setup(m => m.StartRequest(It.IsAny<RoutingTarget>(), "qwen", It.IsAny<int>())).Returns(requestId);
+
+        const string ndjsonResponse =
+            """{"model":"qwen","message":{"role":"assistant","content":"hi"},"done":false}""" + "\n" +
+            """{"model":"qwen","message":{"role":"assistant","content":""},"done":true,"prompt_eval_count":777,"eval_count":9}""" + "\n";
+
+        RequestDelegate next = c =>
+        {
+            c.Response.WriteAsync(ndjsonResponse);
+            return Task.CompletedTask;
+        };
+
+        var metricsRecorder = new Mock<ITokenMetricsRecorder>();
+        metricsRecorder.SetupGet(r => r.IsEnabled).Returns(true);
+
+        var sut = CreateSut(next, tokenEstimator, routingDecisionService, activityMonitor: activityMonitor, tokenMetricsRecorder: metricsRecorder.Object);
+
+        await sut.InvokeAsync(context);
+
+        var expectedAggregate = HeuristicTokenEstimator.Analyze(
+            OllamaRouter.Parsing.OllamaRequestParser.ParseCompletionRequest(requestBody).ContextParts);
+        metricsRecorder.Verify(
+            r => r.Record(It.Is<TokenMetricsCsvRecord>(rec =>
+                rec.RequestId == requestId &&
+                rec.Model == "qwen" &&
+                rec.Target == "Local" &&
+                rec.Endpoint == "/api/chat" &&
+                rec.AggregateMetrics.Equals(expectedAggregate) &&
+                rec.EstimatedPromptTokens == 42 &&
+                rec.ActualPromptTokens == 777 &&
+                rec.ActualResponseTokens == 9 &&
+                rec.StatusCode == 200 &&
+                rec.Success)),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_OpenAiSseResponse_RecordsTokenMetricsCsvWithUsageTokens()
+    {
+        const string requestBody = """{ "model": "qwen", "stream": true, "messages": [ { "role": "user", "content": "hi there" } ] }""";
+        var context = BuildContext("/v1/chat/completions", requestBody);
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator
+            .Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>()))
+            .Returns(33);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), "qwen", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Remote);
+
+        var requestId = Guid.NewGuid();
+        var activityMonitor = new Mock<IActivityMonitorService>();
+        activityMonitor.Setup(m => m.StartRequest(It.IsAny<RoutingTarget>(), "qwen", It.IsAny<int>())).Returns(requestId);
+
+        const string sseResponse =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":555,\"completion_tokens\":11}}\n\n" +
+            "data: [DONE]\n\n";
+
+        RequestDelegate next = c =>
+        {
+            c.Response.ContentType = "text/event-stream";
+            c.Response.WriteAsync(sseResponse);
+            return Task.CompletedTask;
+        };
+
+        var metricsRecorder = new Mock<ITokenMetricsRecorder>();
+        metricsRecorder.SetupGet(r => r.IsEnabled).Returns(true);
+
+        var sut = CreateSut(next, tokenEstimator, routingDecisionService, activityMonitor: activityMonitor, tokenMetricsRecorder: metricsRecorder.Object);
+
+        await sut.InvokeAsync(context);
+
+        metricsRecorder.Verify(
+            r => r.Record(It.Is<TokenMetricsCsvRecord>(rec =>
+                rec.RequestId == requestId &&
+                rec.Model == "qwen" &&
+                rec.Target == "Remote" &&
+                rec.Endpoint == "/v1/chat/completions" &&
+                rec.EstimatedPromptTokens == 33 &&
+                rec.ActualPromptTokens == 555 &&
+                rec.ActualResponseTokens == 11 &&
+                rec.StatusCode == 200 &&
+                rec.Success)),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_TokenMetricsRecorderDisabled_InvokesRecordNever()
+    {
+        const string requestBody = """{ "model": "qwen", "messages": [ { "role": "user", "content": "hello" } ] }""";
+        var context = BuildContext("/api/chat", requestBody);
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var requestId = Guid.NewGuid();
+        var activityMonitor = new Mock<IActivityMonitorService>();
+        activityMonitor.Setup(m => m.StartRequest(It.IsAny<RoutingTarget>(), It.IsAny<string>(), It.IsAny<int>())).Returns(requestId);
+
+        var metricsRecorder = new Mock<ITokenMetricsRecorder>();
+        metricsRecorder.SetupGet(r => r.IsEnabled).Returns(false);
+
+        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService, activityMonitor: activityMonitor, tokenMetricsRecorder: metricsRecorder.Object);
+
+        await sut.InvokeAsync(context);
+
+        // Disabled recorder: never invoked, and the request is otherwise handled normally.
+        metricsRecorder.Verify(r => r.Record(It.IsAny<TokenMetricsCsvRecord>()), Times.Never);
+        activityMonitor.Verify(m => m.CompleteRequest(requestId, It.IsAny<ActivityLogEntry>()), Times.Once);
     }
 }

@@ -273,6 +273,11 @@ public sealed class OllamaRouterOptions
         {
             ContextFitMarginTokens = 0;
         }
+
+        if (Recording?.TokenMetricsCsv is { } tokenMetricsCsv && tokenMetricsCsv.MaxFiles < 0)
+        {
+            tokenMetricsCsv.MaxFiles = 0;
+        }
     }
 }
 
@@ -550,7 +555,57 @@ public sealed class RecordingOptions
     /// Defaults to 500. Set to 0 to keep all files.
     /// </summary>
     public int MaxFiles { get; set; } = 500;
-}
+
+    /// <summary>
+    /// Optional CSV export of the heuristic structural token metrics (words, symbols, non-ASCII
+    /// characters, character count) paired with the actual token counts reported by the Ollama
+    /// instances, for calibrating the <c>HeuristicTokenEstimator</c> model-family coefficients.
+    /// A null (absent) section means the export is disabled, independently of the full JSON
+    /// payload recording mode above.
+    /// </summary>
+    public TokenMetricsCsvOptions? TokenMetricsCsv { get; set; }
+    }
+
+    /// <summary>
+    /// Configuration of the optional token metrics CSV export: each recorded completion request
+    /// produces one aggregate data row (structural text metrics from the prompt vs the actual
+    /// prompt/response token counts evaluated by Ollama), written to a per-request CSV file and/or
+    /// appended to a consolidated dataset CSV ready for statistical regression and profile tuning.
+    /// </summary>
+    public sealed class TokenMetricsCsvOptions
+    {
+        /// <summary>
+        /// Enables the token metrics CSV export. Defaults to false (zero disk I/O).
+        /// </summary>
+        public bool Enabled { get; set; }
+
+        /// <summary>
+        /// Directory where the CSV files are written. Defaults to null, which resolves to the
+        /// "token-metrics" folder in the local application data folder
+        /// (<c>%LOCALAPPDATA%\OllamaRouter\token-metrics</c> on Windows).
+        /// </summary>
+        public string? OutputDirectory { get; set; }
+
+        /// <summary>
+        /// Maximum number of per-request CSV files to keep in the output directory; the oldest
+        /// <c>*_metrics.csv</c> files are deleted once this count is exceeded (the consolidated
+        /// <c>token-metrics.csv</c> is never pruned). Defaults to 1000. Set to 0 to keep all files.
+        /// </summary>
+        public int MaxFiles { get; set; } = 1000;
+
+        /// <summary>
+        /// When true (default), each recorded request produces an individual CSV file containing a
+        /// header row plus the single aggregate data row.
+        /// </summary>
+        public bool GenerateIndividualFiles { get; set; } = true;
+
+        /// <summary>
+        /// When true (default), each recorded request appends one row to the consolidated
+        /// <c>token-metrics.csv</c> dataset in the output directory (the header row is written only
+        /// when the file does not exist or is empty).
+        /// </summary>
+        public bool AppendConsolidatedFile { get; set; } = true;
+    }
 
 /// <summary>
 /// Routing thresholds for a single model.

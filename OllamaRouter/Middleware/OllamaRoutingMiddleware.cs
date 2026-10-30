@@ -37,7 +37,8 @@ public sealed class OllamaRoutingMiddleware(
     ITargetFailureStreakService streakTracker,
     ITargetExecutionTracker executionTracker = null!,
     IContextAutoShrinkManager? contextShrinkManager = null,
-    ISessionAffinityService? sessionAffinity = null)
+    ISessionAffinityService? sessionAffinity = null,
+    ITokenMetricsRecorder? tokenMetricsRecorder = null)
     {
     // During the first 10 s after the liveness prober started, an unresolved (Unknown)
     // target is treated as routable rather than offline, so a request arriving before the
@@ -97,6 +98,14 @@ public sealed class OllamaRoutingMiddleware(
     /// invalidation happens).
     /// </summary>
     private readonly ISessionAffinityService? _sessionAffinity = sessionAffinity;
+
+    /// <summary>
+    /// The best-effort token metrics CSV recorder (null-guarded for unit-test compatibility:
+    /// when null, the middleware records no token metrics — existing unit tests that do not
+    /// inject it keep the exact pre-recording behavior). Registered as a singleton in
+    /// production; a no-op unless the TokenMetricsCsv export is enabled.
+    /// </summary>
+    private readonly ITokenMetricsRecorder? _tokenMetricsRecorder = tokenMetricsRecorder;
 
     // Last-seen raw liveness state per target, used to detect offline/online TRANSITIONS so
     // the Auto-Shrink Manager's leases are reset exactly when a daemon (re)loads (its KV cache
@@ -1082,6 +1091,22 @@ public sealed class OllamaRoutingMiddleware(
             activityMonitor.CompleteRequest(requestId, entry);
             activityStatistics.Add(entry);
             inferenceRequestRecorder.Record(entry, endpoint, body);
+
+            // Token metrics CSV export (dispatch-path only — pre-dispatch 503 short-circuits
+            // never reach this block). Best-effort: Record never throws, and the metrics
+            // computation is gated on IsEnabled so the disabled path costs nothing beyond a
+            // null/bool check. The payload is the FINAL forwarded body (post dynamic-context
+            // sizing rewrite), so the recorded metrics match what was actually sent.
+            if (_tokenMetricsRecorder is { IsEnabled: true } metricsRecorder)
+            {
+                var info = OllamaRequestParser.ParseCompletionRequest(body);
+                var aggregate = HeuristicTokenEstimator.Analyze(info.ContextParts);
+                metricsRecorder.Record(new TokenMetricsCsvRecord(
+                    entry.Timestamp, requestId, entry.Model, entry.Target.ToString(), endpoint,
+                    aggregate, info.PriorContextTokenCount, rawTokenCount,
+                    actualPromptTokens, actualResponseTokens,
+                    entry.ElapsedMilliseconds, entry.StatusCode, success));
+            }
         }
     }
 
