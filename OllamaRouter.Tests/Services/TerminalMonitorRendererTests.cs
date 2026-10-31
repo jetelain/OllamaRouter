@@ -15,7 +15,12 @@ public class TerminalMonitorRendererTests
         string? hardwareProfile = null,
         string contextAllocation = "-")
     {
-        return new MonitorFleetTargetItem(name, enabled, liveness, inFlightRequests, contextAllocation, url, activeModel, hardwareProfile);
+        // Location is derived from the URL (null URL / Cloud row -> "cloud"), mirroring what
+        // BuildMonitorStateResponseAsync computes via TargetLocationClassifier.
+        var location = url is null
+            ? TargetLocationClassifier.ToWireValue(TargetLocation.Cloud)
+            : TargetLocationClassifier.ToWireValue(TargetLocationClassifier.ClassifyUrl(url));
+        return new MonitorFleetTargetItem(name, enabled, liveness, inFlightRequests, contextAllocation, location, url, activeModel, hardwareProfile);
     }
 
     private static MonitorStateResponse CreateSampleState(
@@ -555,7 +560,7 @@ public class TerminalMonitorRendererTests
     }
 
     [Fact]
-    public void Render_FleetNamedTarget_DisplaysNameWithoutWellKnownIcon()
+    public void Render_FleetNamedTarget_DisplaysLocationIconFromUrl()
     {
         var stats = new MonitorStatisticsStatus(
             new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase)
@@ -588,11 +593,127 @@ public class TerminalMonitorRendererTests
 
         var output = TerminalMonitorRenderer.Render(state, "http://localhost:11434/monitor", enableAnsi: false);
 
-        // Fleet names are displayed as plain names (no well-known icon prefix) in the Target column.
+        // The fleet row shows the LOCATION icon: 192.168.1.5 is an RFC 1918 LAN address,
+        // so "desktop" now renders with the remote (📡) icon (the visible fix for the
+        // old name-keyed lookup that only fired for targets literally named local/remote/cloud).
         var desktopRow = output.Split(['\n'], StringSplitOptions.None).Single(l => l.Contains("desktop") && l.Contains("\u25CF"));
         Assert.Contains("\u25CF Online", desktopRow);
-        // No icon prefixed onto the plain fleet name in the row.
+        Assert.Contains("\uD83D\uDCE1 desktop", desktopRow, StringComparison.Ordinal);
         Assert.DoesNotContain("\uD83D\uDDA5\uFE0F desktop", desktopRow, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Render_FleetTargets_LocationIconsByLocationNotName()
+    {
+        // A target NAMED "remote" at a public URL renders the Cloud icon (location wins over name),
+        // a loopback target renders the Local icon, and the Cloud row renders the Cloud icon.
+        var fleet = new List<MonitorFleetTargetItem>
+        {
+            FleetItem("remote", "http://example.com:11434", true, "Online"),
+            FleetItem("Local", "http://127.0.0.1:11434", true, "Online"),
+            FleetItem("Cloud", null, true, "Online", null, 0, null, "baseline")
+        };
+
+        var state = new MonitorStateResponse(
+            CloudEnabled: true,
+            Fleet: fleet,
+            Statistics: new MonitorStatisticsStatus(
+                new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["total"] = new ActivityStatisticsTotals(0, 0, 0)
+                },
+                new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["total"] = new ActivityStatisticsTotals(0, 0, 0)
+                }),
+            InProgress: [],
+            Requests: [],
+            Cost: null,
+            Overhead: null);
+
+        var output = TerminalMonitorRenderer.Render(state, "http://localhost:11434/monitor", enableAnsi: false);
+        var lines = output.Split(["\r\n", "\n"], StringSplitOptions.None).Where(l => l.Contains("\u25CF")).ToList();
+
+        var remoteNamedRow = lines.Single(l => l.Contains("remote"));
+        Assert.Contains("\u2601\uFE0F remote", remoteNamedRow, StringComparison.Ordinal); // location (cloud URL) wins over the name
+
+        var localRow = lines.Single(l => l.Contains("Local"));
+        Assert.Contains("\uD83D\uDDA5\uFE0F Local", localRow, StringComparison.Ordinal);
+
+        var cloudRow = lines.Single(l => l.Contains("Cloud") && !l.Contains("Cloud:"));
+        Assert.Contains("\u2601\uFE0F Cloud", cloudRow, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Render_NameKeyedRows_ResolveIconFromFleet_UnknownNamesFallBackToPlainName()
+    {
+        // Statistics/in-progress/recent rows carry only the target NAME; the renderer resolves
+        // the icon from the fleet ("desktop" @ 192.168.1.5 -> Remote 📡) and keeps a plain,
+        // uncolored name for a statistics key that is not in the fleet ("ghost").
+        var stats = new MonitorStatisticsStatus(
+            new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["desktop"] = new ActivityStatisticsTotals(1, 100, 50),
+                ["ghost"] = new ActivityStatisticsTotals(1, 25, 10),
+                ["Cloud"] = new ActivityStatisticsTotals(0, 0, 0),
+                ["total"] = new ActivityStatisticsTotals(2, 125, 60)
+            },
+            new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["desktop"] = new ActivityStatisticsTotals(1, 100, 50),
+                ["ghost"] = new ActivityStatisticsTotals(1, 25, 10),
+                ["Cloud"] = new ActivityStatisticsTotals(0, 0, 0),
+                ["total"] = new ActivityStatisticsTotals(2, 125, 60)
+            });
+
+        var now = DateTimeOffset.UtcNow;
+        var inProgress = new List<MonitorInProgressItem>
+        {
+            new("desktop", "llama3", 1000, 1000.0)
+        };
+        var recent = new List<MonitorRecentRequestItem>
+        {
+            new(now, "desktop", "llama3", 1000, 1000, 100, 1000.0, 200, true)
+        };
+
+        var fleet = new List<MonitorFleetTargetItem>
+        {
+            FleetItem("desktop", "http://192.168.1.5:11434", true, "Online"),
+            FleetItem("Cloud", null, true, "Online", null, 0, null, "baseline")
+        };
+
+        var state = new MonitorStateResponse(
+            CloudEnabled: true,
+            Fleet: fleet,
+            Statistics: stats,
+            InProgress: inProgress,
+            Requests: recent,
+            Cost: null,
+            Overhead: null);
+
+        var output = TerminalMonitorRenderer.Render(state, "http://localhost:11434/monitor", consoleHeight: 35, enableAnsi: false);
+
+        var lines = output.Split(["\r\n", "\n"], StringSplitOptions.None);
+
+        // In-progress row for the fleet name shows the looked-up remote icon.
+        var inProgressIdx = Array.FindIndex(lines, l => l.Contains("IN PROGRESS"));
+        Assert.True(inProgressIdx >= 0);
+        var inProgressRow = lines[inProgressIdx + 3];
+        Assert.Contains("\uD83D\uDCE1 desktop", inProgressRow, StringComparison.Ordinal);
+
+        // Recent-request row for the fleet name also shows the looked-up remote icon.
+        var recentIdx = Array.FindIndex(lines, l => l.Contains("RECENT REQUESTS"));
+        Assert.True(recentIdx >= 0);
+        var recentRow = lines[recentIdx + 3];
+        Assert.Contains("\uD83D\uDCE1 desktop", recentRow, StringComparison.Ordinal);
+
+        // Statistics rows: fleet name gets the remote icon; the unknown "ghost" key stays plain.
+        var statsDesktopRow = lines.Single(l => l.Contains("│ ") && l.Contains("desktop"));
+        Assert.Contains("\uD83D\uDCE1 desktop", statsDesktopRow, StringComparison.Ordinal);
+        var statsGhostRow = lines.Single(l => l.Contains("│ ") && l.Contains("ghost"));
+        Assert.DoesNotContain("\uD83D\uDCE1", statsGhostRow);
+        Assert.DoesNotContain("\uD83D\uDDA5", statsGhostRow);
+        Assert.DoesNotContain("\u2601", statsGhostRow);
     }
 
     [Fact]

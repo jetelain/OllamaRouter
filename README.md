@@ -259,8 +259,9 @@ appsettings.json  <  config/config.json  <  user secrets  <  environment variabl
 
 | Setting            | Description                                                                                     |
 |--------------------|---------------------------------------------------------------------------------------------------|
-| `Targets`          | Array of named fleet targets (`Name`, `Url`, `RouterUrl`, `MaxVramMB`, `MaxParallel`, `SpeedFactor`, `Enabled`). See [Fleet Targets](#dual-router-mesh-desktop--laptop). |
+| `Targets`          | Array of named fleet targets (`Name`, `Url`, `RouterUrl`, `Location`, `MaxVramMB`, `MaxParallel`, `SpeedFactor`, `Enabled`). See [Fleet Targets](#dual-router-mesh-desktop--laptop). |
 | `Targets:*:RouterUrl` | Optional base address of the OllamaRouter instance running on this node (e.g. `http://192.168.1.20:11434`). Used for router-to-router management operations (such as hardware discovery via `/api/router/hardware`). When omitted, falls back by convention to the same host on port `11434` only if `Url` uses port `11435`. |
+| `Targets:*:Location` | Optional explicit target-location override: `"local"`, `"remote"`, or `"cloud"` (case-insensitive). When set, it wins over the [URL-based classification](#target-location-classification). Defaults to unset (classified from `Url`). |
 | `Targets:*:MaxVramMB` | Optional explicit maximum VRAM (in MB) available on this target. When omitted, VRAM is auto-discovered dynamically via `IFleetHardwareService`. |
 | `Targets:*:SpeedFactor` | Optional per-target **static processing-speed hint**: relative generation-throughput multiplier vs the fleet baseline (`1.0` = fleet average / unset; only values `> 1.0` mean something). At routing time the qualified candidate with the highest effective factor earns the full Stage-2 speed bonus (+150), and the others are scaled linearly between 0 and +150 — so a fast cold node (e.g. your local workstation) can be preferred over a slower node that happens to hold the model hot, while Stage-1 hardware/context gates are untouched (a 48k-ceiling request never routes to a too-small fast node) and a fast node that would evict another model still loses to the hot one (70 < 100, anti-thrash). Recommended heterogenous setup: fast workstation `"SpeedFactor": 2.0`, servers default/omitted. Non-finite or `≤ 1.0` values are treated as `1.0` (zero bonus). See also `GET /api/router/fleet` (`hardware.speedFactor`) and the terminal monitor HW column (`16gb,2.0x`). |
 | `Models`           | Dictionary of model names (base name, no tag) to model-specific routing settings (`CloudModel`, `MaxContextTokens`). |
@@ -291,6 +292,29 @@ appsettings.json  <  config/config.json  <  user secrets  <  environment variabl
 | `Pricing:Currency` | Currency symbol or label to display in the monitoring UI (e.g. `$`, `€`, `USD`). Defaults to `$`. |
 | `TerminalMonitoring:Enabled` | Enables the in-terminal live activity monitor in the server console (zero VRAM consumption). Defaults to `true`. Can also be disabled via `--no-tui`. |
 | `TerminalMonitoring:RefreshIntervalSeconds` | Refresh interval in seconds for the in-terminal live monitor. Defaults to `2.0`. |
+
+### Target location classification
+
+Every fleet target is assigned a **location** — `Local`, `Remote`, or `Cloud` — which drives the
+monitor icon and color in both the [terminal monitor](#in-terminal-activity-monitor-tui) (🖥️ bright cyan /
+📡 bright green / ☁️ bright magenta) and the [web monitor](#monitoring). The location is derived
+**synchronously from the target's `Url`** (no DNS lookups, so it never hangs or blocks startup),
+with an optional per-target override via `Targets:*:Location` that always wins:
+
+| Location | Classification rule (applied in order) |
+|----------|------------------------------------------|
+| **Local** | Loopback host: `localhost`, `127.0.0.1`, `::1`, `0.0.0.0`, or `::` (unspecified hosts are only reachable from the same host). |
+| **Remote** | LAN / private: IPv4 literals in `10.0.0.0/8`, `172.16.0.0/12`, or `192.168.0.0/16`; IPv6 ULA (`fc00::/7`) and link-local (`fe80::/10`) literals; hostnames ending in `.local` (mDNS); Tailscale addresses ending in `.ts.net`; and single-label hostnames (no dot, e.g. `aiserver`). |
+| **Cloud** | Everything else: public IPv4/IPv6 literals (including CGNAT `100.64.0.0/10` and `169.254.0.0/16`), multi-label public hostnames, and any null / malformed / unparseable `Url` (the deterministic fail-safe default). The **Cloud** pseudo-target is always `Cloud` by definition. |
+
+> **Override.** Set `"Location": "remote"` (or `"local"` / `"cloud"`, case-insensitive) on a target
+> when its hostname should be treated differently from its URL implies — e.g. a hostname that
+> resolves to a private IP but should count as `remote`, or a public-looking host that is really
+> a relay. Config binding maps the JSON string to the `TargetLocation` enum automatically.
+
+The location is exposed in the monitor and router APIs (`/monitor/api` fleet rows and
+`GET /api/router/fleet` `targets[]`) as the lowercase wire value `"local"` / `"remote"` /
+`"cloud"`, so both UIs and programmatic consumers stay consistent.
 
 ### Dynamic context sizing (MoE only)
 

@@ -563,6 +563,7 @@ public static class RouterApiEndpointsExtensions
                 Enabled: enabled,
                 Liveness: livenessText,
                 LatencyMs: latencyMs,
+                Location: TargetLocationClassifier.ToWireValue(TargetLocationClassifier.Classify(target)),
                 Hardware: new RouterTargetHardware(
                     GpuVendor: gpuVendor,
                     Devices: devices,
@@ -591,6 +592,7 @@ public static class RouterApiEndpointsExtensions
             Enabled: cloudFlag,
             Liveness: cloudEnabled ? "Online" : "Offline",
             LatencyMs: null,
+            Location: TargetLocationClassifier.ToWireValue(TargetLocation.Cloud),
             Hardware: new RouterTargetHardware(
                 GpuVendor: "Cloud",
                 Devices: new[] { "Cloud Overflow" },
@@ -1618,6 +1620,7 @@ public sealed record RouterTargetItem(
     [property: JsonPropertyName("enabled")] bool Enabled,
     [property: JsonPropertyName("liveness")] string Liveness,
     [property: JsonPropertyName("latencyMs")] long? LatencyMs,
+    [property: JsonPropertyName("location")] string Location,
     [property: JsonPropertyName("hardware")] RouterTargetHardware Hardware,
     [property: JsonPropertyName("execution")] RouterTargetExecution Execution);
 

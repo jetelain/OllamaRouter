@@ -268,6 +268,7 @@ public class MonitorEndpointsExtensionsTests
             var local = fleet[0]!;
             Assert.Equal("Local", local["name"]?.GetValue<string>());
             Assert.Equal("http://127.0.0.1:11435", local["url"]?.GetValue<string>());
+            Assert.Equal("local", local["location"]?.GetValue<string>()); // loopback URL
             Assert.True(local["enabled"]?.GetValue<bool>());
             Assert.Equal("Offline", local["liveness"]?.GetValue<string>()); // no models in the cache mock
             Assert.Equal(0, local["inFlightRequests"]?.GetValue<int>());
@@ -276,6 +277,7 @@ public class MonitorEndpointsExtensionsTests
 
             var cloud = fleet[1]!;
             Assert.Equal("Cloud", cloud["name"]?.GetValue<string>());
+            Assert.Equal("cloud", cloud["location"]?.GetValue<string>()); // Cloud pseudo-target is always cloud
             Assert.True(cloud["url"] == null);
             Assert.False(cloud["enabled"]?.GetValue<bool>()); // availability flag false; cloud not configured
             Assert.Equal("Offline", cloud["liveness"]?.GetValue<string>()); // cloud models not configured
@@ -666,6 +668,67 @@ public class MonitorEndpointsExtensionsTests
             Assert.Contains("statusText = 'Offline'", html);
             Assert.Contains("statusText = 'Probing'", html);
             Assert.Contains("renderFleet", html);
+            Assert.Contains("lv-offline", html);
+            Assert.Contains("lv-probing", html);
+            Assert.Contains("lv-disabled", html);
+            Assert.Contains("statusText = 'Offline'", html);
+            Assert.Contains("statusText = 'Probing'", html);
+            Assert.Contains("renderFleet", html);
+            // Location-based rendering: location-driven CSS classes and the JS lookup built
+            // from data.fleet (t.location), not the legacy name-keyed targetIcons map.
+            Assert.Contains(".target-local { color: #3f9eff; }", html);
+            Assert.Contains(".target-remote { color: #34e0a1; }", html);
+            Assert.Contains(".target-cloud { color: #c48bff; }", html);
+            Assert.Contains("locationIcons", html);
+            Assert.Contains("updateLocationByName", html);
+            Assert.Contains("t.location", html);
+            // The fleet-row span must derive its color class from the location lookup, not the raw name.
+            Assert.Contains("span.className = 'target-' + targetColorClass(target);", html);
+            Assert.DoesNotContain("const targetIcons", html);
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task GetMonitorApi_FleetLocationIsClassifiedPerUrl_AndOverrideWins()
+    {
+        var (app, client, _) = await CreateTestAppAsync(
+            options: new OllamaRouterOptions
+            {
+                Targets =
+                [
+                    new OllamaTargetOptions { Name = "Local", Url = "http://127.0.0.1:11435" },
+                    new OllamaTargetOptions { Name = "desktop", Url = "http://192.168.1.25:11434" },
+                    new OllamaTargetOptions { Name = "edge", Url = "http://example.com:11434" },
+                    // Explicit override: a public URL classified as Remote instead of Cloud.
+                    new OllamaTargetOptions { Name = "lan-relay", Url = "http://example.net:11434", Location = TargetLocation.Remote },
+                    new OllamaTargetOptions { Name = "mDNS", Url = "http://aiserver.local:11434" }
+                ]
+            });
+        try
+        {
+            var response = await client.GetAsync("/monitor/api");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var json = await response.Content.ReadFromJsonAsync<JsonObject>();
+            var fleet = json!["fleet"]!.AsArray();
+
+            var byName = new Dictionary<string, JsonObject>(StringComparer.OrdinalIgnoreCase);
+            foreach (var f in fleet)
+            {
+                byName[f!["name"]!.GetValue<string>()!] = (JsonObject)f!;
+            }
+
+            Assert.Equal("local", byName["Local"]["location"]?.GetValue<string>());
+            Assert.Equal("remote", byName["desktop"]["location"]?.GetValue<string>());
+            Assert.Equal("cloud", byName["edge"]["location"]?.GetValue<string>());
+            Assert.Equal("remote", byName["lan-relay"]["location"]?.GetValue<string>()); // override wins
+            Assert.Equal("remote", byName["mDNS"]["location"]?.GetValue<string>()); // .local hostname
+            Assert.Equal("cloud", byName["Cloud"]["location"]?.GetValue<string>()); // pseudo-target always cloud
         }
         finally
         {

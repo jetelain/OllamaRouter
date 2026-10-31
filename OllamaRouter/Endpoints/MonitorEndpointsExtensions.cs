@@ -187,9 +187,9 @@ public static class MonitorEndpointsExtensions
   .stats th { text-align: center; }
   .stats th:first-child, .stats td:first-child { text-align: left; }
   .stats .today { background: #262626; }
-  .target-Local { color: #3f9eff; }
-  .target-Remote { color: #34e0a1; }
-  .target-Cloud { color: #c48bff; }
+  .target-local { color: #3f9eff; }
+  .target-remote { color: #34e0a1; }
+  .target-cloud { color: #c48bff; }
   .progress-seg-local { background-color: #3f9eff; background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.22) 0 6px, transparent 6px 12px); }
   .progress-seg-remote { background-color: #34e0a1; background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.22) 0 6px, transparent 6px 12px); }
   .progress-seg-cloud { background-color: #c48bff; background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.22) 0 6px, transparent 6px 12px); }
@@ -282,30 +282,32 @@ public static class MonitorEndpointsExtensions
 <h2>Token estimation overhead recommendation</h2>
 <div id="overheadContent"></div>
 <script>
-const targetIcons = { Local: '🖥️', Remote: '📡', Cloud: '☁️' };
+// Location-based icons: every fleet row carries a lowercase 'location' wire value
+// (local/remote/cloud); name-keyed tables (statistics, in-progress, recent requests,
+// usage legend) resolve the location through locationByName (built from data.fleet)
+// and fall back to a plain, uncolored name when the name is unknown.
+const locationIcons = { local: '\uD83D\uDDA5\uFE0F', remote: '\uD83D\uDCE1', cloud: '\u2601\uFE0F' };
 
-// Case-insensitive lookup of the display icon for a target name (fleet names have no icon).
-function targetIcon(name) {
-  for (const key of Object.keys(targetIcons)) {
-    if (name.toLowerCase() === key.toLowerCase()) {
-      return targetIcons[key];
+let locationByName = {};
+
+// (Re)builds the case-insensitive name -> location map from the fleet payload.
+function updateLocationByName(fleet) {
+  locationByName = {};
+  for (const t of fleet) {
+    if (t.name && t.location) {
+      locationByName[t.name.toLowerCase()] = t.location;
     }
   }
-  return '';
 }
 
-// Case-insensitive lookup of the CSS color class for a target name (neutral fallback for fleet names).
 function targetColorClass(name) {
-  for (const key of ['Local', 'Remote', 'Cloud']) {
-    if (name.toLowerCase() === key.toLowerCase()) {
-      return key.toLowerCase();
-    }
-  }
-  return 'neutral';
+  const location = locationByName[name.toLowerCase()];
+  return locationIcons[location] ? location : 'neutral';
 }
 
 function targetLabel(name) {
-  return (targetIcon(name) ? targetIcon(name) + ' ' : '') + name;
+  const location = locationByName[name.toLowerCase()];
+  return (locationIcons[location] ? locationIcons[location] + ' ' : '') + name;
 }
 
 function td(text, className) {
@@ -320,7 +322,7 @@ function td(text, className) {
 function targetCell(target) {
   const cell = document.createElement('td');
   const span = document.createElement('span');
-    span.className = 'target-' + target;
+    span.className = 'target-' + targetColorClass(target);
     span.textContent = targetLabel(target);
     cell.appendChild(span);
   return cell;
@@ -567,6 +569,7 @@ function livenessBadge(liveness, enabled) {
 function renderFleet(fleet) {
   const tbody = document.getElementById('fleetRows');
   clear(tbody);
+  updateLocationByName(fleet);
   for (const t of fleet) {
     const tr = document.createElement('tr');
 
@@ -792,7 +795,8 @@ setInterval(refresh, 2000);
                 ActiveModel: activeModel,
                 InFlightRequests: inFlight,
                 HardwareProfile: hardwareProfile,
-                ContextAllocation: FormatContextAllocation((RoutingTarget)name, leaseSnapshot)));
+                ContextAllocation: FormatContextAllocation((RoutingTarget)name, leaseSnapshot),
+                Location: TargetLocationClassifier.ToWireValue(TargetLocationClassifier.Classify(target))));
 
             periodByName[name] = statistics.Last7Days.GetValueOrDefault((RoutingTarget)name) ?? new ActivityStatisticsTotals(0, 0, 0);
         }
@@ -808,7 +812,8 @@ setInterval(refresh, 2000);
             ActiveModel: null,
             InFlightRequests: 0,
             HardwareProfile: null,
-            ContextAllocation: "baseline"));
+            ContextAllocation: "baseline",
+            Location: TargetLocationClassifier.ToWireValue(TargetLocation.Cloud)));
         periodByName[RoutingTarget.Cloud.Value] = statistics.Last7Days.GetValueOrDefault(RoutingTarget.Cloud) ?? new ActivityStatisticsTotals(0, 0, 0);
 
         var todayByName = new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase);
@@ -1023,7 +1028,8 @@ public sealed record MonitorCostStatus(
 /// One row of the ordered multi-target fleet view (configured targets first, Cloud last):
 /// identity, enablement, liveness (Online/Offline/Probing), the currently loaded model and
 /// in-flight request count (execution tracker; Cloud always null/0), the hardware profile,
-/// and the current context bucket allocation (auto-shrink lease; Cloud always "baseline").
+/// the current context bucket allocation (auto-shrink lease; Cloud always "baseline"), and
+/// the lowercase location classification ("local"/"remote"/"cloud"; Cloud always "cloud").
 /// </summary>
 public sealed record MonitorFleetTargetItem(
     [property: JsonPropertyName("name")] string Name,
@@ -1031,6 +1037,7 @@ public sealed record MonitorFleetTargetItem(
     [property: JsonPropertyName("liveness")] string Liveness,
     [property: JsonPropertyName("inFlightRequests")] int InFlightRequests,
     [property: JsonPropertyName("contextAllocation")] string ContextAllocation,
+    [property: JsonPropertyName("location")] string Location,
     [property: JsonPropertyName("url")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Url = null,
     [property: JsonPropertyName("activeModel")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? ActiveModel = null,
     [property: JsonPropertyName("hardwareProfile")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? HardwareProfile = null);

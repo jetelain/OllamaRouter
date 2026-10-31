@@ -147,10 +147,5 @@ public sealed class OllamaProcessLauncher : IOllamaProcessLauncher
         return PrimaryDefaultPort;
     }
 
-    internal static bool IsLoopback(string? url)
-    {
-        return !string.IsNullOrWhiteSpace(url) &&
-            Uri.TryCreate(url, UriKind.Absolute, out var uri) &&
-            (uri.Host == "localhost" || uri.Host == "127.0.0.1" || uri.Host == "::1");
-    }
+    internal static bool IsLoopback(string? url) => TargetLocationClassifier.IsLoopbackUrl(url);
 }

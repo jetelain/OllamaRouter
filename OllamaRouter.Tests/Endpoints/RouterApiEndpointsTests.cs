@@ -415,6 +415,7 @@ public class RouterApiEndpointsTests
         // Local: online, 1 ms latency, local GPU attached, 2 in flight, expanded lease.
         var local = TargetItem(node, "Local");
         Assert.Equal("http://127.0.0.1:11435", local["url"]!.ToString());
+        Assert.Equal("local", local["location"]!.ToString()); // loopback URL
         Assert.Equal("true", local["enabled"]!.ToString());
         Assert.Equal("Online", local["liveness"]!.ToString());
         Assert.Equal("1", local["latencyMs"]!.ToString());
@@ -429,6 +430,7 @@ public class RouterApiEndpointsTests
         // Server: online, 4 ms latency, disabled via availability, no model, baseline lease.
         var server = TargetItem(node, "Server");
         Assert.Equal("http://192.168.1.100:11434", server["url"]!.ToString());
+        Assert.Equal("remote", server["location"]!.ToString()); // RFC 1918 LAN
         Assert.Equal("false", server["enabled"]!.ToString());
         Assert.Equal("Online", server["liveness"]!.ToString());
         Assert.Equal("4", server["latencyMs"]!.ToString());
@@ -451,6 +453,7 @@ public class RouterApiEndpointsTests
         // Cloud pseudo-target.
         var cloud = TargetItem(node, "Cloud");
         Assert.Null(cloud["url"]);
+        Assert.Equal("cloud", cloud["location"]!.ToString()); // pseudo-target always cloud
         Assert.Equal("true", cloud["enabled"]!.ToString());
         Assert.Equal("Online", cloud["liveness"]!.ToString());
         Assert.Null(cloud["latencyMs"]);

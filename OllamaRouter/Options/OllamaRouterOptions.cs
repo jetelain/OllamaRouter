@@ -300,6 +300,15 @@ public sealed class OllamaTargetOptions
     public string? Url { get; set; }
 
     /// <summary>
+    /// Optional explicit location classification override (<c>"local"</c> / <c>"remote"</c> /
+    /// <c>"cloud"</c>, case-insensitive) that wins over the URL-based classification of
+    /// <see cref="Services.TargetLocationClassifier"/>. Use it when a hostname resolves to a
+    /// private IP but should be treated differently (or vice versa). Null (default) means the
+    /// location is derived from <see cref="Url"/>.
+    /// </summary>
+    public Services.TargetLocation? Location { get; set; }
+
+    /// <summary>
     /// Optional base address of the OllamaRouter instance running on this node (e.g. <c>http://192.168.1.25:11434</c>).
     /// Used for router-to-router management operations such as hardware discovery (<c>/api/router/hardware</c>).
     /// When not set, falls back by convention to the same host on port 11434 only if <see cref="Url"/> is on port 11435.

@@ -38,11 +38,23 @@ public static class TerminalMonitorRenderer
         var addSpacing = height > 40;
         var lines = new List<string>(height + 5);
 
+        // Name -> location lookup (case-insensitive) built once per Render from the fleet rows;
+        // name-keyed tables (statistics, usage legend, in-progress, recent requests) resolve the
+        // icon/color through it and fall back to a plain, uncolored name when unknown.
+        var locationByName = new Dictionary<string, TargetLocation>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in state.Fleet)
+        {
+            if (TryParseWireLocation(item.Location, out var itemLocation))
+            {
+                locationByName[item.Name] = itemLocation;
+            }
+        }
+
         // Header Banner (link is in footer to avoid duplicate)
         AppendHeader(lines, width, enableAnsi);
 
         // Fleet Table (data-driven multi-target view; Cloud always last)
-        AppendFleet(lines, state, enableAnsi);
+        AppendFleet(lines, state, locationByName, enableAnsi);
 
         // Statistics Table
         if (height > 30)
@@ -51,7 +63,7 @@ public static class TerminalMonitorRenderer
             {
                 lines.Add(string.Empty);
             }
-            AppendStatistics(lines, state, enableAnsi);
+            AppendStatistics(lines, state, locationByName, enableAnsi);
         }
 
         // Usage Ratio Progress Bar
@@ -59,7 +71,7 @@ public static class TerminalMonitorRenderer
         {
             lines.Add(string.Empty);
         }
-        AppendUsageRatio(lines, state, width, enableAnsi);
+        AppendUsageRatio(lines, state, width, locationByName, enableAnsi);
 
         // Cost & Savings (if configured)
         if (state.Cost != null)
@@ -76,7 +88,7 @@ public static class TerminalMonitorRenderer
             lines.Add(string.Empty);
         }
         // In Progress Requests
-        AppendInProgress(lines, state, enableAnsi);
+        AppendInProgress(lines, state, locationByName, enableAnsi);
 
         if (addSpacing)
         {
@@ -85,7 +97,7 @@ public static class TerminalMonitorRenderer
         // Recent Requests: calculate available rows so total output fits strictly within height - 2
         var usedLines = lines.Count + 6; // including recent header and footer
         var maxRecentItems = Math.Max(1, height - usedLines);
-        AppendRecentRequests(lines, state, maxRecentItems, enableAnsi);
+        AppendRecentRequests(lines, state, maxRecentItems, locationByName, enableAnsi);
 
         // Footer (contains single, full-featured monitor link)
         AppendFooter(lines, monitorUrl, width, enableAnsi);
@@ -119,7 +131,7 @@ public static class TerminalMonitorRenderer
         lines.Add($" ╚{bar}╝");
     }
 
-    private static void AppendFleet(List<string> lines, MonitorStateResponse state, bool enableAnsi)
+    private static void AppendFleet(List<string> lines, MonitorStateResponse state, IReadOnlyDictionary<string, TargetLocation> locationByName, bool enableAnsi)
     {
         var sb = new StringBuilder();
         sb.Append(" ");
@@ -135,9 +147,10 @@ public static class TerminalMonitorRenderer
         {
             var row = new StringBuilder();
             row.Append("   ");
-            var color = TargetColor(item.Name);
+            var location = LocationOf(locationByName, item.Name);
+            var color = TargetColor(location);
             if (enableAnsi) row.Append(color);
-            row.Append(PadRightDisplay(Truncate(TargetLabel(item.Name), 13), 13));
+            row.Append(PadRightDisplay(Truncate(TargetLabel(item.Name, location), 13), 13));
             if (enableAnsi) row.Append(Reset);
             row.Append(' ');
             AppendLivenessBadge(row, item, enableAnsi);
@@ -185,31 +198,62 @@ public static class TerminalMonitorRenderer
         if (enableAnsi) sb.Append(Reset);
     }
 
-    // Display label (icon + name) with Local/Remote/Cloud icons and a plain-name fallback for
-    // fleet targets.
-    public static string TargetLabel(string target)
+    // Display label for a fleet target: the location icon (🖥️ local / 📡 remote / ☁️ cloud)
+    // followed by the target name; a plain name when the location is unknown.
+    public static string TargetLabel(string name, TargetLocation? location = null)
     {
-        return target.ToLowerInvariant() switch
+        var icon = location switch
         {
-            "local" => "🖥️ Local",
-            "remote" => "📡 Remote",
-            "cloud" => "☁️ Cloud",
-            _ => target
+            TargetLocation.Local => "\uD83D\uDDA5\uFE0F",
+            TargetLocation.Remote => "\uD83D\uDCE1",
+            TargetLocation.Cloud => "\u2601\uFE0F",
+            _ => null
         };
+        return icon is null ? name : $"{icon} {name}";
     }
 
-    private static string TargetColor(string targetKey)
+    private static string TargetColor(TargetLocation? location)
     {
-        return targetKey.ToLowerInvariant() switch
+        return location switch
         {
-            "local" => BrightCyan,
-            "remote" => BrightGreen,
-            "cloud" => BrightMagenta,
+            TargetLocation.Local => BrightCyan,
+            TargetLocation.Remote => BrightGreen,
+            TargetLocation.Cloud => BrightMagenta,
             _ => ""
         };
     }
 
-    private static void AppendStatistics(List<string> lines, MonitorStateResponse state, bool enableAnsi)
+    // Case-insensitive name -> location lookup with a NULL (not the enum default!) fallback
+    // for names that are not in the fleet.
+    private static TargetLocation? LocationOf(IReadOnlyDictionary<string, TargetLocation> locationByName, string name)
+        => locationByName.TryGetValue(name, out var location) ? location : null;
+
+    // Parses the lowercase wire value ("local"/"remote"/"cloud") carried by
+    // MonitorFleetTargetItem.Location back into the enum (unknown values -> false).
+    private static bool TryParseWireLocation(string? location, out TargetLocation value)
+    {
+        value = TargetLocation.Cloud;
+        if (location is null)
+        {
+            return false;
+        }
+
+        switch (location.ToLowerInvariant())
+        {
+            case "local":
+                value = TargetLocation.Local;
+                return true;
+            case "remote":
+                value = TargetLocation.Remote;
+                return true;
+            case "cloud":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static void AppendStatistics(List<string> lines, MonitorStateResponse state, IReadOnlyDictionary<string, TargetLocation> locationByName, bool enableAnsi)
     {
         var header = new StringBuilder();
         header.Append(" ");
@@ -227,7 +271,7 @@ public static class TerminalMonitorRenderer
 
         foreach (var name in today.Keys.Where(key => key != "total"))
         {
-            lines.Add(FormatStatsRow(TargetLabel(name), TargetColor(name), today[name], last7Days.GetValueOrDefault(name, new ActivityStatisticsTotals(0, 0, 0)), enableAnsi));
+            lines.Add(FormatStatsRow(TargetLabel(name, LocationOf(locationByName, name)), TargetColor(LocationOf(locationByName, name)), today[name], last7Days.GetValueOrDefault(name, new ActivityStatisticsTotals(0, 0, 0)), enableAnsi));
         }
 
         lines.Add("   ─────────────┼──────────────────────────┼──────────────────────────");
@@ -260,7 +304,7 @@ public static class TerminalMonitorRenderer
         return sb.ToString();
     }
 
-    private static void AppendUsageRatio(List<string> lines, MonitorStateResponse state, int width, bool enableAnsi)
+    private static void AppendUsageRatio(List<string> lines, MonitorStateResponse state, int width, IReadOnlyDictionary<string, TargetLocation> locationByName, bool enableAnsi)
     {
         var last7 = state.Statistics.Last7Days;
         var entries = last7.Keys
@@ -307,7 +351,7 @@ public static class TerminalMonitorRenderer
 
             if (chars > 0)
             {
-                if (enableAnsi) barSb.Append(TargetColor(entry.Name));
+                if (enableAnsi) barSb.Append(TargetColor(LocationOf(locationByName, entry.Name)));
                 barSb.Append(new string('█', chars));
             }
 
@@ -317,8 +361,8 @@ public static class TerminalMonitorRenderer
                 legendSb.Append(" • ");
             }
             firstLegend = false;
-            if (enableAnsi) legendSb.Append(TargetColor(entry.Name));
-            legendSb.Append(TargetLabel(entry.Name)).Append(": ").Append(pct.ToString("0.0", CultureInfo.InvariantCulture)).Append("%");
+            if (enableAnsi) legendSb.Append(TargetColor(LocationOf(locationByName, entry.Name)));
+            legendSb.Append(TargetLabel(entry.Name, LocationOf(locationByName, entry.Name))).Append(": ").Append(pct.ToString("0.0", CultureInfo.InvariantCulture)).Append("%");
             if (enableAnsi) legendSb.Append(Reset);
         }
 
@@ -397,7 +441,7 @@ public static class TerminalMonitorRenderer
         }
     }
 
-    private static void AppendInProgress(List<string> lines, MonitorStateResponse state, bool enableAnsi)
+    private static void AppendInProgress(List<string> lines, MonitorStateResponse state, IReadOnlyDictionary<string, TargetLocation> locationByName, bool enableAnsi)
     {
         var header = new StringBuilder();
         header.Append(" ");
@@ -419,7 +463,7 @@ public static class TerminalMonitorRenderer
         {
             var sb = new StringBuilder();
             sb.Append("   ");
-            AppendTargetBadge(sb, req.Target, enableAnsi, 11);
+            AppendTargetBadge(sb, req.Target, locationByName, enableAnsi, 11);
             sb.Append(' ');
             sb.Append(PadRightDisplay(Truncate(req.Model, 40), 40));
             sb.Append(' ');
@@ -433,7 +477,7 @@ public static class TerminalMonitorRenderer
         }
     }
 
-    private static void AppendRecentRequests(List<string> lines, MonitorStateResponse state, int maxCount, bool enableAnsi)
+    private static void AppendRecentRequests(List<string> lines, MonitorStateResponse state, int maxCount, IReadOnlyDictionary<string, TargetLocation> locationByName, bool enableAnsi)
     {
         var header = new StringBuilder();
         header.Append(" ");
@@ -463,7 +507,7 @@ public static class TerminalMonitorRenderer
             var timeStr = req.Timestamp.ToLocalTime().ToString("HH:mm:ss", CultureInfo.InvariantCulture);
             sb.Append(timeStr.PadRight(8)).Append(' ');
 
-            AppendTargetBadge(sb, req.Target, enableAnsi, 11);
+            AppendTargetBadge(sb, req.Target, locationByName, enableAnsi, 11);
             sb.Append(' ');
 
             sb.Append(PadRightDisplay(Truncate(req.Model, 17), 17)).Append(' ');
@@ -521,10 +565,11 @@ public static class TerminalMonitorRenderer
         lines.Add(sb.ToString());
     }
 
-    private static void AppendTargetBadge(StringBuilder sb, string target, bool enableAnsi, int padLength)
+    private static void AppendTargetBadge(StringBuilder sb, string target, IReadOnlyDictionary<string, TargetLocation> locationByName, bool enableAnsi, int padLength)
     {
-        var color = TargetColor(target);
-        var icon = TargetLabel(target);
+        var location = LocationOf(locationByName, target);
+        var color = TargetColor(location);
+        var icon = TargetLabel(target, location);
 
         if (enableAnsi) sb.Append(color);
         sb.Append(PadRightDisplay(icon, padLength));
