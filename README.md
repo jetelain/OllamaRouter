@@ -129,6 +129,31 @@ AI agent frameworks, orchestrators (such as [NightCodeForge](https://github.com/
 
    If the requested target is enabled in `targetAvailability`, OllamaRouter honors the pin immediately. If the requested target is currently disabled, it logs a warning and falls back to dynamic routing.
 
+   **Location-scoped pins (allow-lists):** Instead of a concrete target name, the header may carry a *location scope* — the case-insensitive keywords `local`, `remote`, or `cloud`, optionally comma-separated (e.g. `local,remote`):
+
+   | Header value | Effect |
+   |---|---|
+   | `local` | Only targets classified 🖥️ **Local** (loopback: `localhost`, `127.0.0.1`, `::1`) may serve. |
+   | `remote` | Only targets classified 📡 **Remote** (LAN: RFC 1918 / ULA / link-local IPs, `.local`, `.ts.net`, single-label hostnames) may serve. |
+   | `cloud` | The **Cloud** pseudo-target (exact pin, identical to today's `Cloud` behavior). |
+   | `local,remote` | Allow-list: only Local- and Remote-classified targets may serve (the "keep it off ollama.com" privacy scope). Duplicates collapse; each comma-separated token is trimmed individually. |
+
+   - **Exact-name precedence:** A configured target *named* `remote` (or `local`/`cloud`) is always an exact pin — scope keywords are only parsed after exact-name matching fails.
+   - **No-cloud-leak semantics:** A scope that excludes `cloud` (e.g. `local,remote`) never fails over to the Cloud relay: if no in-scope target can serve, the existing `503` all-offline diagnostics are returned rather than silently sending the request to ollama.com. A `{Cloud}`-only scope with Cloud Overflow unavailable mirrors today's pinned-`Cloud` behavior (warning + unscooped dynamic routing, not a hard 503).
+   - **Invalid tokens:** Any empty or unknown token (e.g. `local,,remote`, `banana`) invalidates the whole header — the request falls back to dynamic routing (completions) or the primary target (pinned-management), exactly as with an unrecognized name.
+   - **Telemetry:** The response `X-OllamaRouter-Target` header always echoes the **concrete** target that served the request, never a scope keyword.
+   - **Pinned-management endpoints** (`/api/pull`, `/api/delete`, `/api/copy`, `/api/create`) honor a scope by routing to the first enabled + routable target of an allowed location (declaration order), falling back to the primary target with a warning when none is routable.
+
+   Example — LAN-only inference that never touches ollama.com:
+   ```http
+   POST /api/chat HTTP/1.1
+   Host: localhost:11434
+   X-OllamaRouter-Target: local,remote
+   Content-Type: application/json
+   ```
+
+   Target locations are classified by the `OllamaRouter:Targets[i]:Location` override when set, otherwise from the configured `Url` (see the monitor UI's 🖥️/📡/☁️ icons, which show the same classification).
+
 
 ### Other endpoints
 

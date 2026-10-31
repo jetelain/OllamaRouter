@@ -54,6 +54,10 @@ public class RoutingDecisionServiceTests
         public Task<RoutingDecisionResult> DecideDetailed(int tokens, string model, int? numCtx = null, string? sessionId = null)
             => SUT.DecideWithEvaluationsDetailedAsync(tokens, model, numCtx, e => Evaluations.Add(e), sessionId: sessionId);
 
+        public Task<RoutingDecisionResult> DecideScoped(
+            int tokens, string model, IReadOnlySet<TargetLocation>? allowedLocations, string? sessionId = null)
+            => SUT.DecideWithEvaluationsDetailedAsync(tokens, model, null, e => Evaluations.Add(e), sessionId: sessionId, allowedLocations: allowedLocations);
+
         public RoutingCandidateEvaluation? Eval(RoutingTarget t) => Evaluations.LastOrDefault(e => e.Target == t);
     }
 
@@ -2502,5 +2506,296 @@ public class RoutingDecisionServiceTests
         }
 
         return meta;
+    }
+
+    // ==================================================================
+    // Location-scoped pins (task #40): X-OllamaRouter-Target scope keywords
+    // (local / remote / cloud) restrict the Stage-1 candidate set. Fleet fixture:
+    //   Local  @ loopback        → TargetLocation.Local
+    //   Remote @ 192.168.1.25    → TargetLocation.Remote
+    //   edge   @ public hostname → TargetLocation.Cloud (classifier fail-safe class)
+    // ==================================================================
+
+    private const string ScopeLocalUrl = "http://127.0.0.1:11435";
+    private const string ScopeRemoteUrl = "http://192.168.1.25:11435";
+    private const string ScopeEdgeUrl = "http://public.example.com:11435";
+
+    private static readonly OllamaTargetOptions ScopeLocal = new() { Name = "Local", Url = ScopeLocalUrl, MaxVramMB = 16384, MaxParallel = 1 };
+    private static readonly OllamaTargetOptions ScopeRemote = new() { Name = "Remote", Url = ScopeRemoteUrl, MaxVramMB = 16384, MaxParallel = 1 };
+    private static readonly OllamaTargetOptions ScopeEdge = new() { Name = "edge", Url = ScopeEdgeUrl, MaxVramMB = 16384, MaxParallel = 1 };
+
+    private static readonly RoutingTarget TScopeLocal = new("Local");
+    private static readonly RoutingTarget TScopeRemote = new("Remote");
+    private static readonly RoutingTarget TScopeEdge = new("edge");
+
+    private static OllamaRouterOptions ScopeOptions(
+        string model,
+        string? cloudModel = null,
+        bool dispatchToLargestCapacityOnOverflow = true,
+        IList<OllamaTargetOptions>? targets = null)
+    {
+        return new OllamaRouterOptions
+        {
+            Targets = targets is { Count: > 0 } ? targets : new List<OllamaTargetOptions> { ScopeLocal, ScopeRemote, ScopeEdge },
+            Models = new Dictionary<string, ModelThresholds>
+            {
+                [model] = new ModelThresholds { CloudModel = cloudModel }
+            },
+            DispatchToLargestCapacityOnOverflow = dispatchToLargestCapacityOnOverflow
+        };
+    }
+
+    private static HashSet<string> ScopeCatalog(string model)
+        => new() { $"{ScopeLocalUrl}|{model}", $"{ScopeRemoteUrl}|{model}", $"{ScopeEdgeUrl}|{model}" };
+
+    private static MetaMap AddScopeDense(MetaMap meta, string model, long paramCount)
+    {
+        foreach (var url in new[] { ScopeLocalUrl, ScopeRemoteUrl, ScopeEdgeUrl })
+        {
+            meta.Add(url, model, DenseShow(paramCount), 16 * Gb);
+        }
+
+        return meta;
+    }
+
+    // A4 — null scope ⇒ byte-identical artifacts: a full-locations scope set evaluates exactly
+    // the same candidate list (same targets, scores, details) as the unscooped pipeline.
+    [Fact]
+    public async Task Scope_NullScope_FullScopeSet_ArtifactsByteIdentical()
+    {
+        var meta = AddScopeDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+
+        var unscooped = new List<RoutingCandidateEvaluation>();
+        var unscoopedHarness = BuildScope(
+            ScopeOptions("qwen3.8-27B"),
+            withEngine: true,
+            catalogModels: ScopeCatalog("qwen3.8-27B"),
+            onlineTargets: new() { "Local", "Remote", "edge" },
+            meta: meta).Harness;
+        var r1 = await unscoopedHarness.SUT.DecideWithEvaluationsDetailedAsync(
+            30_000, "qwen3.8-27B", null, e => unscooped.Add(e));
+
+        var (h, _) = BuildScope(
+            ScopeOptions("qwen3.8-27B"),
+            withEngine: true,
+            catalogModels: ScopeCatalog("qwen3.8-27B"),
+            onlineTargets: new() { "Local", "Remote", "edge" },
+            meta: meta);
+        var fullScope = (IReadOnlySet<TargetLocation>)new HashSet<TargetLocation>
+            { TargetLocation.Local, TargetLocation.Remote, TargetLocation.Cloud };
+        var r2 = await h.DecideScoped(30_000, "qwen3.8-27B", fullScope);
+
+        Assert.Equal(r1.Target, r2.Target);
+        Assert.Equal(unscooped.Count, h.Evaluations.Count);
+        for (var i = 0; i < unscooped.Count; i++)
+        {
+            Assert.Equal(unscooped[i], h.Evaluations[i]);
+        }
+    }
+
+    private static (Harness Harness, MetaMap Meta) BuildScope(
+        OllamaRouterOptions options,
+        bool withEngine,
+        HashSet<string> catalogModels,
+        HashSet<string> onlineTargets,
+        MetaMap? meta = null,
+        HashSet<RoutingTarget>? disabled = null,
+        ISessionAffinityService? sessionAffinity = null)
+    {
+        // Reuse the shared harness (the liveness mock keys on target NAMES, which are
+        // agnostic to the fleet fixture).
+        return Build(
+            options,
+            withEngine,
+            catalogModels,
+            onlineTargets,
+            disabled: disabled,
+            meta: meta,
+            sessionAffinity: sessionAffinity);
+    }
+
+    // A1 — {Local, Remote} with every in-scope target context-overflowing: the Cloud
+    // pseudo-target never appears in evaluations (even though it is configured and would
+    // normally be a score-0 candidate), and the DispatchToLargestCapacityOnOverflow escape
+    // hatch is restricted to in-scope candidates. With dispatch=true the in-scope
+    // overflow winner (Local) is returned; with dispatch=false ⇒ NoAvailableTargetException.
+    [Fact]
+    public async Task Scope_LocalRemote_AllOverflow_CloudNeverCandidate()
+    {
+        var meta = AddScopeDense(new MetaMap(), "m", 27_800_000_000);
+        // Modelfile num_ctx 4096 pins CMax everywhere: 30k + 8192 does not fit any target.
+        foreach (var url in new[] { ScopeLocalUrl, ScopeRemoteUrl, ScopeEdgeUrl })
+        {
+            meta.Add(url, "m", new JsonObject
+            {
+                ["model_info"] = new JsonObject { ["general.parameter_count"] = (JsonNode)27_800_000_000L },
+                ["parameters"] = "num_ctx 4096"
+            }, 16 * Gb);
+        }
+
+        var scope = (IReadOnlySet<TargetLocation>)new HashSet<TargetLocation>
+            { TargetLocation.Local, TargetLocation.Remote };
+
+        // Case 1: dispatch=true — the in-scope overflow winner (Local) is picked, never Cloud.
+        {
+            var (h, _) = BuildScope(
+                ScopeOptions("m", cloudModel: "cloud-model:1b", dispatchToLargestCapacityOnOverflow: true),
+                withEngine: true,
+                catalogModels: new() { $"{ScopeLocalUrl}|m", $"{ScopeRemoteUrl}|m", $"{ScopeEdgeUrl}|m" },
+                onlineTargets: new() { "Local", "Remote", "edge" },
+                meta: meta);
+
+            var result = await h.DecideScoped(30_000, "m", scope);
+
+            // The escape hatch picks the largest in-scope overflow candidate (Local), never Cloud.
+            Assert.Equal(TScopeLocal, result.Target);
+            Assert.True(result.IsFallback);
+            // Cloud is NOT in evaluations (the privacy scope excludes it).
+            Assert.DoesNotContain(h.Evaluations, e => e.Target == RoutingTarget.Cloud);
+            // Out-of-scope edge is NOT in evaluations.
+            Assert.DoesNotContain(h.Evaluations, e => e.Target == TScopeEdge);
+            // In-scope targets ARE in evaluations (context-overflowed).
+            Assert.Equal(new[] { TScopeLocal, TScopeRemote }, h.Evaluations.Select(e => e.Target).ToArray());
+            Assert.StartsWith("context overflow", h.Eval(TScopeLocal)!.DisqualifiedReason);
+            Assert.StartsWith("context overflow", h.Eval(TScopeRemote)!.DisqualifiedReason);
+        }
+
+        // Case 2: dispatch=false — NoAvailableTargetException (no in-scope qualified target,
+        // Cloud excluded by scope).
+        {
+            var (h, _) = BuildScope(
+                ScopeOptions("m", cloudModel: "cloud-model:1b", dispatchToLargestCapacityOnOverflow: false),
+                withEngine: true,
+                catalogModels: new() { $"{ScopeLocalUrl}|m", $"{ScopeRemoteUrl}|m", $"{ScopeEdgeUrl}|m" },
+                onlineTargets: new() { "Local", "Remote", "edge" },
+                meta: meta);
+
+            await Assert.ThrowsAsync<NoAvailableTargetException>(() => h.DecideScoped(30_000, "m", scope));
+            Assert.DoesNotContain(h.Evaluations, e => e.Target == RoutingTarget.Cloud);
+        }
+
+        // Case 3 (contrast): unscooped with dispatch=false and Cloud configured — Cloud WOULD
+        // normally be a score-0 candidate. With the scope, Cloud is excluded.
+        {
+            var (h, _) = BuildScope(
+                ScopeOptions("m", cloudModel: "cloud-model:1b"),
+                withEngine: true,
+                catalogModels: new() { $"{ScopeLocalUrl}|m", $"{ScopeRemoteUrl}|m", $"{ScopeEdgeUrl}|m" },
+                onlineTargets: new() { "Local", "Remote", "edge" },
+                meta: meta);
+
+            var result = await h.Decide(30_000, "m");
+            // Without scope: Cloud is a candidate (score 0) and wins over in-scope overflow.
+            Assert.Equal(RoutingTarget.Cloud, result);
+            Assert.Contains(h.Evaluations, e => e.Target == RoutingTarget.Cloud && e.Qualified);
+        }
+    }
+
+    // A2 — {Local} alone picks the loopback target when qualified.
+    [Fact]
+    public async Task Scope_LocalOnly_LoopbackTargetWins()
+    {
+        var meta = AddScopeDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        var (h, _) = BuildScope(
+            ScopeOptions("qwen3.8-27B", cloudModel: "cloud-model:1b"),
+            withEngine: true,
+            catalogModels: ScopeCatalog("qwen3.8-27B"),
+            onlineTargets: new() { "Local", "Remote", "edge" },
+            meta: meta);
+
+        var scope = (IReadOnlySet<TargetLocation>)new HashSet<TargetLocation> { TargetLocation.Local };
+        var result = await h.DecideScoped(30_000, "qwen3.8-27B", scope);
+
+        Assert.Equal(TScopeLocal, result.Target);
+        Assert.Contains(h.Evaluations, e => e.Target == TScopeLocal);
+        Assert.DoesNotContain(h.Evaluations, e => e.Target == TScopeRemote || e.Target == TScopeEdge);
+    }
+
+    // A3 — scope with zero qualified in-scope candidates ⇒ NoAvailableTargetException
+    // (the only in-scope target is offline; out-of-scope targets cannot rescue the request).
+    [Fact]
+    public async Task Scope_NoQualifiedInScope_ThrowsNoAvailableTarget()
+    {
+        var meta = AddScopeDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        // Remote is online + cataloged (out of the {Local} scope); Local is offline.
+        var (h, _) = BuildScope(
+            ScopeOptions("qwen3.8-27B", cloudModel: "cloud-model:1b"),
+            withEngine: true,
+            catalogModels: new() { $"{ScopeLocalUrl}|qwen3.8-27B", $"{ScopeRemoteUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Remote" },
+            meta: meta);
+
+        var scope = (IReadOnlySet<TargetLocation>)new HashSet<TargetLocation> { TargetLocation.Local };
+        await Assert.ThrowsAsync<NoAvailableTargetException>(() => h.DecideScoped(30_000, "qwen3.8-27B", scope));
+
+        Assert.Contains(h.Evaluations, e => e.Target == TScopeLocal && !e.Qualified);
+        Assert.DoesNotContain(h.Evaluations, e => e.Target == TScopeRemote);
+    }
+
+    // A5 — a session lease bound to an out-of-scope target is ignored for the Stage-2 bonus
+    // and the final-winner lease write RE-BINDS the session to the in-scope winner.
+    [Fact]
+    public async Task Scope_SessionLeaseOutOfScope_IgnoredAndReboundToInScopeWinner()
+    {
+        var meta = AddScopeDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        var affinity = new SessionAffinityService(
+            Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions { SessionAffinityTtlMinutes = 30 }),
+            NullLogger<SessionAffinityService>.Instance);
+
+        var (h, _) = BuildScope(
+            ScopeOptions("qwen3.8-27B"),
+            withEngine: true,
+            catalogModels: ScopeCatalog("qwen3.8-27B"),
+            onlineTargets: new() { "Local", "Remote", "edge" },
+            meta: meta,
+            sessionAffinity: affinity);
+
+        // Pre-lease the session to the out-of-scope edge (Cloud-class) target.
+        affinity.SetAffinity("s1", TScopeEdge);
+        Assert.True(affinity.TryGetAffinity("s1", out var leased));
+        Assert.Equal(TScopeEdge, leased);
+
+        var scope = (IReadOnlySet<TargetLocation>)new HashSet<TargetLocation>
+            { TargetLocation.Local, TargetLocation.Remote };
+        var result = await h.DecideScoped(30_000, "qwen3.8-27B", scope, sessionId: "s1");
+
+        // Local (first in-scope in declaration order) wins; it never earned the out-of-scope
+        // lease's SessionAffinityBonus (no evaluation artifact carries it for edge — edge is
+        // not even a candidate).
+        Assert.Equal(TScopeLocal, result.Target);
+        Assert.All(h.Evaluations, e => Assert.Equal(0, e.SessionAffinityBonus));
+        Assert.DoesNotContain(h.Evaluations, e => e.Target == TScopeEdge);
+
+        // The final-winner lease write re-binds the session to the in-scope winner.
+        Assert.True(affinity.TryGetAffinity("s1", out var rebound));
+        Assert.Equal(TScopeLocal, rebound);
+    }
+
+    // A6 — a target LITERALLY named "remote": exact-name precedence is a parse concern, but
+    // the classifier still treats it by its URL — a loopback URL classifies as Local, so it is
+    // INCLUDED in a {Local} scope and excluded from a {Remote} scope.
+    [Fact]
+    public async Task Scope_TargetNamedRemote_ClassifiedByUrl_IncludedInLocalScope()
+    {
+        var options = ScopeOptions(
+            "qwen3.8-27B",
+            targets: [new OllamaTargetOptions { Name = "remote", Url = "http://127.0.0.1:11436", MaxVramMB = 16384, MaxParallel = 1 }]);
+        var meta = new MetaMap();
+        meta.Add("http://127.0.0.1:11436", "qwen3.8-27B", DenseShow(27_800_000_000), 16 * Gb);
+
+        var (h, _) = BuildScope(
+            options,
+            withEngine: true,
+            catalogModels: new() { "http://127.0.0.1:11436|qwen3.8-27B" },
+            onlineTargets: new() { "remote" },
+            meta: meta);
+
+        var localScope = (IReadOnlySet<TargetLocation>)new HashSet<TargetLocation> { TargetLocation.Local };
+        var result = await h.DecideScoped(30_000, "qwen3.8-27B", localScope);
+        Assert.Equal(new RoutingTarget("remote"), result.Target);
+        Assert.Contains(h.Evaluations, e => e.Target == new RoutingTarget("remote") && e.Qualified);
+
+        var remoteScope = (IReadOnlySet<TargetLocation>)new HashSet<TargetLocation> { TargetLocation.Remote };
+        await Assert.ThrowsAsync<NoAvailableTargetException>(() => h.DecideScoped(30_000, "qwen3.8-27B", remoteScope));
     }
 }

@@ -61,4 +61,33 @@ public interface IRoutingDecisionService
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <exception cref="NoAvailableTargetException">Thrown when no candidate passes Stage 1 and Cloud is unavailable.</exception>
     Task<RoutingDecisionResult> DecideDetailedAsync(int tokenCount, string modelName, int? clientRequestedNumCtx = null, string? sessionId = null, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Determines the routing target for the request under a LOCATION SCOPE: only fleet
+    /// targets whose <c>TargetLocation</c> (per <see cref="TargetLocationClassifier"/>,
+    /// <c>Location</c>-override aware) is in <paramref name="allowedLocations"/> participate
+    /// as Stage-1 candidates, and the Cloud pseudo-target participates only when
+    /// <see cref="TargetLocation.Cloud"/> is allowed. A scope-excluded target emits no
+    /// evaluation artifact and can never win — the <c>DispatchToLargestCapacityOnOverflow</c>
+    /// escape hatch is restricted to in-scope candidates, so a privacy scope (e.g.
+    /// <c>local,remote</c>) fails with <see cref="NoAvailableTargetException"/> instead of
+    /// leaking to ollama.com. A session lease bound to an out-of-scope target is ignored for
+    /// the Stage-2 bonus and is naturally re-bound to the in-scope winner by the final-winner
+    /// lease write. A null <paramref name="allowedLocations"/> behaves byte-identically to the
+    /// stateless overload.
+    /// </summary>
+    /// <param name="tokenCount">Estimated token count of the prompt.</param>
+    /// <param name="modelName">Name of the model targeted by the request.</param>
+    /// <param name="clientRequestedNumCtx">The client's static <c>options.num_ctx</c>, if any.</param>
+    /// <param name="sessionId">The opaque session/agent identifier, or null/blank for stateless routing.</param>
+    /// <param name="allowedLocations">The allowed target locations (location scope), or null for the unscooped pipeline.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <exception cref="NoAvailableTargetException">Thrown when no IN-SCOPE candidate passes Stage 1 and Cloud is out of scope or unavailable.</exception>
+    Task<RoutingDecisionResult> DecideDetailedAsync(
+        int tokenCount,
+        string modelName,
+        int? clientRequestedNumCtx,
+        string? sessionId,
+        IReadOnlySet<TargetLocation>? allowedLocations,
+        CancellationToken cancellationToken = default);
 }

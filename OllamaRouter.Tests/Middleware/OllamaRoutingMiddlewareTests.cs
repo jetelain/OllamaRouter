@@ -3228,4 +3228,358 @@ public class OllamaRoutingMiddlewareTests
         metricsRecorder.Verify(r => r.Record(It.IsAny<TokenMetricsCsvRecord>()), Times.Never);
         activityMonitor.Verify(m => m.CompleteRequest(requestId, It.IsAny<ActivityLogEntry>()), Times.Once);
     }
+
+
+
+    // ================================================================================
+    // Location-scoped X-OllamaRouter-Target pins (task #40): bare keywords (local / remote /
+    // cloud) and comma allow-lists select targets BY LOCATION when no configured target bears
+    // that exact name; exact names keep precedence; the response telemetry always echoes the
+    // CONCRETE target name, never the scope keyword. The scope-test fleet below is deliberately
+    // named WITHOUT the scope keywords (Loop / Lan / Edge) so the headers genuinely parse as
+    // location scopes rather than exact-name pins.
+    // ================================================================================
+
+    private const string ScopeLoopUrl = "http://127.0.0.1:11435";         // Loop → Local
+    private const string ScopeLanUrl = "http://192.168.1.25:11435";       // Lan  → Remote
+    private const string ScopeEdgeUrl = "http://edge.public.example:11435"; // Edge → Cloud class
+
+    private static OllamaRouterOptions ScopeFleetOptions() => new()
+    {
+        Targets = new List<OllamaTargetOptions>
+        {
+            new() { Name = "Loop", Url = ScopeLoopUrl, MaxParallel = 1, Enabled = true },
+            new() { Name = "Lan", Url = ScopeLanUrl, MaxParallel = 1, Enabled = true },
+            new() { Name = "Edge", Url = ScopeEdgeUrl, MaxParallel = 1, Enabled = true }
+        }
+    };
+
+    private static readonly HashSet<TargetLocation> LocalScopeSet = new() { TargetLocation.Local };
+    private static readonly HashSet<TargetLocation> RemoteScopeSet = new() { TargetLocation.Remote };
+    private static readonly HashSet<TargetLocation> LocalRemoteScopeSet = new() { TargetLocation.Local, TargetLocation.Remote };
+
+    private static OllamaRoutingMiddleware BuildScopeSut(
+        Mock<IRoutingDecisionService> decision,
+        Mock<ITargetAvailabilityService>? availability = null,
+        Mock<ITargetLivenessService>? liveness = null,
+        ISessionAffinityService? sessionAffinity = null,
+        OllamaRouterOptions? options = null)
+    {
+        var (defaultAvailability, defaultLiveness) = OnlineMocks();
+        return new OllamaRoutingMiddleware(
+            _ => Task.CompletedTask,
+            Estimator().Object,
+            decision.Object,
+            new Mock<IModelCatalogCacheService>().Object,
+            new Mock<IActivityMonitorService>().Object,
+            new Mock<IActivityStatisticsService>().Object,
+            new Mock<IInferenceRequestRecorder>().Object,
+            (availability ?? defaultAvailability).Object,
+            (liveness ?? defaultLiveness).Object,
+            new ModelCapabilityEngine(new Mock<IOllamaModelCatalogClient>().Object, new MemoryCache(new MemoryCacheOptions()), NullLogger<ModelCapabilityEngine>.Instance),
+            MsOptions.Create(options ?? ScopeFleetOptions()),
+            NullLogger<OllamaRoutingMiddleware>.Instance,
+            CreateForwarder(_ => Task.CompletedTask).Object,
+            new TargetFailureStreakService(),
+            new Mock<ITargetExecutionTracker>().Object,
+            contextShrinkManager: null,
+            sessionAffinity,
+            tokenMetricsRecorder: null);
+    }
+
+    // Content-based Moq matcher for IReadOnlySet<TargetLocation> (Moq matches reference
+    // equality by default, so scope-SET arguments must be matched by content).
+    private static object ScopeSetIsEqualTo(HashSet<TargetLocation> expected) =>
+        It.Is<IReadOnlySet<TargetLocation>>(set => set != null && set.SetEquals(expected));
+
+    // B1 — scope keywords (no target named that way in the fleet) route via the scoped
+    // decision overload and the telemetry headers echo the CONCRETE decided target name,
+    // never the keyword.
+    [Fact]
+    public async Task ScopePin_ScopeKeywords_RouteViaScopedDecision_EchoConcreteTarget()
+    {
+        foreach (var (header, scopeSet, expectedTarget) in new[]
+        {
+            ("local", LocalScopeSet, new RoutingTarget("Loop")),
+            ("REMOTE", RemoteScopeSet, new RoutingTarget("Lan")),
+            ("local,remote", LocalRemoteScopeSet, new RoutingTarget("Loop"))
+        })
+        {
+            var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Hello" }""");
+            context.Request.Headers["X-OllamaRouter-Target"] = header;
+
+            var decision = new Mock<IRoutingDecisionService>();
+            decision
+                .Setup(r => r.DecideDetailedAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<string?>(), (IReadOnlySet<TargetLocation>)ScopeSetIsEqualTo(scopeSet), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new RoutingDecisionResult(expectedTarget));
+
+            var sut = BuildScopeSut(decision);
+            await sut.InvokeAsync(context);
+
+            // The request goes to the decided CONCRETE target — never the scope keyword.
+            Assert.Equal(expectedTarget.ToString(), context.Request.Headers["X-Ollama-Target"].ToString());
+            Assert.Equal(expectedTarget.ToString(), context.Response.Headers["X-OllamaRouter-Target"].ToString());
+            Assert.NotEqual(header.Trim().ToLowerInvariant(), context.Response.Headers["X-OllamaRouter-Target"].ToString().ToLowerInvariant());
+
+            // The scoped overload (6-arg) was consulted exactly once with the parsed scope.
+            decision.Verify(r => r.DecideDetailedAsync(
+                    It.Is<int>(t => t == 100), "llama3", It.IsAny<int?>(), It.IsAny<string?>(),
+                    It.Is<IReadOnlySet<TargetLocation>>(s => !ReferenceEquals(s, null) && s.SetEquals(scopeSet)), It.IsAny<CancellationToken>()),
+                Times.Once);
+        }
+    }
+
+    // B1 (cloud) — "cloud" alone is the EXACT Cloud pseudo-target pin (byte-identical to
+    // today's behavior), not a scope: the exact pin is honored and the Cloud relay maps to
+    // the relay target's name in the internal header.
+    [Fact]
+    public async Task ScopePin_CloudAlone_IsExactCloudPin_NotAScope()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Hello" }""");
+        context.Request.Headers["X-OllamaRouter-Target"] = "cloud";
+
+        var decision = new Mock<IRoutingDecisionService>();
+        var sut = BuildScopeSut(decision);
+        await sut.InvokeAsync(context);
+
+        // Cloud relay: the internal header carries the first effective target's name; the
+        // public telemetry echoes the logical Cloud target (today's exact-pinned-Cloud behavior).
+        Assert.Equal("Loop", context.Request.Headers["X-Ollama-Target"].ToString());
+        Assert.Equal("Cloud", context.Response.Headers["X-OllamaRouter-Target"].ToString());
+        decision.Verify(r => r.DecideDetailedAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<string?>(), It.IsAny<IReadOnlySet<TargetLocation>>(), It.IsAny<CancellationToken>()), Times.Never);
+        decision.Verify(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    // B2 — exact-name precedence: a target LITERALLY named "remote" (OrdinalIgnoreCase, here
+    // "Remote") still exact-pins with the capability gate — the scope is never parsed.
+    [Fact]
+    public async Task ScopePin_TargetNamedRemote_ExactNameKeepsPrecedence()
+    {
+        // The default synthesized fleet (Local + Remote) names a target "Remote".
+        var context = BuildContext("/api/chat", FailoverBody);
+        context.Request.Headers["X-OllamaRouter-Target"] = "remote";
+
+        var cache = new Mock<IModelCatalogCacheService>();
+        cache.Setup(c => c.ModelExistsAsync(It.IsAny<string?>(), "llama3", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true); // capable: the model exists on the pinned target
+
+        var decision = new Mock<IRoutingDecisionService>();
+        var forwardedUrls = new List<string>();
+        var forwarder = new Mock<IHttpForwarder>();
+        forwarder.Setup(f => f.SendAsync(
+                It.IsAny<HttpContext>(), It.IsAny<string>(), It.IsAny<HttpMessageInvoker>(),
+                It.IsAny<ForwarderRequestConfig>(), It.IsAny<HttpTransformer>(), It.IsAny<CancellationToken>()))
+            .Callback<HttpContext, string, HttpMessageInvoker, ForwarderRequestConfig, HttpTransformer, CancellationToken>(
+                (c, url, _, _, _, _) => forwardedUrls.Add(url))
+            .Returns(new ValueTask<ForwarderError>(ForwarderError.None));
+
+        var sut = CreateSut(_ => Task.CompletedTask, Estimator(), decision, modelCatalogCache: cache, forwarder: forwarder);
+        await sut.InvokeAsync(context);
+
+        // Exact-pinned to Remote (its URL), capability gate probed — NO scoped decision ran.
+        Assert.Equal(new[] { "http://remote:11434" }, forwardedUrls);
+        Assert.Equal("Remote", context.Request.Headers["X-Ollama-Target"].ToString());
+        decision.Verify(r => r.DecideDetailedAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<string?>(), It.IsAny<IReadOnlySet<TargetLocation>>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    // B3 — "local,remote" with nothing in scope able to serve (the scoped decision throws
+    // NoAvailableTargetException and the fleet is truly all offline) ⇒ the EXISTING 503
+    // diagnostics fire — never the Cloud relay, never an unscooped fall-through.
+    [Fact]
+    public async Task ScopePin_LocalRemote_NothingInScope_Returns503_NeverCloud()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Bonjour" }""");
+        context.Request.Headers["X-OllamaRouter-Target"] = "local,remote";
+        var responseBody = new MemoryStream();
+        context.Response.Body = responseBody;
+
+        var decision = new Mock<IRoutingDecisionService>();
+        decision
+            .Setup(r => r.DecideDetailedAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<string?>(), (IReadOnlySet<TargetLocation>)ScopeSetIsEqualTo(LocalRemoteScopeSet), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new NoAvailableTargetException("No enabled routing target is available to handle the request for model 'llama3'."));
+
+        var (availability, _) = OnlineMocks();
+        var liveness = AllOfflineLiveness(); // fleet truly all offline ⇒ rich 503 diagnostics
+
+        var sut = BuildScopeSut(decision, availability: availability, liveness: liveness);
+        await sut.InvokeAsync(context);
+
+        Assert.Equal(503, context.Response.StatusCode);
+        responseBody.Seek(0, SeekOrigin.Begin);
+        var body = new StreamReader(responseBody).ReadToEnd();
+        Assert.Contains("All fleet targets are offline", body);
+        // The UNSCOPED decision must never run (no silent cloud / fleet fall-through).
+        decision.Verify(r => r.DecideDetailedAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Never);
+        decision.Verify(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    // B3 (happy half) — "local,remote" with the loopback offline: the scoped decision picks
+    // the LAN target and the telemetry echoes its concrete name.
+    [Fact]
+    public async Task ScopePin_LocalRemote_LoopbackOffline_LanTargetChosen()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Bonjour" }""");
+        context.Request.Headers["X-OllamaRouter-Target"] = "local,remote";
+
+        var decision = new Mock<IRoutingDecisionService>();
+        decision
+            .Setup(r => r.DecideDetailedAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<string?>(), (IReadOnlySet<TargetLocation>)ScopeSetIsEqualTo(LocalRemoteScopeSet), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new RoutingDecisionResult(new RoutingTarget("Lan")));
+
+        var sut = BuildScopeSut(decision);
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("Lan", context.Request.Headers["X-Ollama-Target"].ToString());
+        Assert.Equal("Lan", context.Response.Headers["X-OllamaRouter-Target"].ToString());
+    }
+
+    // B4 — a scope that collapses to {Cloud} ("cloud,cloud") with Cloud Overflow UNAVAILABLE:
+    // mirrors today's pinned-Cloud behavior — warning + unscooped dynamic routing (NOT a
+    // hard 503, NOT a scoped decision).
+    [Fact]
+    public async Task ScopePin_CloudOnlyScope_CloudUnavailable_FallsBackToUnscopedDynamicRouting()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Hello" }""");
+        context.Request.Headers["X-OllamaRouter-Target"] = "cloud,cloud"; // collapses to {Cloud}
+
+        var decision = new Mock<IRoutingDecisionService>();
+        decision
+            .Setup(r => r.DecideAsync(100, "llama3", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new RoutingTarget("Loop"));
+
+        // Cloud Overflow unavailable: the targets.json Cloud toggle is off (an empty
+        // availability mock returns false for Cloud) while the fleet targets stay enabled,
+        // so the decision result (Loop) survives the all-offline gate and gets dispatched.
+        var availability = new Mock<ITargetAvailabilityService>();
+        availability.Setup(t => t.IsEnabled(RoutingTarget.Cloud)).Returns(false);
+        availability.Setup(t => t.IsEnabled(It.IsAny<RoutingTarget>())).Returns(true);
+
+        var sut = BuildScopeSut(decision, availability: availability);
+        await sut.InvokeAsync(context);
+
+        // Unscooped dynamic routing ran; no 503, no scoped decision.
+        Assert.Equal("Loop", context.Request.Headers["X-Ollama-Target"].ToString());
+        Assert.Equal(200, context.Response.StatusCode);
+        decision.Verify(r => r.DecideAsync(100, "llama3", It.IsAny<int?>(), It.IsAny<CancellationToken>()), Times.Once);
+        decision.Verify(r => r.DecideDetailedAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<string?>(), It.IsAny<IReadOnlySet<TargetLocation>>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    // B5 — pinned-management scope "remote": the FIRST enabled + routable Remote-location
+    // target in declaration order wins; the response header echoes the CONCRETE name.
+    [Fact]
+    public async Task ScopePin_Management_FirstInScopeRoutableTarget_Wins()
+    {
+        var context = BuildContext("/api/pull", """{ "model": "llama3" }""");
+        context.Request.Headers["X-OllamaRouter-Target"] = "remote";
+
+        var sut = BuildScopeSut(new Mock<IRoutingDecisionService>());
+        await sut.InvokeAsync(context);
+
+        // Fleet: Loop(Local) → Lan(Remote) → Edge(Cloud-class). First in-scope Remote
+        // target in declaration order is Lan; the keyword is never echoed.
+        Assert.Equal("Lan", context.Request.Headers["X-Ollama-Target"].ToString());
+        Assert.Equal("Lan", context.Response.Headers["X-OllamaRouter-Target"].ToString());
+    }
+
+    // B5 (fallback) — management scope "remote" with the only in-scope target offline ⇒
+    // the PRIMARY target (first effective) + warning; the header echoes the concrete name.
+    [Fact]
+    public async Task ScopePin_Management_InScopeOffline_FallsBackToPrimary()
+    {
+        var context = BuildContext("/api/pull", """{ "model": "llama3" }""");
+        context.Request.Headers["X-OllamaRouter-Target"] = "remote";
+
+        var (availability, _) = OnlineMocks();
+        var liveness = new Mock<ITargetLivenessService>();
+        // Moq matches setups in REVERSE registration order: register the general fallback
+        // FIRST, then the specific Lan-offline setup so it is consulted first.
+        liveness.Setup(t => t.EnsureKnownAsync(It.IsAny<RoutingTarget>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(TargetLivenessState.Online);
+        liveness.Setup(t => t.EnsureKnownAsync(new RoutingTarget("Lan"), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(TargetLivenessState.Offline);
+        liveness.Setup(t => t.IsOnline(It.IsAny<RoutingTarget>())).Returns(true);
+        liveness.SetupGet(t => t.ServiceStartTimeUtc).Returns(DateTimeOffset.UtcNow.AddHours(1)); // outside grace
+        liveness.Setup(t => t.GetFleetTargets()).Returns(new RoutingTarget[] { "Loop", "Lan", "Edge" });
+        liveness.Setup(t => t.GetEntries())
+            .Returns(new Dictionary<RoutingTarget, TargetLivenessEntry>
+            {
+                [new RoutingTarget("Lan")] = new(new RoutingTarget("Lan"), TargetLivenessState.Offline, "timeout", DateTimeOffset.UtcNow)
+            });
+
+        var sut = BuildScopeSut(new Mock<IRoutingDecisionService>(), availability: availability, liveness: liveness);
+        await sut.InvokeAsync(context);
+
+        // No in-scope routable target ⇒ the primary (first effective = Loop) fallback.
+        Assert.Equal("Loop", context.Request.Headers["X-Ollama-Target"].ToString());
+        Assert.Equal("Loop", context.Response.Headers["X-OllamaRouter-Target"].ToString());
+    }
+
+    // B6 — invalid scope tokens ("local,,remote" with an empty token, "banana") ⇒ the whole
+    // header is unrecognized ⇒ the EXISTING fallbacks (dynamic for completions, primary for
+    // management), never a scoped decision.
+    [Fact]
+    public async Task ScopePin_InvalidTokens_HeaderIgnored_ExistingFallbacks()
+    {
+        // completions: empty token ⇒ unscooped dynamic routing.
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Hello" }""");
+        context.Request.Headers["X-OllamaRouter-Target"] = "local,,remote";
+        var decision = new Mock<IRoutingDecisionService>();
+        decision
+            .Setup(r => r.DecideAsync(100, "llama3", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new RoutingTarget("Loop"));
+        var sut = BuildScopeSut(decision);
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("Loop", context.Request.Headers["X-Ollama-Target"].ToString());
+        decision.Verify(r => r.DecideAsync(100, "llama3", It.IsAny<int?>(), It.IsAny<CancellationToken>()), Times.Once);
+        decision.Verify(r => r.DecideDetailedAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<string?>(), It.IsAny<IReadOnlySet<TargetLocation>>(), It.IsAny<CancellationToken>()), Times.Never);
+
+        // completions: unknown token ⇒ unscooped dynamic routing.
+        var context2 = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Hello" }""");
+        context2.Request.Headers["X-OllamaRouter-Target"] = "banana";
+        var decision2 = new Mock<IRoutingDecisionService>();
+        decision2
+            .Setup(r => r.DecideAsync(100, "llama3", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new RoutingTarget("Loop"));
+        var sut2 = BuildScopeSut(decision2);
+        await sut2.InvokeAsync(context2);
+        decision2.Verify(r => r.DecideAsync(100, "llama3", It.IsAny<int?>(), It.IsAny<CancellationToken>()), Times.Once);
+
+        // management: invalid scope ⇒ primary target (first effective = Loop).
+        var context3 = BuildContext("/api/pull", """{ "model": "llama3" }""");
+        context3.Request.Headers["X-OllamaRouter-Target"] = "local,,remote";
+        var sut3 = BuildScopeSut(new Mock<IRoutingDecisionService>());
+        await sut3.InvokeAsync(context3);
+        Assert.Equal("Loop", context3.Request.Headers["X-Ollama-Target"].ToString());
+        Assert.Equal("Loop", context3.Response.Headers["X-OllamaRouter-Target"].ToString());
+    }
+
+    // B7 — an HONORED scope pin on the completion path does NOT explicitly SetAffinity from
+    // the middleware (the decision service's natural final-winner lease write is the only
+    // lease write — contrast with an honored EXACT pin, which does SetAffinity).
+    [Fact]
+    public async Task ScopePin_HonoredScope_NoExplicitSetAffinityFromMiddleware()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "Hello" }""");
+        context.Request.Headers["X-OllamaRouter-Target"] = "local,remote";
+        context.Request.Headers["X-OllamaRouter-Session-Id"] = "session-1";
+
+        var decision = new Mock<IRoutingDecisionService>();
+        decision
+            .Setup(r => r.DecideDetailedAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.Is<string?>(s => s == "session-1"), (IReadOnlySet<TargetLocation>)ScopeSetIsEqualTo(LocalRemoteScopeSet), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new RoutingDecisionResult(new RoutingTarget("Loop")));
+
+        var affinity = new Mock<ISessionAffinityService>();
+        var sut = BuildScopeSut(decision, sessionAffinity: affinity.Object);
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("Loop", context.Request.Headers["X-Ollama-Target"].ToString());
+        // No explicit SetAffinity from the middleware for scope pins.
+        affinity.Verify(a => a.SetAffinity(It.IsAny<string>(), It.IsAny<RoutingTarget>()), Times.Never);
+        // The session ID was still passed to the scoped decision (the lease write happens there).
+        decision.Verify(r => r.DecideDetailedAsync(
+                It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.Is<string?>(s => s == "session-1"),
+                It.Is<IReadOnlySet<TargetLocation>>(s => !ReferenceEquals(s, null) && s.SetEquals(LocalRemoteScopeSet)), It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
 }

@@ -106,6 +106,15 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
     private int? GetEffectiveMaxVramMB(OllamaTargetOptions target) =>
         target.GetEffectiveMaxVramMB(_fleetHardware);
 
+    /// <summary>
+    /// Location-scope membership test for a fleet target: its
+    /// <see cref="TargetLocationClassifier"/> (Location-override aware) classification must be
+    /// in <paramref name="allowedLocations"/>. The <paramref name="allowedLocations"/> scope
+    /// being null means unscooped (everything in scope).
+    /// </summary>
+    internal static bool IsInScope(OllamaTargetOptions? target, IReadOnlySet<TargetLocation>? allowedLocations) =>
+        allowedLocations is null || allowedLocations.Contains(TargetLocationClassifier.Classify(target));
+
     public Task<RoutingTarget> DecideAsync(int tokenCount, string modelName, CancellationToken cancellationToken = default)
     {
         return DecideAsync(tokenCount, modelName, clientRequestedNumCtx: null, cancellationToken);
@@ -147,7 +156,28 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
                 "{Model}: Candidate {Target} qualified={Qualified} score={Score}: session={Session} {Detail}",
                 NormalizeModelName(modelName), evaluation.Target, evaluation.Qualified, evaluation.Score, evaluation.SessionAffinityBonus, evaluation.Detail),
             cancellationToken,
-            sessionId);
+            sessionId,
+            allowedLocations: null);
+    }
+
+    public Task<RoutingDecisionResult> DecideDetailedAsync(
+        int tokenCount,
+        string modelName,
+        int? clientRequestedNumCtx,
+        string? sessionId,
+        IReadOnlySet<TargetLocation>? allowedLocations,
+        CancellationToken cancellationToken = default)
+    {
+        return DecideWithEvaluationsDetailedAsync(
+            tokenCount,
+            modelName,
+            clientRequestedNumCtx,
+            evaluation => _logger.LogDebug(
+                "{Model}: Candidate {Target} qualified={Qualified} score={Score}: session={Session} {Detail}",
+                NormalizeModelName(modelName), evaluation.Target, evaluation.Qualified, evaluation.Score, evaluation.SessionAffinityBonus, evaluation.Detail),
+            cancellationToken,
+            sessionId,
+            allowedLocations);
     }
 
     /// <summary>
@@ -185,7 +215,8 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         int? clientRequestedNumCtx,
         Action<RoutingCandidateEvaluation> reportEvaluation,
         CancellationToken cancellationToken = default,
-        string? sessionId = null)
+        string? sessionId = null,
+        IReadOnlySet<TargetLocation>? allowedLocations = null)
     {
         var settings = _options.Value;
         var normalizedName = NormalizeModelName(modelName);
@@ -204,16 +235,41 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             clientRequestedNumCtx,
             sessionId);
 
-        var fleetTargets = settings.GetEffectiveTargets(_logger);
+        // ---- Location-scope candidate filter (null scope ⇒ byte-identical pipeline). ----
+        // A scope excludes out-of-scope fleet targets BEFORE Stage 1 (they emit no evaluation
+        // artifacts and can never win), gates the Cloud pseudo-target on Cloud being allowed,
+        // and — through reusing the filtered list below — restricts the Stage-1 loop, the
+        // speed-bonus post-pass and the DispatchToLargestCapacityOnOverflow escape hatch to
+        // in-scope candidates (a privacy scope must never leak to an out-of-scope relay).
+        var allFleetTargets = settings.GetEffectiveTargets(_logger);
+        var fleetTargets = allowedLocations is null
+            ? allFleetTargets
+            : allFleetTargets.Where(t => allowedLocations.Contains(TargetLocationClassifier.Classify(t))).ToList();
         var evaluations = new List<RoutingCandidateEvaluation>(fleetTargets.Count + 1);
 
         // ---- Session lease lookup (resolved ONCE before the fleet loop). ----
         // A null/absent store (null _sessionAffinity) or a blank sessionId ⇒ no pinned target:
         // the pipeline behaves byte-identically to the stateless (pre-affinity) formula.
+        // Under a location scope, a lease bound to an OUT-OF-SCOPE target is ignored for the
+        // Stage-2 bonus: that target was already excluded from the candidate list above, so it
+        // can never win, and the final-winner lease write below naturally re-binds the session
+        // to the in-scope winner (the stale out-of-scope lease is superseded, not preserved).
         RoutingTarget? pinnedTarget = null;
         if (_sessionAffinity is { } sessionAffinityService && !string.IsNullOrWhiteSpace(sessionId))
         {
             pinnedTarget = sessionAffinityService.TryGetAffinity(sessionId, out var pinned) ? pinned : null;
+            if (pinnedTarget is { } leased && allowedLocations is not null)
+            {
+                var leasedOptions = allFleetTargets.FirstOrDefault(t =>
+                    string.Equals(t.Name, leased.Value, StringComparison.OrdinalIgnoreCase));
+                if (!IsInScope(leasedOptions, allowedLocations))
+                {
+                    _logger.LogDebug(
+                        "{Model}: Session {Session} lease is bound to out-of-scope target {Target}; ignoring the bonus and re-binding to the in-scope winner.",
+                        normalizedName, sessionId, leased);
+                    pinnedTarget = null;
+                }
+            }
         }
 
         // ---- Stage 1 + Stage 2: every fleet target, in declaration order. ----
@@ -246,20 +302,25 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         }
 
         // ---- Cloud pseudo-target: fixed score 0, appended after all fleet targets. ----
-        if (await _cloudHandler.CanProcessAsync(context, cancellationToken))
+        // A scope that does not allow TargetLocation.Cloud excludes the pseudo-target entirely
+        // (a local/remote privacy scope must never leak to ollama.com).
+        if (allowedLocations is null || allowedLocations.Contains(TargetLocation.Cloud))
         {
-            var cloudEvaluation = new RoutingCandidateEvaluation(
-                RoutingTarget.Cloud,
-                Qualified: true,
-                Score: 0,
-                DisqualifiedReason: null,
-                AffinityBonus: 0,
-                HardwareBonus: 0,
-                EvictionPenalty: 0,
-                ConcurrencyPenalty: 0,
-                Detail: "Cloud overflow: fixed score 0 (terminal fallback, sorted after all fleet targets).");
-            evaluations.Add(cloudEvaluation);
-            reportEvaluation(cloudEvaluation);
+            if (await _cloudHandler.CanProcessAsync(context, cancellationToken))
+            {
+                var cloudEvaluation = new RoutingCandidateEvaluation(
+                    RoutingTarget.Cloud,
+                    Qualified: true,
+                    Score: 0,
+                    DisqualifiedReason: null,
+                    AffinityBonus: 0,
+                    HardwareBonus: 0,
+                    EvictionPenalty: 0,
+                    ConcurrencyPenalty: 0,
+                    Detail: "Cloud overflow: fixed score 0 (terminal fallback, sorted after all fleet targets).");
+                evaluations.Add(cloudEvaluation);
+                reportEvaluation(cloudEvaluation);
+            }
         }
 
         // ---- Selection: highest score; ties by declaration order (stable). ----

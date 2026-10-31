@@ -205,31 +205,63 @@ public sealed class OllamaRoutingMiddleware(
         return target.ToString();
     }
 
-    // Case-insensitive lookup of the pinned target over the configured fleet targets plus the
-    // Cloud pseudo-target; unknown names do not match (the request falls back to dynamic routing).
-    private bool TryParsePinnedTarget(string? headerValue, out RoutingTarget target)
+    // Resolves the X-OllamaRouter-Target client pin, in strict precedence order:
+    // 1. BLANK header ⇒ false (existing fallback applies).
+    // 2. EXACT-NAME precedence: the whole trimmed value naming the Cloud pseudo-target or any
+    //    configured effective target (OrdinalIgnoreCase) ⇒ exact pin — so a target LITERALLY
+    //    NAMED e.g. "remote" still exact-pins, never falls through to the location scope.
+    // 3. LOCATION SCOPE: the value splits on ',' and every token (individually trimmed) must be
+    //    a non-blank location keyword (local / remote / cloud, OrdinalIgnoreCase; duplicates
+    //    collapse into a set) ⇒ a scope pin. ANY unknown or empty token (e.g. "local,,remote"
+    //    or "banana") invalidates the whole header ⇒ parse fails (existing dynamic /
+    //    pinned-management fallback, no scope).
+    private bool TryParsePinnedTarget(string? headerValue, out PinnedTargetPin pin)
     {
-        target = default;
+        pin = new PinnedTargetPin(null, null);
         if (string.IsNullOrWhiteSpace(headerValue))
         {
             return false;
         }
 
-        if (string.Equals(headerValue, RoutingTarget.Cloud.Value, StringComparison.OrdinalIgnoreCase))
+        var value = headerValue.Trim();
+
+        // 2. Exact-name precedence (checked BEFORE scope parsing).
+        if (string.Equals(value, RoutingTarget.Cloud.Value, StringComparison.OrdinalIgnoreCase))
         {
-            target = RoutingTarget.Cloud;
+            pin = new PinnedTargetPin(RoutingTarget.Cloud, null);
             return true;
         }
 
-        var match = options.Value.GetEffectiveTargets(logger)
-            .FirstOrDefault(t => string.Equals(t.Name, headerValue, StringComparison.OrdinalIgnoreCase));
-        if (match is null || string.IsNullOrWhiteSpace(match.Name))
+        var exactMatch = options.Value.GetEffectiveTargets(logger)
+            .FirstOrDefault(t => string.Equals(t.Name, value, StringComparison.OrdinalIgnoreCase));
+        if (exactMatch is not null && !string.IsNullOrWhiteSpace(exactMatch.Name))
         {
-            return false;
+            pin = new PinnedTargetPin((RoutingTarget)exactMatch.Name!, null);
+            return true;
         }
 
-        target = (RoutingTarget)match.Name!;
+        // 3. Location-scope allow-list (single keyword or comma-separated list).
+        var locations = new HashSet<TargetLocation>();
+        foreach (var rawToken in value.Split(','))
+        {
+            if (!PinnedTargetLocationKeyword.TryMap(rawToken, out var location))
+            {
+                return false; // unknown/blank token: the whole header is unrecognized.
+            }
+
+            locations.Add(location);
+        }
+
+        pin = new PinnedTargetPin(null, locations);
         return true;
+    }
+
+    // Logs a location scope as a stable comma-joined keyword list (local,remote,cloud order).
+    private static string FormatScope(IReadOnlySet<TargetLocation> allowedLocations)
+    {
+        var names = new[] { "local", "remote", "cloud" };
+        return string.Join(",",
+            Enumerable.Range(0, 3).Where(i => allowedLocations.Contains((TargetLocation)i)).Select(i => names[i]));
     }
 
     // A pinned target is routable when its liveness is Online, or — during the 10 s startup
@@ -450,6 +482,26 @@ public sealed class OllamaRoutingMiddleware(
         return new RoutingDecisionResult(decidedTarget);
     }
 
+    // Location-scoped decision (X-OllamaRouter-Target scope pin): the candidate set is
+    // restricted to the allowed TargetLocations before Stage 1 (out-of-scope targets emit no
+    // artifacts and can never win; the Cloud pseudo-target and the
+    // DispatchToLargestCapacityOnOverflow escape hatch are restricted the same way, so a
+    // privacy scope fails with NoAvailableTargetException instead of leaking to ollama.com).
+    private async Task<RoutingDecisionResult> DecideDetailedWithSessionScopedAsync(
+        int tokenCount, string modelName, int? clientNumCtx, string? sessionId,
+        IReadOnlySet<TargetLocation>? allowedLocations, HttpContext context)
+    {
+        var result = await routingDecisionService.DecideDetailedAsync(
+            tokenCount, modelName, clientNumCtx, sessionId, allowedLocations, context.RequestAborted);
+        if (result != null)
+        {
+            return result;
+        }
+
+        var decidedTarget = await DecideWithSessionAsync(tokenCount, modelName, clientNumCtx, sessionId, context);
+        return new RoutingDecisionResult(decidedTarget);
+    }
+
     // Diagnostics payload for the all-offline 503: enumerates the ENABLED fleet targets
     // in fleet order with their raw (non-TTL) state lowercased and the last probe error.
     // <paramref name="cloudEnabled"/> is false on the pre-dispatch gate (Cloud was NOT
@@ -541,27 +593,70 @@ public sealed class OllamaRoutingMiddleware(
     {
         RoutingTarget? pinned = null;
         if (context.Request.Headers.TryGetValue(OllamaReverseProxyConfig.PublicTargetHeader, out var requestedTargetHeader) &&
-            TryParsePinnedTarget(requestedTargetHeader.ToString(), out var requestedTarget))
+            TryParsePinnedTarget(requestedTargetHeader.ToString(), out var pin))
         {
-            if (targetAvailability.IsEnabled(requestedTarget))
+            if (pin.ExactTarget is { } requestedTarget)
             {
-                var pinnedState = requestedTarget == RoutingTarget.Cloud
-                    ? TargetLivenessState.Online
-                    : await targetLiveness.EnsureKnownAsync(requestedTarget, context.RequestAborted);
-
-                if (IsPinnedTargetRoutable(pinnedState))
+                if (targetAvailability.IsEnabled(requestedTarget))
                 {
-                    pinned = requestedTarget;
-                    logger.LogInformation("Pinned management request routed to pinned target: {Target}", pinned);
+                    var pinnedState = requestedTarget == RoutingTarget.Cloud
+                        ? TargetLivenessState.Online
+                        : await targetLiveness.EnsureKnownAsync(requestedTarget, context.RequestAborted);
+
+                    if (IsPinnedTargetRoutable(pinnedState))
+                    {
+                        pinned = requestedTarget;
+                        logger.LogInformation("Pinned management request routed to pinned target: {Target}", pinned);
+                    }
+                    else
+                    {
+                        logger.LogWarning("Pinned target {Target} is offline (liveness {State}); routing the management request to the primary target.", requestedTarget, pinnedState);
+                    }
                 }
                 else
                 {
-                    logger.LogWarning("Pinned target {Target} is offline (liveness {State}); routing the management request to the primary target.", requestedTarget, pinnedState);
+                    logger.LogWarning("Pinned target {Target} is disabled; routing the management request to the primary target.", requestedTarget);
                 }
             }
-            else
+            else if (pin.AllowedLocations is { } allowedLocations)
             {
-                logger.LogWarning("Pinned target {Target} is disabled; routing the management request to the primary target.", requestedTarget);
+                // Location-scope management routing: the first enabled + routable (online or
+                // within the 10 s startup grace) target of an allowed location in declaration
+                // order wins; none routable ⇒ the primary target fallback below (with warning).
+                // Cloud is a relay with no management concept: a scope containing Cloud simply
+                // contributes no management candidate. The response header ALWAYS echoes the
+                // concrete target name, never a scope keyword.
+                foreach (var t in options.Value.GetEffectiveTargets(logger))
+                {
+                    if (!allowedLocations.Contains(TargetLocationClassifier.Classify(t)) ||
+                        string.IsNullOrWhiteSpace(t.Name))
+                    {
+                        continue;
+                    }
+
+                    var candidate = (RoutingTarget)t.Name!;
+                    if (!targetAvailability.IsEnabled(candidate))
+                    {
+                        continue;
+                    }
+
+                    var state = await targetLiveness.EnsureKnownAsync(candidate, context.RequestAborted);
+                    if (IsPinnedTargetRoutable(state))
+                    {
+                        pinned = candidate;
+                        logger.LogInformation("Pinned management request with location scope '{Scope}' routed to in-scope target: {Target}", FormatScope(allowedLocations), pinned);
+                        break;
+                    }
+
+                    logger.LogWarning("In-scope management target {Target} is disabled or not routable (liveness {State}); trying the next in-scope target.", candidate, state);
+                }
+
+                if (pinned is null)
+                {
+                    logger.LogWarning(
+                        "Pinned location scope '{Scope}' has no enabled+routable target; routing the management request to the primary target.",
+                        FormatScope(allowedLocations));
+                }
             }
         }
 
@@ -664,8 +759,16 @@ public sealed class OllamaRoutingMiddleware(
         var modelName = "unknown";
         var tokenCount = 0;
         var rawTokenCount = 0;
-        RoutingTarget target;
+        // Unassigned-safe default: every routing branch below assigns the real decision (the
+        // pin branches and the dynamic branch cover all reachable paths); the default value
+        // merely satisfies definite-assignment in the branch topology.
+        RoutingTarget target = default;
         RoutingDecisionResult? detailedDecision = null;
+        // The request's location scope (X-OllamaRouter-Target scope pin), or null when the
+        // request is unscooped (no pin, exact pin, or an invalid/unrecognized header). The
+        // decision, the all-offline-gate cloud hand-off and the dispatch-loop failover must
+        // all respect it: a privacy scope never leaks to an out-of-scope relay.
+        IReadOnlySet<TargetLocation>? allowedLocations = null;
 
         try
         {
@@ -680,53 +783,95 @@ public sealed class OllamaRoutingMiddleware(
             var clientNumCtx = DynamicContextPayloadTransformer.ExtractClientNumCtx(body);
 
             if (context.Request.Headers.TryGetValue(OllamaReverseProxyConfig.PublicTargetHeader, out var requestedTargetHeader) &&
-                TryParsePinnedTarget(requestedTargetHeader.ToString(), out var requestedTarget))
+                TryParsePinnedTarget(requestedTargetHeader.ToString(), out var requestedPin))
             {
-                if (targetAvailability.IsEnabled(requestedTarget))
+                if (requestedPin.ExactTarget is { } requestedTarget)
                 {
-                    // Pinned-target liveness gate: never forward to a dead daemon. Cloud is a
-                    // relay (never probed); fleet targets are probed on demand (bounded at
-                    // the 1.5 s probe timeout) before being trusted.
-                    var pinnedState = requestedTarget == RoutingTarget.Cloud
-                        ? TargetLivenessState.Online
-                        : await targetLiveness.EnsureKnownAsync(requestedTarget, context.RequestAborted);
-
-                    if (IsPinnedTargetRoutable(pinnedState))
+                    if (targetAvailability.IsEnabled(requestedTarget))
                     {
-                        // Pinned-target capability gate: the model must exist on the target.
-                        // A known catalog lacking the model falls back to scoring; a degraded
-                        // lookup (empty digest / probe failure) is permissive (honored).
-                        if (await IsPinnedTargetCapableAsync(requestedTarget, modelName, context))
+                        // Pinned-target liveness gate: never forward to a dead daemon. Cloud is a
+                        // relay (never probed); fleet targets are probed on demand (bounded at
+                        // the 1.5 s probe timeout) before being trusted.
+                        var pinnedState = requestedTarget == RoutingTarget.Cloud
+                            ? TargetLivenessState.Online
+                            : await targetLiveness.EnsureKnownAsync(requestedTarget, context.RequestAborted);
+
+                        if (IsPinnedTargetRoutable(pinnedState))
                         {
-                            target = requestedTarget;
-                            detailedDecision = new RoutingDecisionResult(target);
-                            logger.LogInformation("Routing target explicitly pinned via request header: {Target}", target);
-                            // Session stickiness (Q1 resolution): an HONORED pin explicitly
-                            // sets/refreshes the session lease to the pinned target, so the
-                            // caller's subsequent NON-pinned turns stay sticky on it. (Cloud
-                            // pins are never leased: SetAffinity ignores the pseudo-target.)
-                            if (sessionId is not null)
+                            // Pinned-target capability gate: the model must exist on the target.
+                            // A known catalog lacking the model falls back to scoring; a degraded
+                            // lookup (empty digest / probe failure) is permissive (honored).
+                            if (await IsPinnedTargetCapableAsync(requestedTarget, modelName, context))
                             {
-                                _sessionAffinity?.SetAffinity(sessionId, target);
+                                target = requestedTarget;
+                                detailedDecision = new RoutingDecisionResult(target);
+                                logger.LogInformation("Routing target explicitly pinned via request header: {Target}", target);
+                                // Session stickiness (Q1 resolution): an HONORED pin explicitly
+                                // sets/refreshes the session lease to the pinned target, so the
+                                // caller's subsequent NON-pinned turns stay sticky on it. (Cloud
+                                // pins are never leased: SetAffinity ignores the pseudo-target.)
+                                if (sessionId is not null)
+                                {
+                                    _sessionAffinity?.SetAffinity(sessionId, target);
+                                }
+                            }
+                            else
+                            {
+                                logger.LogWarning("Pinned target {Target} does not host model {Model}; falling back to dynamic routing.", requestedTarget, modelName);
+                                detailedDecision = await DecideDetailedWithSessionAsync(tokenCount, modelName, clientNumCtx, sessionId, context);
+                                target = detailedDecision.Target;
                             }
                         }
                         else
                         {
-                            logger.LogWarning("Pinned target {Target} does not host model {Model}; falling back to dynamic routing.", requestedTarget, modelName);
+                            logger.LogWarning("Requested target {Target} is offline (liveness {State}). Falling back to dynamic routing.", requestedTarget, pinnedState);
                             detailedDecision = await DecideDetailedWithSessionAsync(tokenCount, modelName, clientNumCtx, sessionId, context);
                             target = detailedDecision.Target;
                         }
                     }
                     else
                     {
-                        logger.LogWarning("Requested target {Target} is offline (liveness {State}). Falling back to dynamic routing.", requestedTarget, pinnedState);
+                        logger.LogWarning("Requested target {Target} is disabled. Falling back to dynamic routing.", requestedTarget);
                         detailedDecision = await DecideDetailedWithSessionAsync(tokenCount, modelName, clientNumCtx, sessionId, context);
                         target = detailedDecision.Target;
                     }
                 }
-                else
+                else if (requestedPin.AllowedLocations is { } pinLocations)
                 {
-                    logger.LogWarning("Requested target {Target} is disabled. Falling back to dynamic routing.", requestedTarget);
+                    // Location-scope pin: a pure candidate filter (no exact-name liveness or
+                    // capability gate — the decision service's own Stage-1 checks qualify the
+                    // chosen in-scope target). A {Cloud}-only scope with Cloud Overflow
+                    // unavailable mirrors today's pinned-Cloud behavior: warn + unscooped
+                    // dynamic routing (NOT a hard 503).
+                    if (pinLocations.Count == 1 && pinLocations.Contains(TargetLocation.Cloud) &&
+                        !IsCloudOverflowAvailable(modelName))
+                    {
+                        logger.LogWarning(
+                            "Requested location scope 'cloud' cannot be honored: Cloud Overflow is unavailable; falling back to unscooped dynamic routing.");
+                        allowedLocations = null;
+                    }
+                    else
+                    {
+                        allowedLocations = pinLocations;
+                    }
+                }
+
+                if (allowedLocations is not null)
+                {
+                    // Scoped dynamic routing: refresh fleet liveness (a scope pin must not
+                    // route onto a merely-stale-online target), then decide with the scope as
+                    // a Stage-1 candidate filter. NO explicit SetAffinity here (Q5b): only the
+                    // decision service's final-winner lease write applies.
+                    await RefreshFleetLivenessAsync(context.RequestAborted);
+                    detailedDecision = await DecideDetailedWithSessionScopedAsync(tokenCount, modelName, clientNumCtx, sessionId, allowedLocations, context);
+                    target = detailedDecision.Target;
+                }
+                else if (detailedDecision is null)
+                {
+                    // Dynamic routing: refresh every enabled target's TTL-aware liveness verdict first
+                    // (see RefreshFleetLivenessAsync) so a healthy target whose Online verdict merely
+                    // lapsed between re-probe ticks is not disqualified as offline and misrouted.
+                    await RefreshFleetLivenessAsync(context.RequestAborted);
                     detailedDecision = await DecideDetailedWithSessionAsync(tokenCount, modelName, clientNumCtx, sessionId, context);
                     target = detailedDecision.Target;
                 }
@@ -820,7 +965,11 @@ public sealed class OllamaRoutingMiddleware(
 
             if (IsFleetAllOffline())
             {
-                if (IsCloudOverflowAvailable(modelName))
+                // A location scope that excludes Cloud must never hand off to the Cloud relay:
+                // when the in-scope fleet cannot serve, the existing 503 diagnostics fire
+                // instead (a privacy scope never silently leaks to ollama.com).
+                if (IsCloudOverflowAvailable(modelName) &&
+                    (allowedLocations is null || allowedLocations.Contains(TargetLocation.Cloud)))
                 {
                     logger.LogWarning("All fleet targets are offline; handing {ModelName} off to Cloud Overflow.", modelName);
                     target = RoutingTarget.Cloud;
@@ -972,7 +1121,7 @@ public sealed class OllamaRoutingMiddleware(
             // previous `await next(context)` YARP hand-off for completion requests; the
             // forwarder sets the same IForwarderErrorFeature on context.Features that YARP
             // did, so the response-completeness / token-extraction logic below is unchanged.
-            (servedTarget, body) = await DispatchLoopAsync(context, body, target);
+            (servedTarget, body) = await DispatchLoopAsync(context, body, target, allowedLocations);
             if (servedTarget is not null && servedTarget != target && !context.Response.HasStarted)
             {
                 // Telemetry failover-correctness: the dispatch loop served a DIFFERENT target
@@ -1121,7 +1270,7 @@ public sealed class OllamaRoutingMiddleware(
     // failure (response already started) is terminal: no loop. Exhausting every candidate
     // uncommitted produces the terminal 503 all-offline diagnostics (cloud_enabled reports
     // whether the Cloud relay step was available).
-    private async Task<(RoutingTarget? Served, string Body)> DispatchLoopAsync(HttpContext context, string body, RoutingTarget target)
+    private async Task<(RoutingTarget? Served, string Body)> DispatchLoopAsync(HttpContext context, string body, RoutingTarget target, IReadOnlySet<TargetLocation>? allowedLocations = null)
     {
         var effectiveTargets = options.Value.GetEffectiveTargets(logger);
         var targetsByName = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
@@ -1134,8 +1283,11 @@ public sealed class OllamaRoutingMiddleware(
         }
 
         var isCloud = target == RoutingTarget.Cloud;
-        var cloudAvailable = isCloud || IsCloudOverflowAvailable(
-            OllamaRequestParser.ParseCompletionRequest(body).ModelName ?? string.Empty);
+        var cloudAvailable = (isCloud || IsCloudOverflowAvailable(
+            OllamaRequestParser.ParseCompletionRequest(body).ModelName ?? string.Empty))
+            // A location scope that excludes Cloud never takes the terminal Cloud relay step:
+            // exhausting the in-scope candidates produces the existing terminal 503 instead.
+            && (allowedLocations is null || allowedLocations.Contains(TargetLocation.Cloud));
 
         // Ranked candidate list: (routing target, destination URL).
         var candidates = new List<(RoutingTarget Target, string Url)>();
@@ -1164,6 +1316,11 @@ public sealed class OllamaRoutingMiddleware(
                 if (string.IsNullOrWhiteSpace(t.Name))
                 {
                     continue;
+                }
+                if (allowedLocations is not null &&
+                    !allowedLocations.Contains(TargetLocationClassifier.Classify(t)))
+                {
+                    continue; // out of the request's location scope: never a failover candidate.
                 }
                 var candidate = (RoutingTarget)t.Name!;
                 if (candidate == target)
