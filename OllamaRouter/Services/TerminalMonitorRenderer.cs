@@ -140,7 +140,7 @@ public static class TerminalMonitorRenderer
         if (enableAnsi) sb.Append(Reset);
         lines.Add(sb.ToString());
 
-        lines.Add("   Target       Liveness  HW        Active Model               In  Ctx");
+        lines.Add("   Target      Liveness  HW        Active Model             In Ctx");
         lines.Add("   ─────────── ───────── ───────── ──────────────────────── ── ────────────────");
 
         foreach (var item in state.Fleet)
@@ -150,14 +150,14 @@ public static class TerminalMonitorRenderer
             var location = LocationOf(locationByName, item.Name);
             var color = TargetColor(location);
             if (enableAnsi) row.Append(color);
-            row.Append(PadRightDisplay(Truncate(TargetLabel(item.Name, location), 13), 13));
+            row.Append(PadRightDisplay(Truncate(TargetLabel(item.Name, location), 11), 11));
             if (enableAnsi) row.Append(Reset);
             row.Append(' ');
             AppendLivenessBadge(row, item, enableAnsi);
             row.Append(' ');
             row.Append(PadRightDisplay(Truncate(item.HardwareProfile ?? "-", 9), 9));
             row.Append(' ');
-            row.Append(PadRightDisplay(Truncate(item.ActiveModel ?? "-", 20), 20));
+            row.Append(PadRightDisplay(Truncate(item.ActiveModel ?? "-", 24), 24));
             row.Append(' ');
             row.Append(item.InFlightRequests.ToString("0", CultureInfo.InvariantCulture).PadLeft(2));
             row.Append(' ');
@@ -194,7 +194,7 @@ public static class TerminalMonitorRenderer
         }
 
         if (enableAnsi) sb.Append(badgeColor);
-        sb.Append(PadRightDisplay(text, 10));
+        sb.Append(PadRightDisplay(text, 9));
         if (enableAnsi) sb.Append(Reset);
     }
 
@@ -632,7 +632,7 @@ public static class TerminalMonitorRenderer
             }
 
             // BMP wide characters / symbols
-            if (c == '☁' || (c >= 0x2E80 && c <= 0x9FFF))
+            if (c == '☁' || (c >= 0x2E80 && c <= 0x9FFF)) // (🖥️ local / 📡 remote / ☁️ cloud)
             {
                 width += 2;
             }

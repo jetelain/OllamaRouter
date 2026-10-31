@@ -67,7 +67,7 @@ public static partial class MonitorEndpointsExtensions
 
             var effectiveVram = target.GetEffectiveMaxVramMB(fleetHardware);
             var hardwareProfile = effectiveVram.HasValue
-                ? (effectiveVram.Value % 1024 == 0 ? $"{effectiveVram.Value / 1024}gb" : $"{effectiveVram.Value} MB")
+                ? (effectiveVram.Value > 1024 ? $"{Math.Round(effectiveVram.Value / 1024.0)} GB" : $"{effectiveVram.Value} MB")
                 : "-";
 
             // Append the configured speed factor to the HW cell (e.g. "16gb,2.0x") only when it
