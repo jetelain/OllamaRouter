@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Reflection;
 using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -129,6 +130,51 @@ public class MonitorEndpointsExtensionsTests
             Assert.Contains("reclaimLocalVram", html);
             Assert.Contains("reclaimBtn", html);
             Assert.Contains("reclaimStatus", html);
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public void MonitorPageHtml_IsLoadedFromEmbeddedResource()
+    {
+        // Reviewer-driven guard: the page markup must come from the embedded
+        // 'monitor.html' resource, not from a string literal baked into source.
+        var resourceName = "OllamaRouter.Endpoints.monitor.html";
+        using var stream = typeof(MonitorEndpointsExtensions).Assembly.GetManifestResourceStream(resourceName);
+        Assert.NotNull(stream);
+
+        using var reader = new StreamReader(stream, System.Text.Encoding.UTF8);
+        var expected = reader.ReadToEnd();
+
+        var actual = typeof(MonitorEndpointsExtensions)
+            .GetField("MonitorPageHtml", BindingFlags.NonPublic | BindingFlags.Static)
+            ?.GetValue(null) as string;
+
+        Assert.Equal(expected, actual);
+        Assert.StartsWith("<!DOCTYPE html>", actual);
+    }
+
+    [Fact]
+    public async Task GetMonitor_ServesEmbeddedHtml_AsTextHtml()
+    {
+        var (app, client, _) = await CreateTestAppAsync();
+        try
+        {
+            var response = await client.GetAsync("/monitor");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Equal("text/html", response.Content.Headers.ContentType!.ToString());
+            var html = await response.Content.ReadAsStringAsync();
+
+            // The page served over HTTP must be exactly the embedded resource content.
+            var resourceName = "OllamaRouter.Endpoints.monitor.html";
+            using var stream = typeof(MonitorEndpointsExtensions).Assembly.GetManifestResourceStream(resourceName)!;
+            using var reader = new StreamReader(stream, System.Text.Encoding.UTF8);
+            Assert.Equal(reader.ReadToEnd(), html);
         }
         finally
         {

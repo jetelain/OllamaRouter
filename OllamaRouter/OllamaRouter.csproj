@@ -27,4 +27,9 @@
   <ItemGroup>
     <InternalsVisibleTo Include="OllamaRouter.Tests" />
   </ItemGroup>
+
+  <ItemGroup>
+    <!-- Monitor page served verbatim by GET /monitor (OllamaRouter.Endpoints.monitor.html). -->
+    <EmbeddedResource Include="Endpoints\monitor.html" />
+  </ItemGroup>
 </Project>
