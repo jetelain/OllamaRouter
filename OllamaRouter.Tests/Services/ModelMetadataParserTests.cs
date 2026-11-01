@@ -269,4 +269,99 @@ public class ModelMetadataParserTests
         Assert.Null(metadata.NativeContextLength);
     }
 
+    // --- quantization level ----------------------------------------------------------
+
+    [Fact]
+    public void ParseModelMetadata_QuantizationFromTagsDetails()
+    {
+        var tags = new JsonArray
+        {
+            new JsonObject
+            {
+                ["name"] = "m:latest",
+                ["size"] = 100L,
+                ["details"] = new JsonObject { ["quantization_level"] = "Q4_K_M" }
+            }
+        };
+        var metadata = ModelMetadataParser.ParseModelMetadata("m:latest", tags, null);
+        Assert.Equal("Q4_K_M", metadata.QuantizationLevel);
+    }
+
+    [Fact]
+    public void ParseModelMetadata_QuantizationFromShowDetails_WhenTagsLackIt()
+    {
+        // Tags entry matched but has no quantization_level → falls back to /api/show details.
+        var tags = new JsonArray
+        {
+            new JsonObject
+            {
+                ["name"] = "m:latest",
+                ["size"] = 100L,
+                ["details"] = new JsonObject { ["family"] = "llama" }
+            }
+        };
+        var show = Show(("details", new JsonObject { ["quantization_level"] = "Q5_K_S" }));
+        var metadata = ModelMetadataParser.ParseModelMetadata("m:latest", tags, show);
+        Assert.Equal("Q5_K_S", metadata.QuantizationLevel);
+    }
+
+    [Fact]
+    public void ParseModelMetadata_QuantizationTagsTakesPrecedenceOverShow()
+    {
+        var tags = new JsonArray
+        {
+            new JsonObject
+            {
+                ["name"] = "m:latest",
+                ["details"] = new JsonObject { ["quantization_level"] = "Q8_0" }
+            }
+        };
+        var show = Show(("details", new JsonObject { ["quantization_level"] = "F16" }));
+        var metadata = ModelMetadataParser.ParseModelMetadata("m:latest", tags, show);
+        Assert.Equal("Q8_0", metadata.QuantizationLevel);
+    }
+
+    [Fact]
+    public void ParseModelMetadata_QuantizationBlankInTags_FallsBackToShow()
+    {
+        var tags = new JsonArray
+        {
+            new JsonObject
+            {
+                ["name"] = "m:latest",
+                ["details"] = new JsonObject { ["quantization_level"] = "  " }
+            }
+        };
+        var show = Show(("details", new JsonObject { ["quantization_level"] = "Q4_0" }));
+        var metadata = ModelMetadataParser.ParseModelMetadata("m:latest", tags, show);
+        Assert.Equal("Q4_0", metadata.QuantizationLevel);
+    }
+
+    [Fact]
+    public void ParseModelMetadata_QuantizationAbsentEverywhere_ReturnsNull()
+    {
+        var tags = new JsonArray
+        {
+            new JsonObject { ["name"] = "m:latest", ["details"] = new JsonObject { ["family"] = "llama" } }
+        };
+        var show = Show(("details", new JsonObject { ["family"] = "llama" }));
+        var metadata = ModelMetadataParser.ParseModelMetadata("m:latest", tags, show);
+        Assert.Null(metadata.QuantizationLevel);
+    }
+
+    [Fact]
+    public void ParseModelMetadata_QuantizationNonString_ReturnsNull()
+    {
+        var show = Show(("details", new JsonObject { ["quantization_level"] = (JsonNode)42L }));
+        var metadata = ModelMetadataParser.ParseModelMetadata("m", [], show);
+        Assert.Null(metadata.QuantizationLevel);
+    }
+
+    [Fact]
+    public void ParseModelMetadata_NoShow_QuantizationNull()
+    {
+        var metadata = ModelMetadataParser.ParseModelMetadata("m", null, null);
+        Assert.Null(metadata.QuantizationLevel);
+    }
+
 }

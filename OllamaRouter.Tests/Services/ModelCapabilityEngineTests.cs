@@ -21,7 +21,7 @@ public class ModelCapabilityEngineTests
         long weightBytes = 0,
         long? nativeContextLength = null)
     {
-        return new ModelMetadata("test-model:latest", weightBytes, parameterCount, expertCount, family, numCtx, hasModelInfo, numCtx is null ? null : $"num_ctx {numCtx}\n", nativeContextLength);
+        return new ModelMetadata("test-model:latest", weightBytes, parameterCount, expertCount, family, numCtx, hasModelInfo, numCtx is null ? null : $"num_ctx {numCtx}\n", nativeContextLength, null);
     }
 
     private static OllamaTargetOptions Target(string? hint, int? maxVram = null)

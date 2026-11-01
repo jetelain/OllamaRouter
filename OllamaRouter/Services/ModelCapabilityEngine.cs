@@ -144,7 +144,7 @@ public sealed class ModelCapabilityEngine(
     {
         if (string.IsNullOrWhiteSpace(targetUrl) || string.IsNullOrEmpty(modelName) || string.IsNullOrEmpty(catalogDigest))
         {
-            return new ModelMetadata(modelName, 0, null, 0, null, null, false, null, null);
+            return new ModelMetadata(modelName, 0, null, 0, null, null, false, null, null, null);
         }
 
         var cacheKey = BuildCacheKey(targetUrl, catalogDigest, modelName);
@@ -165,7 +165,7 @@ public sealed class ModelCapabilityEngine(
         };
 
         return (ModelMetadata?)await memoryCache.GetOrCreateAsync(cacheKey, factory) ??
-               new ModelMetadata(modelName, 0, null, 0, null, null, false, null, null);
+               new ModelMetadata(modelName, 0, null, 0, null, null, false, null, null, null);
     }
 
     /// <summary>

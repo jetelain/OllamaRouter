@@ -359,8 +359,10 @@ public sealed class TargetExecutionTracker : ITargetExecutionTracker
     /// <summary>
     /// Fail-soft <c>JsonNode</c> parsing of a /api/ps payload: <c>name</c> (falling back to
     /// <c>model</c>) is the model name, <c>size_vram</c> is parsed as long (missing/invalid → 0),
-    /// and <c>num_ctx</c> becomes the best-effort <see cref="TargetLoadedModel.ContextLength"/>
-    /// only when present and numeric (Ollama does not expose it today; later phases may).
+    /// <c>num_ctx</c> becomes the best-effort <see cref="TargetLoadedModel.ContextLength"/>
+    /// only when present and numeric (Ollama does not expose it today; later phases may), and
+    /// <c>details.quantization_level</c> becomes the best-effort
+    /// <see cref="TargetLoadedModel.QuantizationLevel"/> only when present and a non-blank string.
     /// </summary>
     internal static List<TargetLoadedModel> ParseModels(JsonArray models)
     {
@@ -385,7 +387,15 @@ public sealed class TargetExecutionTracker : ITargetExecutionTracker
                 contextLength = ctx.Value;
             }
 
-            parsed.Add(new TargetLoadedModel(name, sizeVram, contextLength));
+            string? quantizationLevel = null;
+            if (obj["details"]?["quantization_level"] is JsonValue quantValue &&
+                quantValue.TryGetValue<string>(out var quantText) &&
+                !string.IsNullOrWhiteSpace(quantText))
+            {
+                quantizationLevel = quantText;
+            }
+
+            parsed.Add(new TargetLoadedModel(name, sizeVram, contextLength, quantizationLevel));
         }
 
         return parsed;

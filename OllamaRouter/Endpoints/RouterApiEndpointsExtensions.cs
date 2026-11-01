@@ -30,6 +30,13 @@ namespace OllamaRouter.Endpoints;
 /// parameter count, native Modelfile num_ctx and the router-calculated hardware-safe context
 /// ceiling (recommendedContextWindow = max CMax over the hardware-capable fleet targets;
 /// cloud overflow is never a ceiling contributor, only the cloudOverflowAvailable hint).</item>
+/// <item><c>GET /api/router/cartography</c> — the fleet cartography: in one call, every fleet
+/// node (hardware summary, liveness, context lease allocation, VRAM totals, its currently
+/// loaded processes with the live /api/ps quantization) plus every fleet model with its
+/// catalog-sourced quantization and per-node deployment matrix (present / capable / context
+/// ceiling / resident / loaded footprint), plus a flat list of all loaded model processes.
+/// Reads in-memory tracker/liveness snapshots and the 30 s single-flight capability cache;
+/// it NEVER triggers a fresh /api/ps refresh.</item>
 /// <item><c>POST /api/router/vram/reclaim</c> and <c>POST /api/router/fleet/unload</c> (exact
 /// alias, identical contract) — fleet VRAM reclaim: unloads the running models on one named
 /// target (case-insensitive; unknown name → 404) or on ALL effective configured targets
@@ -236,6 +243,20 @@ public static class RouterApiEndpointsExtensions
             }
 
             return Results.Json(detail, OllamaRouterJsonSerializerContext.Default.RouterModelDetailResponse);
+        });
+
+        // Fleet cartography (task #41): the model-to-node deployment map — every node's
+        // hardware/context/VRAM/loaded processes, every model's catalog-sourced quantization
+        // and per-target deployment matrix, and a flat list of all loaded processes. Reads
+        // in-memory snapshots + the 30 s capability cache; never calls /api/ps refresh.
+        app.MapGet("/api/router/cartography", async (
+            IOptions<OllamaRouterOptions> options,
+            IServiceProvider serviceProvider,
+            HttpContext context,
+            CancellationToken cancellationToken) =>
+        {
+            var response = await BuildCartographyResponseAsync(options, serviceProvider, context, cancellationToken);
+            return Results.Json(response, OllamaRouterJsonSerializerContext.Default.RouterCartographyResponse);
         });
 
         // Canonical fleet VRAM reclaim + exact alias (identical handler, parameters and
@@ -1127,14 +1148,16 @@ public static class RouterApiEndpointsExtensions
     }
 
     /// <summary>
-    /// Builds the per-model summary: discovers the metadata on the FIRST effective target
+    /// Shared model-summary computation: discovers the metadata on the FIRST effective target
     /// (declaration order) that hosts the model — one /api/show + one /api/tags per model —
     /// reuses that single metadata for every target's pure VRAM-math ceiling derivation, and
     /// computes recommendedContextWindow as the max CMax over the HARDWARE-CAPABLE fleet
     /// targets (cloud overflow is never a ceiling contributor; it is surfaced only via
-    /// CloudOverflowAvailable).
+    /// CloudOverflowAvailable). Returns the public summary plus the raw per-target metadata
+    /// (only when the model is present on the fleet) so the cartography endpoint can build
+    /// its deployment rows without re-discovering anything.
     /// </summary>
-    private static async Task<RouterModelSummary> BuildModelSummaryAsync(
+    private static async Task<ModelSummaryData> ComputeModelSummaryAsync(
         string name,
         OllamaRouterOptions opt,
         IReadOnlyList<OllamaTargetOptions> effectiveTargets,
@@ -1151,8 +1174,8 @@ public static class RouterApiEndpointsExtensions
             .ConfigureAwait(false);
         if (catalogCache is null || capabilityEngine is null || !presentOnFleet)
         {
-            return BuildDegradedSummary(name, cloudOverflowAvailable,
-                cloudOnly: catalogCache is not null && !presentOnFleet);
+            return new ModelSummaryData(BuildDegradedSummary(name, cloudOverflowAvailable,
+                cloudOnly: catalogCache is not null && !presentOnFleet), null, [], presentOnFleet);
         }
 
         var normalizedName = RoutingDecisionService.NormalizeModelName(name);
@@ -1179,7 +1202,7 @@ public static class RouterApiEndpointsExtensions
         if (primaryMetadata is null)
         {
             // Per-model discovery failure degrades to the conservative defaults.
-            return BuildDegradedSummary(name, cloudOverflowAvailable, cloudOnly: false);
+            return new ModelSummaryData(BuildDegradedSummary(name, cloudOverflowAvailable, cloudOnly: false), null, [], presentOnFleet);
         }
 
         var (architecture, _) = capabilityEngine.ClassifyArchitecture(primaryMetadata, pinnedArchitecture);
@@ -1213,13 +1236,35 @@ public static class RouterApiEndpointsExtensions
             ? (int)Math.Min(maxNative, int.MaxValue)
             : (primaryMetadata.NativeContextLength is { } pLen ? (int)Math.Min(pLen, int.MaxValue) : ModelCapabilityEngine.OllamaDefaultContext);
 
-        return new RouterModelSummary(
-            Name: name,
-            Architecture: ModelCapabilityEngine.ArchitectureWireName(architecture),
-            ParameterCount: primaryMetadata.ParameterCount,
-            NativeContextWindow: nativeContext,
-            RecommendedContextWindow: recommended,
-            CloudOverflowAvailable: cloudOverflowAvailable);
+        return new ModelSummaryData(
+            new RouterModelSummary(
+                Name: name,
+                Architecture: ModelCapabilityEngine.ArchitectureWireName(architecture),
+                ParameterCount: primaryMetadata.ParameterCount,
+                NativeContextWindow: nativeContext,
+                RecommendedContextWindow: recommended,
+                CloudOverflowAvailable: cloudOverflowAvailable),
+            primaryMetadata,
+            rawTargetMetadata,
+            presentOnFleet);
+    }
+
+    /// <summary>
+    /// Public-facing projection of <see cref="ComputeModelSummaryAsync"/> used by
+    /// <c>GET /api/router/models</c> and <c>GET /api/router/models/{modelName}</c>.
+    /// </summary>
+    private static async Task<RouterModelSummary> BuildModelSummaryAsync(
+        string name,
+        OllamaRouterOptions opt,
+        IReadOnlyList<OllamaTargetOptions> effectiveTargets,
+        IModelCatalogCacheService? catalogCache,
+        ModelCapabilityEngine? capabilityEngine,
+        ITargetAvailabilityService? availability,
+        CancellationToken cancellationToken)
+    {
+        var data = await ComputeModelSummaryAsync(
+            name, opt, effectiveTargets, catalogCache, capabilityEngine, availability, cancellationToken).ConfigureAwait(false);
+        return data.Summary;
     }
 
     private static RouterModelSummary BuildDegradedSummary(string name, bool cloudOverflowAvailable, bool cloudOnly)
@@ -1267,6 +1312,7 @@ public static class RouterApiEndpointsExtensions
             ExpertCount = targetMetadata.ExpertCount > 0 ? targetMetadata.ExpertCount : primaryMetadata.ExpertCount,
             ModelFamily = targetMetadata.ModelFamily ?? primaryMetadata.ModelFamily,
             NativeContextLength = targetMetadata.NativeContextLength ?? primaryMetadata.NativeContextLength,
+            QuantizationLevel = targetMetadata.QuantizationLevel ?? primaryMetadata.QuantizationLevel,
             HasModelInfo = targetMetadata.HasModelInfo || primaryMetadata.HasModelInfo
         };
     }
@@ -1366,6 +1412,90 @@ public static class RouterApiEndpointsExtensions
         ITargetExecutionTracker? executionTracker,
         CancellationToken cancellationToken)
     {
+        var qualification = await ComputeTargetQualificationAsync(
+            name, target, primaryMetadata, pinnedArchitecture, catalogCache, capabilityEngine, executionTracker, cancellationToken)
+            .ConfigureAwait(false);
+        return qualification.ToCompatibilityRow();
+    }
+
+    /// <summary>
+    /// One cartography deployment row per (model, target) pair: the exact same qualification
+    /// as the <c>GET /api/router/models/{name}</c> target matrix (present/capable/
+    /// contextCeiling/vetoReason/isResident/inFlightRequests — same name-matching rule) plus
+    /// the catalog-sourced <see cref="CartographyDeploymentRow.Quantization"/> (that target's
+    /// metadata quantization, falling back to the primary fleet value) and
+    /// <see cref="CartographyDeploymentRow.LoadedSizeVramBytes"/> (the tracker's exact
+    /// <c>size_vram</c> of the resident process, null when not resident).
+    /// </summary>
+    private static async Task<CartographyDeploymentRow> BuildDeploymentRowAsync(
+        string name,
+        OllamaTargetOptions target,
+        ModelMetadata? primaryMetadata,
+        string? pinnedArchitecture,
+        IModelCatalogCacheService? catalogCache,
+        ModelCapabilityEngine? capabilityEngine,
+        ITargetExecutionTracker? executionTracker,
+        CancellationToken cancellationToken)
+    {
+        var qualification = await ComputeTargetQualificationAsync(
+            name, target, primaryMetadata, pinnedArchitecture, catalogCache, capabilityEngine, executionTracker, cancellationToken)
+            .ConfigureAwait(false);
+
+        // The resident process the isResident flag matched (same ordinal-ignore-case raw or
+        // NormalizeModelName rule); its size_vram is the exact loaded footprint.
+        TargetExecutionState? executionState = null;
+        var routingTarget = (RoutingTarget)target.Name!;
+        try
+        {
+            executionState = executionTracker?.GetState(routingTarget);
+        }
+        catch
+        {
+            executionState = null;
+        }
+
+        long? loadedSizeVramBytes = null;
+        if (qualification.IsResident && executionState is { } state)
+        {
+            var resident = state.LoadedModels.FirstOrDefault(m =>
+                string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(m.Name, RoutingDecisionService.NormalizeModelName(name), StringComparison.OrdinalIgnoreCase));
+            if (resident is { } model)
+            {
+                loadedSizeVramBytes = model.SizeVramBytes;
+            }
+        }
+
+        return new CartographyDeploymentRow(
+            Target: qualification.Target,
+            Present: qualification.Present,
+            Capable: qualification.Capable,
+            VetoReason: qualification.VetoReason,
+            ContextCeiling: qualification.ContextCeiling,
+            IsResident: qualification.IsResident,
+            LoadedSizeVramBytes: loadedSizeVramBytes,
+            InFlightRequests: qualification.InFlightRequests,
+            Quantization: qualification.TargetMetadata?.QuantizationLevel);
+    }
+
+    /// <summary>
+    /// Per-target qualification (the shared core of the <c>GET /api/router/models/{name}</c>
+    /// target matrix and the cartography deployment rows): Capable = hardware-capable
+    /// capability AND model present on that target; the veto reasons are: model absent →
+    /// "model not present in target catalog"; LargeDense on a small-class target → the exact
+    /// <see cref="ModelCapabilityEngine.LargeDenseVetoReason"/> string; undiscoverable
+    /// capability → no veto reason (permissive fallback, matching the routing pipeline).
+    /// </summary>
+    private static async Task<TargetQualification> ComputeTargetQualificationAsync(
+        string name,
+        OllamaTargetOptions target,
+        ModelMetadata? primaryMetadata,
+        string? pinnedArchitecture,
+        IModelCatalogCacheService? catalogCache,
+        ModelCapabilityEngine? capabilityEngine,
+        ITargetExecutionTracker? executionTracker,
+        CancellationToken cancellationToken)
+    {
         var targetName = target.Name!;
         var routingTarget = (RoutingTarget)targetName;
 
@@ -1420,13 +1550,222 @@ public static class RouterApiEndpointsExtensions
             ?? false;
         var inFlight = executionState?.InFlightRequests ?? 0;
 
-        return new RouterModelTargetCompatibility(
+        return new TargetQualification(
             Target: targetName,
+            Present: present,
             Capable: capable,
+            VetoReason: vetoReason,
             ContextCeiling: capability?.CMax ?? ModelCapabilityEngine.OllamaDefaultContext,
             IsResident: isResident,
             InFlightRequests: inFlight,
-            VetoReason: vetoReason);
+            EffectiveMetadata: effectiveMetadata,
+            TargetMetadata: metadata);
+    }
+
+    // ------------------------------------------------------------------
+    //  GET /api/router/cartography
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// Builds the fleet cartography: <c>nodes[]</c> from the in-memory liveness /
+    /// hardware /<see cref="ITargetExecutionTracker"/> snapshots (the Cloud pseudo-target is
+    /// appended last, mirroring <c>GET /api/router/fleet</c> semantics), <c>models[]</c> from
+    /// the merged fleet catalog (+ cloud syntheses) with the shared summary/discovery helpers
+    /// (30 s single-flight capability cache), and <c>loadedModels[]</c> as the flat,
+    /// non-deduped cartesian of every node's loaded processes. EVERY sub-source is resolved
+    /// defensively and degrades fail-soft (a minimal host answers 200 with degraded rows);
+    /// the endpoint NEVER calls <see cref="ITargetExecutionTracker.RefreshAsync"/> — it only
+    /// reads snapshots, so an unreachable node contributes its last-known data (flagged
+    /// <c>stale</c>) and can never hang the request.
+    /// </summary>
+    private static async Task<RouterCartographyResponse> BuildCartographyResponseAsync(
+        IOptions<OllamaRouterOptions> options,
+        IServiceProvider serviceProvider,
+        HttpContext context,
+        CancellationToken cancellationToken)
+    {
+        var opt = options.Value;
+        var effectiveTargets = opt.GetEffectiveTargets();
+        var availability = serviceProvider.GetService<ITargetAvailabilityService>();
+        var liveness = serviceProvider.GetService<ITargetLivenessService>();
+        var livenessEntries = liveness?.GetEntries();
+        var executionTracker = serviceProvider.GetService<ITargetExecutionTracker>();
+        var leaseSnapshot = serviceProvider.GetService<IContextAutoShrinkManager>()?.GetLeaseSnapshot();
+        var modelCatalogCache = serviceProvider.GetService<IModelCatalogCacheService>();
+        var fleetHardware = serviceProvider.GetService<IFleetHardwareService>();
+        var fleetAggregation = serviceProvider.GetService<IFleetAggregationService>();
+        var capabilityEngine = serviceProvider.GetService<ModelCapabilityEngine>();
+
+        // ---- nodes[] (effective targets in configuration order) ----
+        var nodes = new List<CartographyNodeRow>(effectiveTargets.Count + 1);
+        foreach (var target in effectiveTargets)
+        {
+            var name = target.Name!;
+            var routingTarget = (RoutingTarget)name;
+            var enabled = availability is not null &&
+                availability.GetSnapshot().Flags.TryGetValue(routingTarget, out var targetEnabled)
+                ? targetEnabled
+                : true;
+
+            // Liveness: the same "Online"/"Offline"/"Probing" vocabulary as /fleet (with the
+            // catalog-based fallback when the liveness service is not registered).
+            string livenessText;
+            if (livenessEntries is { } entries && entries.TryGetValue(routingTarget, out var entry))
+            {
+                livenessText = entry.State switch
+                {
+                    TargetLivenessState.Online => "Online",
+                    TargetLivenessState.Offline => "Offline",
+                    _ => "Probing"
+                };
+            }
+            else
+            {
+                livenessText = await CatalogHasAnyModelsAsync(modelCatalogCache, target.Url, cancellationToken)
+                    ? "Online"
+                    : "Offline";
+            }
+
+            // Hardware summary from the cached fleet hardware store (fail-soft).
+            NodeHardwareProfile? nodeProfile = null;
+            try
+            {
+                nodeProfile = fleetHardware?.GetProfile(name);
+            }
+            catch
+            {
+                nodeProfile = null;
+            }
+
+            string? gpuName = null;
+            string? gpuVendor = null;
+            if (nodeProfile?.Gpus.Count > 0)
+            {
+                gpuName = nodeProfile.Gpus[0].ModelName;
+                gpuVendor = nodeProfile.Gpus[0].Vendor;
+            }
+            else if (nodeProfile is not null && nodeProfile.IsUnifiedMemory)
+            {
+                gpuVendor = string.Equals(nodeProfile.Architecture, "arm64", StringComparison.OrdinalIgnoreCase)
+                    ? "Apple"
+                    : "Unified";
+                gpuName = $"{nodeProfile.Architecture} Unified Memory";
+            }
+
+            // Tracker snapshot ONLY (never RefreshAsync — the 2 s hosted service owns /api/ps).
+            TargetExecutionState? executionState = null;
+            try
+            {
+                executionState = executionTracker?.GetState(routingTarget);
+            }
+            catch
+            {
+                executionState = null;
+            }
+
+            nodes.Add(new CartographyNodeRow(
+                Name: name,
+                Url: target.Url,
+                Location: TargetLocationClassifier.ToWireValue(TargetLocationClassifier.Classify(target)),
+                Enabled: enabled,
+                Liveness: livenessText,
+                Stale: executionState?.Stale ?? false,
+                LastRefreshedAtUtc: executionState is not null && executionState.LastRefreshedAtUtc != DateTimeOffset.MinValue
+                    ? executionState.LastRefreshedAtUtc
+                    : null,
+                Hardware: new CartographyNodeHardware(
+                    GpuName: gpuName,
+                    GpuVendor: gpuVendor,
+                    TotalVramMB: target.GetEffectiveMaxVramMB(fleetHardware),
+                    IsUnifiedMemory: nodeProfile?.IsUnifiedMemory ?? false,
+                    SystemRamMB: nodeProfile?.SystemRamMB is { } ram and > 0 ? ram : null),
+                ContextAllocation: FormatContextAllocation(routingTarget, leaseSnapshot),
+                InFlightRequests: executionState?.InFlightRequests ?? 0,
+                TotalLoadedVramBytes: executionState?.TotalVramBytes ?? 0L,
+                LoadedModels: executionState?.LoadedModels.Select(m => new CartographyNodeLoadedModel(
+                    Name: m.Name,
+                    SizeVramBytes: m.SizeVramBytes,
+                    Quantization: m.QuantizationLevel,
+                    ContextLength: m.ContextLength)).ToArray() ?? []));
+        }
+
+        // The Cloud pseudo-target row (last), mirroring the /fleet cloud semantics: never
+        // probed/tracked, "Online" iff cloud is enabled, no hardware, baseline allocation.
+        var cloudEnabled = opt.CloudOverflow.Enabled;
+        var cloudFlag = availability is not null &&
+            availability.GetSnapshot().Flags.TryGetValue(RoutingTarget.Cloud, out var cloudEnabledFlag)
+            ? cloudEnabledFlag
+            : cloudEnabled;
+        nodes.Add(new CartographyNodeRow(
+            Name: RoutingTarget.Cloud.Value,
+            Url: null,
+            Location: TargetLocationClassifier.ToWireValue(TargetLocation.Cloud),
+            Enabled: cloudFlag,
+            Liveness: cloudEnabled ? "Online" : "Offline",
+            Stale: false,
+            LastRefreshedAtUtc: null,
+            Hardware: null,
+            ContextAllocation: "baseline",
+            InFlightRequests: 0,
+            TotalLoadedVramBytes: 0L,
+            LoadedModels: []));
+
+        // ---- models[] (merged fleet catalog + cloud syntheses) ----
+        var names = await GetFleetModelNamesAsync(opt, availability, fleetAggregation, modelCatalogCache, context, cancellationToken)
+            .ConfigureAwait(false);
+
+        // Names are independent: run the per-model discovery concurrently (the metadata calls
+        // hit the 30 s single-flight capability cache; a second call within the window
+        // reissues zero /api/show requests).
+        var modelRows = await Task.WhenAll(names.Select(async name =>
+        {
+            var data = await ComputeModelSummaryAsync(
+                name, opt, effectiveTargets, modelCatalogCache, capabilityEngine, availability, cancellationToken)
+                .ConfigureAwait(false);
+
+            var primaryMetadata = data.PrimaryMetadata;
+            var pinnedArchitecture = opt.Models.TryGetValue(
+                RoutingDecisionService.NormalizeModelName(name), out var rowThresholds) ? rowThresholds.Architecture : null;
+
+            // One deployment row per effective target (declaration order); the Cloud
+            // pseudo-target never appears here (it has no OllamaTargetOptions). A model hosted
+            // on NO fleet target (e.g. a cloud-only synthesis — PresentOnFleet is false, the
+            // same signal the detail endpoint uses via AnyTargetHasModelAsync) carries an
+            // empty deployments[], exactly like /api/router/models/{name}.
+            var deployments = !data.PresentOnFleet
+                ? []
+                : await Task.WhenAll(effectiveTargets.Select(target => BuildDeploymentRowAsync(
+                    name, target, primaryMetadata, pinnedArchitecture,
+                    modelCatalogCache, capabilityEngine, executionTracker, cancellationToken)))
+                    .ConfigureAwait(false);
+
+            return new CartographyModelRow(
+                Name: data.Summary.Name,
+                Architecture: data.Summary.Architecture,
+                ParameterCount: data.Summary.ParameterCount,
+                WeightSizeBytes: primaryMetadata?.WeightSizeBytes ?? 0L,
+                Quantization: primaryMetadata?.QuantizationLevel,
+                NativeContextWindow: data.Summary.NativeContextWindow,
+                RecommendedContextWindow: data.Summary.RecommendedContextWindow,
+                CloudOverflowAvailable: data.Summary.CloudOverflowAvailable,
+                Deployments: deployments);
+        })).ConfigureAwait(false);
+
+        // ---- loadedModels[] (flat: target order, then tracker order; no cross-target dedup) ----
+        var loadedModels = nodes
+            .Where(node => node.LoadedModels.Count > 0)
+            .SelectMany(node => node.LoadedModels.Select(m => new CartographyLoadedModelRow(
+                Name: m.Name,
+                Target: node.Name,
+                SizeVramBytes: m.SizeVramBytes,
+                Quantization: m.Quantization,
+                ContextLength: m.ContextLength,
+                ContextAllocation: node.ContextAllocation,
+                Liveness: node.Liveness,
+                Stale: node.Stale)))
+            .ToArray();
+
+        return new RouterCartographyResponse(nodes, modelRows, loadedModels);
     }
 
     // ------------------------------------------------------------------
@@ -1687,6 +2026,148 @@ public sealed record RouterModelTargetCompatibility(
     [property: JsonPropertyName("isResident")] bool IsResident,
     [property: JsonPropertyName("inFlightRequests")] int InFlightRequests,
     [property: JsonPropertyName("vetoReason")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? VetoReason = null);
+
+/// <summary>
+/// Shared model-summary computation result of <c>ComputeModelSummaryAsync</c>: the public
+/// summary plus the primary (first hoster with model_info) fleet metadata and the raw
+/// per-target metadata pairs (empty when the model is present on no fleet target) so the
+/// cartography endpoint can build its deployment rows without re-discovering.
+/// </summary>
+internal sealed record ModelSummaryData(
+    RouterModelSummary Summary,
+    ModelMetadata? PrimaryMetadata,
+    List<(OllamaTargetOptions Target, ModelMetadata Metadata)> RawTargetMetadata,
+    bool PresentOnFleet);
+
+/// <summary>
+/// Per-target qualification core shared by the <c>GET /api/router/models/{name}</c> matrix and
+/// the cartography deployment rows: presence, capability, veto, context ceiling, residency,
+/// in-flight count and the (merged, effective) metadata used for the derivation.
+/// </summary>
+internal sealed record TargetQualification(
+    string Target,
+    bool Present,
+    bool Capable,
+    string? VetoReason,
+    int ContextCeiling,
+    bool IsResident,
+    int InFlightRequests,
+    ModelMetadata? EffectiveMetadata,
+    ModelMetadata? TargetMetadata = null)
+{
+    /// <summary>Projects onto the <c>GET /api/router/models/{name}</c> wire row (byte-identical to the pre-refactor builder).</summary>
+    public RouterModelTargetCompatibility ToCompatibilityRow() => new(
+        Target: Target,
+        Capable: Capable,
+        ContextCeiling: ContextCeiling,
+        IsResident: IsResident,
+        InFlightRequests: InFlightRequests,
+        VetoReason: VetoReason);
+}
+
+/// <summary>
+/// Response payload for <c>GET /api/router/cartography</c>: the fleet node rows (effective
+/// targets in configuration order, Cloud pseudo-target last when present in configuration —
+/// it is always appended), the per-model deployment rows, and the flat list of every loaded
+/// model process (the cartesian flatten of <c>nodes[].loadedModels[]</c>, no cross-target
+/// dedup). Sizes are strictly numeric: bytes (long) where ps-derived, MB (int) where
+/// hardware-derived; there is deliberately NO computed free-VRAM field.
+/// </summary>
+public sealed record RouterCartographyResponse(
+    [property: JsonPropertyName("nodes")] IReadOnlyList<CartographyNodeRow> Nodes,
+    [property: JsonPropertyName("models")] IReadOnlyList<CartographyModelRow> Models,
+    [property: JsonPropertyName("loadedModels")] IReadOnlyList<CartographyLoadedModelRow> LoadedModels);
+
+/// <summary>
+/// One fleet node (or the Cloud pseudo-target) in <c>nodes[]</c>: the wire location value,
+/// liveness (the /fleet "Online"/"Offline"/"Probing" vocabulary), the hardware summary
+/// (null for Cloud), the active KV-cache context lease allocation ("baseline" for Cloud), the
+/// raw loaded-VRAM total (<c>TargetExecutionState.TotalVramBytes</c>), and the currently loaded
+/// processes with their live /api/ps-sourced quantization.
+/// </summary>
+public sealed record CartographyNodeRow(
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("location")] string Location,
+    [property: JsonPropertyName("enabled")] bool Enabled,
+    [property: JsonPropertyName("liveness")] string Liveness,
+    [property: JsonPropertyName("stale")] bool Stale,
+    [property: JsonPropertyName("contextAllocation")] string ContextAllocation,
+    [property: JsonPropertyName("inFlightRequests")] int InFlightRequests,
+    [property: JsonPropertyName("totalLoadedVramBytes")] long TotalLoadedVramBytes,
+    [property: JsonPropertyName("loadedModels")] IReadOnlyList<CartographyNodeLoadedModel> LoadedModels,
+    [property: JsonPropertyName("url")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Url = null,
+    [property: JsonPropertyName("lastRefreshedAtUtc")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] DateTimeOffset? LastRefreshedAtUtc = null,
+    [property: JsonPropertyName("hardware")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] CartographyNodeHardware? Hardware = null);
+
+/// <summary>Hardware summary of one cartography node (strictly numeric MB).</summary>
+public sealed record CartographyNodeHardware(
+    [property: JsonPropertyName("isUnifiedMemory")] bool IsUnifiedMemory,
+    [property: JsonPropertyName("gpuName")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? GpuName = null,
+    [property: JsonPropertyName("gpuVendor")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? GpuVendor = null,
+    [property: JsonPropertyName("totalVramMB")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? TotalVramMB = null,
+    [property: JsonPropertyName("systemRamMB")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] long? SystemRamMB = null);
+
+/// <summary>
+/// One currently loaded model process on a cartography node: the name as reported by
+/// /api/ps, the exact <c>size_vram</c> in bytes, the live-process (ps-sourced)
+/// quantization and the best-effort context length (null when absent).
+/// </summary>
+public sealed record CartographyNodeLoadedModel(
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("sizeVramBytes")] long SizeVramBytes,
+    [property: JsonPropertyName("quantization")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Quantization = null,
+    [property: JsonPropertyName("contextLength")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? ContextLength = null);
+
+/// <summary>
+/// One fleet model in <c>models[]</c>: the same summary fields as
+/// <c>GET /api/router/models</c> plus the weight size in bytes, the catalog-sourced
+/// quantization (tags → show → null) and the per-target deployment matrix (Cloud never
+/// listed; cloud-only models carry an empty list).
+/// </summary>
+public sealed record CartographyModelRow(
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("architecture")] string Architecture,
+    [property: JsonPropertyName("weightSizeBytes")] long WeightSizeBytes,
+    [property: JsonPropertyName("nativeContextWindow")] int NativeContextWindow,
+    [property: JsonPropertyName("recommendedContextWindow")] int RecommendedContextWindow,
+    [property: JsonPropertyName("cloudOverflowAvailable")] bool CloudOverflowAvailable,
+    [property: JsonPropertyName("deployments")] IReadOnlyList<CartographyDeploymentRow> Deployments,
+    [property: JsonPropertyName("parameterCount")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] long? ParameterCount = null,
+    [property: JsonPropertyName("quantization")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Quantization = null);
+
+/// <summary>
+/// One (model, target) deployment row: the exact same qualification as the
+/// <c>GET /api/router/models/{name}</c> target matrix plus the catalog-sourced
+/// quantization of that target's metadata and the exact resident footprint in bytes
+/// (null when the model is not resident there). <see cref="VetoReason"/> is omitted when
+/// absent (null) — same convention as the model-detail matrix.
+/// </summary>
+public sealed record CartographyDeploymentRow(
+    [property: JsonPropertyName("target")] string Target,
+    [property: JsonPropertyName("present")] bool Present,
+    [property: JsonPropertyName("capable")] bool Capable,
+    [property: JsonPropertyName("contextCeiling")] int ContextCeiling,
+    [property: JsonPropertyName("isResident")] bool IsResident,
+    [property: JsonPropertyName("inFlightRequests")] int InFlightRequests,
+    [property: JsonPropertyName("vetoReason")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? VetoReason = null,
+    [property: JsonPropertyName("loadedSizeVramBytes")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] long? LoadedSizeVramBytes = null,
+    [property: JsonPropertyName("quantization")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Quantization = null);
+
+/// <summary>
+/// One flat loaded-process row (no cross-target dedup): the model name, its hosting target,
+/// the exact <c>size_vram</c> in bytes, the live-process (ps-sourced) quantization, the
+/// best-effort context length, plus the hosting node's context allocation / liveness / stale
+/// flags.
+/// </summary>
+public sealed record CartographyLoadedModelRow(
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("target")] string Target,
+    [property: JsonPropertyName("sizeVramBytes")] long SizeVramBytes,
+    [property: JsonPropertyName("contextAllocation")] string ContextAllocation,
+    [property: JsonPropertyName("liveness")] string Liveness,
+    [property: JsonPropertyName("stale")] bool Stale,
+    [property: JsonPropertyName("quantization")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Quantization = null,
+    [property: JsonPropertyName("contextLength")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? ContextLength = null);
 
 /// <summary>
 /// Request body of <c>POST /api/router/context/evaluate</c>: the model to evaluate, the

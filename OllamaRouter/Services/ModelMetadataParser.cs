@@ -22,7 +22,8 @@ public sealed record ModelMetadata(
     int? ModelfileNumCtx,
     bool HasModelInfo,
     string? ParametersRaw,
-    long? NativeContextLength);
+    long? NativeContextLength,
+    string? QuantizationLevel = null);
 
 /// <summary>
 /// Pure, stateless parsers that turn raw Ollama <c>/api/tags</c> and <c>/api/show</c> JSON
@@ -276,7 +277,51 @@ public static class ModelMetadataParser
             ModelfileNumCtx: ParseNumCtx(show),
             HasModelInfo: modelInfo is not null,
             ParametersRaw: TryGetString(show?["parameters"], out var parameters) ? parameters : null,
-            NativeContextLength: ExtractNativeContextLength(modelInfo));
+            NativeContextLength: ExtractNativeContextLength(modelInfo),
+            QuantizationLevel: ResolveQuantizationLevel(modelName, tags, show));
+    }
+
+    /// <summary>
+    /// Resolves the model's quantization level (e.g. "Q4_K_M"): the matched
+    /// <c>/api/tags</c> entry's <c>details.quantization_level</c> (the catalog — the stable
+    /// source of truth) wins, falling back to the <c>/api/show</c>
+    /// <c>details.quantization_level</c>, and degrading to null (never the literal
+    /// "Unknown") when neither is present, blank, or non-string.
+    /// </summary>
+    private static string? ResolveQuantizationLevel(string modelName, JsonArray? tags, JsonObject? show)
+    {
+        // Prefer the matched entry's details.quantization_level from /api/tags.
+        if (tags is not null && !string.IsNullOrEmpty(modelName))
+        {
+            foreach (var tag in tags)
+            {
+                if (tag?["name"]?.ToString() is not { } tagName ||
+                    !string.Equals(tagName, modelName, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (TryGetNonBlankString(tag?["details"]?["quantization_level"], out var tagQuant))
+                {
+                    return tagQuant!;
+                }
+            }
+        }
+
+        // Fallback: details.quantization_level from /api/show.
+        return TryGetNonBlankString(show?["details"]?["quantization_level"], out var showQuant) ? showQuant! : null;
+    }
+
+    private static bool TryGetNonBlankString(JsonNode? node, out string? value)
+    {
+        if (TryGetString(node, out var text) && !string.IsNullOrWhiteSpace(text))
+        {
+            value = text;
+            return true;
+        }
+
+        value = null;
+        return false;
     }
 
     private static long ResolveWeightSize(string modelName, JsonArray? tags, JsonObject? show)

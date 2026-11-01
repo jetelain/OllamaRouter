@@ -12,7 +12,8 @@ namespace OllamaRouter.Services;
 /// <param name="Name">The model name + tag as reported by /api/ps (e.g. "llama3:latest").</param>
 /// <param name="SizeVramBytes">The <c>size_vram</c> field of the /api/ps entry (0 when missing/invalid).</param>
 /// <param name="ContextLength">Best-effort context length (tokens) when discoverable; null otherwise.</param>
-public sealed record TargetLoadedModel(string Name, long SizeVramBytes, int? ContextLength = null);
+/// <param name="QuantizationLevel">Best-effort <c>details.quantization_level</c> from the /api/ps entry (the live-process quantization, authoritative for the resident model); null when absent or malformed.</param>
+public sealed record TargetLoadedModel(string Name, long SizeVramBytes, int? ContextLength = null, string? QuantizationLevel = null);
 
 /// <summary>
 /// Immutable per-target execution-state snapshot handed out by the

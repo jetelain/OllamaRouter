@@ -632,6 +632,41 @@ public class TargetExecutionTrackerTests : IDisposable
     }
 
     [Fact]
+    public void ParseModels_QuantizationLevel_ParsedFromDetails_FailSoft()
+    {
+        var models = new JsonArray
+        {
+            new JsonObject
+            {
+                ["name"] = "full:entry",
+                ["details"] = new JsonObject { ["quantization_level"] = "Q4_K_M" }
+            },
+            new JsonObject
+            {
+                ["name"] = "no-details:entry"
+            },
+            new JsonObject
+            {
+                ["name"] = "non-string-quant:entry",
+                ["details"] = new JsonObject { ["quantization_level"] = (JsonNode)13L }
+            },
+            new JsonObject
+            {
+                ["name"] = "blank-quant:entry",
+                ["details"] = new JsonObject { ["quantization_level"] = "  " }
+            }
+        };
+
+        var parsed = TargetExecutionTracker.ParseModels(models);
+
+        Assert.Equal(4, parsed.Count);
+        Assert.Equal("Q4_K_M", parsed[0].QuantizationLevel);
+        Assert.Null(parsed[1].QuantizationLevel);
+        Assert.Null(parsed[2].QuantizationLevel);
+        Assert.Null(parsed[3].QuantizationLevel);
+    }
+
+    [Fact]
     public void GetState_UnseenTarget_ReturnsFillInStaleState()
     {
         var sut = CreateSimpleSut();

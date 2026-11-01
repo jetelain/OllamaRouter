@@ -164,6 +164,57 @@ AI agent frameworks, orchestrators (such as [NightCodeForge](https://github.com/
 - `POST /monitor/reclaim-vram` unloads running models and accepts an optional query parameter `disableTarget` (defaults to `true` to disable Local for gaming/editing, or pass `?disableTarget=false` for non-destructive unloading).
 - Any other request is proxied as a catch-all to the instance selected by the routing decision.
 
+### Fleet cartography
+
+`GET /api/router/cartography` answers the whole fleet deployment question in one call — where every model lives, with its quantization, context ceilings, and the actual per-process VRAM footprint:
+
+```json
+{
+  "nodes": [
+    {
+      "name": "Local",
+      "url": "http://127.0.0.1:11435",
+      "location": "local",
+      "enabled": true,
+      "liveness": "Online",
+      "stale": false,
+      "lastRefreshedAtUtc": "2026-11-01T12:00:00Z",
+      "hardware": { "gpuName": "NVIDIA GeForce RTX 4090", "gpuVendor": "NVIDIA", "totalVramMB": 24576, "isUnifiedMemory": false, "systemRamMB": 65536 },
+      "contextAllocation": "32k (expanded)",
+      "inFlightRequests": 1,
+      "totalLoadedVramBytes": 33285996544,
+      "loadedModels": [ { "name": "qwen3.6-35b-a3b:latest", "sizeVramBytes": 33285996544, "quantization": "Q4_K_M", "contextLength": 16384 } ]
+    },
+    { "name": "Cloud", "location": "cloud", "enabled": true, "liveness": "Online", "stale": false, "contextAllocation": "baseline", "inFlightRequests": 0, "totalLoadedVramBytes": 0, "loadedModels": [] }
+  ],
+  "models": [
+    {
+      "name": "qwen3.6-35b-a3b:latest",
+      "architecture": "Moe",
+      "parameterCount": 35000000000,
+      "weightSizeBytes": 21474836480,
+      "quantization": "Q4_K_M",
+      "nativeContextWindow": 131072,
+      "recommendedContextWindow": 131072,
+      "cloudOverflowAvailable": true,
+      "deployments": [
+        { "target": "Local", "present": true, "capable": true, "contextCeiling": 131072, "isResident": true, "loadedSizeVramBytes": 33285996544, "inFlightRequests": 1, "quantization": "Q4_K_M" },
+        { "target": "Laptop", "present": false, "capable": false, "contextCeiling": 4096, "isResident": false, "inFlightRequests": 0, "vetoReason": "model not present in target catalog" }
+      ]
+    }
+  ],
+  "loadedModels": [
+    { "name": "qwen3.6-35b-a3b:latest", "target": "Local", "sizeVramBytes": 33285996544, "quantization": "Q4_K_M", "contextLength": 16384, "contextAllocation": "32k (expanded)", "liveness": "Online", "stale": false }
+  ]
+}
+```
+
+- **`nodes[]`** — every effective target in configuration order, plus the Cloud pseudo-target last (when cloud is enabled). Each carries the hardware summary (`totalVramMB` = effective VRAM budget, null when unknown), the active KV-cache context lease (`contextAllocation`), liveness (same `Online`/`Offline`/`Probing` vocabulary as `/api/router/fleet`), the raw loaded-VRAM total (`totalLoadedVramBytes`, the tracker's sum of `size_vram` — no computed "free" value, since `size_vram` excludes OS/driver allocations), and every currently loaded process with its **live `/api/ps`-sourced** `quantization`.
+- **`models[]`** — every model in the merged fleet catalog (including cloud syntheses, which carry `deployments: []` and `cloudOverflowAvailable: true`), with **catalog-sourced** `quantization` (the target's `/api/tags` `details.quantization_level`, falling back to `/api/show`), and a per-target `deployments[]` matrix that agrees exactly with `GET /api/router/models/{name}` on `present`/`capable`/`contextCeiling`/`vetoReason`/`isResident`/`inFlightRequests` — plus the exact resident `loadedSizeVramBytes` (null-omitted when not resident) and that target's catalog quantization.
+- **`loadedModels[]`** — the flat, non-deduped list of every loaded model process (node rows flattened in order), each annotated with its hosting node's `contextAllocation`, `liveness` and `stale`.
+- **Sizing is strictly numeric**: bytes (`long`) where ps-derived (`sizeVramBytes`, `weightSizeBytes`, `loadedSizeVramBytes`), MB (`int`) where hardware-derived (`totalVramMB`, `systemRamMB`). No humanized aliases.
+- **Performance contract**: the endpoint reads in-memory snapshots (liveness, tracker, lease, hardware store) and the 30 s single-flight capability cache — it never triggers a fresh `/api/ps` refresh. Offline nodes appear with their stale cached data flagged (`stale: true`) and never hang the response. A minimal host (only options + availability registered) answers `200` with degraded rows.
+
 ### Model benchmarking
 
 OllamaRouter can automatically determine which candidate models and context sizes are viable on each fleet node. A candidate is **viable** only if it sustains at least **20 tokens/second** decode throughput (measured as `eval_count / (eval_duration × 1e-9)` from a fixed 64-token generation).
