@@ -5,6 +5,7 @@ using Moq;
 using OllamaRouter.Options;
 using OllamaRouter.Services;
 using MsOptions = Microsoft.Extensions.Options.Options;
+using FleetShowBestEntry = OllamaRouter.Services.FleetAggregationService.FleetShowBestEntry;
 
 namespace OllamaRouter.Tests.Services;
 
@@ -249,34 +250,171 @@ public class FleetAggregationServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task GetShowFleet_ModelOnTwoTargets_ReachesHighestPriority_ThenServesFromCache()
+    public async Task GetShowFleet_ModelOnTwoTargets_ReturnsLargestNumCtx_ThenServesFromCache()
     {
         SeedTags(DesktopAuthority, ("llama3", 100));
         SeedTags(ServerAuthority, ("llama3", 200), ("qwen3", 10));
         SeedTags(LaptopAuthority, ("gemma3", 300));
 
-        const string showBody = """{"modelfile":"# Modelfile","details":{"family":"llama"},"model_info":{"param.size":"8B"}}""";
-        foreach (var authority in new[] { DesktopAuthority, ServerAuthority })
-        {
-            _handler.Behavior(authority).Responses["POST /api/show"] = showBody;
-        }
+        // Dt declares a small pre-configured context; Sv declares a much larger one.
+        _handler.Behavior(DesktopAuthority).Responses["POST /api/show"] =
+            """{"parameters":"num_ctx 4096\n","details":{"family":"llama-on-desktop"}}""";
+        _handler.Behavior(ServerAuthority).Responses["POST /api/show"] =
+            """{"modelfile":"# Modelfile\nPARAMETER num_ctx 262144\n","details":{"family":"llama-on-server"}}""";
 
         var service = CreateService();
 
+        // First call: the fleet-wide scan contacts BOTH hosters and returns the payload of
+        // the hoster with the largest declared num_ctx (Sv), not the highest-priority one.
         var result = await service.GetShowFleetAsync("llama3", pinned: null);
         Assert.NotNull(result);
-        Assert.Equal("llama", result!["details"]?["family"]?.GetValue<string>());
-
-        // Highest-priority (earliest config-order) hoster is Dt, even though Sv
-        // also hosts the model: the /api/show request must reach Dt only.
+        Assert.Equal("llama-on-server", result!["details"]?["family"]?.GetValue<string>());
         Assert.Equal(1, _handler.CountCalls(DesktopAuthority, "POST /api/show"));
-        Assert.Equal(0, _handler.CountCalls(ServerAuthority, "POST /api/show"));
+        Assert.Equal(1, _handler.CountCalls(ServerAuthority, "POST /api/show"));
+        Assert.Equal(0, _handler.CountCalls(LaptopAuthority, "POST /api/show"));
 
-        // Second call within the 30 s window: served from memory cache, zero new show traffic.
+        // White-box: the fleet best cache holds Sv's winning entry; the per-target
+        // write-through keys of BOTH scanned hosters are populated.
+        Assert.True(_memoryCache.TryGetValue<FleetShowBestEntry>("FleetAggregation:show-best:llama3", out var best));
+        Assert.NotNull(best);
+        Assert.Equal("Server", best!.TargetName);
+        Assert.Equal(262144, best.NumCtx);
+        Assert.True(_memoryCache.TryGetValue<JsonObject>("FleetAggregation:show:Desktop:llama3", out _));
+        Assert.True(_memoryCache.TryGetValue<JsonObject>("FleetAggregation:show:Server:llama3", out _));
+
+        // Second call within the 30 s window: served from the best cache with zero new I/O
+        // of any kind (no /api/show, no /api/tags refresh — name sets + best cache both warm).
+        var tagsBefore = _handler.CountCalls(DesktopAuthority, "GET /api/tags") +
+                         _handler.CountCalls(ServerAuthority, "GET /api/tags") +
+                         _handler.CountCalls(LaptopAuthority, "GET /api/tags");
         var result2 = await service.GetShowFleetAsync("llama3", pinned: null);
         Assert.NotNull(result2);
+        Assert.Equal("llama-on-server", result2!["details"]?["family"]?.GetValue<string>());
         Assert.Equal(1, _handler.CountCalls(DesktopAuthority, "POST /api/show"));
-        Assert.Equal(0, _handler.CountCalls(ServerAuthority, "POST /api/show"));
+        Assert.Equal(1, _handler.CountCalls(ServerAuthority, "POST /api/show"));
+        Assert.Equal(tagsBefore,
+            _handler.CountCalls(DesktopAuthority, "GET /api/tags") +
+            _handler.CountCalls(ServerAuthority, "GET /api/tags") +
+            _handler.CountCalls(LaptopAuthority, "GET /api/tags"));
+    }
+
+    [Fact]
+    public async Task GetShowFleet_NumCtxTie_EarlierConfigOrderHosterWins()
+    {
+        SeedTags(DesktopAuthority, ("llama3", 100));
+        SeedTags(ServerAuthority, ("llama3", 200));
+        SeedTags(LaptopAuthority, ("gemma3", 300));
+
+        // Both declare the SAME num_ctx: the earlier effective-target (config) order (Dt) wins.
+        _handler.Behavior(DesktopAuthority).Responses["POST /api/show"] =
+            """{"parameters":"num_ctx 16384\n","details":{"family":"llama-on-desktop"}}""";
+        _handler.Behavior(ServerAuthority).Responses["POST /api/show"] =
+            """{"parameters":"num_ctx 16384\n","details":{"family":"llama-on-server"}}""";
+
+        var result = await CreateService().GetShowFleetAsync("llama3", pinned: null);
+        Assert.NotNull(result);
+        Assert.Equal("llama-on-desktop", result!["details"]?["family"]?.GetValue<string>());
+        Assert.True(_memoryCache.TryGetValue<FleetShowBestEntry>("FleetAggregation:show-best:llama3", out var best));
+        Assert.Equal("Desktop", best!.TargetName);
+        Assert.Equal(16384, best.NumCtx);
+    }
+
+    [Fact]
+    public async Task GetShowFleet_AbsentNumCtxLosesToDeclared()
+    {
+        SeedTags(DesktopAuthority, ("llama3", 100));
+        SeedTags(ServerAuthority, ("llama3", 200));
+        SeedTags(LaptopAuthority, ("gemma3", 300));
+
+        // Dt's payload declares no num_ctx (score 0); Sv declares one ⇒ Sv wins even though
+        // Dt is the higher-priority (earlier config-order) hoster.
+        _handler.Behavior(DesktopAuthority).Responses["POST /api/show"] =
+            """{"modelfile":"# Modelfile","details":{"family":"llama-on-desktop"}}""";
+        _handler.Behavior(ServerAuthority).Responses["POST /api/show"] =
+            """{"parameters":"num_ctx 16384\n","details":{"family":"llama-on-server"}}""";
+
+        var result = await CreateService().GetShowFleetAsync("llama3", pinned: null);
+        Assert.NotNull(result);
+        Assert.Equal("llama-on-server", result!["details"]?["family"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task GetShowFleet_AllAbsentNumCtx_HighestPriorityHosterWins()
+    {
+        SeedTags(DesktopAuthority, ("llama3", 100));
+        SeedTags(ServerAuthority, ("llama3", 200));
+        SeedTags(LaptopAuthority, ("gemma3", 300));
+
+        // Neither hoster declares a num_ctx: all scores are 0 ⇒ the earliest config-order
+        // hoster (Dt) wins, preserving the legacy highest-priority behavior.
+        _handler.Behavior(DesktopAuthority).Responses["POST /api/show"] =
+            """{"modelfile":"# Modelfile","details":{"family":"llama-on-desktop"}}""";
+        _handler.Behavior(ServerAuthority).Responses["POST /api/show"] =
+            """{"modelfile":"# Modelfile","details":{"family":"llama-on-server"}}""";
+
+        var result = await CreateService().GetShowFleetAsync("llama3", pinned: null);
+        Assert.NotNull(result);
+        Assert.Equal("llama-on-desktop", result!["details"]?["family"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task GetShowFleet_SlowHoster_MissedBudget_FastHosterWinsWithinBudget()
+    {
+        SeedTags(DesktopAuthority, ("llama3", 100));
+        SeedTags(ServerAuthority, ("llama3", 200), ("qwen3", 10));
+        SeedTags(LaptopAuthority, ("gemma3", 300));
+
+        _handler.Behavior(DesktopAuthority).Responses["POST /api/show"] =
+            """{"parameters":"num_ctx 262144\n","details":{"family":"llama-on-desktop"}}""";
+        _handler.Behavior(ServerAuthority).Responses["POST /api/show"] =
+            """{"parameters":"num_ctx 4096\n","details":{"family":"llama-on-server"}}""";
+
+        // Pre-warm the name-set caches of the hosters while all hosts are fast, so the
+        // hoster enumeration below does NOT trigger an /api/tags refresh on the hanging host
+        // (which would be bounded only by the 4 s client timeout, not the per-target budget).
+        var service = CreateService();
+        Assert.True(await _catalogCache.ModelExistsAsync(DesktopUrl, "llama3"));
+        Assert.True(await _catalogCache.ModelExistsAsync(ServerUrl, "llama3"));
+
+        // Dt (the larger num_ctx winner it would be) now hangs: it misses the 500 ms budget
+        // and must not delay the response or block the winner selection.
+        _handler.Behavior(DesktopAuthority).Hang = true;
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var result = await service.GetShowFleetAsync("llama3", pinned: null);
+        sw.Stop();
+
+        Assert.True(sw.Elapsed < TimeSpan.FromMilliseconds(1500),
+            $"Fleet-wide scan took {sw.Elapsed.TotalMilliseconds:F0} ms; a hanging hoster must not block beyond the budget + margin.");
+        Assert.NotNull(result);
+        Assert.Equal("llama-on-server", result!["details"]?["family"]?.GetValue<string>());
+        // Dt was contacted exactly once (cancelled at the budget); no fake/stale data served.
+        Assert.Equal(1, _handler.CountCalls(DesktopAuthority, "POST /api/show"));
+        Assert.Equal(1, _handler.CountCalls(ServerAuthority, "POST /api/show"));
+    }
+
+    [Fact]
+    public async Task GetShowFleet_NeverSeenHangingHoster_Bounded_AndStillServesFastHoster()
+    {
+        // Dt is NEVER seen: the hoster enumeration's /api/tags lookup reaches the hanging
+        // daemon, bounded by the 4 s HttpClient timeout (no deadlock), so Dt is simply not
+        // considered a hoster and Sv (the single hoster) serves.
+        _handler.ForAuthority(DesktopAuthority, new FakeOllamaHttpHandler.TargetBehavior { Hang = true });
+        SeedTags(ServerAuthority, ("llama3", 200));
+        SeedTags(LaptopAuthority, ("gemma3", 300));
+        _handler.Behavior(ServerAuthority).Responses["POST /api/show"] =
+            """{"parameters":"num_ctx 4096\n","details":{"family":"llama-on-server"}}""";
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var result = await CreateService().GetShowFleetAsync("llama3", pinned: null);
+        sw.Stop();
+
+        Assert.True(sw.Elapsed < TimeSpan.FromMilliseconds(5000),
+            $"Never-seen hanging hoster took {sw.Elapsed.TotalMilliseconds:F0} ms; the call must be bounded (client timeout + margin), never infinite.");
+        Assert.NotNull(result);
+        Assert.Equal("llama-on-server", result!["details"]?["family"]?.GetValue<string>());
+        Assert.Equal(0, _handler.CountCalls(DesktopAuthority, "POST /api/show"));
+        Assert.Equal(1, _handler.CountCalls(ServerAuthority, "POST /api/show"));
     }
 
     [Fact]
@@ -293,7 +431,12 @@ public class FleetAggregationServiceTests : IDisposable
         Assert.NotNull(result);
         Assert.Equal("llama-on-server", result!["details"]?["family"]?.GetValue<string>());
         Assert.Equal(1, _handler.CountCalls(ServerAuthority, "POST /api/show"));
+
+        // A pin NEVER fans out: no /api/show traffic to any other hoster.
         Assert.Equal(0, _handler.CountCalls(DesktopAuthority, "POST /api/show"));
+        Assert.Equal(0, _handler.CountCalls(LaptopAuthority, "POST /api/show"));
+        // And it never writes the fleet best cache.
+        Assert.False(_memoryCache.TryGetValue<FleetShowBestEntry>("FleetAggregation:show-best:llama3", out _));
     }
 
     [Fact]
@@ -328,6 +471,56 @@ public class FleetAggregationServiceTests : IDisposable
         var result = await CreateService().GetShowFleetAsync("mystery", pinned: null);
         Assert.NotNull(result);
         Assert.Equal("desktop", result!["details"]?["family"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task GetShowFleet_SingleHoster_ExactlyOneShowCall()
+    {
+        // The model is hosted by Sv only: the single-hoster path issues exactly one
+        // /api/show, with no redundant calls to the other targets.
+        SeedTags(DesktopAuthority, ("gemma3", 300));
+        SeedTags(ServerAuthority, ("llama3", 200));
+        SeedTags(LaptopAuthority, ("qwen3", 10));
+        _handler.Behavior(ServerAuthority).Responses["POST /api/show"] =
+            """{"parameters":"num_ctx 131072\n","details":{"family":"llama-on-server"}}""";
+
+        var result = await CreateService().GetShowFleetAsync("llama3", pinned: null);
+        Assert.NotNull(result);
+        Assert.Equal("llama-on-server", result!["details"]?["family"]?.GetValue<string>());
+        Assert.Equal(1, _handler.CountCalls(ServerAuthority, "POST /api/show"));
+        Assert.Equal(0, _handler.CountCalls(DesktopAuthority, "POST /api/show"));
+        Assert.Equal(0, _handler.CountCalls(LaptopAuthority, "POST /api/show"));
+        // The single-hoster path does not touch the fleet best cache.
+        Assert.False(_memoryCache.TryGetValue<FleetShowBestEntry>("FleetAggregation:show-best:llama3", out _));
+    }
+
+    [Fact]
+    public async Task GetShowFleet_PinnedNonWinningHoster_ReturnsPinnedPayload()
+    {
+        SeedTags(DesktopAuthority, ("llama3", 100));
+        SeedTags(ServerAuthority, ("llama3", 200));
+        SeedTags(LaptopAuthority, ("gemma3", 300));
+
+        _handler.Behavior(DesktopAuthority).Responses["POST /api/show"] =
+            """{"parameters":"num_ctx 4096\n","details":{"family":"llama-on-desktop"}}""";
+        _handler.Behavior(ServerAuthority).Responses["POST /api/show"] =
+            """{"parameters":"num_ctx 262144\n","details":{"family":"llama-on-server"}}""";
+
+        var service = CreateService();
+
+        // Unpinned: the fan-out scans both; Sv (larger num_ctx) wins the fleet best cache.
+        var fleetResult = await service.GetShowFleetAsync("llama3", pinned: null);
+        Assert.NotNull(fleetResult);
+        Assert.Equal("llama-on-server", fleetResult!["details"]?["family"]?.GetValue<string>());
+
+        // Pinned to Dt (the non-winning hoster): the pin bypasses the best cache and
+        // returns Dt's own payload (served from the fan-out's per-target write-through,
+        // so no further /api/show traffic to either daemon).
+        var pinnedResult = await service.GetShowFleetAsync("llama3", pinned: Dt);
+        Assert.NotNull(pinnedResult);
+        Assert.Equal("llama-on-desktop", pinnedResult!["details"]?["family"]?.GetValue<string>());
+        Assert.Equal(1, _handler.CountCalls(DesktopAuthority, "POST /api/show"));
+        Assert.Equal(1, _handler.CountCalls(ServerAuthority, "POST /api/show"));
     }
 
     [Fact]

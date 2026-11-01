@@ -140,8 +140,8 @@ public static class TerminalMonitorRenderer
         if (enableAnsi) sb.Append(Reset);
         lines.Add(sb.ToString());
 
-        lines.Add("   Target      Liveness  HW        Active Model             In Ctx");
-        lines.Add("   ─────────── ───────── ───────── ──────────────────────── ── ────────────────");
+        lines.Add("   Target      Liveness   HW        Active Model            In Ctx");
+        lines.Add("   ─────────── ────────── ───────── ─────────────────────── ── ────────────────");
 
         foreach (var item in state.Fleet)
         {
@@ -157,7 +157,7 @@ public static class TerminalMonitorRenderer
             row.Append(' ');
             row.Append(PadRightDisplay(Truncate(item.HardwareProfile ?? "-", 9), 9));
             row.Append(' ');
-            row.Append(PadRightDisplay(Truncate(item.ActiveModel ?? "-", 24), 24));
+            row.Append(PadRightDisplay(Truncate(item.ActiveModel ?? "-", 23), 23));
             row.Append(' ');
             row.Append(item.InFlightRequests.ToString("0", CultureInfo.InvariantCulture).PadLeft(2));
             row.Append(' ');
@@ -194,7 +194,7 @@ public static class TerminalMonitorRenderer
         }
 
         if (enableAnsi) sb.Append(badgeColor);
-        sb.Append(PadRightDisplay(text, 9));
+        sb.Append(PadRightDisplay(text, 10));
         if (enableAnsi) sb.Append(Reset);
     }
 
