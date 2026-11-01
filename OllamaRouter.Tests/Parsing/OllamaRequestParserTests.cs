@@ -364,6 +364,99 @@ public class OllamaRequestParserTests
     }
 
     [Fact]
+    public void ParseCompletionRequest_ThinkingOnMessage_IsIncludedInContextParts()
+    {
+        var body = """
+        {
+            "model": "qwen3.8-27b",
+            "messages": [
+                { "role": "user", "content": "Hello!" },
+                { "role": "assistant", "content": "Hi there.", "thinking": "Let me think about this." }
+            ]
+        }
+        """;
+
+        var result = OllamaRequestParser.ParseCompletionRequest(body);
+
+        Assert.Equal(new[] { "Hello!", "Hi there.", "Let me think about this." }, result.ContextParts);
+
+        var toolCallBody = """
+        {
+            "model": "qwen3.8-27b",
+            "messages": [
+                { "role": "user", "content": "What is 2+2?" },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "thinking": "Calling the calculator.",
+                    "tool_calls": [
+                        { "type": "function", "function": { "name": "calculator", "arguments": "{\"expression\": \"2+2\"}" } }
+                    ]
+                }
+            ]
+        }
+        """;
+
+        var toolCallResult = OllamaRequestParser.ParseCompletionRequest(toolCallBody);
+
+        Assert.DoesNotContain(string.Empty, toolCallResult.ContextParts);
+        Assert.Contains("Calling the calculator.", toolCallResult.ContextParts);
+        Assert.Contains("calculator", string.Join("\n", toolCallResult.ContextParts));
+    }
+
+    [Fact]
+    public void ParseCompletionRequest_ThinkingAsContentObject_IsIncludedInContextParts()
+    {
+        var body = """
+        {
+            "model": "qwen3.8-27b",
+            "messages": [
+                { "role": "assistant", "content": "", "thinking": { "content": "thinking as an object." } }
+            ]
+        }
+        """;
+
+        var result = OllamaRequestParser.ParseCompletionRequest(body);
+
+        Assert.Equal(new[] { "thinking as an object." }, result.ContextParts);
+    }
+
+    [Fact]
+    public void ParseCompletionRequest_NullThinking_IsIgnored()
+    {
+        var body = """
+        {
+            "model": "qwen3.8-27b",
+            "messages": [
+                { "role": "assistant", "content": "Hi.", "thinking": null }
+            ]
+        }
+        """;
+
+        var result = OllamaRequestParser.ParseCompletionRequest(body);
+
+        Assert.Equal(new[] { "Hi." }, result.ContextParts);
+    }
+
+    [Fact]
+    public void ParseCompletionRequest_ReasoningContentOnMessage_IsIncludedInContextParts()
+    {
+        var body = """
+        {
+            "model": "qwen3.8-27b",
+            "messages": [
+                { "role": "user", "content": "Hello!" },
+                { "role": "assistant", "content": "Hi there.", "reasoning_content": "OpenAI-style trace." }
+            ]
+        }
+        """;
+
+        var result = OllamaRequestParser.ParseCompletionRequest(body);
+
+        Assert.Equal(new[] { "Hello!", "Hi there.", "OpenAI-style trace." }, result.ContextParts);
+    }
+
+    [Fact]
     public void ParseCompletionRequest_FormatObject_IsIncludedInContextParts()
     {
         var body = """

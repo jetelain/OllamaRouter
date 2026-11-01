@@ -41,7 +41,8 @@ public static class OllamaRequestParser
 
     /// <summary>
     /// Parses a completion or chat request in a single JSON pass, extracting the model name,
-    /// combined textual context, and any prior context tokens without redundant DOM allocations.
+    /// combined textual context (including reasoning/thinking fields echoed on prior messages),
+    /// and any prior context tokens without redundant DOM allocations.
     /// </summary>
     public static OllamaCompletionRequestInfo ParseCompletionRequest(string jsonBody)
     {
@@ -86,11 +87,25 @@ public static class OllamaRequestParser
                     }
 
                     // OpenCode-style clients echo prior reasoning (thinking) content back on assistant
-                    // messages under a custom "reasoning" key. Ollama renders it into the prompt, so it
-                    // must be counted or the prompt size is severely underestimated for agent sessions.
+                    // messages under a "reasoning" key, with the "thinking" and "reasoning_content"
+                    // variants handled just below. Ollama renders it into the prompt, so it must be
+                    // counted or the prompt size is severely underestimated for agent sessions.
                     if (message.TryGetProperty("reasoning", out var reasoning) && reasoning.ValueKind != JsonValueKind.Null)
                     {
                         AppendContent(reasoning, parts);
+                    }
+
+                    // Ollama's native /api/chat protocol (and OllamaSharp.Models.Chat.Message.Thinking)
+                    // echoes prior assistant reasoning under "thinking"; some OpenAI-compatible reasoning
+                    // clients use "reasoning_content". Same underestimation rationale as "reasoning".
+                    if (message.TryGetProperty("thinking", out var thinking) && thinking.ValueKind != JsonValueKind.Null)
+                    {
+                        AppendContent(thinking, parts);
+                    }
+
+                    if (message.TryGetProperty("reasoning_content", out var reasoningContent) && reasoningContent.ValueKind != JsonValueKind.Null)
+                    {
+                        AppendContent(reasoningContent, parts);
                     }
                 }
             }
@@ -184,7 +199,8 @@ public static class OllamaRequestParser
     }
 
     /// <summary>
-    /// Appends the textual content of a message field (e.g. "content" or "reasoning"), which may
+    /// Appends the textual content of a message field (e.g. "content", "reasoning", "thinking",
+    /// or "reasoning_content"), which may
     /// be either a plain string, an array of content parts (OpenAI-compatible multimodal format,
     /// e.g. [{ "type": "text", "text": "..." }, { "type": "image_url", ... }]), or a single object
     /// holding its text under a "text" (OpenAI) or "content" property.
