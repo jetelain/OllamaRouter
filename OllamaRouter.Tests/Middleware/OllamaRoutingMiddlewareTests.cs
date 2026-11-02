@@ -580,6 +580,140 @@ public class OllamaRoutingMiddlewareTests
     }
 
     [Fact]
+    public async Task InvokeAsync_CompletionWithReasoningAndHeaders_StartAndCompleteCarryRawMonitorValues()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "hello", "reasoning_effort": "high" }""");
+        context.Request.Headers[OllamaReverseProxyConfig.PublicSessionIdHeader] = "s1";
+        context.Request.Headers[OllamaReverseProxyConfig.PublicAgentIdHeader] = "a2";
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var requestId = Guid.NewGuid();
+        var activityMonitor = new Mock<IActivityMonitorService>();
+        string? startReasoning = null, startSession = null, startAgent = null;
+        activityMonitor
+            .Setup(m => m.StartRequest(It.IsAny<RoutingTarget>(), It.IsAny<string>(), It.IsAny<int>(),
+                It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<string?>()))
+            .Callback<RoutingTarget, string, int, string?, string?, string?>(
+                (_, _, _, reasoning, session, agent) =>
+                {
+                    startReasoning = reasoning;
+                    startSession = session;
+                    startAgent = agent;
+                })
+            .Returns(requestId);
+
+        // No ISessionAffinityService wired: the display-only capture must still happen (D4).
+        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService, activityMonitor: activityMonitor);
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("high", startReasoning);
+        Assert.Equal("s1", startSession);
+        Assert.Equal("a2", startAgent);
+
+        activityMonitor.Verify(
+            m => m.CompleteRequest(
+                requestId,
+                It.Is<ActivityLogEntry>(e => e.ReasoningEffort == "high" && e.SessionId == "s1" && e.AgentId == "a2")),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_CompletionThinkTrue_NoHeaders_StartCarriesTrueAndNullIds()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "hello", "think": true }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var requestId = Guid.NewGuid();
+        var activityMonitor = new Mock<IActivityMonitorService>();
+        string? startReasoning = "sentinel", startSession = "sentinel", startAgent = "sentinel";
+        activityMonitor
+            .Setup(m => m.StartRequest(It.IsAny<RoutingTarget>(), It.IsAny<string>(), It.IsAny<int>(),
+                It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<string?>()))
+            .Callback<RoutingTarget, string, int, string?, string?, string?>(
+                (_, _, _, reasoning, session, agent) =>
+                {
+                    startReasoning = reasoning;
+                    startSession = session;
+                    startAgent = agent;
+                })
+            .Returns(requestId);
+
+        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService, activityMonitor: activityMonitor);
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("true", startReasoning);
+        Assert.Null(startSession);
+        Assert.Null(startAgent);
+
+        activityMonitor.Verify(
+            m => m.CompleteRequest(
+                requestId,
+                It.Is<ActivityLogEntry>(e => e.ReasoningEffort == "true" && e.SessionId == null && e.AgentId == null)),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task InvokeAsync_CompletionNeitherBodyProperty_NeitherPresent_NullReasoningAndWhitespaceSessionNull()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "llama3", "prompt": "hello" }""");
+        context.Request.Headers[OllamaReverseProxyConfig.PublicSessionIdHeader] = "   ";
+        context.Request.Headers[OllamaReverseProxyConfig.PublicAgentIdHeader] = "a9";
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var requestId = Guid.NewGuid();
+        var activityMonitor = new Mock<IActivityMonitorService>();
+        string? startReasoning = null, startSession = null, startAgent = null;
+        activityMonitor
+            .Setup(m => m.StartRequest(It.IsAny<RoutingTarget>(), It.IsAny<string>(), It.IsAny<int>(),
+                It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<string?>()))
+            .Callback<RoutingTarget, string, int, string?, string?, string?>(
+                (_, _, _, reasoning, session, agent) =>
+                {
+                    startReasoning = reasoning;
+                    startSession = session;
+                    startAgent = agent;
+                })
+            .Returns(requestId);
+
+        var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService, activityMonitor: activityMonitor);
+
+        await sut.InvokeAsync(context);
+
+        Assert.Null(startReasoning);
+        Assert.Null(startSession); // whitespace-only session header ⇒ absent
+        Assert.Equal("a9", startAgent);
+
+        activityMonitor.Verify(
+            m => m.CompleteRequest(
+                requestId,
+                It.Is<ActivityLogEntry>(e => e.ReasoningEffort == null && e.SessionId == null && e.AgentId == "a9")),
+            Times.Once);
+    }
+
+    [Fact]
     public async Task InvokeAsync_CompletionRequest_RecordsFullRequestBody()
     {
         const string requestBody = """{ "model": "qwen", "messages": [ { "role": "user", "content": "hello" } ] }""";

@@ -123,7 +123,10 @@ public static partial class MonitorEndpointsExtensions
                 r.Target.ToString(),
                 r.Model,
                 r.EstimatedPromptTokens,
-                (now - r.StartedAt).TotalMilliseconds)).ToList(),
+                (now - r.StartedAt).TotalMilliseconds,
+                r.ReasoningEffort,
+                r.SessionId,
+                r.AgentId)).ToList(),
             snapshot.RecentRequests.Select(r => new MonitorRecentRequestItem(
                 r.Timestamp,
                 r.Target.ToString(),
@@ -134,7 +137,10 @@ public static partial class MonitorEndpointsExtensions
                 r.ElapsedMilliseconds,
                 r.StatusCode,
                 r.Success,
-                r.RawPromptTokens)).ToList(),
+                r.RawPromptTokens,
+                r.ReasoningEffort,
+                r.SessionId,
+                r.AgentId)).ToList(),
             CalculateCostStatus(statistics.Last7Days, options.CurrentValue.Pricing),
             includeOverhead
                 ? CalculateOverheadStatus(snapshot.RecentRequests, options.CurrentValue.TokenEstimationOverheadFactor, options.CurrentValue.TokenEstimator)

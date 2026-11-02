@@ -97,7 +97,10 @@ public sealed record MonitorInProgressItem(
     [property: JsonPropertyName("target")] string Target,
     [property: JsonPropertyName("model")] string Model,
     [property: JsonPropertyName("estimatedPromptTokens")] int EstimatedPromptTokens,
-    [property: JsonPropertyName("elapsedMs")] double ElapsedMs);
+    [property: JsonPropertyName("elapsedMs")] double ElapsedMs,
+    [property: JsonPropertyName("reasoningEffort")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? ReasoningEffort = null,
+    [property: JsonPropertyName("sessionId")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? SessionId = null,
+    [property: JsonPropertyName("agentId")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? AgentId = null);
 
 public sealed record MonitorRecentRequestItem(
     [property: JsonPropertyName("timestamp")] DateTimeOffset Timestamp,
@@ -109,7 +112,10 @@ public sealed record MonitorRecentRequestItem(
     [property: JsonPropertyName("elapsedMs")] double ElapsedMs,
     [property: JsonPropertyName("statusCode")] int? StatusCode,
     [property: JsonPropertyName("success")] bool Success,
-    [property: JsonPropertyName("rawPromptTokens")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? RawPromptTokens = null);
+    [property: JsonPropertyName("rawPromptTokens")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? RawPromptTokens = null,
+    [property: JsonPropertyName("reasoningEffort")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? ReasoningEffort = null,
+    [property: JsonPropertyName("sessionId")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? SessionId = null,
+    [property: JsonPropertyName("agentId")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? AgentId = null);
 
 public sealed record MonitorOverheadRecommendation(
     [property: JsonPropertyName("model")] string Model,

@@ -75,6 +75,64 @@ public class ActivityMonitorServiceTests
     }
 
     [Fact]
+    public void StartRequest_WithReasoningSessionAndAgent_SnapshotCarriesValues()
+    {
+        var sut = new ActivityMonitorService();
+
+        sut.StartRequest(RoutingTarget.Local, "llama3", 42, "high", "s1", "a2");
+
+        var inProgress = Assert.Single(sut.GetSnapshot().InProgressRequests);
+
+        Assert.Equal("high", inProgress.ReasoningEffort);
+        Assert.Equal("s1", inProgress.SessionId);
+        Assert.Equal("a2", inProgress.AgentId);
+    }
+
+    [Fact]
+    public void StartRequest_LegacyThreeArgCall_ValuesAreNull()
+    {
+        var sut = new ActivityMonitorService();
+
+        sut.StartRequest(RoutingTarget.Local, "llama3", 42);
+
+        var inProgress = Assert.Single(sut.GetSnapshot().InProgressRequests);
+
+        Assert.Null(inProgress.ReasoningEffort);
+        Assert.Null(inProgress.SessionId);
+        Assert.Null(inProgress.AgentId);
+    }
+
+    [Fact]
+    public void CompleteRequest_EntryCarryingValues_RecentRequestsCarryValues()
+    {
+        var sut = new ActivityMonitorService();
+        var requestId = sut.StartRequest(RoutingTarget.Local, "llama3", 42);
+
+        var entry = new ActivityLogEntry(
+            DateTimeOffset.UtcNow,
+            RoutingTarget.Local,
+            "llama3",
+            42,
+            40,
+            128,
+            1500,
+            200,
+            true,
+            38,
+            "true",
+            "s1",
+            "a2");
+
+        sut.CompleteRequest(requestId, entry);
+
+        var recorded = Assert.Single(sut.GetSnapshot().RecentRequests);
+
+        Assert.Equal("true", recorded.ReasoningEffort);
+        Assert.Equal("s1", recorded.SessionId);
+        Assert.Equal("a2", recorded.AgentId);
+    }
+
+    [Fact]
     public void CompleteRequest_TargetStaysBusy_WhileAnotherRequestIsStillInProgress()
     {
         var sut = new ActivityMonitorService();

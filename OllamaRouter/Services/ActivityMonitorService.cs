@@ -15,10 +15,11 @@ public sealed class ActivityMonitorService(
     private readonly ConcurrentQueue<ActivityLogEntry> _history = new();
     private readonly ITargetExecutionTracker? _executionTracker = executionTracker;
 
-    public Guid StartRequest(RoutingTarget target, string model, int estimatedPromptTokens)
+    public Guid StartRequest(RoutingTarget target, string model, int estimatedPromptTokens,
+        string? reasoningEffort = null, string? sessionId = null, string? agentId = null)
     {
         var id = Guid.NewGuid();
-        _inProgress[id] = new InProgressRequest(id, DateTimeOffset.UtcNow, target, model, estimatedPromptTokens);
+        _inProgress[id] = new InProgressRequest(id, DateTimeOffset.UtcNow, target, model, estimatedPromptTokens, reasoningEffort, sessionId, agentId);
         return id;
     }
 

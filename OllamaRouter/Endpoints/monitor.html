@@ -111,7 +111,7 @@
 <h2>In progress</h2>
 <table>
   <thead>
-    <tr><th>Target</th><th>Model</th><th>In (est.)</th><th>Running for</th></tr>
+    <tr><th>Target</th><th>Model</th><th>In (est.)</th><th>Running for</th><th>Reasoning</th><th>Session</th><th>Agent</th></tr>
   </thead>
   <tbody id="inProgressRows"></tbody>
 </table>
@@ -119,7 +119,7 @@
 <h2>Recent requests</h2>
 <table>
   <thead>
-    <tr><th>Time</th><th>Target</th><th>Model</th><th>In (est. / act.)</th><th>Out</th><th>Elapsed</th><th>Status</th></tr>
+    <tr><th>Time</th><th>Target</th><th>Model</th><th>In (est. / act.)</th><th>Out</th><th>Elapsed</th><th>Status</th><th>Reasoning</th><th>Session</th><th>Agent</th></tr>
   </thead>
   <tbody id="rows"></tbody>
 </table>
@@ -462,7 +462,7 @@ async function refresh() {
     if (data.inProgress.length === 0) {
       const emptyCell = td('No request in progress');
       emptyCell.className = 'empty';
-      emptyCell.colSpan = 4;
+      emptyCell.colSpan = 7;
       addRow(inProgressRows, [emptyCell]);
     } else {
       for (const r of data.inProgress) {
@@ -470,7 +470,10 @@ async function refresh() {
           targetCell(r.target),
           td(r.model),
           td(tokens(r.estimatedPromptTokens), 'num'),
-          td((r.elapsedMs / 1000).toFixed(1) + 's', 'num')
+          td((r.elapsedMs / 1000).toFixed(1) + 's', 'num'),
+          td(r.reasoningEffort || '-'),
+          td(r.sessionId || '-'),
+          td(r.agentId || '-')
         ], 'pending');
       }
     }
@@ -486,7 +489,10 @@ async function refresh() {
         td(tokens(r.estimatedPromptTokens) + ' / ' + tokens(r.actualPromptTokens), 'num'),
         td(tokens(r.actualResponseTokens), 'num'),
         td((r.elapsedMs / 1000).toFixed(1) + 's', 'num'),
-        td(r.statusCode, 'num')
+        td(r.statusCode, 'num'),
+        td(r.reasoningEffort || '-'),
+        td(r.sessionId || '-'),
+        td(r.agentId || '-')
       ], r.success ? null : 'fail');
     }
 

@@ -493,4 +493,211 @@ public class OllamaRequestParserTests
         Assert.Empty(result.ContextParts);
         Assert.Equal(0, result.PriorContextTokenCount);
     }
+
+    [Fact]
+    public void ParseCompletionRequest_ThinkTrue_ReasoningEffortIsTrue()
+    {
+        var body = """
+        {
+            "model": "llama3",
+            "think": true,
+            "prompt": "hello"
+        }
+        """;
+
+        var result = OllamaRequestParser.ParseCompletionRequest(body);
+
+        Assert.Equal("true", result.ReasoningEffort);
+    }
+
+    [Fact]
+    public void ParseCompletionRequest_ThinkFalse_ReasoningEffortIsFalse()
+    {
+        var body = """
+        {
+            "model": "llama3",
+            "think": false,
+            "prompt": "hello"
+        }
+        """;
+
+        var result = OllamaRequestParser.ParseCompletionRequest(body);
+
+        Assert.Equal("false", result.ReasoningEffort);
+    }
+
+    [Theory]
+    [InlineData("\"1024\"", "1024")]
+    [InlineData("\"high\"", "high")]
+    [InlineData("\"low\"", "low")]
+    public void ParseCompletionRequest_ThinkString_VerbatimValue(string json, string expected)
+    {
+        var body = $$"""
+        {
+            "model": "llama3",
+            "think": {{json}},
+            "prompt": "hello"
+        }
+        """;
+
+        var result = OllamaRequestParser.ParseCompletionRequest(body);
+
+        Assert.Equal(expected, result.ReasoningEffort);
+    }
+
+    [Theory]
+    [InlineData("low")]
+    [InlineData("medium")]
+    [InlineData("high")]
+    public void ParseCompletionRequest_ReasoningEffort_VerbatimValue(string value)
+    {
+        var body = $$"""
+        {
+            "model": "gpt-oss",
+            "reasoning_effort": "{{value}}",
+            "prompt": "hello"
+        }
+        """;
+
+        var result = OllamaRequestParser.ParseCompletionRequest(body);
+
+        Assert.Equal(value, result.ReasoningEffort);
+    }
+
+    [Fact]
+    public void ParseCompletionRequest_BothThinkAndReasoningEffort_ThinkWins()
+    {
+        var body = """
+        {
+            "model": "llama3",
+            "think": "1024",
+            "reasoning_effort": "high",
+            "prompt": "hello"
+        }
+        """;
+
+        var result = OllamaRequestParser.ParseCompletionRequest(body);
+
+        Assert.Equal("1024", result.ReasoningEffort);
+    }
+
+    [Fact]
+    public void ParseCompletionRequest_NeitherProperty_ReasoningEffortIsNull()
+    {
+        var body = """
+        {
+            "model": "llama3",
+            "prompt": "hello"
+        }
+        """;
+
+        var result = OllamaRequestParser.ParseCompletionRequest(body);
+
+        Assert.Null(result.ReasoningEffort);
+    }
+
+    [Fact]
+    public void ParseCompletionRequest_ThinkNullOnly_ReasoningEffortIsNull()
+    {
+        var body = """
+        {
+            "model": "llama3",
+            "think": null,
+            "prompt": "hello"
+        }
+        """;
+
+        var result = OllamaRequestParser.ParseCompletionRequest(body);
+
+        Assert.Null(result.ReasoningEffort);
+    }
+
+    [Fact]
+    public void ParseCompletionRequest_ThinkNullWithReasoningEffort_FallsThroughToReasoningEffort()
+    {
+        var body = """
+        {
+            "model": "llama3",
+            "think": null,
+            "reasoning_effort": "high",
+            "prompt": "hello"
+        }
+        """;
+
+        var result = OllamaRequestParser.ParseCompletionRequest(body);
+
+        Assert.Equal("high", result.ReasoningEffort);
+    }
+
+    [Fact]
+    public void ParseCompletionRequest_ThinkWhitespaceString_ReasoningEffortIsNull()
+    {
+        var body = """
+        {
+            "model": "llama3",
+            "think": "   ",
+            "reasoning_effort": "low",
+            "prompt": "hello"
+        }
+        """;
+
+        var result = OllamaRequestParser.ParseCompletionRequest(body);
+
+        // Whitespace-only think counts as absent; falls through to reasoning_effort.
+        Assert.Equal("low", result.ReasoningEffort);
+
+        var whitespaceOnly = OllamaRequestParser.ParseCompletionRequest(
+            """
+            { "model": "llama3", "think": "  ", "prompt": "hello" }
+            """);
+        Assert.Null(whitespaceOnly.ReasoningEffort);
+    }
+
+    [Fact]
+    public void ParseCompletionRequest_ThinkObjectOrArray_ReasoningEffortIsNull()
+    {
+        var body = """
+        {
+            "model": "llama3",
+            "think": { "budget": 1024 },
+            "reasoning_effort": ["low"],
+            "prompt": "hello"
+        }
+        """;
+
+        var result = OllamaRequestParser.ParseCompletionRequest(body);
+
+        Assert.Null(result.ReasoningEffort);
+    }
+
+    [Fact]
+    public void ParseCompletionRequest_InvalidJson_ReasoningEffortIsNull_NoThrow()
+    {
+        var result = OllamaRequestParser.ParseCompletionRequest("invalid-json");
+
+        Assert.Null(result.ReasoningEffort);
+        Assert.Equal("", result.ModelName);
+        Assert.Empty(result.ContextParts);
+        Assert.Equal(0, result.PriorContextTokenCount);
+    }
+
+    [Fact]
+    public void ParseCompletionRequest_ThinkProperty_ExistingOutputsUnaffected()
+    {
+        var body = """
+        {
+            "model": "llama3",
+            "think": "1024",
+            "messages": [ { "role": "user", "content": "hi" } ],
+            "context": [1, 2, 3]
+        }
+        """;
+
+        var result = OllamaRequestParser.ParseCompletionRequest(body);
+
+        Assert.Equal("llama3", result.ModelName);
+        Assert.Equal("hi", Assert.Single(result.ContextParts));
+        Assert.Equal(3, result.PriorContextTokenCount);
+        Assert.Equal("1024", result.ReasoningEffort);
+    }
 }

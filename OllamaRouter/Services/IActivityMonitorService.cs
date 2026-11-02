@@ -13,7 +13,10 @@ public sealed record ActivityLogEntry(
     long ElapsedMilliseconds,
     int StatusCode,
     bool Success,
-    int? RawPromptTokens = null);
+    int? RawPromptTokens = null,
+    string? ReasoningEffort = null,
+    string? SessionId = null,
+    string? AgentId = null);
 
 /// <summary>
 /// A chat/generate request that is currently being processed by an instance.
@@ -23,7 +26,10 @@ public sealed record InProgressRequest(
     DateTimeOffset StartedAt,
     RoutingTarget Target,
     string Model,
-    int EstimatedPromptTokens);
+    int EstimatedPromptTokens,
+    string? ReasoningEffort = null,
+    string? SessionId = null,
+    string? AgentId = null);
 
 /// <summary>
 /// Current state of the monitoring: which instances are busy, the requests currently in
@@ -43,9 +49,13 @@ public interface IActivityMonitorService
 {
     /// <summary>
     /// Registers the start of a request being routed to the given instance. Returns an id to be
-    /// passed to <see cref="CompleteRequest"/> once the request finishes.
+    /// passed to <see cref="CompleteRequest"/> once the request finishes. The optional
+    /// <paramref name="reasoningEffort"/> (raw body property value), <paramref name="sessionId"/>
+    /// and <paramref name="agentId"/> (raw public header values, null when absent) are display-only
+    /// monitoring metadata.
     /// </summary>
-    Guid StartRequest(RoutingTarget target, string model, int estimatedPromptTokens);
+    Guid StartRequest(RoutingTarget target, string model, int estimatedPromptTokens,
+        string? reasoningEffort = null, string? sessionId = null, string? agentId = null);
 
     /// <summary>
     /// Marks a request (previously registered via <see cref="StartRequest"/>) as finished, and

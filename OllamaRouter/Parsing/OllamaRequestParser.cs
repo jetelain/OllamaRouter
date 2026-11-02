@@ -61,6 +61,20 @@ public static class OllamaRequestParser
                 modelName = nameElement.GetString() ?? "";
             }
 
+            // The request's reasoning/think effort, rendered verbatim as sent (e.g. "true",
+            // "1024", "high"): Ollama-native "think" takes precedence, OpenAI-compatible
+            // "reasoning_effort" is the fallback; null/object/array/whitespace values are
+            // treated as absent (null).
+            string? reasoningEffort = null;
+            if (root.TryGetProperty("think", out var think))
+            {
+                reasoningEffort = RenderReasoningValue(think);
+            }
+            if (reasoningEffort is null && root.TryGetProperty("reasoning_effort", out var reasoningEffortElement))
+            {
+                reasoningEffort = RenderReasoningValue(reasoningEffortElement);
+            }
+
             int priorContextTokenCount = 0;
             if (root.TryGetProperty("context", out var context) && context.ValueKind == JsonValueKind.Array)
             {
@@ -150,7 +164,7 @@ public static class OllamaRequestParser
                 parts.Add(formatElement.GetRawText());
             }
 
-            return new OllamaCompletionRequestInfo(modelName, parts, priorContextTokenCount);
+            return new OllamaCompletionRequestInfo(modelName, parts, priorContextTokenCount, reasoningEffort);
         }
         catch
         {
@@ -253,6 +267,30 @@ public static class OllamaRequestParser
         }
     }
 
+    /// <summary>
+    /// Renders a reasoning-effort JSON value verbatim as sent: boolean → "true"/"false",
+    /// string → the verbatim value (whitespace-only ⇒ absent), number → its raw text
+    /// (defensive, e.g. a numeric think budget). JSON null, objects, arrays and any other
+    /// kinds count as absent (null).
+    /// </summary>
+    private static string? RenderReasoningValue(JsonElement value)
+    {
+        switch (value.ValueKind)
+        {
+            case JsonValueKind.True:
+                return "true";
+            case JsonValueKind.False:
+                return "false";
+            case JsonValueKind.String:
+                var text = value.GetString();
+                return string.IsNullOrWhiteSpace(text) ? null : text;
+            case JsonValueKind.Number:
+                return value.GetRawText();
+            default:
+                return null;
+        }
+    }
+
     public static string ExtractModelName(string jsonBody)
     {
         try
@@ -318,4 +356,5 @@ public static class OllamaRequestParser
 public readonly record struct OllamaCompletionRequestInfo(
     string ModelName,
     IReadOnlyList<string> ContextParts,
-    int PriorContextTokenCount);
+    int PriorContextTokenCount,
+    string? ReasoningEffort = null);

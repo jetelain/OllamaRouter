@@ -1158,4 +1158,46 @@ public class MonitorEndpointsExtensionsTests
             await app.DisposeAsync();
         }
     }
+
+    [Fact]
+    public async Task GetMonitorApi_InProgressAndRecentRequests_IncludeReasoningSessionAndAgent_AndOmitNulls()
+    {
+        var inProgress = new List<InProgressRequest>
+        {
+            new(Guid.NewGuid(), DateTimeOffset.UtcNow, RoutingTarget.Local, "llama3", 42, "high", "s1", "a2")
+        };
+        var requests = new List<ActivityLogEntry>
+        {
+            new(DateTimeOffset.UtcNow, RoutingTarget.Local, "llama3", 42, 40, 100, 1500, 200, true, 38, "true", "s1", null)
+        };
+
+        var (app, client, mocks) = await CreateTestAppAsync();
+        try
+        {
+            mocks.ActivityMonitor.Setup(m => m.GetSnapshot())
+                .Returns(new ActivityMonitorSnapshot(new Dictionary<RoutingTarget, bool>(), inProgress, requests));
+
+            var response = await client.GetAsync("/monitor/api");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var json = await response.Content.ReadFromJsonAsync<JsonObject>();
+            Assert.NotNull(json);
+
+            var ip = Assert.Single(json["inProgress"]!.AsArray());
+            Assert.Equal("high", ip?["reasoningEffort"]?.GetValue<string>());
+            Assert.Equal("s1", ip?["sessionId"]?.GetValue<string>());
+            Assert.Equal("a2", ip?["agentId"]?.GetValue<string>());
+
+            var req = Assert.Single(json["requests"]!.AsArray());
+            Assert.NotNull(req);
+            Assert.Equal("true", req["reasoningEffort"]?.GetValue<string>());
+            Assert.Equal("s1", req["sessionId"]?.GetValue<string>());
+            Assert.Null(req["agentId"]); // null value ⇒ property omitted from JSON
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
 }

@@ -461,6 +461,29 @@ public sealed class OllamaRoutingMiddleware(
         return sessionId;
     }
 
+    // Display-only capture of the two public sticky-routing headers as INDEPENDENT raw values
+    // (trimmed; empty/whitespace ⇒ null) for the monitoring UI: no 256-char cap, no logging,
+    // and unconditional — monitoring must show the ids even where sticky routing itself is not
+    // wired (no ISessionAffinityService). Routing/lease semantics live solely in
+    // TryExtractSessionId above and are untouched.
+    private static void TryExtractSessionAndAgentIds(HttpContext context, out string? sessionId, out string? agentId)
+    {
+        sessionId = null;
+        agentId = null;
+
+        if (context.Request.Headers.TryGetValue(OllamaReverseProxyConfig.PublicSessionIdHeader, out var sessionHeader))
+        {
+            var raw = sessionHeader.ToString()?.Trim();
+            sessionId = string.IsNullOrEmpty(raw) ? null : raw;
+        }
+
+        if (context.Request.Headers.TryGetValue(OllamaReverseProxyConfig.PublicAgentIdHeader, out var agentHeader))
+        {
+            var raw = agentHeader.ToString()?.Trim();
+            agentId = string.IsNullOrEmpty(raw) ? null : raw;
+        }
+    }
+
     private Task<RoutingTarget> DecideWithSessionAsync(
         int tokenCount, string modelName, int? clientNumCtx, string? sessionId, HttpContext context)
     {
@@ -751,6 +774,11 @@ public sealed class OllamaRoutingMiddleware(
         // SessionAffinityBonus + lease rebinding and echoed back in the response telemetry.
         var sessionId = _sessionAffinity is not null ? TryExtractSessionId(context) : null;
 
+        // The request's display-only raw header values for the monitor (X-OllamaRouter-Session-Id
+        // and X-OllamaRouter-Agent-Id captured INDEPENDENTLY; trimmed; empty ⇒ null). Never
+        // participates in routing — the merged sticky-routing id above keeps its own semantics.
+        TryExtractSessionAndAgentIds(context, out var rawSessionId, out var rawAgentId);
+
         // The target currently holding an in-flight accounting slot (the decided primary);
         // reassigned to the finally-served target after the dispatch loop so a request that
         // fails over Remote→Local is counted against Local, never against an exhausted candidate.
@@ -759,6 +787,7 @@ public sealed class OllamaRoutingMiddleware(
         var modelName = "unknown";
         var tokenCount = 0;
         var rawTokenCount = 0;
+        string? reasoningEffort = null;
         // Unassigned-safe default: every routing branch below assigns the real decision (the
         // pin branches and the dynamic branch cover all reachable paths); the default value
         // merely satisfies definite-assignment in the branch topology.
@@ -774,6 +803,7 @@ public sealed class OllamaRoutingMiddleware(
         {
             var requestInfo = OllamaRequestParser.ParseCompletionRequest(body);
             modelName = string.IsNullOrEmpty(requestInfo.ModelName) ? "unknown" : requestInfo.ModelName;
+            reasoningEffort = requestInfo.ReasoningEffort;
             rawTokenCount = tokenEstimator.EstimateTokens(requestInfo.ContextParts, modelName)
                 + requestInfo.PriorContextTokenCount;
             tokenCount = (int)Math.Ceiling(rawTokenCount * options.CurrentValue.TokenEstimationOverheadFactor);
@@ -1108,7 +1138,7 @@ public sealed class OllamaRoutingMiddleware(
             executionTracker.IncrementInFlight(target);
         }
 
-        var requestId = activityMonitor.StartRequest(target, modelName, tokenCount);
+        var requestId = activityMonitor.StartRequest(target, modelName, tokenCount, reasoningEffort, rawSessionId, rawAgentId);
         var stopwatch = Stopwatch.StartNew();
         var success = false;
         var isClientAborted = false;
@@ -1234,7 +1264,10 @@ public sealed class OllamaRoutingMiddleware(
                 stopwatch.ElapsedMilliseconds,
                 recordedStatusCode,
                 success,
-                rawTokenCount);
+                rawTokenCount,
+                reasoningEffort,
+                rawSessionId,
+                rawAgentId);
 
 
             activityMonitor.CompleteRequest(requestId, entry);
