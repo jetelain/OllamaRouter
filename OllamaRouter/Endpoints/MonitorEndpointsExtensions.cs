@@ -23,7 +23,7 @@ public static partial class MonitorEndpointsExtensions
         app.MapGet("/monitor/api", async (
             IActivityMonitorService activityMonitor,
             IActivityStatisticsService activityStatistics,
-            IOptions<OllamaRouterOptions> options,
+            IOptionsMonitor<OllamaRouterOptions> options,
             ITargetAvailabilityService targetAvailability,
             IModelCatalogCacheService modelCatalogCache,
             IServiceProvider serviceProvider,
@@ -58,7 +58,7 @@ public static partial class MonitorEndpointsExtensions
             [FromQuery] bool? disableTarget,
             IOllamaModelCatalogClient catalogClient,
             ITargetAvailabilityService targetAvailability,
-            IOptions<OllamaRouterOptions> options,
+            IOptionsMonitor<OllamaRouterOptions> options,
             IServiceProvider serviceProvider,
             CancellationToken cancellationToken) =>
             await ReclaimLocalLegacyAsync(
@@ -69,7 +69,7 @@ public static partial class MonitorEndpointsExtensions
             [FromQuery] bool? disableTarget,
             IOllamaModelCatalogClient catalogClient,
             ITargetAvailabilityService targetAvailability,
-            IOptions<OllamaRouterOptions> options,
+            IOptionsMonitor<OllamaRouterOptions> options,
             IServiceProvider serviceProvider,
             CancellationToken cancellationToken) =>
             await ReclaimLocalLegacyAsync(
@@ -94,7 +94,7 @@ public static partial class MonitorEndpointsExtensions
         bool shouldDisable,
         IOllamaModelCatalogClient catalogClient,
         ITargetAvailabilityService targetAvailability,
-        IOptions<OllamaRouterOptions> options,
+        IOptionsMonitor<OllamaRouterOptions> options,
         IContextAutoShrinkManager? shrinkManager,
         CancellationToken cancellationToken)
     {
@@ -103,7 +103,7 @@ public static partial class MonitorEndpointsExtensions
             DisableLocalTarget(targetAvailability);
         }
 
-        var effectiveTargets = options.Value.GetEffectiveTargets();
+        var effectiveTargets = options.CurrentValue.GetEffectiveTargets();
         var localTarget = effectiveTargets.FirstOrDefault(t => string.Equals(t.Name, "Local", StringComparison.OrdinalIgnoreCase))
             ?? effectiveTargets.FirstOrDefault(t => OllamaProcessLauncher.IsLoopback(t.Url));
 
@@ -111,7 +111,7 @@ public static partial class MonitorEndpointsExtensions
 #pragma warning disable CS0618
         if (string.IsNullOrWhiteSpace(localUrl))
         {
-            localUrl = options.Value.LocalUrl?.TrimEnd('/');
+            localUrl = options.CurrentValue.LocalUrl?.TrimEnd('/');
         }
 #pragma warning restore CS0618
 

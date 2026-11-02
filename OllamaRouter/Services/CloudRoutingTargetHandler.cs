@@ -8,7 +8,7 @@ using OllamaRouter.Options;
 /// </summary>
 public sealed class CloudRoutingTargetHandler(
     ITargetAvailabilityService targetAvailability,
-    IOptions<OllamaRouterOptions>? options = null,
+    IOptionsMonitor<OllamaRouterOptions>? options = null,
     ILogger<CloudRoutingTargetHandler>? logger = null)
 {
     public RoutingTarget Target => RoutingTarget.Cloud;
@@ -26,13 +26,14 @@ public sealed class CloudRoutingTargetHandler(
     public bool IsAvailable() => IsEnabled && IsCloudOverflowEnabled();
 
     /// <summary>
-    /// True when the static CloudOverflow.Enabled switch is on (the targets.json Cloud toggle is
+    /// True when the CloudOverflow.Enabled switch is on (the targets.json Cloud toggle is
     /// <see cref="IsEnabled"/>). The options are optional so existing tests that construct the
     /// handler without options keep the previous behavior (always enabled when the toggle is on).
+    /// The switch is read from <c>CurrentValue</c> per call so runtime config edits apply live.
     /// </summary>
     private bool IsCloudOverflowEnabled()
     {
-        var opts = options?.Value;
+        var opts = options?.CurrentValue;
         return opts is null || opts.CloudOverflow.Enabled;
     }
 
@@ -52,7 +53,7 @@ public sealed class CloudRoutingTargetHandler(
 
         // Shared precedence (CloudRelayResolver): per-model CloudModel wins over
         // CloudOverflow.DefaultModel. A missing resolvable model means Cloud cannot serve.
-        var opts = options?.Value;
+        var opts = options?.CurrentValue;
         var cloudModel = opts is null
             ? context.Thresholds?.CloudModel
             : CloudRelayResolver.ResolveCloudModel(opts, context.ModelName);

@@ -1,8 +1,8 @@
+using OllamaRouter.Tests.TestHelpers;
 using Microsoft.Extensions.Logging.Abstractions;
 using OllamaRouter.Options;
 using OllamaRouter.Services;
 using Pmad.AI.Tokens;
-using MsOptions = Microsoft.Extensions.Options.Options;
 
 namespace OllamaRouter.Tests.Services;
 
@@ -54,7 +54,7 @@ public class TokenMetricsRecorderTests : IDisposable
 
     private static TokenMetricsRecorder CreateSut(TokenMetricsCsvOptions? csv) =>
         new(
-            MsOptions.Create(new OllamaRouterOptions { Recording = csv is null ? null : new RecordingOptions { TokenMetricsCsv = csv } }),
+            new TestOptionsMonitor<OllamaRouterOptions>(new OllamaRouterOptions { Recording = csv is null ? null : new RecordingOptions { TokenMetricsCsv = csv } }),
             NullLogger<TokenMetricsRecorder>.Instance);
 
     [Theory]

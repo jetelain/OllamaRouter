@@ -1,3 +1,4 @@
+using OllamaRouter.Tests.TestHelpers;
 using System.Text.Json.Nodes;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -128,7 +129,7 @@ public class ModelPreloadServiceTests
             catalogCache);
 
         var sut = new ModelPreloadService(
-            Microsoft.Extensions.Options.Options.Create(options),
+            new TestOptionsMonitor<OllamaRouterOptions>(options),
             catalog.Object,
             catalogCache,
             engine,

@@ -10,7 +10,7 @@ public static partial class MonitorEndpointsExtensions
     public static async Task<MonitorStateResponse> BuildMonitorStateResponseAsync(
         IActivityMonitorService activityMonitor,
         IActivityStatisticsService activityStatistics,
-        IOptions<OllamaRouterOptions> options,
+        IOptionsMonitor<OllamaRouterOptions> options,
         ITargetAvailabilityService targetAvailability,
         IModelCatalogCacheService modelCatalogCache,
         CancellationToken cancellationToken = default,
@@ -23,10 +23,10 @@ public static partial class MonitorEndpointsExtensions
         var snapshot = activityMonitor.GetSnapshot();
         var statistics = activityStatistics.GetSnapshot();
         var now = DateTimeOffset.UtcNow;
-        var cloudEnabled = options.Value.IsCloudOverflowConfigured();
+        var cloudEnabled = options.CurrentValue.IsCloudOverflowConfigured();
         var targets = targetAvailability.GetSnapshot();
 
-        var effectiveTargets = options.Value.GetEffectiveTargets();
+        var effectiveTargets = options.CurrentValue.GetEffectiveTargets();
         var livenessEntries = liveness?.GetEntries();
         var leaseSnapshot = contextShrinkManager?.GetLeaseSnapshot();
 
@@ -135,9 +135,9 @@ public static partial class MonitorEndpointsExtensions
                 r.StatusCode,
                 r.Success,
                 r.RawPromptTokens)).ToList(),
-            CalculateCostStatus(statistics.Last7Days, options.Value.Pricing),
+            CalculateCostStatus(statistics.Last7Days, options.CurrentValue.Pricing),
             includeOverhead
-                ? CalculateOverheadStatus(snapshot.RecentRequests, options.Value.TokenEstimationOverheadFactor, options.Value.TokenEstimator)
+                ? CalculateOverheadStatus(snapshot.RecentRequests, options.CurrentValue.TokenEstimationOverheadFactor, options.CurrentValue.TokenEstimator)
                 : null);
     }
 

@@ -1,3 +1,4 @@
+using OllamaRouter.Tests.TestHelpers;
 using System.Text.Json.Nodes;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.DependencyInjection;
@@ -182,7 +183,7 @@ public class RoutingDecisionServiceTests
 
         var cloudHandler = new CloudRoutingTargetHandler(availability.Object);
         var sut = new RoutingDecisionService(
-            Microsoft.Extensions.Options.Options.Create(options),
+            new TestOptionsMonitor<OllamaRouterOptions>(options),
             cacheService.Object,
             liveness.Object,
             availability.Object,
@@ -733,7 +734,7 @@ public class RoutingDecisionServiceTests
         // CloudOverflow.Enabled switch / DefaultModel precedence would be silently ignored.
         services.AddTransient<CloudRoutingTargetHandler>(sp => new CloudRoutingTargetHandler(
             sp.GetRequiredService<ITargetAvailabilityService>(),
-            sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
+            sp.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>(),
             sp.GetRequiredService<ILogger<CloudRoutingTargetHandler>>()));
         services.AddTransient<IRoutingDecisionService, RoutingDecisionService>();
 
@@ -1598,7 +1599,7 @@ public class RoutingDecisionServiceTests
 
     private static SessionAffinityService CreateSessionAffinity() =>
         new SessionAffinityService(
-            Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions { SessionAffinityTtlMinutes = 30 }),
+            new TestOptionsMonitor<OllamaRouterOptions>(new OllamaRouterOptions { SessionAffinityTtlMinutes = 30 }),
             NullLogger<SessionAffinityService>.Instance);
 
     [Fact]
@@ -2739,7 +2740,7 @@ public class RoutingDecisionServiceTests
     {
         var meta = AddScopeDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
         var affinity = new SessionAffinityService(
-            Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions { SessionAffinityTtlMinutes = 30 }),
+            new TestOptionsMonitor<OllamaRouterOptions>(new OllamaRouterOptions { SessionAffinityTtlMinutes = 30 }),
             NullLogger<SessionAffinityService>.Instance);
 
         var (h, _) = BuildScope(

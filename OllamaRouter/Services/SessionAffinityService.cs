@@ -25,7 +25,7 @@ public sealed class SessionAffinityService : ISessionAffinityService
     private const int SweepMaxEntries = 100;
 
     private readonly ConcurrentDictionary<string, SessionLease> _leases = new(StringComparer.OrdinalIgnoreCase);
-    private readonly TimeSpan _ttl;
+    private readonly IOptionsMonitor<OllamaRouterOptions> _options;
     private readonly ILogger<SessionAffinityService> _logger;
     private readonly Func<DateTimeOffset> _clock;
 
@@ -35,16 +35,23 @@ public sealed class SessionAffinityService : ISessionAffinityService
     /// Injectable clock (defaults to <see cref="DateTimeOffset.UtcNow"/>; tests inject a fake).
     /// </param>
     public SessionAffinityService(
-        IOptions<OllamaRouterOptions> options,
+        IOptionsMonitor<OllamaRouterOptions> options,
         ILogger<SessionAffinityService> logger,
         Func<DateTimeOffset>? clock = null)
     {
-        var ttlMinutes = options.Value.SessionAffinityTtlMinutes > 0
-            ? options.Value.SessionAffinityTtlMinutes
-            : 30;
-        _ttl = TimeSpan.FromMinutes(ttlMinutes);
+        _options = options;
         _logger = logger;
         _clock = clock ?? (() => DateTimeOffset.UtcNow);
+    }
+
+    // Live sliding TTL: a positive configured value, else the 30-minute default (read per use so
+    // config edits rebind without a restart).
+    private TimeSpan GetTtl()
+    {
+        var ttlMinutes = _options.CurrentValue.SessionAffinityTtlMinutes > 0
+            ? _options.CurrentValue.SessionAffinityTtlMinutes
+            : 30;
+        return TimeSpan.FromMinutes(ttlMinutes);
     }
 
     public bool TryGetAffinity(string sessionId, out RoutingTarget target)
@@ -63,15 +70,16 @@ public sealed class SessionAffinityService : ISessionAffinityService
         }
 
         var now = _clock();
-        if (now - lease.LastAccessUtc > _ttl)
+        var ttl = GetTtl();
+        if (now - lease.LastAccessUtc > ttl)
         {
             // TTL expired: remove lazily (TryRemove is safe against a concurrent re-pin).
             if (_leases.TryGetValue(sessionId, out var current) &&
-                now - current.LastAccessUtc > _ttl &&
+                now - current.LastAccessUtc > ttl &&
                 _leases.TryRemove(sessionId, out _))
             {
                 _logger.LogDebug("Session affinity lease for '{SessionId}' on {Target} expired after {Ttl}.",
-                    sessionId, lease.Target.Value, _ttl);
+                    sessionId, lease.Target.Value, ttl);
             }
 
             return false;
@@ -128,6 +136,7 @@ public sealed class SessionAffinityService : ISessionAffinityService
         }
 
         var now = _clock();
+        var ttl = GetTtl();
         var swept = 0;
         foreach (var (sessionId, lease) in _leases)
         {
@@ -136,7 +145,7 @@ public sealed class SessionAffinityService : ISessionAffinityService
                 break;
             }
 
-            if (now - lease.LastAccessUtc > _ttl && _leases.TryRemove(sessionId, out _))
+            if (now - lease.LastAccessUtc > ttl && _leases.TryRemove(sessionId, out _))
             {
                 swept++;
             }

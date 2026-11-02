@@ -17,9 +17,9 @@ public static class OllamaEndpointsExtensions
 {
     public static WebApplication MapOllamaRouterEndpoints(this WebApplication app)
     {
-        app.MapGet("/api/tags", async (IFleetAggregationService aggregation, IOptions<OllamaRouterOptions> options, HttpContext context) =>
+        app.MapGet("/api/tags", async (IFleetAggregationService aggregation, IOptionsMonitor<OllamaRouterOptions> options, HttpContext context) =>
         {
-            var mergedModels = await aggregation.GetTagsFleetAsync(BuildCloudTagSyntheses(options.Value), context);
+            var mergedModels = await aggregation.GetTagsFleetAsync(BuildCloudTagSyntheses(options.CurrentValue), context);
 
             var response = new JsonObject
             {
@@ -41,9 +41,9 @@ public static class OllamaEndpointsExtensions
             return Results.Content(response.ToJsonString(), "application/json");
         });
 
-        app.MapGet("/v1/models", async (IFleetAggregationService aggregation, IOptions<OllamaRouterOptions> options, HttpContext context) =>
+        app.MapGet("/v1/models", async (IFleetAggregationService aggregation, IOptionsMonitor<OllamaRouterOptions> options, HttpContext context) =>
         {
-            var mergedModels = await aggregation.GetOpenAIModelsFleetAsync(BuildCloudModelSyntheses(options.Value), context);
+            var mergedModels = await aggregation.GetOpenAIModelsFleetAsync(BuildCloudModelSyntheses(options.CurrentValue), context);
 
             var response = new JsonObject
             {
@@ -54,7 +54,7 @@ public static class OllamaEndpointsExtensions
             return Results.Content(response.ToJsonString(), "application/json");
         });
 
-        app.MapPost("/api/show", async (IFleetAggregationService aggregation, IOptions<OllamaRouterOptions> options, HttpContext context) =>
+        app.MapPost("/api/show", async (IFleetAggregationService aggregation, IOptionsMonitor<OllamaRouterOptions> options, HttpContext context) =>
         {
             var body = await ReadBodyAsync(context.Request);
             var modelName = OllamaRequestParser.ExtractModelName(body);
@@ -72,7 +72,7 @@ public static class OllamaEndpointsExtensions
                 !string.IsNullOrWhiteSpace(pinHeader.ToString()))
             {
                 var pin = pinHeader.ToString()!;
-                var match = options.Value.GetEffectiveTargets()
+                var match = options.CurrentValue.GetEffectiveTargets()
                     .FirstOrDefault(t => string.Equals(t.Name, pin, StringComparison.OrdinalIgnoreCase));
                 if (match is not null)
                 {

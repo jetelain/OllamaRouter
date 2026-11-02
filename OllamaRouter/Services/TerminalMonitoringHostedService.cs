@@ -19,7 +19,7 @@ public sealed class TerminalMonitoringHostedService : BackgroundService
     private readonly ITargetLivenessService _targetLiveness;
     private readonly ITargetExecutionTracker _targetExecutionTracker;
     private readonly IContextAutoShrinkManager _contextAutoShrinkManager;
-    private readonly IOptions<OllamaRouterOptions> _options;
+    private readonly IOptionsMonitor<OllamaRouterOptions> _options;
     private readonly IHostApplicationLifetime _lifetime;
     private readonly IFleetHardwareService? _fleetHardware;
 
@@ -31,7 +31,7 @@ public sealed class TerminalMonitoringHostedService : BackgroundService
         ITargetLivenessService targetLiveness,
         ITargetExecutionTracker targetExecutionTracker,
         IContextAutoShrinkManager contextAutoShrinkManager,
-        IOptions<OllamaRouterOptions> options,
+        IOptionsMonitor<OllamaRouterOptions> options,
         IHostApplicationLifetime lifetime,
         IFleetHardwareService? fleetHardware = null)
     {
@@ -47,9 +47,21 @@ public sealed class TerminalMonitoringHostedService : BackgroundService
         _fleetHardware = fleetHardware;
     }
 
+    /// <summary>
+    /// Live refresh interval: re-read from <see cref="IOptionsMonitor{TOptions}.CurrentValue"/>
+    /// each render-loop iteration (non-positive values fall back to the 2 s default).
+    /// </summary>
+    private TimeSpan ResolveLiveRefreshInterval()
+    {
+        var seconds = _options.CurrentValue.TerminalMonitoring.RefreshIntervalSeconds;
+        return TimeSpan.FromSeconds(seconds > 0 ? seconds : 2.0);
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var settings = _options.Value.TerminalMonitoring;
+        // Startup-only Enabled check (per maintainer decision 2026-11-02): the TUI toggle is
+        // evaluated once when the hosted service starts; only the refresh interval is live.
+        var settings = _options.CurrentValue.TerminalMonitoring;
         if (!settings.Enabled || Console.IsOutputRedirected)
         {
             return;
@@ -107,9 +119,6 @@ public sealed class TerminalMonitoringHostedService : BackgroundService
                 Console.Write("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
             }
 
-            var intervalSeconds = settings.RefreshIntervalSeconds > 0 ? settings.RefreshIntervalSeconds : 2.0;
-            var interval = TimeSpan.FromSeconds(intervalSeconds);
-
             string? lastRendered = null;
             int lastWidth = -1;
             int lastHeight = -1;
@@ -131,7 +140,7 @@ public sealed class TerminalMonitoringHostedService : BackgroundService
                         contextShrinkManager: _contextAutoShrinkManager,
                         fleetHardware: _fleetHardware).ConfigureAwait(false);
 
-                    var monitorUrl = _options.Value.BindAddress.TrimEnd('/').Replace("+", "localhost") + "/monitor";
+                    var monitorUrl = _options.CurrentValue.BindAddress.TrimEnd('/').Replace("+", "localhost") + "/monitor";
 
                     int width = 80;
                     int height = 24;
@@ -152,7 +161,7 @@ public sealed class TerminalMonitoringHostedService : BackgroundService
                         width == lastWidth &&
                         height == lastHeight)
                     {
-                        await Task.Delay(interval, stoppingToken).ConfigureAwait(false);
+                        await Task.Delay(ResolveLiveRefreshInterval(), stoppingToken).ConfigureAwait(false);
                         continue;
                     }
 
@@ -188,7 +197,7 @@ public sealed class TerminalMonitoringHostedService : BackgroundService
                     // Prevent any rendering or snapshot exception from crashing the background loop
                 }
 
-                await Task.Delay(interval, stoppingToken).ConfigureAwait(false);
+                await Task.Delay(ResolveLiveRefreshInterval(), stoppingToken).ConfigureAwait(false);
             }
         }
         finally

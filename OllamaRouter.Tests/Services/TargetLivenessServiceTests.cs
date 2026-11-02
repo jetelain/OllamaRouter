@@ -1,3 +1,4 @@
+using OllamaRouter.Tests.TestHelpers;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -95,7 +96,7 @@ public class TargetLivenessServiceTests : IDisposable
     {
         var handler = new CountingFakeHttpMessageHandler(respond);
         var client = new HttpClient(handler) { Timeout = probeTimeout ?? TimeSpan.FromSeconds(2) };
-        var options = Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions
+        var options = new TestOptionsMonitor<OllamaRouterOptions>(new OllamaRouterOptions
         {
             LocalUrl = LocalUrl,
             RemoteUrl = RemoteUrl
@@ -451,7 +452,7 @@ public class TargetLivenessServiceTests : IDisposable
         var port = ((IPEndPoint)listener.LocalEndpoint).Port;
         var url = $"http://127.0.0.1:{port}";
 
-        var options = Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions { LocalUrl = url });
+        var options = new TestOptionsMonitor<OllamaRouterOptions>(new OllamaRouterOptions { LocalUrl = url });
         var catalog = new CountingCatalogCache();
         var client = new HttpClient { Timeout = TimeSpan.FromMilliseconds(300) };
         _clients.Add(client);
@@ -494,7 +495,7 @@ public class TargetLivenessServiceTests : IDisposable
             }
         });
 
-        var onlineOptions = Microsoft.Extensions.Options.Options.Create(new OllamaRouterOptions { LocalUrl = $"http://127.0.0.1:{okPort}" });
+        var onlineOptions = new TestOptionsMonitor<OllamaRouterOptions>(new OllamaRouterOptions { LocalUrl = $"http://127.0.0.1:{okPort}" });
         var onlineSut = new TargetLivenessService(onlineOptions, catalog, client, NullLogger<TargetLivenessService>.Instance);
         var state = await onlineSut.EnsureKnownAsync(RoutingTarget.Local);
 

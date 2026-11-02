@@ -9,6 +9,7 @@ using OllamaRouter.Endpoints;
 using OllamaRouter.Options;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services;
+using OllamaRouter.Tests.TestHelpers;
 
 namespace OllamaRouter.Tests.Endpoints;
 
@@ -69,8 +70,7 @@ public class RouterVramReclaimTests
             opt.SerializerOptions.TypeInfoResolverChain.Insert(0, OllamaRouterJsonSerializerContext.Default);
         });
 
-        var optionsMock = new Mock<IOptions<OllamaRouterOptions>>();
-        optionsMock.Setup(o => o.Value).Returns(options ?? TwoTargetFleet());
+        var optionsMonitor = new TestOptionsMonitor<OllamaRouterOptions>(options ?? TwoTargetFleet());
 
         var availability = new Mock<ITargetAvailabilityService>();
         var catalogClient = new Mock<IOllamaModelCatalogClient>();
@@ -81,7 +81,7 @@ public class RouterVramReclaimTests
             .Setup(c => c.StopRunningModelsAsync(ServerUrl, It.IsAny<CancellationToken>()))
             .ReturnsAsync(new[] { "qwen3.8-27b" });
 
-        builder.Services.AddSingleton(optionsMock.Object);
+        builder.Services.AddSingleton<IOptionsMonitor<OllamaRouterOptions>>(optionsMonitor);
         builder.Services.AddSingleton(availability.Object);
         builder.Services.AddSingleton(catalogClient.Object);
         if (shrinkManager is not null)

@@ -1,3 +1,4 @@
+using OllamaRouter.Tests.TestHelpers;
 using System.Net;
 using System.Net.Http.Json;
 using System.Reflection;
@@ -75,7 +76,7 @@ public class MonitorEndpointsExtensionsTests
         builder.Services.AddSingleton(mocks.TargetAvailability.Object);
         builder.Services.AddSingleton(mocks.CatalogClient.Object);
         builder.Services.AddSingleton(mocks.ModelCatalogCache.Object);
-        builder.Services.AddSingleton(Microsoft.Extensions.Options.Options.Create(options ?? new OllamaRouterOptions
+        builder.Services.AddSingleton<IOptionsMonitor<OllamaRouterOptions>>(new TestOptionsMonitor<OllamaRouterOptions>(options ?? new OllamaRouterOptions
         {
             LocalUrl = localUrl,
             Pricing = pricing

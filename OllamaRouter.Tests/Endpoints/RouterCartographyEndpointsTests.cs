@@ -1,3 +1,4 @@
+using OllamaRouter.Tests.TestHelpers;
 using System.Net;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -13,7 +14,6 @@ using OllamaRouter.Options;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services;
 using OllamaRouter.Tests.Services;
-using MsOptions = Microsoft.Extensions.Options.Options;
 
 namespace OllamaRouter.Tests.Endpoints;
 
@@ -264,7 +264,7 @@ public class RouterCartographyEndpointsTests
             .Setup(t => t.GetState(It.IsAny<RoutingTarget>()))
             .Returns<RoutingTarget>(t => executionStates?.GetValueOrDefault(t));
 
-        builder.Services.AddSingleton(MsOptions.Create(options));
+        builder.Services.AddSingleton<IOptionsMonitor<OllamaRouterOptions>>(new TestOptionsMonitor<OllamaRouterOptions>(options));
         builder.Services.AddSingleton(catalogClient.Object);
         builder.Services.AddSingleton(liveness.Object);
         builder.Services.AddSingleton(availability.Object);
@@ -664,7 +664,7 @@ public class RouterCartographyEndpointsTests
         {
             opt.SerializerOptions.TypeInfoResolverChain.Insert(0, OllamaRouterJsonSerializerContext.Default);
         });
-        builder.Services.AddSingleton(MsOptions.Create(options));
+        builder.Services.AddSingleton<IOptionsMonitor<OllamaRouterOptions>>(new TestOptionsMonitor<OllamaRouterOptions>(options));
         builder.Services.AddSingleton<IOllamaModelCatalogClient>(realCatalogClient);
         builder.Services.AddSingleton(liveness.Object);
         builder.Services.AddSingleton(availability.Object);
@@ -749,7 +749,7 @@ public class RouterCartographyEndpointsTests
         availability.Setup(t => t.IsEnabled(It.IsAny<RoutingTarget>())).Returns(true);
         availability.Setup(t => t.GetSnapshot()).Returns(new TargetAvailabilitySnapshot(
             new Dictionary<RoutingTarget, bool> { [Local] = true, [Server] = true }));
-        builder.Services.AddSingleton(MsOptions.Create(options));
+        builder.Services.AddSingleton<IOptionsMonitor<OllamaRouterOptions>>(new TestOptionsMonitor<OllamaRouterOptions>(options));
         builder.Services.AddSingleton(availability.Object);
 
         var app = builder.Build();

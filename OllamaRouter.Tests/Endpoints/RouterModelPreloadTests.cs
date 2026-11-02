@@ -1,3 +1,4 @@
+using OllamaRouter.Tests.TestHelpers;
 using System.Net;
 using System.Net.Http.Json;
 using System.Text;
@@ -15,7 +16,6 @@ using OllamaRouter.Options;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services;
 using OllamaRouter.Services.Hardware;
-using MsOptions = Microsoft.Extensions.Options.Options;
 
 namespace OllamaRouter.Tests.Endpoints;
 
@@ -127,7 +127,7 @@ public class RouterModelPreloadTests
         var tracker = new Mock<ITargetExecutionTracker>();
         tracker.Setup(t => t.GetState(It.IsAny<RoutingTarget>())).Returns((TargetExecutionState?)null);
 
-        builder.Services.AddSingleton(MsOptions.Create(options));
+        builder.Services.AddSingleton<IOptionsMonitor<OllamaRouterOptions>>(new TestOptionsMonitor<OllamaRouterOptions>(options));
         builder.Services.AddSingleton(catalog.Object);
         builder.Services.AddSingleton(liveness.Object);
         builder.Services.AddSingleton(availability.Object);
@@ -139,7 +139,7 @@ public class RouterModelPreloadTests
 
         // The production DI shape (defensive nullable-tolerant registration).
         builder.Services.AddSingleton<IModelPreloadService>(sp => new ModelPreloadService(
-            sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
+            sp.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>(),
             sp.GetRequiredService<IOllamaModelCatalogClient>(),
             sp.GetService<IModelCatalogCacheService>(),
             sp.GetService<ModelCapabilityEngine>(),

@@ -34,54 +34,51 @@ public sealed class TokenMetricsRecorder : ITokenMetricsRecorder
     private static readonly char[] EscapableChars = { ',', '"', '\r', '\n' };
 
     private readonly object gate = new();
-    private readonly string? outputDirectory;
-    private readonly int maxFiles;
-    private readonly bool generateIndividualFiles;
-    private readonly bool appendConsolidatedFile;
+    private readonly IOptionsMonitor<OllamaRouterOptions> options;
     private readonly ILogger<TokenMetricsRecorder> logger;
     private long sequence;
 
-    public TokenMetricsRecorder(IOptions<OllamaRouterOptions> options, ILogger<TokenMetricsRecorder> logger)
+    /// <summary>
+    /// Creates the recorder. The CSV export configuration (enabled switch, output directory,
+    /// max files, per-file/consolidated flags) is read from
+    /// <c>IOptionsMonitor.CurrentValue</c> per recorded request, so a runtime config edit takes
+    /// effect without a restart.
+    /// </summary>
+    public TokenMetricsRecorder(IOptionsMonitor<OllamaRouterOptions> options, ILogger<TokenMetricsRecorder> logger)
     {
+        this.options = options;
         this.logger = logger;
 
-        var csv = options.Value.Recording?.TokenMetricsCsv;
-        if (csv is null || !csv.Enabled || (!csv.GenerateIndividualFiles && !csv.AppendConsolidatedFile))
+        // Informational startup log only; the per-request live read is authoritative.
+        if (IsExportActive(options.CurrentValue))
         {
-            outputDirectory = null;
-            maxFiles = 0;
-            generateIndividualFiles = false;
-            appendConsolidatedFile = false;
-            return;
+            logger.LogInformation("Token metrics CSV recording enabled: {Directory}", ResolveOutputDirectory(options.CurrentValue));
         }
-
-        generateIndividualFiles = csv.GenerateIndividualFiles;
-        appendConsolidatedFile = csv.AppendConsolidatedFile;
-        maxFiles = Math.Max(0, csv.MaxFiles);
-        outputDirectory = !string.IsNullOrWhiteSpace(csv.OutputDirectory)
-            ? csv.OutputDirectory
-            : Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "OllamaRouter",
-                "token-metrics");
-
-        logger.LogInformation("Token metrics CSV recording enabled: {Directory}", outputDirectory);
     }
 
-    public bool IsEnabled => outputDirectory is not null;
+    /// <summary>Live enabled flag (re-evaluated from <c>CurrentValue</c> on every read).</summary>
+    public bool IsEnabled => IsExportActive(options.CurrentValue);
 
     public void Record(TokenMetricsCsvRecord record)
     {
-        if (!IsEnabled)
+        // Snapshot-per-operation: one CurrentValue read drives the whole record + prune pass.
+        var settings = options.CurrentValue;
+        var csv = settings.Recording?.TokenMetricsCsv;
+        if (csv is null || !csv.Enabled || (!csv.GenerateIndividualFiles && !csv.AppendConsolidatedFile))
         {
             return;
         }
+
+        var generateIndividualFiles = csv.GenerateIndividualFiles;
+        var appendConsolidatedFile = csv.AppendConsolidatedFile;
+        var maxFiles = Math.Max(0, csv.MaxFiles);
+        var outputDirectory = ResolveOutputDirectory(settings);
 
         lock (gate)
         {
             try
             {
-                Directory.CreateDirectory(outputDirectory!);
+                Directory.CreateDirectory(outputDirectory);
 
                 var row = BuildDataRow(record);
 
@@ -90,14 +87,14 @@ public sealed class TokenMetricsRecorder : ITokenMetricsRecorder
                     var fileName =
                         $"{record.Timestamp.UtcDateTime:yyyyMMdd-HHmmss-fff}_{Interlocked.Increment(ref sequence):D6}_{Slugify(record.Model)}_metrics.csv";
                     File.WriteAllText(
-                        Path.Combine(outputDirectory!, fileName),
+                        Path.Combine(outputDirectory, fileName),
                         ColumnHeader + "\r\n" + row + "\r\n",
                         new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
                 }
 
                 if (appendConsolidatedFile)
                 {
-                    var consolidatedPath = Path.Combine(outputDirectory!, ConsolidatedFileName);
+                    var consolidatedPath = Path.Combine(outputDirectory, ConsolidatedFileName);
                     if (!File.Exists(consolidatedPath) || new FileInfo(consolidatedPath).Length == 0)
                     {
                         File.AppendAllText(consolidatedPath, ColumnHeader + "\r\n", new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
@@ -108,7 +105,7 @@ public sealed class TokenMetricsRecorder : ITokenMetricsRecorder
 
                 if (generateIndividualFiles && maxFiles > 0)
                 {
-                    PruneIndividualFiles();
+                    PruneIndividualFiles(maxFiles, outputDirectory);
                 }
             }
             catch (Exception ex)
@@ -116,6 +113,23 @@ public sealed class TokenMetricsRecorder : ITokenMetricsRecorder
                 logger.LogWarning(ex, "Error recording token metrics CSV for model {Model}", record.Model);
             }
         }
+    }
+
+    private static bool IsExportActive(OllamaRouterOptions settings)
+    {
+        var csv = settings.Recording?.TokenMetricsCsv;
+        return csv is not null && csv.Enabled && (csv.GenerateIndividualFiles || csv.AppendConsolidatedFile);
+    }
+
+    private static string ResolveOutputDirectory(OllamaRouterOptions settings)
+    {
+        var csv = settings.Recording!.TokenMetricsCsv!;
+        return !string.IsNullOrWhiteSpace(csv.OutputDirectory)
+            ? csv.OutputDirectory
+            : Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "OllamaRouter",
+                "token-metrics");
     }
 
     // Builds the single RFC 4180 data row in the fixed column order: invariant-culture
@@ -160,9 +174,9 @@ public sealed class TokenMetricsRecorder : ITokenMetricsRecorder
     // ones. File names start with a sortable UTC timestamp, so ordinal name order is creation
     // order. The consolidated token-metrics.csv does not match the "*_metrics.csv" glob and is
     // never pruned.
-    private void PruneIndividualFiles()
+    private void PruneIndividualFiles(int maxFiles, string outputDirectory)
     {
-        var oldestFirst = Directory.EnumerateFiles(outputDirectory!, "*_metrics.csv")
+        var oldestFirst = Directory.EnumerateFiles(outputDirectory, "*_metrics.csv")
             .OrderBy(path => Path.GetFileName(path), StringComparer.Ordinal)
             .ToArray();
 

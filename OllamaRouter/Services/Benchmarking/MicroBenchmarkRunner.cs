@@ -46,7 +46,7 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
     private readonly IOptions<CandidateModelCatalogOptions> _catalogOptions;
     private readonly IFleetHardwareService _fleetHardware;
     private readonly ITokenEstimator _tokenEstimator;
-    private readonly IOptions<OllamaRouterOptions> _routerOptions;
+    private readonly IOptionsMonitor<OllamaRouterOptions> _routerOptions;
     private readonly IOllamaModelCatalogClient _catalogClient;
     private readonly HttpClient _httpClient;
     private readonly IHostApplicationLifetime _lifetime;
@@ -66,7 +66,7 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
         IOptions<CandidateModelCatalogOptions> catalogOptions,
         IFleetHardwareService fleetHardware,
         ITokenEstimator tokenEstimator,
-        IOptions<OllamaRouterOptions> routerOptions,
+        IOptionsMonitor<OllamaRouterOptions> routerOptions,
         IOllamaModelCatalogClient catalogClient,
         HttpClient httpClient,
         IHostApplicationLifetime lifetime,
@@ -102,7 +102,7 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
         }
 
         var rolesList = roles?.ToList() ?? new List<UsageRole>();
-        var effectiveTargets = _routerOptions.Value.GetEffectiveTargets(_logger)
+        var effectiveTargets = _routerOptions.CurrentValue.GetEffectiveTargets(_logger)
             .Where(t => !string.Equals(t.Name, "Cloud", StringComparison.OrdinalIgnoreCase))
             .ToList();
 
@@ -189,7 +189,7 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
 
     /// <inheritdoc/>
     public IReadOnlyList<string> GetEffectiveTargetNames() =>
-        _routerOptions.Value.GetEffectiveTargets(_logger)
+        _routerOptions.CurrentValue.GetEffectiveTargets(_logger)
             .Where(t => !string.Equals(t.Name, "Cloud", StringComparison.OrdinalIgnoreCase))
             .Select(t => t.Name!)
             .ToList();

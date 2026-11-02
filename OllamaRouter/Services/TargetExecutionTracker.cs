@@ -36,7 +36,7 @@ public sealed class TargetExecutionTracker : ITargetExecutionTracker
     /// </summary>
     private static readonly TimeSpan StartupGracePeriod = TimeSpan.FromSeconds(10);
 
-    private readonly OllamaRouterOptions _options;
+    private readonly IOptionsMonitor<OllamaRouterOptions> _options;
     private readonly ITargetLivenessService _liveness;
     private readonly IOllamaModelCatalogClient _catalogClient;
     private readonly ILogger<TargetExecutionTracker> _logger;
@@ -66,26 +66,7 @@ public sealed class TargetExecutionTracker : ITargetExecutionTracker
     /// configuration's Enabled flag, matching <see cref="FleetAggregationService"/>).
     /// </summary>
     public TargetExecutionTracker(
-        IOptions<OllamaRouterOptions> options,
-        ITargetLivenessService liveness,
-        ITargetAvailabilityService targetAvailability,
-        IOllamaModelCatalogClient catalogClient,
-        ILogger<TargetExecutionTracker> logger,
-        TimeSpan? refreshTtl = null,
-        TimeSpan? perTargetBudget = null,
-        IContextAutoShrinkManager? contextShrinkManager = null)
-        : this(options.Value, liveness, targetAvailability, catalogClient, logger, refreshTtl, perTargetBudget, contextShrinkManager)
-    {
-    }
-
-    /// <summary>
-    /// Test-friendly constructor accepting an already-resolved options instance (same defaults
-    /// as the <see cref="IOptions{TOptions}"/> overload). <paramref name="contextShrinkManager"/>
-    /// is the optional Auto-Shrink Manager lease-invalidation hook (null = no lease resets,
-    /// the pre-Phase-3 behavior) so existing unit tests keep compiling unmodified.
-    /// </summary>
-    public TargetExecutionTracker(
-        OllamaRouterOptions options,
+        IOptionsMonitor<OllamaRouterOptions> options,
         ITargetLivenessService liveness,
         ITargetAvailabilityService targetAvailability,
         IOllamaModelCatalogClient catalogClient,
@@ -103,8 +84,28 @@ public sealed class TargetExecutionTracker : ITargetExecutionTracker
 
         // Per-target budget: the injected override, else the configured aggregation budget,
         // with the same 500 ms fallback as FleetAggregationService.GetPerTargetBudget.
-        var ms = perTargetBudget?.TotalMilliseconds ?? options.Aggregation?.PerTargetTimeoutMs ?? 500;
+        var ms = perTargetBudget?.TotalMilliseconds ?? options.CurrentValue.Aggregation?.PerTargetTimeoutMs ?? 500;
         _perTargetBudget = ms > 0 ? TimeSpan.FromMilliseconds(ms) : DefaultPerTargetBudget;
+    }
+
+    /// <summary>
+    /// Test-friendly constructor accepting an already-resolved options instance (same defaults
+    /// as the <see cref="IOptionsMonitor{TOptions}"/> overload, fixed-snapshot semantics: the
+    /// captured instance never changes). <paramref name="contextShrinkManager"/> is the optional
+    /// Auto-Shrink Manager lease-invalidation hook (null = no lease resets,
+    /// the pre-Phase-3 behavior) so existing unit tests keep compiling unmodified.
+    /// </summary>
+    public TargetExecutionTracker(
+        OllamaRouterOptions options,
+        ITargetLivenessService liveness,
+        ITargetAvailabilityService targetAvailability,
+        IOllamaModelCatalogClient catalogClient,
+        ILogger<TargetExecutionTracker> logger,
+        TimeSpan? refreshTtl = null,
+        TimeSpan? perTargetBudget = null,
+        IContextAutoShrinkManager? contextShrinkManager = null)
+        : this(new FixedOptionsMonitor<OllamaRouterOptions>(options), liveness, targetAvailability, catalogClient, logger, refreshTtl, perTargetBudget, contextShrinkManager)
+    {
     }
 
     /// <summary>The refresh period driven by the hosted timer service (the tracker's TTL).</summary>
@@ -241,7 +242,7 @@ public sealed class TargetExecutionTracker : ITargetExecutionTracker
     {
         var withinGrace = IsWithinStartupGrace();
         var entries = _liveness.GetEntries();
-        return _options.GetEffectiveTargets(_logger)
+        return _options.CurrentValue.GetEffectiveTargets(_logger)
             .Where(t => t.Enabled &&
                         !string.Equals(t.Name, RoutingTarget.Cloud.Value, StringComparison.OrdinalIgnoreCase) &&
                         !string.IsNullOrWhiteSpace(t.Url) &&

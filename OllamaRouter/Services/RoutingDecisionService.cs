@@ -55,7 +55,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
     /// <summary>Bytes per MiB for the eviction VRAM-sum comparison (mirrors ModelCapabilityEngine's weight→MB conversion).</summary>
     private const long BytesPerMiB = 1_048_576;
 
-    private readonly IOptions<OllamaRouterOptions> _options;
+    private readonly IOptionsMonitor<OllamaRouterOptions> _options;
     private readonly IModelCatalogCacheService _modelCatalogCacheService;
     private readonly ITargetLivenessService _liveness;
     private readonly ITargetAvailabilityService _availability;
@@ -76,7 +76,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
     /// <paramref name="fleetHardware"/> supplies dynamic hardware profiles when targets omit explicit <c>MaxVramMB</c>.
     /// </summary>
     public RoutingDecisionService(
-        IOptions<OllamaRouterOptions> options,
+        IOptionsMonitor<OllamaRouterOptions> options,
         IModelCatalogCacheService modelCatalogCacheService,
         ITargetLivenessService liveness,
         ITargetAvailabilityService availability,
@@ -218,7 +218,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         string? sessionId = null,
         IReadOnlySet<TargetLocation>? allowedLocations = null)
     {
-        var settings = _options.Value;
+        var settings = _options.CurrentValue;
         var normalizedName = NormalizeModelName(modelName);
         settings.Models.TryGetValue(normalizedName, out var thresholds);
 
@@ -552,7 +552,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             return Disqualified(target, $"hardware incapable ({capability.Architecture} on target with MaxVramMB {maxVramDescription})");
         }
 
-        var effectiveRequired = (long)context.TokenCount + Math.Max(0, _options.Value.ContextFitMarginTokens);
+        var effectiveRequired = (long)context.TokenCount + Math.Max(0, _options.CurrentValue.ContextFitMarginTokens);
         if (context.ClientRequestedNumCtx.HasValue)
         {
             effectiveRequired = Math.Min(effectiveRequired, context.ClientRequestedNumCtx.Value);
@@ -564,7 +564,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
                 context.TokenCount,
                 context.ClientRequestedNumCtx,
                 capacityForFit,
-                _options.Value.ContextFitMarginTokens).Qualified)
+                _options.CurrentValue.ContextFitMarginTokens).Qualified)
         {
             return Disqualified(target, $"context overflow (CMax: {capacityForFit} < Required: {effectiveRequired})");
         }
@@ -661,7 +661,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             // The role is decided by the target's OWN pre-configured capacity (task #25):
             // the same additive margin-adjusted requirement used for Stage-1 qualification
             // (no hardcoded capacity ceiling).
-            var effectiveRequired = (long)context.TokenCount + Math.Max(0, _options.Value.ContextFitMarginTokens);
+            var effectiveRequired = (long)context.TokenCount + Math.Max(0, _options.CurrentValue.ContextFitMarginTokens);
             if (context.ClientRequestedNumCtx.HasValue)
             {
                 effectiveRequired = Math.Min(effectiveRequired, context.ClientRequestedNumCtx.Value);
@@ -703,7 +703,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
     /// </summary>
     private async Task<bool> HasDenseHotOrBusyLargeTargetAsync(RoutingContext context, CancellationToken cancellationToken)
     {
-        var fleetTargets = _options.Value.GetEffectiveTargets(_logger);
+        var fleetTargets = _options.CurrentValue.GetEffectiveTargets(_logger);
         foreach (var candidate in fleetTargets)
         {
             var maxVram = GetEffectiveMaxVramMB(candidate);
@@ -1007,11 +1007,11 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         {
             cloudStatus = "Administratively Disabled";
         }
-        else if (!(_options.Value?.CloudOverflow?.Enabled ?? true))
+        else if (!(_options.CurrentValue?.CloudOverflow?.Enabled ?? true))
         {
             cloudStatus = "Statically Disabled";
         }
-        else if (_options.Value is { } opt && string.IsNullOrEmpty(CloudRelayResolver.ResolveCloudModel(opt, context.ModelName)))
+        else if (_options.CurrentValue is { } opt && string.IsNullOrEmpty(CloudRelayResolver.ResolveCloudModel(opt, context.ModelName)))
         {
             cloudStatus = "No CloudModel configured";
         }

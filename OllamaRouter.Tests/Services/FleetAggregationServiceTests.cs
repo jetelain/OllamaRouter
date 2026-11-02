@@ -1,10 +1,10 @@
+using OllamaRouter.Tests.TestHelpers;
 using System.Text.Json.Nodes;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using OllamaRouter.Options;
 using OllamaRouter.Services;
-using MsOptions = Microsoft.Extensions.Options.Options;
 using FleetShowBestEntry = OllamaRouter.Services.FleetAggregationService.FleetShowBestEntry;
 
 namespace OllamaRouter.Tests.Services;
@@ -83,7 +83,7 @@ public class FleetAggregationServiceTests : IDisposable
         }
 
         return new FleetAggregationService(
-            MsOptions.Create(options),
+            new TestOptionsMonitor<OllamaRouterOptions>(options),
             _catalogClient,
             _catalogCache,
             _liveness.Object,

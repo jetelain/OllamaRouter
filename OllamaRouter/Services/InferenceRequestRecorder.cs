@@ -25,39 +25,39 @@ public sealed class InferenceRequestRecorder : IInferenceRequestRecorder
     private static readonly JsonSerializerOptions PrettyOptions = new() { WriteIndented = true };
 
     private readonly object gate = new();
-    private readonly string? outputDirectory;
-    private readonly int maxFiles;
+    private readonly IOptionsMonitor<OllamaRouterOptions> options;
     private readonly ILogger<InferenceRequestRecorder> logger;
     private long sequence;
 
-    public InferenceRequestRecorder(IOptions<OllamaRouterOptions> options, ILogger<InferenceRequestRecorder> logger)
+    /// <summary>
+    /// Creates the recorder. The Recording configuration (enabled switch, output directory,
+    /// max files) is read from <c>IOptionsMonitor.CurrentValue</c> per recorded request, so a
+    /// runtime re-enable/relocation in config takes effect without a restart.
+    /// </summary>
+    public InferenceRequestRecorder(IOptionsMonitor<OllamaRouterOptions> options, ILogger<InferenceRequestRecorder> logger)
     {
+        this.options = options;
         this.logger = logger;
 
-        if (options.Value.Recording is not { Enabled: true })
+        // Informational startup log only; the per-request live read is authoritative.
+        var outputDirectory = ResolveOutputDirectory(options.CurrentValue);
+        if (outputDirectory is not null)
         {
-            outputDirectory = null;
-            maxFiles = 0;
-            return;
+            logger.LogInformation("Inference request recording enabled: {Directory}", outputDirectory);
         }
-
-        outputDirectory = !string.IsNullOrWhiteSpace(options.Value.Recording.OutputDirectory)
-            ? options.Value.Recording.OutputDirectory
-            : Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "OllamaRouter",
-                "inference-requests");
-        maxFiles = options.Value.Recording.MaxFiles;
-
-        logger.LogInformation("Inference request recording enabled: {Directory}", outputDirectory);
     }
 
     public void Record(ActivityLogEntry entry, string endpoint, string requestBody)
     {
+        // Snapshot-per-operation: one CurrentValue read drives the whole record + prune pass.
+        var settings = options.CurrentValue;
+        var outputDirectory = ResolveOutputDirectory(settings);
         if (outputDirectory is null)
         {
             return;
         }
+
+        var maxFiles = settings.Recording?.MaxFiles ?? 0;
 
         lock (gate)
         {
@@ -65,7 +65,7 @@ public sealed class InferenceRequestRecorder : IInferenceRequestRecorder
             {
                 Directory.CreateDirectory(outputDirectory);
 
-                var payloadFile = CreatePayloadFile(entry.Model, requestBody);
+                var payloadFile = CreatePayloadFile(entry.Model, requestBody, outputDirectory);
                 var record = new InferenceRequestRecord(
                     entry.Timestamp,
                     entry.Target.ToString(),
@@ -84,7 +84,7 @@ public sealed class InferenceRequestRecorder : IInferenceRequestRecorder
                     Path.Combine(outputDirectory, ManifestFileName),
                     JsonSerializer.Serialize(record, InferenceRequestSerializerContext.Default.InferenceRequestRecord) + "\n");
 
-                PruneIfNecessary();
+                PruneIfNecessary(maxFiles, outputDirectory);
             }
             catch (Exception ex)
             {
@@ -93,15 +93,31 @@ public sealed class InferenceRequestRecorder : IInferenceRequestRecorder
         }
     }
 
+    // Resolves the live output directory: null when recording is disabled (the fast path).
+    private static string? ResolveOutputDirectory(OllamaRouterOptions settings)
+    {
+        if (settings.Recording is not { Enabled: true })
+        {
+            return null;
+        }
+
+        return !string.IsNullOrWhiteSpace(settings.Recording.OutputDirectory)
+            ? settings.Recording.OutputDirectory
+            : Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "OllamaRouter",
+                "inference-requests");
+    }
+
     // Writes the full request body as a standalone pretty-printed JSON payload file (falling
     // back to the raw text when the body is not valid JSON) and returns its file name.
-    private string CreatePayloadFile(string model, string requestBody)
+    private string CreatePayloadFile(string model, string requestBody, string outputDirectory)
     {
         var fileName =
             $"{DateTime.UtcNow:yyyyMMdd-HHmm-ss-fff}_{Interlocked.Increment(ref sequence):D6}_{Slugify(model)}.json";
         var content = TryPrettyPrintRequestJson(requestBody) ?? requestBody;
 
-        File.WriteAllText(Path.Combine(outputDirectory!, fileName), content);
+        File.WriteAllText(Path.Combine(outputDirectory, fileName), content);
         return fileName;
     }
 
@@ -120,7 +136,7 @@ public sealed class InferenceRequestRecorder : IInferenceRequestRecorder
 
     // Keeps the output directory below MaxFiles by deleting the oldest payload files, then
     // rewrites the manifest so that it only references files that still exist.
-    private void PruneIfNecessary()
+    private void PruneIfNecessary(int maxFiles, string outputDirectory)
     {
         if (maxFiles <= 0)
         {
@@ -128,7 +144,7 @@ public sealed class InferenceRequestRecorder : IInferenceRequestRecorder
         }
 
         // Payload file names start with a sortable UTC timestamp, so name order is creation order.
-        var oldestFirst = Directory.EnumerateFiles(outputDirectory!, "*.json")
+        var oldestFirst = Directory.EnumerateFiles(outputDirectory, "*.json")
             .OrderBy(path => Path.GetFileName(path), StringComparer.Ordinal)
             .ToArray();
 
@@ -151,12 +167,12 @@ public sealed class InferenceRequestRecorder : IInferenceRequestRecorder
             }
         }
 
-        RewriteManifest();
+        RewriteManifest(outputDirectory);
     }
 
     // Rewrites the manifest, dropping lines that are not valid JSON or whose payload file has
     // been deleted.
-    private void RewriteManifest()
+    private void RewriteManifest(string outputDirectory)
     {
         var manifestPath = Path.Combine(outputDirectory!, ManifestFileName);
         if (!File.Exists(manifestPath))
@@ -182,7 +198,7 @@ public sealed class InferenceRequestRecorder : IInferenceRequestRecorder
                 file = null; // Corrupted line: drop it from the manifest.
             }
 
-            if (file is null || !File.Exists(Path.Combine(outputDirectory!, file)))
+            if (file is null || !File.Exists(Path.Combine(outputDirectory, file)))
             {
                 continue;
             }

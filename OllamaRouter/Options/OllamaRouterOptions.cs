@@ -6,6 +6,28 @@ namespace OllamaRouter.Options;
 /// Configuration options for the Ollama router, bound to the "OllamaRouter" section of the
 /// factory `appsettings.json` plus the optional user-owned `config/config.json` (next to the
 /// executable; user values override factory defaults, standard sources override both).
+/// <para>
+/// <b>Live vs startup rebinding boundary.</b> All production consumers read this options type
+/// through <c>IOptionsMonitor&lt;OllamaRouterOptions&gt;</c>, so behavioral options are LIVE at
+/// runtime (an on-disk <c>config/config.json</c> change rebinds on the next dispatch / loop
+/// iteration, no restart required): <c>MaxConsecutiveFailures</c>, <c>SessionAffinityTtlMinutes</c>,
+/// <c>ContextFitMarginTokens</c>, <c>DispatchToLargestCapacityOnOverflow</c>,
+/// <c>FilterNamespacedModels</c>, <c>TokenEstimationOverheadFactor</c>, <c>Models:{model}.*</c>
+/// thresholds, <c>CloudOverflow.*</c>, <c>Recording.*</c> (incl. <c>TokenMetricsCsv</c>),
+/// <c>Aggregation.PerTargetTimeoutMs</c>, <c>DynamicContext.*</c>,
+/// <c>TerminalMonitoring.RefreshIntervalSeconds</c>, <c>Pricing.*</c> and per-EXISTING-target
+/// attributes (<c>Enabled</c>, <c>MaxParallel</c>, <c>MaxVramMB</c>, <c>SpeedFactor</c>,
+/// <c>Location</c>).
+/// </para>
+/// <para>
+/// The following remain STARTUP-SCOPED (a process restart is required for changes to take
+/// effect): fleet membership (YARP routes/clusters are built once from the startup snapshot
+/// via <c>LoadFromMemory</c>; adding/removing targets needs a restart — YARP dynamic
+/// configuration is a separate feature), per-target <c>Url</c>/<c>RouterUrl</c> (cluster
+/// destinations are fixed at startup), <see cref="BindAddress"/> (the Kestrel listener binds
+/// at startup), <c>TokenEstimator</c> engine selection (a DI-time singleton) and
+/// <c>TerminalMonitoring.Enabled</c> (startup-only TUI toggle).
+/// </para>
 /// </summary>
 public sealed class OllamaRouterOptions
 {

@@ -12,7 +12,7 @@ namespace OllamaRouter.Services;
 /// model-directed /api/show resolution with a 30 s in-memory response cache.
 /// </summary>
 public sealed class FleetAggregationService(
-    IOptions<OllamaRouterOptions> options,
+    IOptionsMonitor<OllamaRouterOptions> options,
     IOllamaModelCatalogClient catalogClient,
     IModelCatalogCacheService catalogCache,
     ITargetLivenessService liveness,
@@ -45,7 +45,7 @@ public sealed class FleetAggregationService(
     {
         var withinGrace = IsWithinStartupGrace();
         var entries = liveness.GetEntries();
-        return options.Value.GetEffectiveTargets(logger)
+        return options.CurrentValue.GetEffectiveTargets(logger)
             .Where(t => t.Enabled &&
                         !string.Equals(t.Name, RoutingTarget.Cloud.Value, StringComparison.OrdinalIgnoreCase) &&
                         !string.IsNullOrWhiteSpace(t.Url) &&
@@ -354,7 +354,7 @@ public sealed class FleetAggregationService(
 
         // (3) Primary target: "Local" (case-insensitive) when present+enabled, else the first
         // enabled effective target, else the first effective target (the exact legacy default).
-        var effective = options.Value.GetEffectiveTargets(logger);
+        var effective = options.CurrentValue.GetEffectiveTargets(logger);
         var local = effective.FirstOrDefault(t => string.Equals(t.Name, OllamaReverseProxyConfig.LocalTarget, StringComparison.OrdinalIgnoreCase));
         var primary = (local is not null && local.Enabled)
             ? local
@@ -364,7 +364,7 @@ public sealed class FleetAggregationService(
 
     private bool TryGetTarget(string name, out OllamaTargetOptions target)
     {
-        target = options.Value.GetEffectiveTargets(logger)
+        target = options.CurrentValue.GetEffectiveTargets(logger)
             .FirstOrDefault(t => string.Equals(t.Name, name, StringComparison.OrdinalIgnoreCase))!;
         return target is not null && !string.IsNullOrWhiteSpace(target.Name);
     }
@@ -392,7 +392,7 @@ public sealed class FleetAggregationService(
 
     private TimeSpan GetPerTargetBudget()
     {
-        var ms = options.Value.Aggregation?.PerTargetTimeoutMs ?? 500;
+        var ms = options.CurrentValue.Aggregation?.PerTargetTimeoutMs ?? 500;
         return ms > 0 ? TimeSpan.FromMilliseconds(ms) : TimeSpan.FromMilliseconds(500);
     }
 
@@ -404,7 +404,7 @@ public sealed class FleetAggregationService(
         string? dedupeKey)
     {
         var fanOut = GetFanOutTargets();
-        var effective = options.Value.GetEffectiveTargets(logger);
+        var effective = options.CurrentValue.GetEffectiveTargets(logger);
 
         // Online/grace targets are fetched live (in parallel, each under its own per-target
         // budget); every other enabled target is offline and contributes its cached catalog

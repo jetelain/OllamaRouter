@@ -72,7 +72,7 @@ public static class RouterApiEndpointsExtensions
     public static WebApplication MapOllamaRouterApiEndpoints(this WebApplication app)
     {
         app.MapGet("/api/router/info", async (
-            IOptions<OllamaRouterOptions> options,
+            IOptionsMonitor<OllamaRouterOptions> options,
             IServiceProvider serviceProvider,
             CancellationToken cancellationToken) =>
         {
@@ -82,7 +82,7 @@ public static class RouterApiEndpointsExtensions
         });
 
         app.MapGet("/api/router/fleet", async (
-            IOptions<OllamaRouterOptions> options,
+            IOptionsMonitor<OllamaRouterOptions> options,
             ITargetAvailabilityService targetAvailability,
             IServiceProvider serviceProvider,
             CancellationToken cancellationToken) =>
@@ -229,7 +229,7 @@ public static class RouterApiEndpointsExtensions
         });
 
         app.MapGet("/api/router/models", async (
-            IOptions<OllamaRouterOptions> options,
+            IOptionsMonitor<OllamaRouterOptions> options,
             IServiceProvider serviceProvider,
             HttpContext context,
             CancellationToken cancellationToken) =>
@@ -239,7 +239,7 @@ public static class RouterApiEndpointsExtensions
         });
 
         app.MapGet("/api/router/models/{*modelName}", async (
-            IOptions<OllamaRouterOptions> options,
+            IOptionsMonitor<OllamaRouterOptions> options,
             IServiceProvider serviceProvider,
             HttpContext context,
             string modelName,
@@ -263,7 +263,7 @@ public static class RouterApiEndpointsExtensions
         // and per-target deployment matrix, and a flat list of all loaded processes. Reads
         // in-memory snapshots + the 30 s capability cache; never calls /api/ps refresh.
         app.MapGet("/api/router/cartography", async (
-            IOptions<OllamaRouterOptions> options,
+            IOptionsMonitor<OllamaRouterOptions> options,
             IServiceProvider serviceProvider,
             HttpContext context,
             CancellationToken cancellationToken) =>
@@ -281,7 +281,7 @@ public static class RouterApiEndpointsExtensions
 
         app.MapPost("/api/router/context/evaluate", async (
             HttpRequest request,
-            IOptions<OllamaRouterOptions> options,
+            IOptionsMonitor<OllamaRouterOptions> options,
             IServiceProvider serviceProvider,
             CancellationToken cancellationToken) =>
         {
@@ -369,7 +369,7 @@ public static class RouterApiEndpointsExtensions
     /// </summary>
     private static async Task<IResult> PreloadModelHandler(
         HttpRequest request,
-        IOptions<OllamaRouterOptions> options,
+        IOptionsMonitor<OllamaRouterOptions> options,
         IServiceProvider serviceProvider,
         [FromQuery] int? keepAliveSeconds,
         [FromQuery] int? contextIntentTokens,
@@ -408,7 +408,7 @@ public static class RouterApiEndpointsExtensions
     /// parameter is required (400 when missing). Same validation and 200/404/503 mapping.
     /// </summary>
     private static async Task<IResult> PreloadPreviewHandler(
-        IOptions<OllamaRouterOptions> options,
+        IOptionsMonitor<OllamaRouterOptions> options,
         IServiceProvider serviceProvider,
         [FromQuery] string? model,
         [FromQuery] int? keepAliveSeconds,
@@ -470,7 +470,7 @@ public static class RouterApiEndpointsExtensions
     /// candidate qualified (or the service is unregistered), 200 with the full report.
     /// </summary>
     private static async Task<IResult> ValidateAndExecutePreloadAsync(
-        IOptions<OllamaRouterOptions> options,
+        IOptionsMonitor<OllamaRouterOptions> options,
         IServiceProvider serviceProvider,
         string modelName,
         int? keepAliveSeconds,
@@ -567,7 +567,7 @@ public static class RouterApiEndpointsExtensions
     /// </summary>
     private static async Task<IResult> ReclaimVramHandler(
         HttpRequest request,
-        IOptions<OllamaRouterOptions> options,
+        IOptionsMonitor<OllamaRouterOptions> options,
         IOllamaModelCatalogClient catalogClient,
         IServiceProvider serviceProvider,
         [FromQuery] string? target,
@@ -600,7 +600,7 @@ public static class RouterApiEndpointsExtensions
             ? body.DisableTarget
             : disableTarget ?? false;
 
-        var effectiveTargets = options.Value.GetEffectiveTargets();
+        var effectiveTargets = options.CurrentValue.GetEffectiveTargets();
         if (effectiveTargets.Count == 0)
         {
             return Results.Json(
@@ -657,11 +657,11 @@ public static class RouterApiEndpointsExtensions
     // ------------------------------------------------------------------
 
     private static async Task<(RouterFleetSummary Fleet, RouterFeatures Features)> BuildInfoBlocksAsync(
-        IOptions<OllamaRouterOptions> options,
+        IOptionsMonitor<OllamaRouterOptions> options,
         IServiceProvider serviceProvider,
         CancellationToken cancellationToken)
     {
-        var opt = options.Value;
+        var opt = options.CurrentValue;
         var effectiveTargets = opt.GetEffectiveTargets();
         var liveness = serviceProvider.GetService<ITargetLivenessService>();
         var livenessEntries = liveness?.GetEntries();
@@ -726,12 +726,12 @@ public static class RouterApiEndpointsExtensions
     // ------------------------------------------------------------------
 
     private static async Task<RouterFleetResponse> BuildFleetResponseAsync(
-        IOptions<OllamaRouterOptions> options,
+        IOptionsMonitor<OllamaRouterOptions> options,
         ITargetAvailabilityService targetAvailability,
         IServiceProvider serviceProvider,
         CancellationToken cancellationToken)
     {
-        var opt = options.Value;
+        var opt = options.CurrentValue;
         var effectiveTargets = opt.GetEffectiveTargets();
         var availability = targetAvailability.GetSnapshot();
         var liveness = serviceProvider.GetService<ITargetLivenessService>();
@@ -952,12 +952,12 @@ public static class RouterApiEndpointsExtensions
     // ------------------------------------------------------------------
 
     private static async Task<RouterModelsResponse> BuildModelsListAsync(
-        IOptions<OllamaRouterOptions> options,
+        IOptionsMonitor<OllamaRouterOptions> options,
         IServiceProvider serviceProvider,
         HttpContext context,
         CancellationToken cancellationToken)
     {
-        var opt = options.Value;
+        var opt = options.CurrentValue;
         var effectiveTargets = opt.GetEffectiveTargets();
         var fleetAggregation = serviceProvider.GetService<IFleetAggregationService>();
         var catalogCache = serviceProvider.GetService<IModelCatalogCacheService>();
@@ -982,13 +982,13 @@ public static class RouterApiEndpointsExtensions
     }
 
     private static async Task<RouterModelDetailResponse?> BuildModelDetailAsync(
-        IOptions<OllamaRouterOptions> options,
+        IOptionsMonitor<OllamaRouterOptions> options,
         IServiceProvider serviceProvider,
         HttpContext context,
         string modelName,
         CancellationToken cancellationToken)
     {
-        var opt = options.Value;
+        var opt = options.CurrentValue;
         var effectiveTargets = opt.GetEffectiveTargets();
         var fleetAggregation = serviceProvider.GetService<IFleetAggregationService>();
         var catalogCache = serviceProvider.GetService<IModelCatalogCacheService>();
@@ -1812,12 +1812,12 @@ public static class RouterApiEndpointsExtensions
     /// <c>stale</c>) and can never hang the request.
     /// </summary>
     private static async Task<RouterCartographyResponse> BuildCartographyResponseAsync(
-        IOptions<OllamaRouterOptions> options,
+        IOptionsMonitor<OllamaRouterOptions> options,
         IServiceProvider serviceProvider,
         HttpContext context,
         CancellationToken cancellationToken)
     {
-        var opt = options.Value;
+        var opt = options.CurrentValue;
         var effectiveTargets = opt.GetEffectiveTargets();
         var availability = serviceProvider.GetService<ITargetAvailabilityService>();
         var liveness = serviceProvider.GetService<ITargetLivenessService>();
@@ -2015,12 +2015,12 @@ public static class RouterApiEndpointsExtensions
     /// <see cref="NoAvailableTargetException"/> or no decision service is registered.
     /// </summary>
     private static async Task<RouterContextEvaluateResponse?> EvaluateContextPreviewAsync(
-        IOptions<OllamaRouterOptions> options,
+        IOptionsMonitor<OllamaRouterOptions> options,
         IServiceProvider serviceProvider,
         RouterContextEvaluateRequest request,
         CancellationToken cancellationToken)
     {
-        var opt = options.Value;
+        var opt = options.CurrentValue;
         var decisionService = serviceProvider.GetService<IRoutingDecisionService>() as RoutingDecisionService;
         if (decisionService is null)
         {

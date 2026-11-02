@@ -24,7 +24,7 @@ public sealed class ModelPreloadService : IModelPreloadService
     /// </summary>
     public const int LargeIntentThresholdTokens = 65_536;
 
-    private readonly OllamaRouterOptions _options;
+    private readonly IOptionsMonitor<OllamaRouterOptions> _options;
     private readonly IOllamaModelCatalogClient _catalogClient;
     private readonly IModelCatalogCacheService? _catalogCache;
     private readonly ModelCapabilityEngine? _capabilityEngine;
@@ -35,7 +35,7 @@ public sealed class ModelPreloadService : IModelPreloadService
     private readonly ILogger<ModelPreloadService> _logger;
 
     public ModelPreloadService(
-        IOptions<OllamaRouterOptions> options,
+        IOptionsMonitor<OllamaRouterOptions> options,
         IOllamaModelCatalogClient catalogClient,
         IModelCatalogCacheService? catalogCache,
         ModelCapabilityEngine? capabilityEngine,
@@ -45,7 +45,7 @@ public sealed class ModelPreloadService : IModelPreloadService
         IFleetHardwareService? fleetHardware,
         ILogger<ModelPreloadService> logger)
     {
-        _options = options.Value;
+        _options = options;
         _catalogClient = catalogClient;
         _catalogCache = catalogCache;
         _capabilityEngine = capabilityEngine;
@@ -128,7 +128,7 @@ public sealed class ModelPreloadService : IModelPreloadService
         var selected = selection.Selected!;
         var resolvedName = selection.ResolvedModel!;
         var intent = selection.Intent!.Value;
-        var appliedKeepAlive = keepAliveSeconds ?? selected.GetEffectivePreloadKeepAliveSeconds(_options, _fleetHardware);
+        var appliedKeepAlive = keepAliveSeconds ?? selected.GetEffectivePreloadKeepAliveSeconds(_options.CurrentValue, _fleetHardware);
         var appliedNumCtx = Math.Min(intent, selection.SelectedCeiling!.Value);
 
         bool? loadAccepted = null;
@@ -206,7 +206,7 @@ public sealed class ModelPreloadService : IModelPreloadService
         string? pinnedTarget,
         CancellationToken cancellationToken)
     {
-        var effectiveTargets = _options.GetEffectiveTargets();
+        var effectiveTargets = _options.CurrentValue.GetEffectiveTargets();
 
         // ---- 1. Model name resolution (the exact /api/router/models/{name} rules): the fleet
         // catalog (first-seen order + cloud syntheses when Cloud overflow is on), then the
@@ -217,9 +217,9 @@ public sealed class ModelPreloadService : IModelPreloadService
         // models resolve here but then fail the per-target model-presence gate (the Cloud
         // pseudo-target is never a preload candidate) → 503 with the skip reasons.
         var names = await RouterApiEndpointsExtensions.GetFleetModelNamesAsync(
-            _options, _availability, fleetAggregation: null, _catalogCache, context: null, cancellationToken).ConfigureAwait(false);
+            _options.CurrentValue, _availability, fleetAggregation: null, _catalogCache, context: null, cancellationToken).ConfigureAwait(false);
         var resolved = RouterApiEndpointsExtensions.ResolveModelName(modelName, names);
-        if (resolved is null && _options.FilterNamespacedModels)
+        if (resolved is null && _options.CurrentValue.FilterNamespacedModels)
         {
             resolved = await RouterApiEndpointsExtensions.ResolveModelOnFleetAsync(
                 _catalogCache, effectiveTargets, modelName, cancellationToken).ConfigureAwait(false);
@@ -318,7 +318,7 @@ public sealed class ModelPreloadService : IModelPreloadService
         // default sentinel when none) and the active intent (explicit request value or the
         // recommended-window soft fallback).
         var normalizedName = RoutingDecisionService.NormalizeModelName(resolved);
-        var pinnedArchitecture = _options.Models.TryGetValue(normalizedName, out var thresholds) ? thresholds.Architecture : null;
+        var pinnedArchitecture = _options.CurrentValue.Models.TryGetValue(normalizedName, out var thresholds) ? thresholds.Architecture : null;
 
         var recommended = ModelCapabilityEngine.OllamaDefaultContext;
         foreach (var entry in evaluated)
@@ -365,7 +365,7 @@ public sealed class ModelPreloadService : IModelPreloadService
                 intent,
                 softIntent ? intent : null,
                 entry.ContextCeiling,
-                _options.ContextFitMarginTokens).Qualified;
+                _options.CurrentValue.ContextFitMarginTokens).Qualified;
             if (!qualified)
             {
                 entry.SkipReason = $"context ceiling {entry.ContextCeiling} below intent {intent}";

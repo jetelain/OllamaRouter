@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using OllamaRouter.Options;
 
@@ -300,6 +301,29 @@ public class OllamaRouterOptionsTests
         OllamaRouter.Extensions.OllamaRouterServiceCollectionExtensions.AddOllamaRouter(services, options, stateDirectory: @"C:\override\state", enableTui: false);
 
         Assert.Equal(@"C:\override\state", options.StateDirectory);
+    }
+
+    [Fact]
+    public void AddOllamaRouter_ConfigOverload_BindsSection_NormalizesAndEnforcesNoTui()
+    {
+        var services = new Microsoft.Extensions.DependencyInjection.ServiceCollection();
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["OllamaRouter:MaxConsecutiveFailures"] = "6",
+            ["OllamaRouter:ContextFitMarginTokens"] = "-1",
+            ["OllamaRouter:DynamicContext:AutoShrinkIdleTimeoutSeconds"] = "-5"
+        }).Build();
+
+        OllamaRouter.Extensions.OllamaRouterServiceCollectionExtensions.AddOllamaRouter(
+            services, configuration, stateDirectory: null, enableTui: false);
+
+        using var provider = services.BuildServiceProvider();
+        var value = provider.GetRequiredService<Microsoft.Extensions.Options.IOptionsMonitor<OllamaRouterOptions>>().CurrentValue;
+
+        Assert.Equal(6, value.MaxConsecutiveFailures);
+        Assert.Equal(0, value.ContextFitMarginTokens); // normalizer clamp on bind
+        Assert.Equal(60, value.DynamicContext.AutoShrinkIdleTimeoutSeconds); // normalizer clamp on bind
+        Assert.False(value.TerminalMonitoring.Enabled); // enableTui: false PostConfigure
     }
 
     // ------------------------------------------------------------------

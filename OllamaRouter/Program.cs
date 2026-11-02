@@ -56,27 +56,22 @@ builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.TypeInfoResolverChain.Insert(0, OllamaRouterJsonSerializerContext.Default);
 });
 
-// Resolved + normalized options (Normalize() clamps the additive context fit margin and
-// normalizes dynamic context settings). The exact same instance is registered by AddOllamaRouter.
-var ollamaOptions = builder.Configuration.GetSection(OllamaRouterOptions.SectionName).Get<OllamaRouterOptions>()
-    ?? new OllamaRouterOptions();
-ollamaOptions.Normalize();
-ollamaOptions.DynamicContext.Normalize();
-
 // Full service registration + request pipeline (YARP from the effective fleet target list, the
 // routing middleware before UseRouting, hybrid endpoints, monitor endpoints, YARP catch-all).
-builder.Services.AddOllamaRouter(ollamaOptions, enableTui: !IsTuiDisabled(args));
+// Options are configuration-driven: IOptionsMonitor re-binds on the reloadOnChange change token
+// (config/config.json) and the normalizer re-applies the clamps on every rebind; --no-tui is
+// enforced via a PostConfigure that re-runs on every bind/reload.
+builder.Services.AddOllamaRouter(builder.Configuration, enableTui: !IsTuiDisabled(args));
 
 var app = builder.Build();
 appLogger = app.Logger;
 
-var disableTui = IsTuiDisabled(args);
-if (disableTui)
-{
-    ollamaOptions.TerminalMonitoring.Enabled = false;
-}
-
 static bool IsTuiDisabled(string[] args) => args.Any(a => string.Equals(a, "--no-tui", StringComparison.OrdinalIgnoreCase));
+
+// Startup-scoped options reads (fleet log line, DynamicContext startup logging, fleet targets,
+// process launch, bind address, monitor URL) use the live monitor's CURRENT value; structural
+// artifacts (YARP routes/clusters, bind address) are fixed for this process by design.
+var ollamaOptions = app.Services.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>().CurrentValue;
 
 // Effective fleet targets plus the Cloud pseudo-target (deduplicated, case-insensitively).
 var startupLogger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("OllamaRouter.Startup");

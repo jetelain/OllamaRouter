@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
@@ -36,7 +37,88 @@ namespace OllamaRouter.Extensions;
 public static class OllamaRouterServiceCollectionExtensions
 {
     /// <summary>
+    /// Registers the complete OllamaRouter service graph, binding <see cref="OllamaRouterOptions"/>
+    /// from <paramref name="configuration"/> for LIVE runtime rebinding: every service, the
+    /// middleware and the endpoint handlers consume <c>IOptionsMonitor&lt;OllamaRouterOptions&gt;</c>
+    /// (never a static <c>IOptions</c> snapshot), so an on-disk change of the layered user
+    /// configuration (<c>config/config.json</c>, <c>reloadOnChange</c>) is re-bound on the next
+    /// dispatch / loop iteration without a process restart.
+    /// <para>
+    /// A one-shot STARTUP snapshot of the same section is still resolved for the registration-time
+    /// structural artifacts that cannot (by design) be rebuilt at runtime:
+    /// the state-directory files, the YARP route/cluster memory config, the per-target keyed
+    /// stores, the <see cref="ITokenEstimator"/> engine singleton and the probe client timeout.
+    /// Those remain startup-scoped: changing fleet membership (adding/removing targets), target
+    /// <c>Url</c>/<c>RouterUrl</c>, <c>BindAddress</c> or the <c>TokenEstimator</c> engine requires
+    /// a process restart (YARP dynamic configuration is a separate feature).
+    /// </para>
+    /// </summary>
+    /// <param name="services">The service collection to configure.</param>
+    /// <param name="configuration">The layered application configuration (factory
+    /// <c>appsettings.json</c> + user <c>config/config.json</c>); the <c>OllamaRouter</c> section is
+    /// bound into <c>IOptionsMonitor&lt;OllamaRouterOptions&gt;</c> and re-normalized on every rebind
+    /// by <see cref="OllamaRouterOptionsNormalizer"/>.</param>
+    /// <param name="stateDirectory">
+    /// Directory for the persisted state files. Defaults to
+    /// <c>%LOCALAPPDATA%\OllamaRouter</c> (production); tests pass a temp directory.
+    /// </param>
+    /// <param name="enableTui">
+    /// When false, disables the in-terminal activity monitor (mirrors the <c>--no-tui</c> flag)
+    /// via a <c>PostConfigure</c> that is enforced on every bind/reload.
+    /// </param>
+    /// <param name="reprobeInterval">Optional liveness re-probe interval override (default 10 s).</param>
+    /// <param name="onlineCacheTtl">Optional Online-verdict TTL override (default 15 s).</param>
+    /// <param name="probeTimeout">Optional liveness probe HTTP client timeout override (default 3.5 s).</param>
+    public static IServiceCollection AddOllamaRouter(
+        this IServiceCollection services,
+        IConfiguration configuration,
+        string? stateDirectory = null,
+        bool enableTui = true,
+        TimeSpan? reprobeInterval = null,
+        TimeSpan? onlineCacheTtl = null,
+        TimeSpan? probeTimeout = null)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        // Dynamic options infrastructure: IOptionsMonitor re-binds when the reloadOnChange
+        // change token fires; the normalizer re-applies the clamps on every bind/rebind.
+        services.AddOptions();
+        services.Configure<OllamaRouterOptions>(configuration.GetSection(OllamaRouterOptions.SectionName));
+        services.AddSingleton<IPostConfigureOptions<OllamaRouterOptions>, OllamaRouterOptionsNormalizer>();
+
+        if (!enableTui)
+        {
+            services.PostConfigure<OllamaRouterOptions>(opt => opt.TerminalMonitoring.Enabled = false);
+        }
+
+        // One-shot startup snapshot for the registration-time structural artifacts (state files,
+        // YARP memory config, keyed stores, TokenEstimator engine, probe timeout) - see above.
+        var startupOptions = configuration.GetSection(OllamaRouterOptions.SectionName).Get<OllamaRouterOptions>()
+            ?? new OllamaRouterOptions();
+        startupOptions.Normalize();
+        startupOptions.DynamicContext.Normalize();
+        startupOptions.StateDirectory = ResolveEffectiveStateDirectory(startupOptions, stateDirectory);
+
+        return AddOllamaRouterCore(
+            services,
+            startupOptions,
+            stateDirectory,
+            reprobeInterval,
+            onlineCacheTtl,
+            probeTimeout);
+    }
+
+    /// <summary>
     /// Registers the complete OllamaRouter service graph for <paramref name="options"/>.
+    /// <para>
+    /// Backwards-compatible instance overload (unit tests, mesh fleet): <paramref name="options"/>
+    /// is registered as a singleton, as the static <c>IOptions&lt;OllamaRouterOptions&gt;</c> snapshot
+    /// AND (via <c>TryAddSingleton</c>) as a live-by-reference
+    /// <see cref="OllamaRouter.Options.FixedOptionsMonitor{TOptions}"/> so the identical service
+    /// graph resolves <c>IOptionsMonitor&lt;OllamaRouterOptions&gt;</c> in every registration path.
+    /// A caller-registered monitor (e.g. the test <c>TestOptionsMonitor&lt;T&gt;</c>) takes precedence
+    /// because the monitor is added with <c>TryAddSingleton</c>.
+    /// </para>
     /// </summary>
     /// <param name="services">The service collection to configure.</param>
     /// <param name="options">The resolved router options instance (bound from configuration in production,
@@ -60,25 +142,63 @@ public static class OllamaRouterServiceCollectionExtensions
         TimeSpan? onlineCacheTtl = null,
         TimeSpan? probeTimeout = null)
     {
-        var effectiveStateDirectory = string.IsNullOrWhiteSpace(stateDirectory)
-            ? (string.IsNullOrWhiteSpace(options.StateDirectory)
-                ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OllamaRouter", "state")
-                : options.StateDirectory)
-            : stateDirectory;
-        options.StateDirectory = effectiveStateDirectory;
-
-        services.ConfigureHttpJsonOptions(httpJsonOptions =>
-        {
-            httpJsonOptions.SerializerOptions.TypeInfoResolverChain.Insert(0, OllamaRouterJsonSerializerContext.Default);
-        });
+        options.StateDirectory = ResolveEffectiveStateDirectory(options, stateDirectory);
 
         // Register the resolved options instance (not config-bound) so both production (where it was
         // already bound + normalized in Program.cs) and tests (constructed directly) share one value.
         services.AddSingleton(options);
         services.AddSingleton<IOptions<OllamaRouterOptions>>(MsOptions.Create(options));
 
+        // Live-by-reference monitor for the same instance: the shared service graph consumes
+        // IOptionsMonitor everywhere; a caller-registered monitor (tests) wins via TryAdd.
+        services.TryAddSingleton<IOptionsMonitor<OllamaRouterOptions>>(_ => new FixedOptionsMonitor<OllamaRouterOptions>(options));
+
+        if (!enableTui)
+        {
+            // The raw MsOptions.Create singleton does not run PostConfigure delegates, so the
+            // --no-tui switch is applied directly to the shared instance (parity with the
+            // configuration overload's PostConfigure, which re-enforces it on every rebind).
+            options.TerminalMonitoring.Enabled = false;
+        }
+
+        return AddOllamaRouterCore(services, options, stateDirectory, reprobeInterval, onlineCacheTtl, probeTimeout);
+    }
+
+    /// <summary>
+    /// Resolves the effective on-disk state directory: the explicit override, else the
+    /// options-level <c>StateDirectory</c>, else <c>%LOCALAPPDATA%\OllamaRouter\state</c>.
+    /// </summary>
+    private static string ResolveEffectiveStateDirectory(OllamaRouterOptions options, string? stateDirectory)
+        => string.IsNullOrWhiteSpace(stateDirectory)
+            ? (string.IsNullOrWhiteSpace(options.StateDirectory)
+                ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OllamaRouter", "state")
+                : options.StateDirectory)
+            : stateDirectory;
+
+    /// <summary>
+    /// Shared registration core behind both <see cref="AddOllamaRouter"/> overloads.
+    /// <paramref name="startupOptions"/> is a one-shot startup snapshot used for the
+    /// registration-time structural artifacts only; every service SP factory resolves the live
+    /// <c>IOptionsMonitor&lt;OllamaRouterOptions&gt;</c> instead.
+    /// </summary>
+    private static IServiceCollection AddOllamaRouterCore(
+        IServiceCollection services,
+        OllamaRouterOptions startupOptions,
+        string? stateDirectory,
+        TimeSpan? reprobeInterval,
+        TimeSpan? onlineCacheTtl,
+        TimeSpan? probeTimeout)
+    {
+        // startupOptions.StateDirectory was set by the caller overload before the core runs.
+        var effectiveStateDirectory = startupOptions.StateDirectory!;
+
+        services.ConfigureHttpJsonOptions(httpJsonOptions =>
+        {
+            httpJsonOptions.SerializerOptions.TypeInfoResolverChain.Insert(0, OllamaRouterJsonSerializerContext.Default);
+        });
+
         // Code-based YARP configuration: routes/clusters generated from the effective fleet target list.
-        var (routes, clusters) = OllamaReverseProxyConfig.Build(options);
+        var (routes, clusters) = OllamaReverseProxyConfig.Build(startupOptions);
         services.AddReverseProxy().LoadFromMemory(routes, clusters);
 
         // Middleware-owned dispatch loop: a single HttpForwarder instance (YARP 2.3.0 has no DI-friendly
@@ -93,7 +213,7 @@ public static class OllamaRouterServiceCollectionExtensions
         // Effective fleet targets plus the Cloud pseudo-target; used by the availability and statistics
         // services so state is keyed per target. Invalid Targets entries are skipped with a warning here.
         var startupLogger = LoggerFactory.Create(_ => { }).CreateLogger("OllamaRouter.Startup");
-        var fleetTargets = BuildFleetTargets(options, startupLogger);
+        var fleetTargets = BuildFleetTargets(startupOptions, startupLogger);
 
         services.AddHttpClient<IOllamaModelCatalogClient, OllamaModelCatalogClient>(client =>
         {
@@ -124,7 +244,7 @@ public static class OllamaRouterServiceCollectionExtensions
             return new SocketsHttpHandler { PooledConnectionLifetime = TimeSpan.FromSeconds(10) };
         });
 
-        if (string.Equals(options.TokenEstimator, "Tiktoken", StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(startupOptions.TokenEstimator, "Tiktoken", StringComparison.OrdinalIgnoreCase))
         {
             services.AddSingleton<ITokenEstimator, TiktokenTokenEstimator>();
         }
@@ -138,10 +258,10 @@ public static class OllamaRouterServiceCollectionExtensions
         // precedence would otherwise be silently ignored at runtime).
         services.AddTransient<CloudRoutingTargetHandler>(sp => new CloudRoutingTargetHandler(
             sp.GetRequiredService<ITargetAvailabilityService>(),
-            sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
+            sp.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>(),
             sp.GetRequiredService<ILogger<CloudRoutingTargetHandler>>()));
         services.AddTransient<IRoutingDecisionService>(sp => new RoutingDecisionService(
-            sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
+            sp.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>(),
             sp.GetRequiredService<IModelCatalogCacheService>(),
             sp.GetRequiredService<ITargetLivenessService>(),
             sp.GetRequiredService<ITargetAvailabilityService>(),
@@ -164,7 +284,7 @@ public static class OllamaRouterServiceCollectionExtensions
 
         // Fleet hardware topology store (singleton + targets-hardware.json persistence + hosted service).
         services.AddSingleton<FleetHardwareService>(sp => new FleetHardwareService(
-            sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
+            sp.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>(),
             sp.GetRequiredService<IHardwareProfileProvider>(),
             sp.GetRequiredService<IHttpClientFactory>().CreateClient("HardwareProbe"),
             sp.GetRequiredService<ILogger<FleetHardwareService>>(),
@@ -180,7 +300,7 @@ public static class OllamaRouterServiceCollectionExtensions
         // registration). All enrichment dependencies are nullable-tolerant so minimal test
         // hosts keep working (defensive, like every other endpoint in this graph).
         services.AddSingleton<IModelPreloadService>(sp => new ModelPreloadService(
-            sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
+            sp.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>(),
             sp.GetRequiredService<IOllamaModelCatalogClient>(),
             sp.GetService<IModelCatalogCacheService>(),
             sp.GetService<ModelCapabilityEngine>(),
@@ -209,7 +329,7 @@ public static class OllamaRouterServiceCollectionExtensions
             sp.GetRequiredService<IOptions<CandidateModelCatalogOptions>>(),
             sp.GetRequiredService<IFleetHardwareService>(),
             sp.GetRequiredService<ITokenEstimator>(),
-            sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
+            sp.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>(),
             sp.GetRequiredService<IOllamaModelCatalogClient>(),
             sp.GetRequiredService<IHttpClientFactory>().CreateClient("Benchmark"),
             // Optional: test hosts without a full application host fall back to a token that
@@ -233,11 +353,8 @@ public static class OllamaRouterServiceCollectionExtensions
                 fleetTargets,
                 sp.GetRequiredService<ILogger<TargetAvailabilityService>>()));
 
-        // In-terminal activity monitor (registered always; disabled when !enableTui via the option).
-        if (!enableTui)
-        {
-            services.PostConfigure<OllamaRouterOptions>(opt => opt.TerminalMonitoring.Enabled = false);
-        }
+        // In-terminal activity monitor (registered always; disabled via the option's
+        // TerminalMonitoring.Enabled, enforced by the caller overload at registration time).
         services.AddHostedService<TerminalMonitoringHostedService>();
 
         // Target liveness prober (singleton + hosted service): boot probe + background re-prober.
@@ -247,7 +364,7 @@ public static class OllamaRouterServiceCollectionExtensions
         // registration is behavior-identical (IHostedService is an IEnumerable aggregate resolved
         // by the host the same way) and works in both the production host and the test host.
         services.AddSingleton<ITargetLivenessService>(sp => new TargetLivenessService(
-            sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
+            sp.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>(),
             sp.GetRequiredService<IModelCatalogCacheService>(),
             sp.GetRequiredService<IHttpClientFactory>().CreateClient("LivenessProbe"),
             sp.GetRequiredService<ILogger<TargetLivenessService>>(),
@@ -258,7 +375,7 @@ public static class OllamaRouterServiceCollectionExtensions
         // Multi-target execution state tracker (singleton + hosted refresh timer). The SP factory injects
         // the shared Auto-Shrink Manager so evicted models reset their leases.
         services.AddSingleton<ITargetExecutionTracker>(sp => new TargetExecutionTracker(
-            sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
+            sp.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>(),
             sp.GetRequiredService<ITargetLivenessService>(),
             sp.GetRequiredService<ITargetAvailabilityService>(),
             sp.GetRequiredService<IOllamaModelCatalogClient>(),

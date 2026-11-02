@@ -1,8 +1,8 @@
+using OllamaRouter.Tests.TestHelpers;
 using System.Text.Json.Nodes;
 using Microsoft.Extensions.Logging.Abstractions;
 using OllamaRouter.Options;
 using OllamaRouter.Services;
-using MsOptions = Microsoft.Extensions.Options.Options;
 
 namespace OllamaRouter.Tests.Services;
 
@@ -46,7 +46,7 @@ public class InferenceRequestRecorderTests : IDisposable
 
     private InferenceRequestRecorder CreateSut(RecordingOptions? recording) =>
         new(
-            MsOptions.Create(new OllamaRouterOptions { Recording = recording }),
+            new TestOptionsMonitor<OllamaRouterOptions>(new OllamaRouterOptions { Recording = recording }),
             NullLogger<InferenceRequestRecorder>.Instance);
 
     [Theory]

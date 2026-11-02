@@ -10,6 +10,7 @@ using OllamaRouter.Options;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services;
 using OllamaRouter.Services.Hardware;
+using OllamaRouter.Tests.TestHelpers;
 
 namespace OllamaRouter.Tests.Endpoints;
 
@@ -25,7 +26,7 @@ public class RouterApiEndpointsTests
     {
         public WebApplication App { get; }
         public HttpClient Client { get; }
-        public Mock<IOptions<OllamaRouterOptions>> Options { get; }
+        public TestOptionsMonitor<OllamaRouterOptions> Options { get; }
         public Mock<ITargetAvailabilityService> Availability { get; }
         public Mock<ITargetLivenessService>? Liveness { get; }
         public Mock<ITargetExecutionTracker>? Tracker { get; }
@@ -36,7 +37,7 @@ public class RouterApiEndpointsTests
         public Harness(
             WebApplication app,
             HttpClient client,
-            Mock<IOptions<OllamaRouterOptions>> options,
+            TestOptionsMonitor<OllamaRouterOptions> options,
             Mock<ITargetAvailabilityService> availability,
             Mock<ITargetLivenessService>? liveness,
             Mock<ITargetExecutionTracker>? tracker,
@@ -83,8 +84,7 @@ public class RouterApiEndpointsTests
             opt.SerializerOptions.TypeInfoResolverChain.Insert(0, OllamaRouterJsonSerializerContext.Default);
         });
 
-        var optionsMock = new Mock<IOptions<OllamaRouterOptions>>();
-        optionsMock.Setup(o => o.Value).Returns(options ?? new OllamaRouterOptions());
+        var optionsMonitor = new TestOptionsMonitor<OllamaRouterOptions>(options ?? new OllamaRouterOptions());
 
         var availability = new Mock<ITargetAvailabilityService>();
         availability.Setup(t => t.GetSnapshot())
@@ -127,7 +127,7 @@ public class RouterApiEndpointsTests
             .Setup(c => c.HasAnyModelsAsync(It.IsAny<string?>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(false);
 
-        builder.Services.AddSingleton(optionsMock.Object);
+        builder.Services.AddSingleton<IOptionsMonitor<OllamaRouterOptions>>(optionsMonitor);
         builder.Services.AddSingleton(availability.Object);
         if (registerLiveness && liveness is not null)
         {
@@ -187,7 +187,7 @@ public class RouterApiEndpointsTests
         var harness = new Harness(
             app,
             client,
-            optionsMock,
+            optionsMonitor,
             availability,
             registerLiveness ? liveness : null,
             registerTracker ? tracker : null,

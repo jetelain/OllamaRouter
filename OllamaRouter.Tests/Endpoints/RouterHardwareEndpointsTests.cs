@@ -1,3 +1,4 @@
+using OllamaRouter.Tests.TestHelpers;
 using System.Net.Http.Json;
 using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Builder;
@@ -11,7 +12,6 @@ using OllamaRouter.Serialization;
 using OllamaRouter.Services;
 using OllamaRouter.Services.Hardware;
 using OllamaRouter.Tests.Services;
-using MsOptions = Microsoft.Extensions.Options.Options;
 
 namespace OllamaRouter.Tests.Endpoints;
 
@@ -56,8 +56,7 @@ public class RouterHardwareEndpointsTests
             opt.SerializerOptions.TypeInfoResolverChain.Insert(0, OllamaRouterJsonSerializerContext.Default);
         });
 
-        var optionsMock = new Mock<IOptions<OllamaRouterOptions>>();
-        optionsMock.Setup(o => o.Value).Returns(options);
+        var optionsMonitor = new TestOptionsMonitor<OllamaRouterOptions>(options);
 
         var availability = new Mock<ITargetAvailabilityService>();
         availability.Setup(t => t.GetSnapshot()).Returns(new TargetAvailabilitySnapshot(new Dictionary<RoutingTarget, bool>()
@@ -85,7 +84,7 @@ public class RouterHardwareEndpointsTests
         var catalogCache = new Mock<IModelCatalogCacheService>();
         catalogCache.Setup(c => c.HasAnyModelsAsync(It.IsAny<string?>(), It.IsAny<CancellationToken>())).ReturnsAsync(false);
 
-        builder.Services.AddSingleton(optionsMock.Object);
+        builder.Services.AddSingleton<IOptionsMonitor<OllamaRouterOptions>>(optionsMonitor);
         builder.Services.AddSingleton(availability.Object);
         builder.Services.AddSingleton(liveness.Object);
         builder.Services.AddSingleton(tracker.Object);
@@ -245,7 +244,7 @@ public class RouterHardwareEndpointsTests
             Timeout = TimeSpan.FromSeconds(3)
         };
         var fleet = new FleetHardwareService(
-            MsOptions.Create(options),
+            new TestOptionsMonitor<OllamaRouterOptions>(options),
             localProvider,
             probeClient,
             Microsoft.Extensions.Logging.Abstractions.NullLogger<FleetHardwareService>.Instance,
@@ -274,7 +273,7 @@ public class RouterHardwareEndpointsTests
 
         // Restart the service on the same state dir: served without any peer contact.
         var restarted = new FleetHardwareService(
-            MsOptions.Create(options),
+            new TestOptionsMonitor<OllamaRouterOptions>(options),
             localProvider,
             probeClient,
             Microsoft.Extensions.Logging.Abstractions.NullLogger<FleetHardwareService>.Instance,

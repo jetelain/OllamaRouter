@@ -1,3 +1,4 @@
+using OllamaRouter.Tests.TestHelpers;
 using System.Diagnostics;
 using System.Net;
 using System.Text;
@@ -247,7 +248,7 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
             MsOptions.Create(options),
             _fleetHardware.Object,
             new FixedTokenEstimator(),
-            MsOptions.Create(_options),
+            new TestOptionsMonitor<OllamaRouterOptions>(_options),
             _catalogClient.Object,
             httpClient,
             _lifetime.Object,
@@ -557,7 +558,7 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
             }),
             _fleetHardware.Object,
             new FixedTokenEstimator(),
-            MsOptions.Create(_options),
+            new TestOptionsMonitor<OllamaRouterOptions>(_options),
             _catalogClient.Object,
             new HttpClient(_handler),
             capturingLifetime,

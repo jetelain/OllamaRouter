@@ -1,3 +1,4 @@
+using OllamaRouter.Tests.TestHelpers;
 using System.Net;
 using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Builder;
@@ -10,7 +11,6 @@ using OllamaRouter.Endpoints;
 using OllamaRouter.Options;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services;
-using MsOptions = Microsoft.Extensions.Options.Options;
 
 namespace OllamaRouter.Tests.Endpoints;
 
@@ -229,7 +229,7 @@ public class RouterModelApiEndpointsTests
             .Setup(t => t.GetState(It.IsAny<RoutingTarget>()))
             .Returns<RoutingTarget>(t => executionStates?.GetValueOrDefault(t));
 
-        builder.Services.AddSingleton(MsOptions.Create(options));
+        builder.Services.AddSingleton<IOptionsMonitor<OllamaRouterOptions>>(new TestOptionsMonitor<OllamaRouterOptions>(options));
         builder.Services.AddSingleton(catalogClient.Object);
         builder.Services.AddSingleton(liveness.Object);
         builder.Services.AddSingleton(availability.Object);
@@ -251,10 +251,10 @@ public class RouterModelApiEndpointsTests
         {
             builder.Services.AddTransient<CloudRoutingTargetHandler>(sp => new CloudRoutingTargetHandler(
                 sp.GetRequiredService<ITargetAvailabilityService>(),
-                sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
+                sp.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>(),
                 sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<CloudRoutingTargetHandler>>()));
             builder.Services.AddTransient<IRoutingDecisionService>(sp => new RoutingDecisionService(
-                sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
+                sp.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>(),
                 sp.GetRequiredService<IModelCatalogCacheService>(),
                 sp.GetRequiredService<ITargetLivenessService>(),
                 sp.GetRequiredService<ITargetAvailabilityService>(),
@@ -805,7 +805,7 @@ public class RouterModelApiEndpointsTests
         builder.WebHost.UseUrls("http://127.0.0.1:0");
         var availability = new Mock<ITargetAvailabilityService>();
         availability.Setup(t => t.IsEnabled(It.IsAny<RoutingTarget>())).Returns(true);
-        builder.Services.AddSingleton(MsOptions.Create(options));
+        builder.Services.AddSingleton<IOptionsMonitor<OllamaRouterOptions>>(new TestOptionsMonitor<OllamaRouterOptions>(options));
         builder.Services.AddSingleton(availability.Object);
 
         var app = builder.Build();

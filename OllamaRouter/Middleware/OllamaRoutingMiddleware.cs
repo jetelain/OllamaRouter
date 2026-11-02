@@ -31,7 +31,7 @@ public sealed class OllamaRoutingMiddleware(
     ITargetAvailabilityService targetAvailability,
     ITargetLivenessService targetLiveness,
     ModelCapabilityEngine capabilityEngine,
-    IOptions<OllamaRouterOptions> options,
+    IOptionsMonitor<OllamaRouterOptions> options,
     ILogger<OllamaRoutingMiddleware> logger,
     IHttpForwarder forwarder,
     ITargetFailureStreakService streakTracker,
@@ -152,7 +152,7 @@ public sealed class OllamaRoutingMiddleware(
     // (Remote in the legacy configuration, preserving the previous behavior exactly).
     private string GetDefaultHeaderValue()
     {
-        var effectiveTargets = options.Value.GetEffectiveTargets(logger);
+        var effectiveTargets = options.CurrentValue.GetEffectiveTargets(logger);
         if (effectiveTargets.Count == 0)
         {
             return OllamaReverseProxyConfig.LocalTarget;
@@ -173,7 +173,7 @@ public sealed class OllamaRoutingMiddleware(
     // the legacy Remote-then-Local preference. Returns null when no target is enabled.
     private string? GetFallbackHeaderValue()
     {
-        var effectiveTargets = options.Value.GetEffectiveTargets(logger);
+        var effectiveTargets = options.CurrentValue.GetEffectiveTargets(logger);
         return effectiveTargets.FirstOrDefault(t => string.Equals(t.Name, OllamaReverseProxyConfig.RemoteTarget, StringComparison.OrdinalIgnoreCase)
                 && targetAvailability.IsEnabled(t.Name))?.Name
             ?? effectiveTargets.FirstOrDefault(t => string.Equals(t.Name, OllamaReverseProxyConfig.LocalTarget, StringComparison.OrdinalIgnoreCase)
@@ -189,7 +189,7 @@ public sealed class OllamaRoutingMiddleware(
     {
         if (target == RoutingTarget.Cloud)
         {
-            var effectiveTargets = options.Value.GetEffectiveTargets(logger);
+            var effectiveTargets = options.CurrentValue.GetEffectiveTargets(logger);
             var relay = effectiveTargets.FirstOrDefault(t => string.Equals(t.Name, OllamaReverseProxyConfig.LocalTarget, StringComparison.OrdinalIgnoreCase))
                 ?? (effectiveTargets.Count > 0 ? effectiveTargets[0] : null);
             if (relay is null)
@@ -232,7 +232,7 @@ public sealed class OllamaRoutingMiddleware(
             return true;
         }
 
-        var exactMatch = options.Value.GetEffectiveTargets(logger)
+        var exactMatch = options.CurrentValue.GetEffectiveTargets(logger)
             .FirstOrDefault(t => string.Equals(t.Name, value, StringComparison.OrdinalIgnoreCase));
         if (exactMatch is not null && !string.IsNullOrWhiteSpace(exactMatch.Name))
         {
@@ -314,7 +314,7 @@ public sealed class OllamaRoutingMiddleware(
     // over CloudOverflow.DefaultModel).
     private bool IsCloudOverflowAvailable(string modelName)
     {
-        return CloudRelayResolver.IsCloudOverflowAvailable(targetAvailability, options.Value, modelName);
+        return CloudRelayResolver.IsCloudOverflowAvailable(targetAvailability, options.CurrentValue, modelName);
     }
 
     // Whether the given fleet target can receive a request right now: enabled in
@@ -626,7 +626,7 @@ public sealed class OllamaRoutingMiddleware(
                 // Cloud is a relay with no management concept: a scope containing Cloud simply
                 // contributes no management candidate. The response header ALWAYS echoes the
                 // concrete target name, never a scope keyword.
-                foreach (var t in options.Value.GetEffectiveTargets(logger))
+                foreach (var t in options.CurrentValue.GetEffectiveTargets(logger))
                 {
                     if (!allowedLocations.Contains(TargetLocationClassifier.Classify(t)) ||
                         string.IsNullOrWhiteSpace(t.Name))
@@ -688,7 +688,7 @@ public sealed class OllamaRoutingMiddleware(
         }
 
         OllamaTargetOptions? pinnedOptions = null;
-        foreach (var t in options.Value.GetEffectiveTargets(logger))
+        foreach (var t in options.CurrentValue.GetEffectiveTargets(logger))
         {
             if (string.Equals(t.Name, pinned.Value, StringComparison.OrdinalIgnoreCase))
             {
@@ -776,7 +776,7 @@ public sealed class OllamaRoutingMiddleware(
             modelName = string.IsNullOrEmpty(requestInfo.ModelName) ? "unknown" : requestInfo.ModelName;
             rawTokenCount = tokenEstimator.EstimateTokens(requestInfo.ContextParts, modelName)
                 + requestInfo.PriorContextTokenCount;
-            tokenCount = (int)Math.Ceiling(rawTokenCount * options.Value.TokenEstimationOverheadFactor);
+            tokenCount = (int)Math.Ceiling(rawTokenCount * options.CurrentValue.TokenEstimationOverheadFactor);
             // The client's static options.num_ctx (upper-bound preference, never a disqualifier):
             // fed to the routing pipeline's context-fit clamp (plan §2.2) and reused by the
             // dynamic context sizing rewrite below.
@@ -1272,7 +1272,7 @@ public sealed class OllamaRoutingMiddleware(
     // whether the Cloud relay step was available).
     private async Task<(RoutingTarget? Served, string Body)> DispatchLoopAsync(HttpContext context, string body, RoutingTarget target, IReadOnlySet<TargetLocation>? allowedLocations = null)
     {
-        var effectiveTargets = options.Value.GetEffectiveTargets(logger);
+        var effectiveTargets = options.CurrentValue.GetEffectiveTargets(logger);
         var targetsByName = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
         foreach (var t in effectiveTargets)
         {
@@ -1328,7 +1328,7 @@ public sealed class OllamaRoutingMiddleware(
                     continue;
                 }
                 if (!IsRoutableNow(candidate)
-                    || streakTracker.ShouldSkip(candidate, options.Value.MaxConsecutiveFailures))
+                    || streakTracker.ShouldSkip(candidate, options.CurrentValue.MaxConsecutiveFailures))
                 {
                     continue;
                 }
@@ -1363,7 +1363,7 @@ public sealed class OllamaRoutingMiddleware(
                 // Cloud terminal step: swap in the cloud-rewritten body (per-model CloudModel
                 // precedence over CloudOverflow.DefaultModel) and never restore it afterwards.
                 var requestedModel = OllamaRequestParser.ParseCompletionRequest(body).ModelName ?? string.Empty;
-                var cloudModel = CloudRelayResolver.ResolveCloudModel(options.Value, requestedModel);
+                var cloudModel = CloudRelayResolver.ResolveCloudModel(options.CurrentValue, requestedModel);
                 if (!string.IsNullOrEmpty(cloudModel))
                 {
                     body = OllamaRequestParser.ReplaceModelName(body, cloudModel);
@@ -1448,7 +1448,7 @@ public sealed class OllamaRoutingMiddleware(
             Dictionary<string, string?> targetsByName,
             List<(RoutingTarget Target, string Url)> candidates)
         {
-            var preferred = options.Value.CloudOverflow.PreferredRelayTarget;
+            var preferred = options.CurrentValue.CloudOverflow.PreferredRelayTarget;
             var preferredEntry = effectiveTargets
                 .FirstOrDefault(t => !string.IsNullOrWhiteSpace(t.Name) &&
                                       string.Equals(t.Name, preferred, StringComparison.OrdinalIgnoreCase));
@@ -1618,7 +1618,7 @@ public sealed class OllamaRoutingMiddleware(
         int tokenCount,
         string body)
     {
-        var dynamicOptions = options.Value.DynamicContext;
+        var dynamicOptions = options.CurrentValue.DynamicContext;
         if (!dynamicOptions.Enabled)
         {
             return (null, null);
@@ -1626,7 +1626,7 @@ public sealed class OllamaRoutingMiddleware(
 
         var normalizedName = RoutingDecisionService.NormalizeModelName(modelName);
         OllamaTargetOptions? targetOptions = null;
-        foreach (var t in options.Value.GetEffectiveTargets(logger))
+        foreach (var t in options.CurrentValue.GetEffectiveTargets(logger))
         {
             if (string.Equals(t.Name, target.Value, StringComparison.OrdinalIgnoreCase))
             {
@@ -1653,7 +1653,7 @@ public sealed class OllamaRoutingMiddleware(
             var metadata = await capabilityEngine.GetMetadataAsync(targetUrl, modelName, digest, context.RequestAborted);
 
             ModelThresholds? thresholds = null;
-            options.Value.Models.TryGetValue(normalizedName, out thresholds);
+            options.CurrentValue.Models.TryGetValue(normalizedName, out thresholds);
 
             var capability = capabilityEngine.DeriveCapability(metadata, target.Value, targetOptions, thresholds?.Architecture);
             if (!DynamicContextSizingEngine.IsHardwareSuitable(capability))
@@ -1667,7 +1667,7 @@ public sealed class OllamaRoutingMiddleware(
             }
 
             var clientNumCtx = DynamicContextPayloadTransformer.ExtractClientNumCtx(body);
-            var margin = Math.Max(0, options.Value.ContextFitMarginTokens);
+            var margin = Math.Max(0, options.CurrentValue.ContextFitMarginTokens);
             var decision = DynamicContextSizingEngine.Decide(
                 dynamicOptions,
                 capability,

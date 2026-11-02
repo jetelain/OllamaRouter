@@ -31,7 +31,7 @@ public sealed class FleetHardwareService : IFleetHardwareService, IHostedService
     private const string HardwarePath = "/api/router/hardware";
     private static readonly TimeSpan PeerProbeTtl = TimeSpan.FromDays(1);
 
-    private readonly IOptions<OllamaRouterOptions> _options;
+    private readonly IOptionsMonitor<OllamaRouterOptions> _options;
     private readonly IHardwareProfileProvider _localProvider;
     private readonly HttpClient _probeClient;
     private readonly ILogger<FleetHardwareService> _logger;
@@ -47,7 +47,7 @@ public sealed class FleetHardwareService : IFleetHardwareService, IHostedService
     private Task? _loopTask;
 
     public FleetHardwareService(
-        IOptions<OllamaRouterOptions> options,
+        IOptionsMonitor<OllamaRouterOptions> options,
         IHardwareProfileProvider localProvider,
         HttpClient probeClient,
         ILogger<FleetHardwareService> logger,
@@ -75,7 +75,7 @@ public sealed class FleetHardwareService : IFleetHardwareService, IHostedService
         }
 
         // Cache miss: check if this is the local workstation target
-        var match = _options.Value.GetEffectiveTargets()
+        var match = _options.CurrentValue.GetEffectiveTargets()
             .FirstOrDefault(t => string.Equals(t.Name, targetName, StringComparison.OrdinalIgnoreCase));
 
         if (match is not null && IsLocalWorkstationTarget(match))
@@ -124,7 +124,7 @@ public sealed class FleetHardwareService : IFleetHardwareService, IHostedService
 
     public async Task<IReadOnlyList<FleetHardwareNode>> GetFleetHardwareAsync(CancellationToken ct = default)
     {
-        var targets = _options.Value.GetEffectiveTargets();
+        var targets = _options.CurrentValue.GetEffectiveTargets();
         var localProfile = await GetLocalProfileSafeAsync(ct).ConfigureAwait(false);
 
         var rows = new List<FleetHardwareNode>(targets.Count);
@@ -228,7 +228,7 @@ public sealed class FleetHardwareService : IFleetHardwareService, IHostedService
             return Task.FromResult(false);
         }
 
-        var match = _options.Value.GetEffectiveTargets()
+        var match = _options.CurrentValue.GetEffectiveTargets()
             .FirstOrDefault(t => string.Equals(t.Name, targetName, StringComparison.OrdinalIgnoreCase));
         if (match is null)
         {
@@ -455,4 +455,3 @@ public sealed class FleetHardwareService : IFleetHardwareService, IHostedService
         }
     }
 }
-

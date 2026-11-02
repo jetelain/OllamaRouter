@@ -1,3 +1,4 @@
+using OllamaRouter.Tests.TestHelpers;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
@@ -8,7 +9,6 @@ using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using OllamaRouter.Options;
 using OllamaRouter.Services;
-using MsOptions = Microsoft.Extensions.Options.Options;
 
 namespace OllamaRouter.Tests.Services;
 
@@ -105,7 +105,7 @@ public class TargetExecutionTrackerTests : IDisposable
         _clients.Add(client);
 
         var liveness = new TargetLivenessService(
-            MsOptions.Create(ThreeTargetOptions()),
+            new TestOptionsMonitor<OllamaRouterOptions>(ThreeTargetOptions()),
             new CountingCatalogCache(),
             client,
             NullLogger<TargetLivenessService>.Instance);
@@ -207,7 +207,7 @@ public class TargetExecutionTrackerTests : IDisposable
         });
 
         var sut = new TargetExecutionTracker(
-            MsOptions.Create(ThreeTargetOptions()),
+            new TestOptionsMonitor<OllamaRouterOptions>(ThreeTargetOptions()),
             liveness,
             new Mock<ITargetAvailabilityService>().Object,
             responder,
@@ -260,7 +260,7 @@ public class TargetExecutionTrackerTests : IDisposable
         var liveness = new Mock<ITargetLivenessService>();
         SetupLiveness(liveness, includeCloud: false);
         var sut = new TargetExecutionTracker(
-            MsOptions.Create(ThreeTargetOptions()),
+            new TestOptionsMonitor<OllamaRouterOptions>(ThreeTargetOptions()),
             liveness.Object,
             new Mock<ITargetAvailabilityService>().Object,
             catalog,
@@ -283,7 +283,7 @@ public class TargetExecutionTrackerTests : IDisposable
         var liveness = new Mock<ITargetLivenessService>();
         SetupLiveness(liveness, includeCloud: false);
         var sut = new TargetExecutionTracker(
-            MsOptions.Create(ThreeTargetOptions()),
+            new TestOptionsMonitor<OllamaRouterOptions>(ThreeTargetOptions()),
             liveness.Object,
             new Mock<ITargetAvailabilityService>().Object,
             catalog,
@@ -310,7 +310,7 @@ public class TargetExecutionTrackerTests : IDisposable
         var liveness = new Mock<ITargetLivenessService>();
         SetupLiveness(liveness, includeCloud: false);
         var sut = new TargetExecutionTracker(
-            MsOptions.Create(ThreeTargetOptions()),
+            new TestOptionsMonitor<OllamaRouterOptions>(ThreeTargetOptions()),
             liveness.Object,
             new Mock<ITargetAvailabilityService>().Object,
             catalog,
@@ -350,7 +350,7 @@ public class TargetExecutionTrackerTests : IDisposable
         var liveness = new Mock<ITargetLivenessService>();
         SetupLiveness(liveness, includeCloud: false);
         var sut = new TargetExecutionTracker(
-            MsOptions.Create(ThreeTargetOptions()),
+            new TestOptionsMonitor<OllamaRouterOptions>(ThreeTargetOptions()),
             liveness.Object,
             new Mock<ITargetAvailabilityService>().Object,
             catalog,
@@ -494,7 +494,7 @@ public class TargetExecutionTrackerTests : IDisposable
         var liveness = new Mock<ITargetLivenessService>();
         SetupLiveness(liveness, includeCloud: false);
         var sut = new TargetExecutionTracker(
-            MsOptions.Create(ThreeTargetOptions()),
+            new TestOptionsMonitor<OllamaRouterOptions>(ThreeTargetOptions()),
             liveness.Object,
             new Mock<ITargetAvailabilityService>().Object,
             catalog,
@@ -579,7 +579,7 @@ public class TargetExecutionTrackerTests : IDisposable
         var options = ThreeTargetOptions();
         options.Targets.Add(new OllamaTargetOptions { Name = "Cloud", Url = "http://cloud.invalid:11434" });
         var sut = new TargetExecutionTracker(
-            MsOptions.Create(options),
+            new TestOptionsMonitor<OllamaRouterOptions>(options),
             liveness.Object,
             new Mock<ITargetAvailabilityService>().Object,
             responder,
@@ -706,7 +706,7 @@ public class TargetExecutionTrackerTests : IDisposable
 
         var shrinkManager = new RecordingShrinkManager();
         var sut = new TargetExecutionTracker(
-            MsOptions.Create(ThreeTargetOptions()),
+            new TestOptionsMonitor<OllamaRouterOptions>(ThreeTargetOptions()),
             liveness.Object,
             new Mock<ITargetAvailabilityService>().Object,
             catalog,
@@ -743,7 +743,7 @@ public class TargetExecutionTrackerTests : IDisposable
 
         var shrinkManager = new RecordingShrinkManager();
         var sut = new TargetExecutionTracker(
-            MsOptions.Create(ThreeTargetOptions()),
+            new TestOptionsMonitor<OllamaRouterOptions>(ThreeTargetOptions()),
             liveness.Object,
             new Mock<ITargetAvailabilityService>().Object,
             catalog,
@@ -775,7 +775,7 @@ public class TargetExecutionTrackerTests : IDisposable
 
         var shrinkManager = new RecordingShrinkManager();
         var sut = new TargetExecutionTracker(
-            MsOptions.Create(ThreeTargetOptions()),
+            new TestOptionsMonitor<OllamaRouterOptions>(ThreeTargetOptions()),
             liveness.Object,
             new Mock<ITargetAvailabilityService>().Object,
             catalog,
@@ -803,7 +803,7 @@ public class TargetExecutionTrackerTests : IDisposable
         var liveness = new Mock<ITargetLivenessService>();
         SetupLiveness(liveness, includeCloud: false);
         return new TargetExecutionTracker(
-            MsOptions.Create(ThreeTargetOptions()),
+            new TestOptionsMonitor<OllamaRouterOptions>(ThreeTargetOptions()),
             liveness.Object,
             new Mock<ITargetAvailabilityService>().Object,
             new CountingCatalogClient(_ => (new JsonArray(), true)),

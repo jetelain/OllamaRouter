@@ -28,7 +28,7 @@ namespace OllamaRouter.Services;
 /// </para>
 /// </summary>
 public sealed class TargetLivenessService(
-    IOptions<OllamaRouterOptions> options,
+    IOptionsMonitor<OllamaRouterOptions> options,
     IModelCatalogCacheService modelCatalogCache,
     HttpClient probeHttpClient,
     ILogger<TargetLivenessService> logger,
@@ -146,7 +146,7 @@ public sealed class TargetLivenessService(
     {
         // Cloud is never part of GetEffectiveTargets(); the defensive filter keeps
         // the guarantee explicit (Cloud is a relay and is never probed).
-        return options.Value.GetEffectiveTargets(logger)
+        return options.CurrentValue.GetEffectiveTargets(logger)
             .Where(t => !string.IsNullOrWhiteSpace(t.Name) && !string.IsNullOrWhiteSpace(t.Url))
             .Select(t => (RoutingTarget)t.Name!)
             .DistinctBy(t => t.Value ?? "")
@@ -308,7 +308,7 @@ public sealed class TargetLivenessService(
     }
 
     private string? GetTargetUrl(RoutingTarget target) =>
-        options.Value.GetEffectiveTargets(logger)
+        options.CurrentValue.GetEffectiveTargets(logger)
             .FirstOrDefault(t => string.Equals(t.Name, target.Value, StringComparison.OrdinalIgnoreCase))
             ?.Url;
 

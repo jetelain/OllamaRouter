@@ -1,3 +1,4 @@
+using OllamaRouter.Tests.TestHelpers;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
@@ -11,7 +12,6 @@ using OllamaRouter.Options;
 using OllamaRouter.ReverseProxy;
 using OllamaRouter.Services;
 using Yarp.ReverseProxy.Forwarder;
-using MsOptions = Microsoft.Extensions.Options.Options;
 
 namespace OllamaRouter.Tests.Middleware;
 
@@ -109,7 +109,7 @@ public class OllamaRoutingMiddlewareTests
             effectiveTargetAvailability.Object,
             effectiveTargetLiveness.Object,
             effectiveCapabilityEngine,
-            MsOptions.Create(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
+            new TestOptionsMonitor<OllamaRouterOptions>(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
             NullLogger<OllamaRoutingMiddleware>.Instance,
             CreateForwarder(next, forwarder).Object,
             streakTracker ?? new TargetFailureStreakService(),
@@ -1001,7 +1001,7 @@ public class OllamaRoutingMiddlewareTests
         return liveness;
     }
 
-    private static (OllamaRouterOptions Options, Microsoft.Extensions.Options.IOptions<OllamaRouterOptions> OptionsWrapper) OptionsWithCloud(string? cloudModel)
+    private static (OllamaRouterOptions Options, Microsoft.Extensions.Options.IOptionsMonitor<OllamaRouterOptions> OptionsWrapper) OptionsWithCloud(string? cloudModel)
     {
         var options = new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" };
         if (cloudModel is not null)
@@ -1009,7 +1009,7 @@ public class OllamaRoutingMiddlewareTests
             options.Models["llama3"] = new ModelThresholds { CloudModel = cloudModel };
         }
 
-        return (options, MsOptions.Create(options));
+        return (options, new TestOptionsMonitor<OllamaRouterOptions>(options));
     }
 
     [Fact]
@@ -1371,7 +1371,7 @@ public class OllamaRoutingMiddlewareTests
             availability.Object,
             liveness.Object,
             capabilityEngine,
-            MsOptions.Create(options),
+            new TestOptionsMonitor<OllamaRouterOptions>(options),
             NullLogger<OllamaRoutingMiddleware>.Instance,
             CreateForwarder(next).Object,
             new TargetFailureStreakService(),
@@ -1927,7 +1927,7 @@ public class OllamaRoutingMiddlewareTests
             availability.Object,
             liveness.Object,
             capabilityEngine,
-            MsOptions.Create(options),
+            new TestOptionsMonitor<OllamaRouterOptions>(options),
             NullLogger<OllamaRoutingMiddleware>.Instance,
             CreateForwarder(cloudCaptureNext).Object,
             new TargetFailureStreakService(),
@@ -2059,7 +2059,7 @@ public class OllamaRoutingMiddlewareTests
             availability.Object,
             liveness.Object,
             new ModelCapabilityEngine(new Mock<IOllamaModelCatalogClient>().Object, new MemoryCache(new MemoryCacheOptions()), NullLogger<ModelCapabilityEngine>.Instance),
-            MsOptions.Create(options),
+            new TestOptionsMonitor<OllamaRouterOptions>(options),
             NullLogger<OllamaRoutingMiddleware>.Instance,
             forwarder.Object,
             streak,
@@ -2854,7 +2854,7 @@ public class OllamaRoutingMiddlewareTests
 
         var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService,
             sessionAffinity: new SessionAffinityService(
-                MsOptions.Create(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
+                new TestOptionsMonitor<OllamaRouterOptions>(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
                 NullLogger<SessionAffinityService>.Instance));
 
         await sut.InvokeAsync(context);
@@ -2882,7 +2882,7 @@ public class OllamaRoutingMiddlewareTests
 
         var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService,
             sessionAffinity: new SessionAffinityService(
-                MsOptions.Create(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
+                new TestOptionsMonitor<OllamaRouterOptions>(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
                 NullLogger<SessionAffinityService>.Instance));
 
         await sut.InvokeAsync(context);
@@ -2908,7 +2908,7 @@ public class OllamaRoutingMiddlewareTests
 
         var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService,
             sessionAffinity: new SessionAffinityService(
-                MsOptions.Create(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
+                new TestOptionsMonitor<OllamaRouterOptions>(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
                 NullLogger<SessionAffinityService>.Instance));
 
         await sut.InvokeAsync(context);
@@ -2935,7 +2935,7 @@ public class OllamaRoutingMiddlewareTests
         // still use the legacy overload and emit no session response header.
         var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService,
             sessionAffinity: new SessionAffinityService(
-                MsOptions.Create(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
+                new TestOptionsMonitor<OllamaRouterOptions>(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
                 NullLogger<SessionAffinityService>.Instance));
 
         await sut.InvokeAsync(context);
@@ -2961,7 +2961,7 @@ public class OllamaRoutingMiddlewareTests
 
         var sut = CreateSut(_ => Task.CompletedTask, tokenEstimator, routingDecisionService,
             sessionAffinity: new SessionAffinityService(
-                MsOptions.Create(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
+                new TestOptionsMonitor<OllamaRouterOptions>(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
                 NullLogger<SessionAffinityService>.Instance));
 
         await sut.InvokeAsync(context);
@@ -2981,7 +2981,7 @@ public class OllamaRoutingMiddlewareTests
         // into both the middleware and observed here) holds the lease turn 1's winner set —
         // the same store the production decision service reads for the +150 bonus in turn 2.
         var affinity = new SessionAffinityService(
-            MsOptions.Create(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
+            new TestOptionsMonitor<OllamaRouterOptions>(new OllamaRouterOptions { LocalUrl = "http://localhost:11435", RemoteUrl = "http://remote:11434" }),
             NullLogger<SessionAffinityService>.Instance);
         var tokenEstimator = new Mock<ITokenEstimator>();
         tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
@@ -3277,7 +3277,7 @@ public class OllamaRoutingMiddlewareTests
             (availability ?? defaultAvailability).Object,
             (liveness ?? defaultLiveness).Object,
             new ModelCapabilityEngine(new Mock<IOllamaModelCatalogClient>().Object, new MemoryCache(new MemoryCacheOptions()), NullLogger<ModelCapabilityEngine>.Instance),
-            MsOptions.Create(options ?? ScopeFleetOptions()),
+            new TestOptionsMonitor<OllamaRouterOptions>(options ?? ScopeFleetOptions()),
             NullLogger<OllamaRoutingMiddleware>.Instance,
             CreateForwarder(_ => Task.CompletedTask).Object,
             new TargetFailureStreakService(),

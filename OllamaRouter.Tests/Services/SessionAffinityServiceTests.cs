@@ -1,8 +1,8 @@
+using OllamaRouter.Tests.TestHelpers;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using OllamaRouter.Options;
 using OllamaRouter.Services;
-using MsOptions = Microsoft.Extensions.Options.Options;
 
 namespace OllamaRouter.Tests.Services;
 
@@ -27,7 +27,7 @@ public class SessionAffinityServiceTests
     {
         var clock = new FakeClock { Now = Start };
         var service = new SessionAffinityService(
-            MsOptions.Create(new OllamaRouterOptions { SessionAffinityTtlMinutes = ttlMinutes }),
+            new TestOptionsMonitor<OllamaRouterOptions>(new OllamaRouterOptions { SessionAffinityTtlMinutes = ttlMinutes }),
             NullLogger<SessionAffinityService>.Instance,
             () => clock.Now);
         return (service, clock);
@@ -210,7 +210,7 @@ public class SessionAffinityServiceTests
     {
         var clock = new FakeClock { Now = Start };
         var service = new SessionAffinityService(
-            MsOptions.Create(new OllamaRouterOptions()),
+            new TestOptionsMonitor<OllamaRouterOptions>(new OllamaRouterOptions()),
             NullLogger<SessionAffinityService>.Instance,
             () => clock.Now);
         service.SetAffinity("agent-1", new RoutingTarget("aiserver1"));
@@ -229,7 +229,7 @@ public class SessionAffinityServiceTests
     {
         var clock = new FakeClock { Now = Start };
         var service = new SessionAffinityService(
-            MsOptions.Create(new OllamaRouterOptions { SessionAffinityTtlMinutes = 0 }),
+            new TestOptionsMonitor<OllamaRouterOptions>(new OllamaRouterOptions { SessionAffinityTtlMinutes = 0 }),
             NullLogger<SessionAffinityService>.Instance,
             () => clock.Now);
         service.SetAffinity("agent-1", new RoutingTarget("aiserver1"));

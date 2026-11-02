@@ -1,3 +1,4 @@
+using OllamaRouter.Tests.TestHelpers;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -13,7 +14,6 @@ using OllamaRouter.Options;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services;
 using OllamaRouter.Services.Benchmarking;
-using MsOptions = Microsoft.Extensions.Options.Options;
 
 namespace OllamaRouter.Tests.Endpoints;
 
@@ -126,7 +126,7 @@ public sealed class RouterBenchmarkEndpointsTests : IDisposable
         {
             opt.SerializerOptions.TypeInfoResolverChain.Insert(0, OllamaRouterJsonSerializerContext.Default);
         });
-        builder.Services.AddSingleton(MsOptions.Create(options));
+        builder.Services.AddSingleton<IOptionsMonitor<OllamaRouterOptions>>(new TestOptionsMonitor<OllamaRouterOptions>(options));
         builder.Services.AddSingleton<IMicroBenchmarkRunner>(runner);
 
         var app = builder.Build();

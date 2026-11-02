@@ -1,3 +1,4 @@
+using OllamaRouter.Tests.TestHelpers;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Json;
@@ -13,7 +14,6 @@ using OllamaRouter.Endpoints;
 using OllamaRouter.Options;
 using OllamaRouter.Services;
 using OllamaRouter.Tests.Services;
-using MsOptions = Microsoft.Extensions.Options.Options;
 
 namespace OllamaRouter.Tests.Endpoints;
 
@@ -85,7 +85,7 @@ public class AggregatedEndpointsTests
         builder.Services.AddSingleton<IModelCatalogCacheService>(cache);
         builder.Services.AddSingleton(liveness.Object);
         builder.Services.AddSingleton(availability.Object);
-        builder.Services.AddSingleton(MsOptions.Create(options));
+        builder.Services.AddSingleton<IOptionsMonitor<OllamaRouterOptions>>(new TestOptionsMonitor<OllamaRouterOptions>(options));
         builder.Services.AddSingleton<IFleetAggregationService, FleetAggregationService>();
 
         var app = builder.Build();

@@ -1,10 +1,10 @@
+using OllamaRouter.Tests.TestHelpers;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Moq;
 using OllamaRouter.Options;
 using OllamaRouter.Services;
 using OllamaRouter.Services.Hardware;
-using MsOptions = Microsoft.Extensions.Options.Options;
 
 namespace OllamaRouter.Tests.Services;
 
@@ -593,7 +593,7 @@ public class HardwareProfileTests
 
         var probeClient = new HttpClient(new ThrowingHandler()) { Timeout = TimeSpan.FromSeconds(3) };
         return new FleetHardwareService(
-            MsOptions.Create(options),
+            new TestOptionsMonitor<OllamaRouterOptions>(options),
             localMock.Object,
             probeClient,
             NullLogger<FleetHardwareService>.Instance,
@@ -701,7 +701,7 @@ public class HardwareProfileTests
                 Array.Empty<GpuDeviceProfile>(), 8192, 25.6));
 
         var service = new FleetHardwareService(
-            MsOptions.Create(options),
+            new TestOptionsMonitor<OllamaRouterOptions>(options),
             localMock.Object,
             new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(3) },
             NullLogger<FleetHardwareService>.Instance,
@@ -740,7 +740,7 @@ public class HardwareProfileTests
                 Array.Empty<GpuDeviceProfile>(), 8192, 25.6));
 
         var service = new FleetHardwareService(
-            MsOptions.Create(options),
+            new TestOptionsMonitor<OllamaRouterOptions>(options),
             localMock.Object,
             new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(3) },
             NullLogger<FleetHardwareService>.Instance,
@@ -828,7 +828,7 @@ public class HardwareProfileTests
                 Array.Empty<GpuDeviceProfile>(), 8192, 25.6));
 
         var service = new FleetHardwareService(
-            MsOptions.Create(options),
+            new TestOptionsMonitor<OllamaRouterOptions>(options),
             localMock.Object,
             new HttpClient(new ThrowingHandler()) { Timeout = TimeSpan.FromSeconds(3) },
             NullLogger<FleetHardwareService>.Instance,
@@ -868,7 +868,7 @@ public class HardwareProfileTests
                 Array.Empty<GpuDeviceProfile>(), 8192, 25.6));
 
         var service = new FleetHardwareService(
-            MsOptions.Create(options),
+            new TestOptionsMonitor<OllamaRouterOptions>(options),
             localMock.Object,
             new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(3) },
             NullLogger<FleetHardwareService>.Instance,
@@ -898,7 +898,7 @@ public class HardwareProfileTests
 
         var badHandler = new BadJsonHandler();
         var service = new FleetHardwareService(
-            MsOptions.Create(options),
+            new TestOptionsMonitor<OllamaRouterOptions>(options),
             localMock.Object,
             new HttpClient(badHandler) { Timeout = TimeSpan.FromSeconds(3) },
             NullLogger<FleetHardwareService>.Instance,
@@ -1005,7 +1005,7 @@ public class HardwareProfileTests
                 Array.Empty<GpuDeviceProfile>(), 8192, 25.6));
 
         var service = new FleetHardwareService(
-            MsOptions.Create(options),
+            new TestOptionsMonitor<OllamaRouterOptions>(options),
             localMock.Object,
             new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(3) },
             NullLogger<FleetHardwareService>.Instance,
@@ -1051,7 +1051,7 @@ public class HardwareProfileTests
                 Array.Empty<GpuDeviceProfile>(), 8192, 25.6));
 
         var service = new FleetHardwareService(
-            MsOptions.Create(options),
+            new TestOptionsMonitor<OllamaRouterOptions>(options),
             localMock.Object,
             new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(3) },
             NullLogger<FleetHardwareService>.Instance,
