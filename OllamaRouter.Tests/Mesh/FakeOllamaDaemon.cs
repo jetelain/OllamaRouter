@@ -56,7 +56,9 @@ public sealed record RecordedRequest(
 /// A deterministic in-process fake Ollama daemon: a real Kestrel <see cref="WebApplication"/> on an
 /// ephemeral loopback port implementing the production Ollama API surface the router actually
 /// consumes (<c>GET /</c> liveness, <c>GET /api/tags</c>, <c>POST /api/show</c>, <c>GET /api/ps</c>,
-/// <c>POST /api/chat</c> NDJSON streaming, <c>POST /v1/chat/completions</c> SSE). Every inbound
+/// <c>POST /api/chat</c> NDJSON streaming, <c>POST /v1/chat/completions</c> SSE, and the
+/// empty-prompt non-streaming <c>POST /api/generate</c> preload primitive, which grows the
+/// daemon's loaded set). Every inbound
 /// request is recorded with its <see cref="RecordedRequest.SourceEndpoint"/> (the remote/source
 /// endpoint of the connection), method, path, headers and body — the observation plane for the
 /// loop-free assertion (plan §5) and for asserting the exact rewritten <c>options.num_ctx</c> the
@@ -315,6 +317,29 @@ public sealed class FakeOllamaDaemon : IAsyncDisposable
             await WriteChatNdJsonAsync(context, model, context.RequestAborted);
         });
 
+        // Preload load primitive (task #44): a bounded, non-streaming, EMPTY-prompt generate.
+        // Ollama's documented behavior ("if an empty prompt is provided, the model will be
+        // loaded into memory") is mirrored here: the daemon grows its /api/ps loaded set with
+        // the requested model and responds with an empty non-streaming completion. The request
+        // body's keep_alive + options.num_ctx are recorded for the observation surface below.
+        app.MapPost("/api/generate", async context =>
+        {
+            var model = ReadModel(context.Request);
+            if (model is not null)
+            {
+                LoadModel(model);
+            }
+
+            context.Response.ContentType = "application/json";
+            var response = new JsonObject
+            {
+                ["model"] = model ?? "",
+                ["response"] = string.Empty,
+                ["done"] = true
+            };
+            await context.Response.WriteAsync(response.ToJsonString(), context.RequestAborted);
+        });
+
         app.MapPost("/v1/chat/completions", async context =>
         {
             var model = ReadModel(context.Request);
@@ -372,6 +397,43 @@ public sealed class FakeOllamaDaemon : IAsyncDisposable
                 options["num_ctx"] is JsonValue value && value.TryGetValue(out int? numCtx))
             {
                 return numCtx;
+            }
+        }
+        catch
+        {
+            return null;
+        }
+
+        return null;
+    }
+
+    /// <summary>All recorded <c>POST /api/generate</c> requests (the preload load surface).</summary>
+    public IReadOnlyList<RecordedRequest> GenerateHits() =>
+        Requests.Where(r => r.Method == "POST" && r.Path.StartsWith("/api/generate", StringComparison.Ordinal)).ToList();
+
+    /// <summary>
+    /// The <c>keep_alive</c> (+ optional <c>options.num_ctx</c>) the daemon received in the most
+    /// recent <c>POST /api/generate</c> body for <paramref name="model"/> (null when the body
+    /// carried no keep_alive or no such hit).
+    /// </summary>
+    public (int KeepAliveSeconds, int? NumCtx)? LastGeneratePayload(string model)
+    {
+        var body = GenerateHits()
+            .Where(r => ReadModelFromBody(r.Body) is { } m && string.Equals(m, model, StringComparison.OrdinalIgnoreCase))
+            .Select(r => r.Body).LastOrDefault();
+        if (body is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            if (JsonNode.Parse(body) is JsonObject root)
+            {
+                var keepAlive = root["keep_alive"] is JsonValue k && k.TryGetValue(out int? keep) ? keep : null;
+                var numCtx = root["options"] is JsonObject options &&
+                    options["num_ctx"] is JsonValue n && n.TryGetValue(out int? ctx) ? ctx : null;
+                return keepAlive is { } ka ? (ka, numCtx) : null;
             }
         }
         catch

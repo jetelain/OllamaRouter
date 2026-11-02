@@ -65,6 +65,20 @@ public interface IOllamaModelCatalogClient
     Task<bool> UnloadModelAsync(string? baseUrl, string modelName, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Preloads (warms) a model on the specified instance via a bounded, non-streaming
+    /// <c>POST /api/generate</c> with an empty prompt and an explicit <c>keep_alive</c>
+    /// (seconds; -1 keeps the model resident indefinitely) and, when <paramref name="numCtx"/>
+    /// is a positive value, <c>options.num_ctx</c> pinned to it (absent ⇒ the daemon keeps its
+    /// Modelfile default, avoiding a needless KV reallocation). Fail-soft like
+    /// <see cref="UnloadModelAsync"/>: returns <see cref="PreloadOutcome"/>(false, error) on
+    /// missing url/model, non-2xx, or transport/parse failure — never throws. The call is
+    /// bounded by the client's own timeout (default 4 s); a large-model cold load that misses
+    /// the bound is reported as not accepted (fail-soft), which the router surfaces without a
+    /// 5xx. See <c>POST /api/router/models/{*modelName}/preload</c> (task #44).
+    /// </summary>
+    Task<PreloadOutcome> PreloadModelAsync(string? baseUrl, string modelName, int keepAliveSeconds, int? numCtx, CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Unloads all currently loaded models on the specified instance to free VRAM.
     /// Returns the list of model names that were unloaded.
     /// </summary>

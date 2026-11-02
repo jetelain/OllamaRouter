@@ -22,9 +22,11 @@ Standard .NET configuration keys for the `OllamaRouter` section — the same JSO
     // Overrides any factory default key, e.g.:
     "TokenEstimationOverheadFactor": 1.11,
     "MaxConsecutiveFailures": 3,
+    "PreloadDefaultKeepAliveSeconds": 900, // last-resort preload retention for unclassifiable nodes (server/cloud = -1, desktop = 900 by convention)
     "Targets": [
       { "Name": "desktop", "Url": "http://127.0.0.1:11435", "SpeedFactor": 2.0 }, // fast local workstation hint (relative throughput; 1.0 = default)
-      { "Name": "laptop", "Url": "http://192.168.1.20:11435" }
+      { "Name": "laptop", "Url": "http://192.168.1.20:11435" },
+      { "Name": "server", "Url": "http://192.168.1.10:11434", "KeepAliveSeconds": -1 } // explicit per-node preload retention (-1 = resident indefinitely)
     ]
   }
 }

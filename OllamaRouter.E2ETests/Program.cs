@@ -19,7 +19,8 @@ Scenario[] scenarios =
     MonitorScenarios.GetMonitorApi(),
     MonitorScenarios.UpdateTargets(),
     MonitorScenarios.ReclaimVram(),
-    MonitorScenarios.ServiceUnavailableWhenNoTargets()
+    MonitorScenarios.ServiceUnavailableWhenNoTargets(),
+    PreloadScenarios.PreloadModel()
 ];
 
 // Opt-in live dual-router mesh group (plan §5): runs only when OLLAMAROUTER_E2E_MESH=1 AND a
@@ -27,7 +28,7 @@ Scenario[] scenarios =
 // is byte-for-byte unaffected — when the flag is off, the group is skipped with a printed notice.
 if (config.MeshEnabled && config.RouterUrlB.Length > 0)
 {
-    scenarios = scenarios.Concat(MeshScenarios.All(config)).ToArray();
+    scenarios = scenarios.Concat(MeshScenarios.All(config)).Concat(PreloadScenarios.Mesh(config)).ToArray();
 }
 else if (config.MeshEnabled)
 {

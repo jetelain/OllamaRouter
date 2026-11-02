@@ -83,6 +83,19 @@ public sealed class OllamaRouterOptions
     public int ContextFitMarginTokens { get; set; } = 8192;
 
     /// <summary>
+    /// Last-resort preload keep-alive default (in seconds) for the model preload endpoints
+    /// (<c>POST /api/router/models/{*modelName}/preload</c>): used by
+    /// <see cref="OllamaTargetOptions.GetEffectivePreloadKeepAliveSeconds(OllamaRouterOptions, Hardware.IFleetHardwareService?)"/>
+    /// ONLY when neither an explicit per-node <see cref="OllamaTargetOptions.KeepAliveSeconds"/>
+    /// override nor the class convention (cloud / server-class = -1 indefinitely, desktop/
+    /// laptop-class = 900 seconds / 15 min) applies — i.e. an unclassifiable node (unknown
+    /// VRAM, no cloud location signal). Defaults to 900 (15 min). Values <= -2 are clamped to
+    /// 900 by <see cref="Normalize"/>; -1 (indefinite) and 0 ("no extra retention beyond the
+    /// Ollama default" policy) and positive values are kept as-is.
+    /// </summary>
+    public int PreloadDefaultKeepAliveSeconds { get; set; } = 900;
+
+    /// <summary>
     /// When true and all enabled fleet targets fail Stage-1 context qualification,
     /// the router dispatches the request to the online, capable target with the largest context
     /// capacity (Max CMax) rather than rejecting with a 503 error.
@@ -274,6 +287,23 @@ public sealed class OllamaRouterOptions
             ContextFitMarginTokens = 0;
         }
 
+        // Preload keep-alive normalization: the router-level last-resort default keeps -1
+        // (indefinite), 0 (no extra retention) and positive values; <= -2 clamps to 900.
+        // Per-node overrides: 0 ("immediate unload" is NOT a preload intent) and <= -2 are
+        // invalid → reset to null so the class convention takes over at resolution time.
+        if (PreloadDefaultKeepAliveSeconds <= -2)
+        {
+            PreloadDefaultKeepAliveSeconds = 900;
+        }
+
+        foreach (var target in Targets)
+        {
+            if (target.KeepAliveSeconds is { } keepAlive && (keepAlive == 0 || keepAlive <= -2))
+            {
+                target.KeepAliveSeconds = null;
+            }
+        }
+
         if (Recording?.TokenMetricsCsv is { } tokenMetricsCsv && tokenMetricsCsv.MaxFiles < 0)
         {
             tokenMetricsCsv.MaxFiles = 0;
@@ -322,6 +352,23 @@ public sealed class OllamaTargetOptions
     public int? MaxVramMB { get; set; }
 
     /// <summary>
+    /// Explicit preload keep-alive retention (in seconds) for this node, consumed by the model
+    /// preload endpoints (<c>POST /api/router/models/{*modelName}/preload</c>):
+    /// <c>-1</c> = resident indefinitely (Ollama <c>keep_alive: -1</c>), a positive value =
+    /// that many seconds, <c>null</c> (default) = derive from the documented class convention
+    /// (see <see cref="GetEffectivePreloadKeepAliveSeconds(OllamaRouterOptions, Hardware.IFleetHardwareService?)"/>):
+    /// cloud-class nodes → -1 (indefinite), server-class nodes (effective VRAM ≥
+    /// <c>DynamicContextSizingEngine.ServerClassVramThresholdMB</c>, 32,768 MB) → -1,
+    /// desktop/laptop-class nodes → 900 (15 min), unclassifiable → the router-level
+    /// <see cref="OllamaRouterOptions.PreloadDefaultKeepAliveSeconds"/>. An explicit value
+    /// (including -1 on a desktop-class node) is honored verbatim — the class convention
+    /// applies only when this is unset. 0 and values <= -2 are invalid preload intents:
+    /// <see cref="OllamaRouterOptions.Normalize"/> resets them to null (fall-through to the
+    /// convention).
+    /// </summary>
+    public int? KeepAliveSeconds { get; set; }
+
+    /// <summary>
     /// Static processing-speed hint: relative generation-throughput multiplier vs the fleet
     /// baseline (1.0 = fleet average / unset). Only values > 1.0 earn a Stage-2 SpeedBonus
     /// (the fastest-configured qualified node earns the full +150); non-finite values and
@@ -367,6 +414,38 @@ public sealed class OllamaTargetOptions
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Resolves the effective preload keep-alive (in seconds) for this node:
+    /// an explicit <see cref="KeepAliveSeconds"/> (<c>-1</c> or positive) wins verbatim (the
+    /// operator may pin -1 on a desktop-class node), otherwise the documented class convention
+    /// (see <see cref="Services.PreloadKeepAlivePolicy"/>): cloud class → -1 (indefinite),
+    /// server class (effective VRAM ≥ <see cref="Services.DynamicContextSizingEngine.ServerClassVramThresholdMB"/>)
+    /// → -1, desktop/laptop class (known VRAM below the threshold) → 900 (15 min),
+    /// unclassifiable (unknown VRAM, not cloud) → the router-level
+    /// <see cref="OllamaRouterOptions.PreloadDefaultKeepAliveSeconds"/> of
+    /// <paramref name="routerOptions"/>. Fail-safe: never throws (invalid explicit values
+    /// normalized away by <see cref="OllamaRouterOptions.Normalize"/> fall through to the
+    /// convention).
+    /// </summary>
+    public int GetEffectivePreloadKeepAliveSeconds(
+        OllamaRouterOptions routerOptions,
+        Services.Hardware.IFleetHardwareService? fleetHardware = null)
+    {
+        if (KeepAliveSeconds is { } explicitKeepAlive && (explicitKeepAlive == -1 || explicitKeepAlive > 0))
+        {
+            return explicitKeepAlive;
+        }
+
+        var nodeClass = Services.PreloadKeepAlivePolicy.GetPreloadNodeClass(this, GetEffectiveMaxVramMB(fleetHardware));
+        return nodeClass switch
+        {
+            Services.PreloadNodeClass.Cloud => Services.PreloadKeepAlivePolicy.CloudAndServerKeepAliveSeconds,
+            Services.PreloadNodeClass.Server => Services.PreloadKeepAlivePolicy.CloudAndServerKeepAliveSeconds,
+            Services.PreloadNodeClass.Desktop => Services.PreloadKeepAlivePolicy.DesktopClassKeepAliveSeconds,
+            _ => routerOptions.PreloadDefaultKeepAliveSeconds
+        };
     }
 
     /// <summary>

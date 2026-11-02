@@ -302,6 +302,103 @@ public class OllamaRouterOptionsTests
         Assert.Equal(@"C:\override\state", options.StateDirectory);
     }
 
+    // ------------------------------------------------------------------
+    //  Preload keep-alive resolver + normalization (task #44)
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public void GetEffectivePreloadKeepAliveSeconds_ExplicitOverride_WinsVerbatimIncludingMinusOneOnDesktop()
+    {
+        var options = new OllamaRouterOptions();
+        var desktop = new OllamaTargetOptions { Name = "Desktop", Url = "http://127.0.0.1:11435", MaxVramMB = 16384, KeepAliveSeconds = -1 };
+        var cloud = new OllamaTargetOptions { Name = "Cloud", Location = OllamaRouter.Services.TargetLocation.Cloud, KeepAliveSeconds = 300 };
+
+        // Explicit values are honored verbatim (-1 on a desktop-class node stays -1, Open Q5).
+        Assert.Equal(-1, desktop.GetEffectivePreloadKeepAliveSeconds(options));
+        Assert.Equal(300, cloud.GetEffectivePreloadKeepAliveSeconds(options));
+    }
+
+    [Fact]
+    public void GetEffectivePreloadKeepAliveSeconds_CloudClassWithoutOverride_ResolvesToIndefinite()
+    {
+        var options = new OllamaRouterOptions();
+        var cloud = new OllamaTargetOptions { Name = "Cloud", Location = OllamaRouter.Services.TargetLocation.Cloud, MaxVramMB = 16384 };
+
+        // Cloud class wins over the (desktop-range) VRAM: resident indefinitely.
+        Assert.Equal(-1, cloud.GetEffectivePreloadKeepAliveSeconds(options));
+    }
+
+    [Fact]
+    public void GetEffectivePreloadKeepAliveSeconds_ServerVramWithoutOverride_ResolvesToIndefinite()
+    {
+        var options = new OllamaRouterOptions();
+        var atThreshold = new OllamaTargetOptions { Name = "Server", Url = "http://192.168.1.10:11434", MaxVramMB = OllamaRouter.Services.DynamicContextSizingEngine.ServerClassVramThresholdMB };
+        var aboveThreshold = new OllamaTargetOptions { Name = "Server2", Url = "http://192.168.1.11:11434", MaxVramMB = 65536 };
+
+        Assert.Equal(-1, atThreshold.GetEffectivePreloadKeepAliveSeconds(options));
+        Assert.Equal(-1, aboveThreshold.GetEffectivePreloadKeepAliveSeconds(options));
+    }
+
+    [Fact]
+    public void GetEffectivePreloadKeepAliveSeconds_DesktopVramWithoutOverride_ResolvesTo15Minutes()
+    {
+        var options = new OllamaRouterOptions();
+        var desktop = new OllamaTargetOptions { Name = "Desktop", Url = "http://127.0.0.1:11435", MaxVramMB = 16384 };
+        var laptop = new OllamaTargetOptions { Name = "Laptop", Url = "http://192.168.1.20:11435", MaxVramMB = 8192 };
+
+        Assert.Equal(900, desktop.GetEffectivePreloadKeepAliveSeconds(options));
+        Assert.Equal(900, laptop.GetEffectivePreloadKeepAliveSeconds(options));
+    }
+
+    [Fact]
+    public void GetEffectivePreloadKeepAliveSeconds_UnknownVramNonCloud_FallsBackToRouterDefault()
+    {
+        var options = new OllamaRouterOptions { PreloadDefaultKeepAliveSeconds = 120 };
+        var unknown = new OllamaTargetOptions { Name = "Mystery", Url = "http://192.168.1.30:11434" };
+
+        Assert.Equal(120, unknown.GetEffectivePreloadKeepAliveSeconds(options));
+    }
+
+    [Fact]
+    public void Normalize_PerNodeKeepAliveSeconds_InvalidValuesResetToNull_ValidValuesKept()
+    {
+        var options = new OllamaRouterOptions
+        {
+            Targets =
+            [
+                new OllamaTargetOptions { Name = "A", Url = "http://127.0.0.1:11435", KeepAliveSeconds = 0 },
+                new OllamaTargetOptions { Name = "B", Url = "http://127.0.0.1:11435", KeepAliveSeconds = -5 },
+                new OllamaTargetOptions { Name = "C", Url = "http://127.0.0.1:11435", KeepAliveSeconds = -1 },
+                new OllamaTargetOptions { Name = "D", Url = "http://127.0.0.1:11435", KeepAliveSeconds = 300 },
+                new OllamaTargetOptions { Name = "E", Url = "http://127.0.0.1:11435", KeepAliveSeconds = null }
+            ]
+        };
+
+        options.Normalize();
+
+        Assert.Null(options.Targets[0]!.KeepAliveSeconds); // 0 = not a preload intent
+        Assert.Null(options.Targets[1]!.KeepAliveSeconds); // <= -2 is invalid
+        Assert.Equal(-1, options.Targets[2]!.KeepAliveSeconds);
+        Assert.Equal(300, options.Targets[3]!.KeepAliveSeconds);
+        Assert.Null(options.Targets[4]!.KeepAliveSeconds);
+    }
+
+    [Fact]
+    public void Normalize_RouterDefaultKeepAliveSeconds_InvalidValuesClampTo900_LegitValuesKept()
+    {
+        var bad = new OllamaRouterOptions { PreloadDefaultKeepAliveSeconds = -7 };
+        bad.Normalize();
+        Assert.Equal(900, bad.PreloadDefaultKeepAliveSeconds);
+
+        var zero = new OllamaRouterOptions { PreloadDefaultKeepAliveSeconds = 0 };
+        zero.Normalize();
+        Assert.Equal(0, zero.PreloadDefaultKeepAliveSeconds); // 0 = no extra retention (legitimate router policy)
+
+        var indefinite = new OllamaRouterOptions { PreloadDefaultKeepAliveSeconds = -1 };
+        indefinite.Normalize();
+        Assert.Equal(-1, indefinite.PreloadDefaultKeepAliveSeconds);
+    }
+
     private sealed class CapturingLogger : ILogger
     {
         private readonly List<string> warnings;

@@ -422,6 +422,103 @@ public class OllamaModelCatalogClientTests
         Assert.InRange(Environment.TickCount64 - started, 0, 5000);
     }
 
+    // ------------------------------------------------------------------
+    //  PreloadModelAsync (task #44)
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task PreloadModelAsync_PositiveKeepAliveAndNumCtx_PostsExactGeneratePayload()
+    {
+        var (sut, handler) = CreateSut(_ => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("{}", Encoding.UTF8, "application/json") });
+
+        var outcome = await sut.PreloadModelAsync("http://127.0.0.1:11435", "llama3:8b", 900, 8192);
+
+        Assert.True(outcome.Accepted);
+        Assert.Null(outcome.Error);
+        Assert.Equal(HttpMethod.Post, handler.LastRequest?.Method);
+        Assert.Equal("http://127.0.0.1:11435/api/generate", handler.LastRequest?.RequestUri?.ToString());
+
+        var body = System.Text.Json.Nodes.JsonNode.Parse(handler.LastRequestBody!)!.AsObject()!;
+        Assert.Equal("llama3:8b", body["model"]!.GetValue<string>());
+        Assert.Equal(string.Empty, body["prompt"]!.GetValue<string>()); // empty prompt = load-only
+        Assert.False(body["stream"]!.GetValue<bool>());
+        Assert.Equal(900, body["keep_alive"]!.GetValue<int>());
+        Assert.Equal(8192, body["options"]!["num_ctx"]!.GetValue<int>());
+    }
+
+    [Fact]
+    public async Task PreloadModelAsync_IndefiniteKeepAlive_PostsMinusOne()
+    {
+        var (sut, handler) = CreateSut(_ => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("{}", Encoding.UTF8, "application/json") });
+
+        var outcome = await sut.PreloadModelAsync("http://127.0.0.1:11435", "qwen3:30b", -1, null);
+
+        Assert.True(outcome.Accepted);
+        var body = System.Text.Json.Nodes.JsonNode.Parse(handler.LastRequestBody!)!.AsObject()!;
+        Assert.Equal(-1, body["keep_alive"]!.GetValue<int>());
+
+        // No positive num_ctx: the options block is ABSENT entirely (the daemon keeps its
+        // Modelfile default — no needless KV reallocation).
+        Assert.Null(body["options"]);
+    }
+
+    [Fact]
+    public async Task PreloadModelAsync_ZeroNumCtx_DoesNotPinNumCtx()
+    {
+        var (sut, handler) = CreateSut(_ => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("{}", Encoding.UTF8, "application/json") });
+
+        await sut.PreloadModelAsync("http://127.0.0.1:11435", "llama3:8b", 900, 0);
+
+        var body = System.Text.Json.Nodes.JsonNode.Parse(handler.LastRequestBody!)!.AsObject()!;
+        Assert.Null(body["options"]); // 0 is not a positive num_ctx
+    }
+
+    [Fact]
+    public async Task PreloadModelAsync_MissingBaseUrl_ReturnsFailureWithoutHttp()
+    {
+        var (sut, handler) = CreateSut(_ => throw new InvalidOperationException("must not be called"));
+
+        var outcome = await sut.PreloadModelAsync(null, "llama3:8b", 900, 8192);
+
+        Assert.False(outcome.Accepted);
+        Assert.Equal("no target url or model name", outcome.Error);
+        Assert.Null(handler.LastRequest);
+    }
+
+    [Fact]
+    public async Task PreloadModelAsync_EmptyModelName_ReturnsFailureWithoutHttp()
+    {
+        var (sut, handler) = CreateSut(_ => throw new InvalidOperationException("must not be called"));
+
+        var outcome = await sut.PreloadModelAsync("http://127.0.0.1:11435", "  ", 900, 8192);
+
+        Assert.False(outcome.Accepted);
+        Assert.Equal("no target url or model name", outcome.Error);
+        Assert.Null(handler.LastRequest);
+    }
+
+    [Fact]
+    public async Task PreloadModelAsync_HttpError_FailSoftNotAccepted()
+    {
+        var (sut, _) = CreateSut(_ => new HttpResponseMessage(HttpStatusCode.InternalServerError));
+
+        var outcome = await sut.PreloadModelAsync("http://127.0.0.1:11435", "llama3:8b", 900, 8192);
+
+        Assert.False(outcome.Accepted);
+        Assert.Equal("http 500", outcome.Error);
+    }
+
+    [Fact]
+    public async Task PreloadModelAsync_TransportException_FailSoftNotAccepted()
+    {
+        var (sut, _) = CreateSut(_ => throw new HttpRequestException("connection refused"));
+
+        var outcome = await sut.PreloadModelAsync("http://127.0.0.1:11435", "llama3:8b", 900, 8192);
+
+        Assert.False(outcome.Accepted);
+        Assert.Equal("connection refused", outcome.Error);
+    }
+
     private sealed class NoRespondHandler : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)

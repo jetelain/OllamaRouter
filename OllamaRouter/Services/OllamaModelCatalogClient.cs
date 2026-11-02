@@ -147,6 +147,43 @@ public sealed class OllamaModelCatalogClient(HttpClient httpClient) : IOllamaMod
         }
     }
 
+    public async Task<PreloadOutcome> PreloadModelAsync(string? baseUrl, string modelName, int keepAliveSeconds, int? numCtx, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(baseUrl) || string.IsNullOrWhiteSpace(modelName))
+        {
+            return new PreloadOutcome(false, "no target url or model name");
+        }
+
+        try
+        {
+            var payload = new JsonObject
+            {
+                ["model"] = modelName,
+                ["prompt"] = string.Empty,
+                ["stream"] = false,
+                ["keep_alive"] = keepAliveSeconds
+            };
+
+            // Pin the context size only when requested (a positive num_ctx): when absent the
+            // daemon keeps its Modelfile default — preloading with a forced reallocation to
+            // the same size would waste a full KV refill on a resident model.
+            if (numCtx is { } value and > 0)
+            {
+                payload["options"] = new JsonObject { ["num_ctx"] = value };
+            }
+
+            using var content = new StringContent(payload.ToJsonString(), Encoding.UTF8, "application/json");
+            var response = await httpClient.PostAsync(BuildUrl(baseUrl, "/api/generate"), content, cancellationToken);
+            return response.IsSuccessStatusCode
+                ? new PreloadOutcome(true)
+                : new PreloadOutcome(false, $"http {(int)response.StatusCode}");
+        }
+        catch (Exception ex)
+        {
+            return new PreloadOutcome(false, ex.Message);
+        }
+    }
+
     public async Task<IReadOnlyList<string>> StopRunningModelsAsync(string? baseUrl, CancellationToken cancellationToken = default)
     {
         var runningModels = await GetRunningModelNamesAsync(baseUrl, cancellationToken);

@@ -174,6 +174,22 @@ public static class OllamaRouterServiceCollectionExtensions
         services.AddSingleton<ModelCapabilityEngine>();
         services.AddSingleton<IOllamaProcessLauncher, OllamaProcessLauncher>();
 
+        // Model pre-load (task #44): the router-owned, stateless/idempotent model warm-up
+        // (selection reuses the capability stack; the bounded load call + /api/ps residency
+        // confirmation ride the existing IOllamaModelCatalogClient client — no new HttpClient
+        // registration). All enrichment dependencies are nullable-tolerant so minimal test
+        // hosts keep working (defensive, like every other endpoint in this graph).
+        services.AddSingleton<IModelPreloadService>(sp => new ModelPreloadService(
+            sp.GetRequiredService<IOptions<OllamaRouterOptions>>(),
+            sp.GetRequiredService<IOllamaModelCatalogClient>(),
+            sp.GetService<IModelCatalogCacheService>(),
+            sp.GetService<ModelCapabilityEngine>(),
+            sp.GetService<ITargetLivenessService>(),
+            sp.GetService<ITargetAvailabilityService>(),
+            sp.GetService<ITargetExecutionTracker>(),
+            sp.GetService<IFleetHardwareService>(),
+            sp.GetRequiredService<ILogger<ModelPreloadService>>()));
+
         // Micro-benchmark engine (task #28): the candidate catalog is code-defined in v1
         // (a config.json binding hook is out of scope), the "Benchmark" client carries no
         // client-level timeout (pulls are legitimately long; per-request CTS budgets apply)
