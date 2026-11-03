@@ -13,7 +13,10 @@ internal enum UserConfigLoadStatus
 {
     /// <summary>
     /// The user configuration file does not exist. This is a valid, silent state:
-    /// factory defaults from <c>appsettings.json</c> are in effect and no provider is registered.
+    /// factory defaults from <c>appsettings.json</c> are in effect. An <c>Optional</c> provider
+    /// IS still registered (task #19) so that a file created later by the Setup API
+    /// (<c>PUT /api/router/config</c>, <c>POST/PUT/DELETE /api/router/targets</c>) or by hand is
+    /// picked up by the next <c>IConfiguration.Reload()</c> / file-watch trigger.
     /// </summary>
     Absent = 0,
 
@@ -117,13 +120,6 @@ internal static class RouterConfigurationSources
 
         var fullPath = GetFullPath(contentRootPath);
 
-        // Absent user file: valid, silent state. Never register a provider for a missing file.
-        if (!File.Exists(fullPath))
-        {
-            logger?.LogInformation(AbsentMessageTemplate, fullPath);
-            return UserConfigLoadStatus.Absent;
-        }
-
         // Idempotency: a source for the same relative path (case-insensitive) was already registered.
         if (configuration.Sources.Any(s => s is JsonConfigurationSource { Path: var p } &&
             string.Equals(p, UserConfigRelativePath, StringComparison.OrdinalIgnoreCase)))
@@ -131,13 +127,21 @@ internal static class RouterConfigurationSources
             return UserConfigLoadStatus.Loaded;
         }
 
-        // Fail-open pre-validation: an invalid user file must never throw out of Build().
-        if (!IsLoadable(fullPath))
+        // Fail-open pre-validation (unchanged from the original behavior): a PRESENT-but-invalid
+        // user file must never throw out of Build() — it is ignored with a prominent error and
+        // NO provider is registered for it.
+        var present = File.Exists(fullPath);
+        if (present && !IsLoadable(fullPath))
         {
             ReportFailure(InvalidJsonMessageTemplate, fullPath, logger, loggerAccessor);
             return UserConfigLoadStatus.InvalidJson;
         }
 
+        // Register the source ALWAYS (task #19), even when the file is absent at startup:
+        // with Optional = true an absent file contributes no values (behavior-neutral for
+        // existing hosts), while a file created later by the Setup API (first write on a fresh
+        // install) is picked up by the post-write IConfiguration.Reload() / the file watcher,
+        // so a no-file-at-startup install reaches the steady state "file is the source of truth".
         // Register with a path relative to the builder's base path — the same semantics as
         // AddJsonFile("appsettings.json", ...): in a Web host the base path is the content root,
         // so the provider resolves "config/config.json" next to the executable. (Unit tests
@@ -145,7 +149,7 @@ internal static class RouterConfigurationSources
         var source = new JsonConfigurationSource
         {
             Path = UserConfigRelativePath,
-            Optional = false,
+            Optional = true,
             ReloadOnChange = true,
             // An invalid hot edit must not crash the process, but must never be silent either:
             // the provider retains its previous valid data on a failed reload, and we log the error prominently.
@@ -156,6 +160,12 @@ internal static class RouterConfigurationSources
             }
         };
         AddOrInsertAfterAppsettingsAnchor(configuration, source, environment);
+
+        if (!present)
+        {
+            logger?.LogInformation(AbsentMessageTemplate, fullPath);
+            return UserConfigLoadStatus.Absent;
+        }
 
         logger?.LogInformation(LoadedMessageTemplate, fullPath);
         return UserConfigLoadStatus.Loaded;

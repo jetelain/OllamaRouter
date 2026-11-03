@@ -70,6 +70,22 @@ namespace OllamaRouter.Serialization;
 [JsonSerializable(typeof(RouterBenchmarkRunResponse))]
 [JsonSerializable(typeof(RouterBenchmarkResultsResponse))]
 [JsonSerializable(typeof(RouterBenchmarkClearedResponse))]
+// Dynamic fleet configuration / Setup API DTOs (task #19).
+[JsonSerializable(typeof(RouterConfigResponse))]
+[JsonSerializable(typeof(RouterTargetConfigDto))]
+[JsonSerializable(typeof(RouterCloudConfigDto))]
+[JsonSerializable(typeof(RouterDynamicContextConfigDto))]
+[JsonSerializable(typeof(RouterRecordingConfigDto))]
+[JsonSerializable(typeof(RouterResilienceConfigDto))]
+[JsonSerializable(typeof(RouterPricingConfigDto))]
+[JsonSerializable(typeof(UpdateRouterConfigRequest))]
+[JsonSerializable(typeof(UpdateCloudConfigRequest))]
+[JsonSerializable(typeof(UpdateRouterConfigResponse))]
+[JsonSerializable(typeof(UpdateTargetRequest))]
+[JsonSerializable(typeof(UpdateTargetResponse))]
+[JsonSerializable(typeof(AddTargetRequest))]
+[JsonSerializable(typeof(AddTargetResponse))]
+[JsonSerializable(typeof(DeleteTargetResponse))]
 public partial class OllamaRouterJsonSerializerContext : JsonSerializerContext
 {
 }

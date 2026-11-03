@@ -6,6 +6,7 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using OllamaRouter.Configuration;
 using OllamaRouter.Endpoints;
 using OllamaRouter.Middleware;
 using OllamaRouter.Options;
@@ -50,7 +51,12 @@ public static class OllamaRouterServiceCollectionExtensions
     /// stores, the <see cref="ITokenEstimator"/> engine singleton and the probe client timeout.
     /// Those remain startup-scoped: changing fleet membership (adding/removing targets), target
     /// <c>Url</c>/<c>RouterUrl</c>, <c>BindAddress</c> or the <c>TokenEstimator</c> engine requires
-    /// a process restart (YARP dynamic configuration is a separate feature).
+    /// a process restart (YARP dynamic configuration is a separate feature). EXCEPTION (task
+    /// #19): the Setup API (<c>POST/PUT/DELETE /api/router/targets</c>, <c>PUT /api/router/config</c>,
+    /// via <c>IRouterConfigPersistence</c>) makes membership + target-Url changes effective without
+    /// a restart on the inference (completion) dispatch path (the middleware resolves the
+    /// candidate list live from the options per request); YARP passthrough paths keep the startup
+    /// route/cluster table until the follow-up "YARP dynamic topology" task.
     /// </para>
     /// </summary>
     /// <param name="services">The service collection to configure.</param>
@@ -209,6 +215,17 @@ public static class OllamaRouterServiceCollectionExtensions
         // Per-target failure streak tracker: singleton, thread-safe in-memory counter shared by the
         // routing decision service and the middleware's dispatch loop.
         services.AddSingleton<ITargetFailureStreakService, TargetFailureStreakService>();
+
+        // Dynamic fleet configuration / Setup API (task #19): load-merge-atomic-write persistence
+        // of the user config layer (config/config.json) + in-memory application to the shared
+        // IOptionsMonitor-bound instance. Resolved defensively by the endpoint handlers
+        // (IServiceProvider.GetService) so a minimal host without a host environment still serves
+        // every endpoint; the IHostEnvironment lookup happens inside the constructor (bare
+        // ServiceCollection hosts fall back to the assembly base directory).
+        services.AddSingleton<IRouterConfigPersistence>(sp => new RouterConfigPersistence(
+            sp.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>(),
+            sp,
+            sp.GetService<ILoggerFactory>()?.CreateLogger<RouterConfigPersistence>()));
 
         // Effective fleet targets plus the Cloud pseudo-target; used by the availability and statistics
         // services so state is keyed per target. Invalid Targets entries are skipped with a warning here.

@@ -147,6 +147,18 @@ public sealed class OllamaRoutingMiddleware(
         }
     }
 
+    // LIVE config enablement of a target (OllamaTargetOptions.Enabled), read from the current
+    // options on every call so a Setup-API (task #19) enable/disable takes effect on the next
+    // request without a restart. Used by the completion exact-pin gate (the pin bypasses
+    // DecideAsync's own Enabled check). A name that is not an effective target cannot reach
+    // this gate (TryParsePinnedTarget only matches effective names) and is treated as enabled.
+    private bool IsTargetConfigEnabled(RoutingTarget target) =>
+        options.CurrentValue.GetEffectiveTargets(logger)
+            .FirstOrDefault(t => string.Equals(t.Name, target.Value, StringComparison.OrdinalIgnoreCase))
+            is { } targetOptions
+            ? targetOptions.Enabled
+            : true;
+
     // The header value for non-inspected requests: the name of the target named "Local"
     // (case-insensitive) when enabled, otherwise the first other enabled effective target
     // (Remote in the legacy configuration, preserving the previous behavior exactly).
@@ -817,7 +829,13 @@ public sealed class OllamaRoutingMiddleware(
             {
                 if (requestedPin.ExactTarget is { } requestedTarget)
                 {
-                    if (targetAvailability.IsEnabled(requestedTarget))
+                    // Two independent enablement gates for a pinned completion:
+                    // 1. targetAvailability (the state-file targets.json administrative toggle),
+                    // 2. the LIVE config Enabled flag (OllamaTargetOptions.Enabled) — checked
+                    //    here (not only in the decision service) because an exact pin bypasses
+                    //    DecideAsync; a Setup-API (task #19) disable must take effect on the very
+                    //    next pinned request without a restart.
+                    if (targetAvailability.IsEnabled(requestedTarget) && IsTargetConfigEnabled(requestedTarget))
                     {
                         // Pinned-target liveness gate: never forward to a dead daemon. Cloud is a
                         // relay (never probed); fleet targets are probed on demand (bounded at

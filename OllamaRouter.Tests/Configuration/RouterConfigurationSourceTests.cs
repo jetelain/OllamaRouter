@@ -184,7 +184,9 @@ public class RouterConfigurationSourceTests : IDisposable
                  string.Equals(p, RouterConfigurationSources.UserConfigRelativePath, StringComparison.OrdinalIgnoreCase));
         var jsonSource = (JsonConfigurationSource)source;
         Assert.True(jsonSource.ReloadOnChange);
-        Assert.False(jsonSource.Optional);
+        // Task #19: the user source is ALWAYS Optional (even a present file) so a Setup-API
+        // created config/config.json is picked up by the post-write reload on a fresh install.
+        Assert.True(jsonSource.Optional);
     }
 
     // ------------------------------------------------------------------ Precedence

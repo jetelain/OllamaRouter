@@ -21,12 +21,25 @@ namespace OllamaRouter.Options;
 /// </para>
 /// <para>
 /// The following remain STARTUP-SCOPED (a process restart is required for changes to take
-/// effect): fleet membership (YARP routes/clusters are built once from the startup snapshot
-/// via <c>LoadFromMemory</c>; adding/removing targets needs a restart — YARP dynamic
-/// configuration is a separate feature), per-target <c>Url</c>/<c>RouterUrl</c> (cluster
-/// destinations are fixed at startup), <see cref="BindAddress"/> (the Kestrel listener binds
+/// effect): fleet membership for the YARP passthrough paths (YARP routes/clusters are built
+/// once from the startup snapshot via <c>LoadFromMemory</c>; YARP dynamic configuration is a
+/// separate feature), per-target <c>Url</c>/<c>RouterUrl</c> (cluster destinations are fixed at
+/// startup), <see cref="BindAddress"/> (the Kestrel listener binds
 /// at startup), <c>TokenEstimator</c> engine selection (a DI-time singleton) and
 /// <c>TerminalMonitoring.Enabled</c> (startup-only TUI toggle).
+/// </para>
+/// <para>
+/// <b>Setup-API exception (task #19).</b> The dynamic fleet configuration / Setup API
+/// (<c>POST</c>/<c>PUT</c>/<c>DELETE /api/router/targets</c>, <c>PUT /api/router/config</c>, persisted via
+/// <c>IRouterConfigPersistence</c> to <c>config/config.json</c>) makes fleet membership and target
+/// <c>Url</c> changes effective WITHOUT a restart on the inference (completion) dispatch path: the
+/// routing middleware resolves its candidate list live from
+/// <c>IOptionsMonitor&lt;OllamaRouterOptions&gt;.CurrentValue.GetEffectiveTargets()</c> per request, so a
+/// runtime-added, updated or removed target is immediately (un)routable for
+/// <c>POST /api/chat|/api/generate|/v1/chat/completions|/v1/completions|/api/embeddings</c>. The
+/// YARP passthrough paths (pinned <c>pull</c>/<c>create</c>/<c>copy</c>/<c>delete</c> and the default-class
+/// pass-through) keep the startup route/cluster table until the follow-up "YARP dynamic
+/// topology" task (rebuild via <c>IInMemoryConfigProvider</c>).
 /// </para>
 /// </summary>
 public sealed class OllamaRouterOptions
@@ -416,6 +429,16 @@ public sealed class OllamaTargetOptions
     /// Whether the target is active in the fleet. Defaults to true.
     /// </summary>
     public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    /// Stored, free-form hardware hint (e.g. "8gb", "16gb", "96gb") surfaced by the Setup API
+    /// (<c>GET /api/router/config</c>, <c>POST /api/router/targets</c>) for Web-UI display and
+    /// persisted to <c>config/config.json</c> under <c>OllamaRouter:Targets</c>.
+    /// NO v1 routing consumer: location classification stays URL/VRAM-driven
+    /// (<see cref="Services.TargetLocationClassifier"/>), so the value influences no routing
+    /// decision. Null (default) means unset.
+    /// </summary>
+    public string? HardwareHint { get; set; }
 
     /// <summary>
     /// Returns the effective maximum VRAM (in MB) of this target: the explicit
