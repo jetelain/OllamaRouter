@@ -14,6 +14,7 @@ using OllamaRouter.Endpoints;
 using OllamaRouter.Extensions;
 using OllamaRouter.Options;
 using OllamaRouter.ReverseProxy;
+using OllamaRouter.Security;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services;
 using OllamaRouter.Tests.Mesh;
@@ -247,6 +248,12 @@ public class RouterConfigEndpointsTests
         Assert.Equal(0.5, pricing["completionPricePerMillion"]!.GetValue<double>());
         Assert.Null(pricing["pricePerMillion"]); // JSON null (member present).
         Assert.Equal("$", pricing["currency"]!.GetValue<string>());
+
+        // apiSecurity section (task #50): the EFFECTIVE settings only — no key material.
+        var apiSecurity = (json["apiSecurity"]! as JsonObject)!;
+        Assert.Equal(2, apiSecurity.Count);
+        Assert.False(apiSecurity["requireKeyForAllEndpoints"]!.GetValue<bool>());
+        Assert.Equal(24, apiSecurity["defaultKeyRotationHours"]!.GetValue<int>());
     }
 
     [Fact]
@@ -265,6 +272,11 @@ public class RouterConfigEndpointsTests
         Assert.True(cloud["enabled"]!.GetValue<bool>());
         Assert.Null(cloud["defaultModel"]); // JSON null (member present, not omitted).
         Assert.False(cloud["overflowConfigured"]!.GetValue<bool>(), "overflowConfigured must be false without a cloud model");
+
+        // apiSecurity section (task #50) is present with the defaults even when cloud is unset.
+        var apiSecurity = (json["apiSecurity"]! as JsonObject)!;
+        Assert.False(apiSecurity["requireKeyForAllEndpoints"]!.GetValue<bool>());
+        Assert.Equal(24, apiSecurity["defaultKeyRotationHours"]!.GetValue<int>());
     }
 
     // ------------------------------------------------------------------
@@ -898,6 +910,39 @@ public class RouterConfigProvisioningPipelineTests
 
         public ITargetLivenessService Liveness => Services.GetRequiredService<ITargetLivenessService>();
 
+        /// <summary>
+        /// The API key store (task #50): the harness resolves it from the production DI graph;
+        /// the default key is re-read per AUTHENTICATED call (the documented re-read-after-401
+        /// pattern — a rotation would otherwise invalidate a cached key mid-test).
+        /// </summary>
+        public IApiKeyStore Keys => Services.GetRequiredService<IApiKeyStore>();
+
+        /// <summary>
+        /// Sends a request with the current default key stamped as
+        /// <c>Authorization: Bearer &lt;key&gt;</c> (task #50): required for the default
+        /// config-affecting protected routes (POST/PUT/DELETE /api/router/targets, GET/PUT
+        /// /api/router/config). Read routes and POST /targets stay open and need no key.
+        /// </summary>
+        public Task<HttpResponseMessage> SendAuthedAsync(HttpMethod method, string path, HttpContent? content = null)
+        {
+            var request = new HttpRequestMessage(method, path) { Content = content };
+            request.Headers.Authorization =
+                new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", Keys.GetDefaultKey());
+            return Client.SendAsync(request);
+        }
+
+        public Task<HttpResponseMessage> PostAuthedAsync(string path, HttpContent content) =>
+            SendAuthedAsync(HttpMethod.Post, path, content);
+
+        public Task<HttpResponseMessage> PutAuthedAsync(string path, HttpContent content) =>
+            SendAuthedAsync(HttpMethod.Put, path, content);
+
+        public Task<HttpResponseMessage> DeleteAuthedAsync(string path) =>
+            SendAuthedAsync(HttpMethod.Delete, path);
+
+        public Task<HttpResponseMessage> GetAuthedAsync(string path) =>
+            SendAuthedAsync(HttpMethod.Get, path);
+
         public async ValueTask DisposeAsync()
         {
             try
@@ -1047,9 +1092,11 @@ public class RouterConfigProvisioningPipelineTests
         await using var harness = await PipelineHarness.StartAsync([TargetFor(alpha)]);
         Assert.True(await WaitTargetOnlineAsync(harness, "alpha", TimeSpan.FromSeconds(10)), "alpha must come online");
 
-        // Add daemon B's node through the Setup API (live liveness probe against the real daemon).
+        // Add daemon B's node through the Setup API (live liveness probe against the real
+        // daemon). POST /api/router/targets is in the default key-protected set (task #50):
+        // the request carries the default key stamped by the harness helper.
         var addBody = new JsonObject { ["name"] = "bravo", ["url"] = bravo.Url, ["maxParallel"] = 1 };
-        using var addResponse = await harness.Client.PostAsync(
+        using var addResponse = await harness.PostAuthedAsync(
             "/api/router/targets",
             new StringContent(addBody.ToJsonString(), Encoding.UTF8, "application/json"));
         Assert.Equal(HttpStatusCode.Created, addResponse.StatusCode);
@@ -1087,8 +1134,9 @@ public class RouterConfigProvisioningPipelineTests
         var alphaHitsBefore = alpha.ChatHits().Count;
         Assert.True(alphaHitsBefore >= 1);
 
-        // Administratively disable alpha through the Setup API (no restart).
-        using var putResponse = await harness.Client.PutAsync(
+        // Administratively disable alpha through the Setup API (no restart). PUT
+        // /api/router/targets/{name} is key-protected (task #50): the key is stamped.
+        using var putResponse = await harness.PutAuthedAsync(
             "/api/router/targets/alpha",
             new StringContent("""{"enabled": false}""", Encoding.UTF8, "application/json"));
         Assert.Equal(HttpStatusCode.OK, putResponse.StatusCode);
@@ -1111,7 +1159,7 @@ public class RouterConfigProvisioningPipelineTests
 
         await using var harness = await PipelineHarness.StartAsync([TargetFor(alpha)]);
 
-        using var putResponse = await harness.Client.PutAsync(
+        using var putResponse = await harness.PutAuthedAsync(
             "/api/router/config",
             new StringContent(
                 """{"resilience": { "maxConsecutiveFailures": 7, "consecutiveFailuresTokenTolerance": 4000 }}""",
@@ -1121,8 +1169,9 @@ public class RouterConfigProvisioningPipelineTests
         // The shared options instance reads the new value immediately (no daemon restart).
         Assert.Equal(7, harness.Options.MaxConsecutiveFailures);
 
-        // And the GET endpoint reports it.
-        using var getResponse = await harness.Client.GetAsync("/api/router/config");
+        // And the GET endpoint reports it (GET /api/router/config is key-protected — the key
+        // is stamped; an unauthenticated GET would 401, see the middleware tests).
+        using var getResponse = await harness.GetAuthedAsync("/api/router/config");
         Assert.Equal(HttpStatusCode.OK, getResponse.StatusCode);
         var json = (JsonNode.Parse(await getResponse.Content.ReadAsStringAsync())! as JsonObject)!;
         Assert.Equal(7, ((json["resilience"]! as JsonObject)!)["maxConsecutiveFailures"]!.GetValue<int>());
@@ -1143,8 +1192,9 @@ public class RouterConfigProvisioningPipelineTests
         await using var harness = await PipelineHarness.StartAsync([TargetFor(alpha)]);
         Assert.True(await WaitTargetOnlineAsync(harness, "alpha", TimeSpan.FromSeconds(10)), "alpha must come online");
 
-        // Add bravo through the Setup API, then remove it again.
-        using var addResponse = await harness.Client.PostAsync(
+        // Add bravo through the Setup API, then remove it again (key-protected routes carry
+        // the default key, task #50).
+        using var addResponse = await harness.PostAuthedAsync(
             "/api/router/targets",
             new StringContent(
                 new JsonObject { ["name"] = "bravo", ["url"] = bravo.Url, ["testConnectionFirst"] = false }.ToJsonString(),
@@ -1153,12 +1203,12 @@ public class RouterConfigProvisioningPipelineTests
         Assert.True(addResponse.IsSuccessStatusCode, $"target add failed: {(int)addResponse.StatusCode} {addBody}");
         Assert.Equal(2, harness.Options.Targets.Count);
 
-        using var deleteResponse = await harness.Client.DeleteAsync("/api/router/targets/bravo");
+        using var deleteResponse = await harness.DeleteAuthedAsync("/api/router/targets/bravo");
         var deleteBody = await deleteResponse.Content.ReadAsStringAsync();
         Assert.True(deleteResponse.IsSuccessStatusCode, $"target delete failed: {(int)deleteResponse.StatusCode} {deleteBody}");
 
-        // GET config excludes the removed target (memory + disk).
-        using var getResponse = await harness.Client.GetAsync("/api/router/config");
+        // GET config excludes the removed target (memory + disk) — key-protected GET.
+        using var getResponse = await harness.GetAuthedAsync("/api/router/config");
         var json = (JsonNode.Parse(await getResponse.Content.ReadAsStringAsync())! as JsonObject)!;
         var names = ((json["targets"]! as JsonArray)!).Select(t => ((JsonObject)t!)["name"]!.GetValue<string>()).ToList();
         Assert.DoesNotContain("bravo", names, StringComparer.OrdinalIgnoreCase);
@@ -1180,8 +1230,9 @@ public class RouterConfigProvisioningPipelineTests
 
         await using var harness = await PipelineHarness.StartAsync([TargetFor(alpha)]);
 
-        // Mutate the configuration through the Setup API.
-        using var addResponse = await harness.Client.PostAsync(
+        // Mutate the configuration through the Setup API (key-protected routes carry the
+        // default key, task #50).
+        using var addResponse = await harness.PostAuthedAsync(
             "/api/router/targets",
             new StringContent(
                 new JsonObject
@@ -1194,7 +1245,7 @@ public class RouterConfigProvisioningPipelineTests
                 }.ToJsonString(),
                 Encoding.UTF8, "application/json"));
         Assert.Equal(HttpStatusCode.Created, addResponse.StatusCode);
-        using var putResponse = await harness.Client.PutAsync(
+        using var putResponse = await harness.PutAuthedAsync(
             "/api/router/config",
             new StringContent(
                 """{"resilience": { "maxConsecutiveFailures": 7, "consecutiveFailuresTokenTolerance": 4000 }}""",

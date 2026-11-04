@@ -86,6 +86,16 @@ namespace OllamaRouter.Serialization;
 [JsonSerializable(typeof(AddTargetRequest))]
 [JsonSerializable(typeof(AddTargetResponse))]
 [JsonSerializable(typeof(DeleteTargetResponse))]
+// API key management DTOs (task #50).
+[JsonSerializable(typeof(ApiSecurityConfigDto))]
+[JsonSerializable(typeof(ApiKeysListResponse))]
+[JsonSerializable(typeof(ApiKeyInfoResponse))]
+[JsonSerializable(typeof(ApiKeyCreateRequest))]
+[JsonSerializable(typeof(ApiKeyCreatedResponse))]
+[JsonSerializable(typeof(ApiKeyDeletedResponse))]
+[JsonSerializable(typeof(ApiKeyRotatedResponse))]
+// API key store file format (config/api-keys.json — hashes only; internal, same assembly).
+[JsonSerializable(typeof(OllamaRouter.Security.ApiKeyFile))]
 public partial class OllamaRouterJsonSerializerContext : JsonSerializerContext
 {
 }

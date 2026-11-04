@@ -9,6 +9,7 @@ using Microsoft.Extensions.Options;
 using OllamaRouter.Configuration;
 using OllamaRouter.Middleware;
 using OllamaRouter.Options;
+using OllamaRouter.Security;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services;
 using OllamaRouter.Services.Benchmarking;
@@ -362,6 +363,28 @@ public static class RouterApiEndpointsExtensions
         app.MapPut("/api/router/targets/{name}", UpdateTargetHandler);
         app.MapDelete("/api/router/targets/{name}", DeleteTargetHandler);
 
+        // ------------------------------------------------------------------
+        //  API key management (task #50): every route below is key-protected by the
+        //  ApiKeyAuthMiddleware BY DEFINITION (managing keys requires a valid key).
+        // ------------------------------------------------------------------
+        app.MapGet("/api/router/api-keys", (IServiceProvider serviceProvider) =>
+        {
+            var keyStore = serviceProvider.GetService<IApiKeyStore>();
+            if (keyStore is null)
+            {
+                return KeyStoreFailure();
+            }
+
+            var keys = keyStore.GetUserKeys()
+                .Select(k => new ApiKeyInfoResponse(k.Name, k.CreatedAt, k.ExpiresAt))
+                .ToList();
+            return Results.Json(new ApiKeysListResponse(keys),
+                OllamaRouterJsonSerializerContext.Default.ApiKeysListResponse);
+        });
+        app.MapPost("/api/router/api-keys", CreateApiKeyHandler);
+        app.MapDelete("/api/router/api-keys/{name}", DeleteApiKeyHandler);
+        app.MapPost("/api/router/api-keys/default/rotate", RotateDefaultApiKeyHandler);
+
         return app;
     }
 
@@ -372,9 +395,10 @@ public static class RouterApiEndpointsExtensions
     /// <summary>
     /// Builds the full configuration response shared by <c>GET /api/router/config</c> and the
     /// <c>PUT /api/router/config</c> echo. All values are read from the live options instance;
-    /// NO credential fields are exposed (the product has no API keys — the cloud relay depends
-    /// on the fleet node's ollama.com sign-in). The Cloud pseudo-target is not part of
-    /// <c>targets</c> (it is a relay, never a fleet member).
+    /// NO key material is exposed (the API-key system of task #50 stores the default key
+    /// protected in config/default-key.dat and user keys as hashes only — the response carries
+    /// the <c>apiSecurity</c> SECTION SETTINGS, never any key). The Cloud pseudo-target is not
+    /// part of <c>targets</c> (it is a relay, never a fleet member).
     /// </summary>
     private static RouterConfigResponse BuildRouterConfigResponse(OllamaRouterOptions options)
     {
@@ -412,7 +436,10 @@ public static class RouterApiEndpointsExtensions
                 pricing.PromptPricePerMillion,
                 pricing.CompletionPricePerMillion,
                 pricing.PricePerMillion,
-                pricing.Currency));
+                pricing.Currency),
+            new ApiSecurityConfigDto(
+                options.ApiSecurity.RequireKeyForAllEndpoints,
+                options.ApiSecurity.DefaultKeyRotationHours));
     }
 
     /// <summary>
@@ -823,6 +850,128 @@ public static class RouterApiEndpointsExtensions
             new DeleteTargetResponse(true, $"Target '{name}' removed successfully."),
             OllamaRouterJsonSerializerContext.Default.DeleteTargetResponse);
     }
+
+    // ------------------------------------------------------------------
+    //  API key management (task #50) — key-protected by the auth middleware by definition
+    // ------------------------------------------------------------------
+
+    private static IResult KeyStoreFailure() =>
+        Results.Json(
+            new OllamaErrorResponse("router API key store is not available in this host"),
+            OllamaRouterJsonSerializerContext.Default.OllamaErrorResponse,
+            statusCode: StatusCodes.Status500InternalServerError);
+
+    /// <summary>
+    /// Handler of <c>POST /api/router/api-keys</c> (task #50): creates a user API key. Body:
+    /// <c>{ name, validFor? }</c> where <c>validFor</c> is an INTEGER NUMBER OF HOURS
+    /// (e.g. 168 = 7 days; omitted/null = no expiry; &lt; 1 → 400). The raw base64url key is
+    /// returned to the caller EXACTLY ONCE in the 201 response — only its SHA-256 hash is
+    /// persisted (config/api-keys.json, 0600 on Unix). Status matrix: 201 created / 400 invalid
+    /// name or validFor / 409 duplicate name (case-insensitive) / 500 persistence failure or
+    /// missing key store.
+    /// </summary>
+    private static async Task<IResult> CreateApiKeyHandler(
+        HttpRequest request,
+        IServiceProvider serviceProvider,
+        CancellationToken cancellationToken)
+    {
+        var keyStore = serviceProvider.GetService<IApiKeyStore>();
+        if (keyStore is null)
+        {
+            return KeyStoreFailure();
+        }
+
+        ApiKeyCreateRequest? createRequest;
+        try
+        {
+            createRequest = await JsonSerializer.DeserializeAsync(
+                request.Body,
+                OllamaRouterJsonSerializerContext.Default.ApiKeyCreateRequest,
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (JsonException)
+        {
+            createRequest = null;
+        }
+
+        if (createRequest is null)
+        {
+            return ApiKeyError("invalid or missing API key request body", StatusCodes.Status400BadRequest);
+        }
+
+        // JSON omission of a non-nullable string field deserializes to null at runtime, so the
+        // null-fallback is defensive (and keeps the 400 path deterministic).
+        var name = createRequest.Name?.Trim() ?? string.Empty;
+        var result = await keyStore.CreateUserKeyAsync(name, createRequest.ValidFor).ConfigureAwait(false);
+        switch (result.Failure)
+        {
+            case ApiKeyCreateFailure.Duplicate:
+                return ApiKeyError(
+                    $"an API key named '{name}' already exists", StatusCodes.Status409Conflict);
+            case ApiKeyCreateFailure.PersistError:
+                return ApiKeyError(
+                    $"failed to create the API key: {result.Error}", StatusCodes.Status500InternalServerError);
+            case ApiKeyCreateFailure.None when result.Created is { } created:
+                return Results.Json(
+                    new ApiKeyCreatedResponse(true, created.Name, created.Key, created.CreatedAt, created.ExpiresAt),
+                    OllamaRouterJsonSerializerContext.Default.ApiKeyCreatedResponse,
+                    statusCode: StatusCodes.Status201Created);
+            default:
+                return ApiKeyError(result.Error ?? "invalid API key request body", StatusCodes.Status400BadRequest);
+        }
+    }
+
+    /// <summary>
+    /// Handler of <c>DELETE /api/router/api-keys/{name}</c> (task #50): deletes the user key
+    /// (case-insensitive) → 200 { success: true }; unknown name → 404 { success: false, error }.
+    /// </summary>
+    private static async Task<IResult> DeleteApiKeyHandler(
+        IServiceProvider serviceProvider,
+        string name,
+        CancellationToken cancellationToken)
+    {
+        var keyStore = serviceProvider.GetService<IApiKeyStore>();
+        if (keyStore is null)
+        {
+            return KeyStoreFailure();
+        }
+
+        var deleted = await keyStore.DeleteUserKeyAsync(name).ConfigureAwait(false);
+        return deleted
+            ? Results.Json(new ApiKeyDeletedResponse(true, null),
+                OllamaRouterJsonSerializerContext.Default.ApiKeyDeletedResponse)
+            : Results.Json(new ApiKeyDeletedResponse(false, $"API key not found: {name}"),
+                OllamaRouterJsonSerializerContext.Default.ApiKeyDeletedResponse,
+                statusCode: StatusCodes.Status404NotFound);
+    }
+
+    /// <summary>
+    /// Handler of <c>POST /api/router/api-keys/default/rotate</c> (task #50): manually rotates
+    /// the default key IMMEDIATELY (ignores the elapsed interval — same semantics as an
+    /// auto-rotation tick): the previous default key is dead instantly (no grace period) and
+    /// the new raw key is returned exactly once (it is also logged at INFO by the store).
+    /// </summary>
+    private static async Task<IResult> RotateDefaultApiKeyHandler(
+        IServiceProvider serviceProvider,
+        CancellationToken cancellationToken)
+    {
+        var keyStore = serviceProvider.GetService<IApiKeyStore>();
+        if (keyStore is null)
+        {
+            return KeyStoreFailure();
+        }
+
+        var key = await keyStore.RotateDefaultKeyAsync().ConfigureAwait(false);
+        return Results.Json(
+            new ApiKeyRotatedResponse(true, key, keyStore.GetDefaultKeyGeneratedAt()),
+            OllamaRouterJsonSerializerContext.Default.ApiKeyRotatedResponse);
+    }
+
+    private static IResult ApiKeyError(string error, int statusCode)
+        => Results.Json(
+            new OllamaErrorResponse(error),
+            OllamaRouterJsonSerializerContext.Default.OllamaErrorResponse,
+            statusCode: statusCode);
 
     /// <summary>
     /// Validates the <c>PUT /api/router/config</c> body: returns a 400 error message, or null
@@ -3123,7 +3272,8 @@ public sealed record RouterBenchmarkClearedResponse(
         [property: JsonPropertyName("dynamicContext")] RouterDynamicContextConfigDto DynamicContext,
         [property: JsonPropertyName("recording")] RouterRecordingConfigDto Recording,
         [property: JsonPropertyName("resilience")] RouterResilienceConfigDto Resilience,
-        [property: JsonPropertyName("pricing")] RouterPricingConfigDto Pricing);
+        [property: JsonPropertyName("pricing")] RouterPricingConfigDto Pricing,
+        [property: JsonPropertyName("apiSecurity")] ApiSecurityConfigDto ApiSecurity);
 
     /// <summary>
     /// One fleet target row of <c>GET /api/router/config</c> / the target CRUD responses
@@ -3208,7 +3358,9 @@ public sealed record RouterBenchmarkClearedResponse(
     /// The cloud section of a <c>PUT /api/router/config</c> body (task #19): <c>enabled</c> is
     /// always applied; <c>defaultModel</c> / <c>preferredRelayTarget</c> null/absent = no
     /// change, <c>""</c> = clear (defaultModel → null, preferredRelayTarget → "Local"). There
-    /// is NO apiKey field (decision: the product has no API-key concept).
+    /// is NO apiKey field: the router's own API-key system (task #50) is managed exclusively
+    /// via the <c>/api/router/api-keys</c> endpoints and the <c>ApiSecurity</c> config section —
+    /// key material is never part of the config endpoints' wire format.
     /// </summary>
     public sealed record UpdateCloudConfigRequest(
         [property: JsonPropertyName("enabled")] bool Enabled,
@@ -3283,3 +3435,72 @@ public sealed record RouterBenchmarkClearedResponse(
     public sealed record DeleteTargetResponse(
         [property: JsonPropertyName("success")] bool Success,
         [property: JsonPropertyName("message")] string Message);
+
+    // ------------------------------------------------------------------
+    //  DTOs: API key management (task #50)
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// The apiSecurity section of <c>GET /api/router/config</c> (task #50): the EFFECTIVE
+    /// (live-bound) API-key security settings — the enforcement-scope switch and the default-
+    /// key auto-rotation interval. No key material is ever part of the response.
+    /// </summary>
+    public sealed record ApiSecurityConfigDto(
+        [property: JsonPropertyName("requireKeyForAllEndpoints")] bool RequireKeyForAllEndpoints,
+        [property: JsonPropertyName("defaultKeyRotationHours")] int DefaultKeyRotationHours);
+
+    /// <summary>
+    /// One masked row of <c>GET /api/router/api-keys</c> (task #50): identity + timestamps
+    /// ONLY — the response NEVER contains the hash or the raw key value.
+    /// </summary>
+    public sealed record ApiKeyInfoResponse(
+        [property: JsonPropertyName("name")] string Name,
+        [property: JsonPropertyName("createdAt")] DateTimeOffset CreatedAt,
+        [property: JsonPropertyName("expiresAt")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] DateTimeOffset? ExpiresAt = null);
+
+    /// <summary>
+    /// Response of <c>GET /api/router/api-keys</c> (task #50): the masked user key list
+    /// (empty array when no user keys exist).
+    /// </summary>
+    public sealed record ApiKeysListResponse(
+        [property: JsonPropertyName("keys")] IReadOnlyList<ApiKeyInfoResponse> Keys);
+
+    /// <summary>
+    /// Request body of <c>POST /api/router/api-keys</c> (task #50): <c>name</c> is required
+    /// (≤ 64 chars, no whitespace / slash / colon / control characters, case-insensitively
+    /// unique); <c>validFor</c> is an OPTIONAL integer NUMBER OF HOURS (e.g. 168 = 7 days;
+    /// omitted/null = no expiry; &lt; 1 → 400).
+    /// </summary>
+    public sealed record ApiKeyCreateRequest(
+        [property: JsonPropertyName("name")] string Name,
+        [property: JsonPropertyName("validFor")] int? ValidFor = null);
+
+    /// <summary>
+    /// 201 response of <c>POST /api/router/api-keys</c> (task #50): the raw base64url key
+    /// (<c>key</c>) is returned EXACTLY ONCE — only its SHA-256 hash is persisted; <c>createdAt</c>
+    /// / <c>expiresAt</c> are ISO 8601 UTC timestamps (expiresAt null = no expiry).
+    /// </summary>
+    public sealed record ApiKeyCreatedResponse(
+        [property: JsonPropertyName("success")] bool Success,
+        [property: JsonPropertyName("name")] string Name,
+        [property: JsonPropertyName("key")] string Key,
+        [property: JsonPropertyName("createdAt")] DateTimeOffset CreatedAt,
+        [property: JsonPropertyName("expiresAt")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] DateTimeOffset? ExpiresAt = null);
+
+    /// <summary>
+    /// Response of <c>DELETE /api/router/api-keys/{name}</c> (task #50): success flag; on 404
+    /// <c>error</c> carries "API key not found: {name}" (omitted on success).
+    /// </summary>
+    public sealed record ApiKeyDeletedResponse(
+        [property: JsonPropertyName("success")] bool Success,
+        [property: JsonPropertyName("error")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Error = null);
+
+    /// <summary>
+    /// 200 response of <c>POST /api/router/api-keys/default/rotate</c> (task #50): the NEW raw
+    /// default key (returned once; also logged at INFO) and its <c>generatedAt</c> (ISO 8601
+    /// UTC); the previous default key stopped working immediately (no grace period).
+    /// </summary>
+    public sealed record ApiKeyRotatedResponse(
+        [property: JsonPropertyName("success")] bool Success,
+        [property: JsonPropertyName("key")] string Key,
+        [property: JsonPropertyName("generatedAt")] DateTimeOffset GeneratedAt);

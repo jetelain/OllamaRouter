@@ -490,6 +490,70 @@ Both files share the fixed RFC 4180 column order (CRLF line endings, quote-escap
 
 Per-request files are capped at `Recording:TokenMetricsCsv:MaxFiles` (default `1000`); the oldest are deleted first (the consolidated file is never pruned). The exporter runs after the response completes, is fail-soft (any I/O failure only produces a log entry), and has zero disk I/O when disabled.
 
+## API key security (configuration endpoints)
+
+nThe router's Setup API can edit persistent configuration (fleet targets, hardware profiles, benchmark results, the full router config). To keep that safe even on a trusted LAN, **config-affecting endpoints require a valid API key by default**. A 401 response carries `WWW-Authenticate: Bearer` plus a JSON `error` body and never echoes key material.
+
+**Default protected routes** (key required, everything else — reads, the monitor UI, `POST /targets`, inference/proxy paths — stays open):
+
+| Method | Route |
+|---|---|
+| `GET`, `PUT` | `/api/router/config` |
+| `POST` | `/api/router/targets` |
+| `PUT`, `DELETE` | `/api/router/targets/{name}` |
+| `PUT` | `/api/router/fleet/hardware/{targetName}` |
+| `POST` | `/api/router/benchmark` |
+| `DELETE` | `/api/router/benchmark/results` |
+| `GET`, `POST` | `/api/router/api-keys` (key management) |
+| `DELETE` | `/api/router/api-keys/{name}` (key management) |
+| `POST` | `/api/router/api-keys/default/rotate` (key management) |
+
+The monitor availability toggle (`POST /targets`) is **not** protected in default mode (runtime state, not persistent config — the browser flow needs no key).
+
+**`ApiSecurity.RequireKeyForAllEndpoints`** (default `false`) extends key enforcement to **every** endpoint (reads, `/monitor*`, proxy paths, runtime actions). Both `ApiSecurity` values are **live**: an edit of `config/config.json` rebinds without a restart.
+
+```json
+"ApiSecurity": {
+  "RequireKeyForAllEndpoints": false,
+  "DefaultKeyRotationHours": 24
+}
+```
+
+### Key files (next to `config/config.json`)
+
+- **`config/default-key.dat`** — the auto-generated **default key** (32 random bytes, base64url, 43 chars). On Windows the file is a **DPAPI-wrapped blob** (unwrapable only by the same Windows user); on Unix the envelope is stored plain with **`0600`** (owner read/write) permissions. On first start the key is generated and its raw value is **logged at INFO** (and again on every rotation) so a local same-user operator can capture it; local same-user automation can also read/unwrap `default-key.dat` directly as the user running the router.
+- **`config/api-keys.json`** — user keys as **hashes only** (name + SHA-256 of the base64url key + optional expiry), also `0600` on Unix. Raw user keys are returned to the caller **exactly once** at creation and never written to disk.
+
+A missing key file is regenerated on startup; a corrupt/unwrappable one is logged and regenerated (fail-open — a DPAPI blob that stops unwrapping after a service-account change follows the same contract).
+
+### Auto-rotation (no grace period)
+
+The default key auto-rotates every `ApiSecurity.DefaultKeyRotationHours` hours (default **24**): the new key is written atomically, logged at INFO, and the **old key stops working immediately** (no grace period). Callers should implement the **re-read-the-key-after-401** pattern: on a 401, re-read `default-key.dat` (or re-fetch the key) and retry once.
+
+`POST /api/router/api-keys/default/rotate` (key-protected) rotates the default key **manually and immediately** with the same semantics; the response returns the new raw key.
+
+### User keys with custom durations
+
+Create additional keys via the key-management endpoints (all key-protected by definition — managing keys requires a valid key):
+
+```bash
+# Create a key valid for 168 hours (168 = hours; omitted "validFor" = no expiry; < 1 = 400)
+curl -X POST http://localhost:11434/api/router/api-keys \
+  -H "Authorization: Bearer <default-or-user-key>" \
+  -H "Content-Type: application/json" \
+  -d '{ "name": "ci", "validFor": 168 }'   # → 201, the raw key is returned once
+
+curl http://localhost:11434/api/router/api-keys \
+  -H "X-Api-Key: <key>"                      # → list (masked: name, createdAt, expiresAt only)
+
+curl -X DELETE http://localhost:11434/api/router/api-keys/ci \
+  -H "Authorization: Bearer <key>"           # → 200 (404 when unknown)
+```
+
+Expired user keys are rejected with 401 (expiry is enforced lazily at validation time). Keys are accepted via **`Authorization: Bearer <key>`** or **`X-Api-Key: <key>`** (the Bearer header wins when both are present).
+
+**Security notes**: the raw default key is logged at INFO on (re)generation by design (local operators capture it from the log; log files live in `logs/` next to the executable); `GET /api/router/config` reports the effective `apiSecurity` section settings but **no key material**; 401 responses and warning logs never contain key material; key comparisons are constant-time.
+
 ## Dual-Router Mesh (Desktop + Laptop)
 
 OllamaRouter is designed to run as a **symmetrical mesh**: place one router on *each* node and let every router see every physical daemon. Because a router only ever forwards **directly to a physical daemon** (it never lists a peer router as a target), the mesh is loop-free by construction — there is no router→router hop to recurse on.

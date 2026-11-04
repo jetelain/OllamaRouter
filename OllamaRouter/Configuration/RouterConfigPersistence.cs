@@ -8,6 +8,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using OllamaRouter.Endpoints;
 using OllamaRouter.Options;
+using OllamaRouter.Security;
 
 namespace OllamaRouter.Configuration;
 
@@ -358,6 +359,9 @@ public sealed class RouterConfigPersistence : IRouterConfigPersistence
             Directory.CreateDirectory(directory);
             tempPath = Path.Combine(directory, $"config.json.tmp-{Guid.NewGuid():N}");
             await File.WriteAllTextAsync(tempPath, root.ToJsonString(FileWriteOptions), cancellationToken).ConfigureAwait(false);
+            // 0600 hardening (task #50): the user config layer lands owner-only on Unix
+            // (behavior-neutral on Windows).
+            SecretFilePermissions.ApplyOwnerOnly(tempPath);
             File.Move(tempPath, ConfigFilePath, overwrite: true);
             return new RouterConfigPersistResult(true);
         }

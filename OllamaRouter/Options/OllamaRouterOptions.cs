@@ -15,7 +15,7 @@ namespace OllamaRouter.Options;
 /// <c>FilterNamespacedModels</c>, <c>TokenEstimationOverheadFactor</c>, <c>Models:{model}.*</c>
 /// thresholds, <c>CloudOverflow.*</c>, <c>Recording.*</c> (incl. <c>TokenMetricsCsv</c>),
 /// <c>Aggregation.PerTargetTimeoutMs</c>, <c>DynamicContext.*</c>,
-/// <c>TerminalMonitoring.RefreshIntervalSeconds</c>, <c>Pricing.*</c> and per-EXISTING-target
+/// <c>TerminalMonitoring.RefreshIntervalSeconds</c>, <c>ApiSecurity.*</c>, <c>Pricing.*</c> and per-EXISTING-target
 /// attributes (<c>Enabled</c>, <c>MaxParallel</c>, <c>MaxVramMB</c>, <c>SpeedFactor</c>,
 /// <c>Location</c>).
 /// </para>
@@ -238,6 +238,15 @@ public sealed class OllamaRouterOptions
     public DynamicContextOptions DynamicContext { get; set; } = new();
 
     /// <summary>
+    /// API key security configuration (task #50): config-affecting endpoints are
+    /// key-protected by default; <see cref="ApiSecurityOptions.RequireKeyForAllEndpoints"/>
+    /// extends enforcement to every endpoint, and <see cref="ApiSecurityOptions.DefaultKeyRotationHours"/>
+    /// controls the auto-rotation interval of the auto-generated default key. Both values are
+    /// LIVE (read from <c>IOptionsMonitor</c> per request / per rotation tick).
+    /// </summary>
+    public ApiSecurityOptions ApiSecurity { get; set; } = new();
+
+    /// <summary>
     /// Returns the effective fleet target list: the configured <see cref="Targets"/> in order
     /// (skipping invalid entries with a null/empty <c>Name</c> or <c>Url</c>, logging a warning
     /// for each skipped entry), or — when no targets are configured — a synthesized legacy list
@@ -343,6 +352,8 @@ public sealed class OllamaRouterOptions
         {
             tokenMetricsCsv.MaxFiles = 0;
         }
+
+        ApiSecurity.Normalize();
     }
 }
 
@@ -822,4 +833,49 @@ public sealed class PricingOptions
         (PromptPricePerMillion.HasValue && PromptPricePerMillion.Value >= 0) ||
         (CompletionPricePerMillion.HasValue && CompletionPricePerMillion.Value >= 0) ||
         (PricePerMillion.HasValue && PricePerMillion.Value >= 0);
+}
+
+/// <summary>
+/// API key security configuration (task #50): the router exposes an API-key system so
+/// config-affecting endpoints (GET/PUT /api/router/config, POST/PUT/DELETE
+/// /api/router/targets, PUT /api/router/fleet/hardware/{targetName},
+/// POST /api/router/benchmark, DELETE /api/router/benchmark/results and the key
+/// management endpoints) cannot be edited unauthenticated. An auto-generated DEFAULT key is
+/// stored in config/default-key.dat (DPAPI-wrapped on Windows, 0600 on Unix) and is
+/// auto-rotated every <see cref="DefaultKeyRotationHours"/> hours (no grace period); operators
+/// can create additional, duration-limited user keys (hashes only, in
+/// config/api-keys.json) via the /api/router/api-keys endpoints.
+/// </summary>
+public sealed class ApiSecurityOptions
+{
+    /// <summary>
+    /// When true (default false), the API key is required on EVERY endpoint (reads, monitor
+    /// pages, proxying, runtime actions) instead of only the default config-affecting route
+    /// set. LIVE: the auth middleware reads this per request via
+    /// IOptionsMonitor&lt;OllamaRouterOptions&gt;.CurrentValue, so a config/config.json
+    /// edit rebinds without a restart.
+    /// </summary>
+    public bool RequireKeyForAllEndpoints { get; set; } = false;
+
+    /// <summary>
+    /// Auto-rotation interval (in hours) of the auto-generated default API key: when the
+    /// stored key's generatedAt is older than this many hours the rotation service
+    /// generates a new key, atomically replaces config/default-key.dat and logs the new
+    /// raw key at INFO (callers must re-read the key after a 401; there is NO grace period
+    /// for the old key). Defaults to 24 (hours). Values &lt;= 0 are clamped back to 24 by
+    /// <see cref="Normalize"/>. LIVE: each rotation tick reads the current value.
+    /// </summary>
+    public int DefaultKeyRotationHours { get; set; } = 24;
+
+    /// <summary>
+    /// Normalizes the section after config binding: clamps non-positive
+    /// <see cref="DefaultKeyRotationHours"/> back to the 24 h default. Never throws.
+    /// </summary>
+    public void Normalize()
+    {
+        if (DefaultKeyRotationHours <= 0)
+        {
+            DefaultKeyRotationHours = 24;
+        }
+    }
 }

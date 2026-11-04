@@ -11,6 +11,7 @@ using OllamaRouter.Endpoints;
 using OllamaRouter.Middleware;
 using OllamaRouter.Options;
 using OllamaRouter.ReverseProxy;
+using OllamaRouter.Security;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services;
 using OllamaRouter.Services.Benchmarking;
@@ -227,6 +228,21 @@ public static class OllamaRouterServiceCollectionExtensions
             sp,
             sp.GetService<ILoggerFactory>()?.CreateLogger<RouterConfigPersistence>()));
 
+        // API key security (task #50): the at-rest protector is platform-selected at DI time
+        // (DPAPI-wrapped default key on Windows; plain + 0600 permissions on Unix; unit tests
+        // inject a fake protector so real DPAPI is never touched), the key store owns
+        // config/default-key.dat + config/api-keys.json (lazy load, atomic writes) and the
+        // rotation service auto-rotates the stale default key (class-based AddHostedService —
+        // the factory form trips the .NET 10 TryAddEnumerable type-validation, see below).
+        services.AddSingleton<IKeyProtector>(_ =>
+            OperatingSystem.IsWindows() ? new DpapiKeyProtector() : new PlainKeyProtector());
+        services.AddSingleton<IApiKeyStore>(sp => new ApiKeyStore(
+            sp.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>(),
+            sp,
+            sp.GetRequiredService<IKeyProtector>(),
+            sp.GetService<ILoggerFactory>()?.CreateLogger<ApiKeyStore>()));
+        services.AddHostedService<DefaultKeyRotationHostedService>();
+
         // Effective fleet targets plus the Cloud pseudo-target; used by the availability and statistics
         // services so state is keyed per target. Invalid Targets entries are skipped with a warning here.
         var startupLogger = LoggerFactory.Create(_ => { }).CreateLogger("OllamaRouter.Startup");
@@ -404,12 +420,19 @@ public static class OllamaRouterServiceCollectionExtensions
     }
 
     /// <summary>
-    /// Applies the OllamaRouter request pipeline in the exact production order: the routing middleware
+    /// Applies the OllamaRouter request pipeline in the exact production order: the API key
+    /// auth middleware FIRST (a 401 short-circuits before everything else; path-based
+    /// protection of the config-affecting route set, or of EVERY route when
+    /// <c>ApiSecurity.RequireKeyForAllEndpoints</c> is set), then the routing middleware
     /// (before <c>UseRouting</c> so the X-Ollama-Target header is set before route selection), then the
     /// hybrid short-circuit endpoints, the monitor endpoints, and finally the YARP catch-all.
     /// </summary>
     public static WebApplication UseOllamaRouterPipeline(this WebApplication app)
     {
+        // 0. API KEY AUTH (task #50): must run FIRST so a 401 short-circuits before header
+        //    sanitization/dispatch, endpoint selection and the YARP proxy.
+        app.UseMiddleware<ApiKeyAuthMiddleware>();
+
         // 1. INSPECTION MIDDLEWARE (dynamic routing). Must run before UseRouting: because
         //    WebApplication implicitly inserts UseRouting at the very beginning as soon as any Map*
         //    is called, UseRouting() must be called explicitly here, after the middleware, so the
