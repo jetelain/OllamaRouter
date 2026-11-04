@@ -15,7 +15,9 @@ namespace OllamaRouter.Tests.Services;
 /// Tests for the two-stage hot-model affinity scoring pipeline (Phase 3, item 3):
 /// Stage-1 candidate qualification + Stage-2 calibrated scoring
 /// (Affinity +100, Hardware +20, Eviction -80, Concurrency (InFlight×40)+(cliff?100:0)),
-/// declaration-order tie-break, and the Cloud fixed-score-0 terminal fallback.
+/// declaration-order tie-break, and the Cloud fixed-score-0 terminal fallback (which is
+/// preempted by the DispatchToLargestCapacityOnOverflow clamped dispatch on context
+/// overflow — task #53 precedence).
 /// </summary>
 public class RoutingDecisionServiceTests
 {
@@ -2478,6 +2480,133 @@ public class RoutingDecisionServiceTests
     }
 
     // ==================================================================
+    // Largest-capacity fallback precedence over Cloud Overflow (task #53)
+    // ==================================================================
+
+    [Fact]
+    public async Task LargestCapacityFallback_TakesPriorityOverCloudOverflow_WhenCloudConfigured()
+    {
+        var meta = new MetaMap();
+        meta.Add(DesktopUrl, "m", PinnedDenseShow(7_000_000_000, modelfileNumCtx: 4096), 16 * Gb);
+        meta.Add(LaptopUrl, "m", PinnedDenseShow(7_000_000_000, modelfileNumCtx: 16384), 8 * Gb);
+        meta.Add(ServerUrl, "m", PinnedDenseShow(7_000_000_000, modelfileNumCtx: 65536), 16 * Gb);
+
+        var (h, _) = Build(
+            FleetOptions("m", cloudModel: "cloud-model", dispatchToLargestCapacityOnOverflow: true),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|m", $"{LaptopUrl}|m", $"{ServerUrl}|m" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            meta: meta);
+
+        // 70,000 + 8,192 = 78,192 tokens > 65536 max capacity -> all targets overflow context
+        var result = await h.DecideDetailed(70_000, "m");
+
+        // The clamped local dispatch wins over the qualified (fixed score 0) Cloud candidate
+        Assert.Equal(TServer, result.Target);
+        Assert.True(result.IsFallback);
+        Assert.Equal("LargestCapacityOverflow", result.FallbackStrategy);
+        Assert.Equal(65536, result.TargetCMax);
+
+        // The Cloud pseudo-target WAS appended and qualified (the legacy pre-emption qualifier)
+        // but is NOT the winner: the escape hatch runs before the score-ranked selection
+        var cloud = h.Eval(RoutingTarget.Cloud);
+        Assert.NotNull(cloud);
+        Assert.True(cloud!.Qualified);
+        Assert.Contains("terminal fallback behind the largest-capacity clamp", cloud.Detail);
+    }
+
+    [Fact]
+    public async Task LargestCapacityFallback_Disabled_FallsThroughToCloudOverflow()
+    {
+        var meta = new MetaMap();
+        meta.Add(DesktopUrl, "m", PinnedDenseShow(7_000_000_000, modelfileNumCtx: 4096), 16 * Gb);
+        meta.Add(LaptopUrl, "m", PinnedDenseShow(7_000_000_000, modelfileNumCtx: 16384), 8 * Gb);
+        meta.Add(ServerUrl, "m", PinnedDenseShow(7_000_000_000, modelfileNumCtx: 65536), 16 * Gb);
+
+        var (h, _) = Build(
+            FleetOptions("m", cloudModel: "cloud-model", dispatchToLargestCapacityOnOverflow: false),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|m", $"{LaptopUrl}|m", $"{ServerUrl}|m" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            meta: meta);
+
+        // 70,000 + 8,192 = 78,192 tokens > 65536 -> all targets overflow context
+        var result = await h.DecideDetailed(70_000, "m");
+
+        // Option disabled -> no clamped local dispatch; Cloud wins via the normal selection
+        Assert.Equal(RoutingTarget.Cloud, result.Target);
+        Assert.False(result.IsFallback);
+        Assert.Null(result.FallbackStrategy);
+        Assert.Null(result.TargetCMax);
+    }
+
+    [Fact]
+    public async Task LargestCapacityFallback_StreakExceeded_FallsBackToCloudOverflow()
+    {
+        var meta = new MetaMap();
+        meta.Add(ServerUrl, "m", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 131_072), 16 * Gb);
+
+        var options = FleetOptions("m", cloudModel: "cloud-model", dispatchToLargestCapacityOnOverflow: true);
+        options.MaxConsecutiveFailures = 3;
+
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{ServerUrl}|m" },
+            onlineTargets: new() { "Server" },
+            failureStreaks: _ => 5, // Server streak (5) > threshold (3); no other fallback candidate
+            meta: meta);
+
+        // 150,000 + 8,192 = 158,192 tokens > 131,072 -> Server context overflow
+        var result = await h.DecideDetailed(150_000, "m");
+
+        // Every largest-capacity fallback candidate is in a failure streak -> deferred to the
+        // terminal fallback: Cloud (no IsFallback result, no clamped dispatch to a failing node)
+        Assert.Equal(RoutingTarget.Cloud, result.Target);
+        Assert.False(result.IsFallback);
+        Assert.Null(result.FallbackStrategy);
+        Assert.Null(result.TargetCMax);
+        Assert.False(h.Eval(TServer)!.Qualified);
+        Assert.StartsWith("context overflow", h.Eval(TServer)!.DisqualifiedReason);
+    }
+
+    [Fact]
+    public async Task LargestCapacityFallback_NonContextDisqualification_RoutesToCloud()
+    {
+        // 27B LargeDense on an 8 GB Laptop-class target only: hardware incapable, not overflow
+        var meta = new MetaMap();
+        meta.Add(LaptopUrl, "qwen3.8-27B", PinnedDenseShow(27_800_000_000), 8 * Gb);
+
+        var options = new OllamaRouterOptions
+        {
+            Targets = new List<OllamaTargetOptions> { Laptop },
+            Models = new Dictionary<string, ModelThresholds>
+            {
+                ["qwen3.8-27B"] = new ModelThresholds { CloudModel = "cloud-model" }
+            },
+            DispatchToLargestCapacityOnOverflow = true
+        };
+
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{LaptopUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Laptop" },
+            meta: meta);
+
+        // 1,000 tokens fit any capacity: the only failure is hardware incapable (27B on 8 GB)
+        var result = await h.DecideDetailed(1_000, "qwen3.8-27B");
+
+        // Non-context disqualification => no clamped dispatch; Cloud wins via the normal selection
+        Assert.Equal(RoutingTarget.Cloud, result.Target);
+        Assert.False(result.IsFallback);
+        Assert.Null(result.FallbackStrategy);
+        Assert.Null(result.TargetCMax);
+        Assert.False(h.Eval(TLaptop)!.Qualified);
+        Assert.StartsWith("hardware incapable", h.Eval(TLaptop)!.DisqualifiedReason);
+    }
+
+    // ==================================================================
     // Speed bonus tests end; shared helpers below
     // ==================================================================
 
@@ -2675,11 +2804,11 @@ public class RoutingDecisionServiceTests
             Assert.DoesNotContain(h.Evaluations, e => e.Target == RoutingTarget.Cloud);
         }
 
-        // Case 3 (contrast): unscooped with dispatch=false and Cloud configured — Cloud WOULD
-        // normally be a score-0 candidate. With the scope, Cloud is excluded.
+        // Case 3 (contrast): unscooped with dispatch=false and Cloud configured — Cloud is a
+        // score-0 candidate and, with the escape hatch disabled, wins over the overflow.
         {
             var (h, _) = BuildScope(
-                ScopeOptions("m", cloudModel: "cloud-model:1b"),
+                ScopeOptions("m", cloudModel: "cloud-model:1b", dispatchToLargestCapacityOnOverflow: false),
                 withEngine: true,
                 catalogModels: new() { $"{ScopeLocalUrl}|m", $"{ScopeRemoteUrl}|m", $"{ScopeEdgeUrl}|m" },
                 onlineTargets: new() { "Local", "Remote", "edge" },
@@ -2688,6 +2817,26 @@ public class RoutingDecisionServiceTests
             var result = await h.Decide(30_000, "m");
             // Without scope: Cloud is a candidate (score 0) and wins over in-scope overflow.
             Assert.Equal(RoutingTarget.Cloud, result);
+            Assert.Contains(h.Evaluations, e => e.Target == RoutingTarget.Cloud && e.Qualified);
+        }
+
+        // Case 4 (task #53): unscooped with dispatch=true and Cloud configured — the
+        // largest-capacity escape hatch runs BEFORE the score-ranked selection and preempts
+        // the qualified Cloud pseudo-target: the clamped local dispatch wins.
+        {
+            var (h, _) = BuildScope(
+                ScopeOptions("m", cloudModel: "cloud-model:1b"),
+                withEngine: true,
+                catalogModels: new() { $"{ScopeLocalUrl}|m", $"{ScopeRemoteUrl}|m", $"{ScopeEdgeUrl}|m" },
+                onlineTargets: new() { "Local", "Remote", "edge" },
+                meta: meta);
+
+            var result = await h.DecideDetailed(30_000, "m");
+            // Tied CMax (4096) + zero in-flight ⇒ declaration order: Local is the first target.
+            Assert.Equal(TScopeLocal, result.Target);
+            Assert.True(result.IsFallback);
+            Assert.Equal("LargestCapacityOverflow", result.FallbackStrategy);
+            // Cloud remains a qualified candidate (it just no longer wins).
             Assert.Contains(h.Evaluations, e => e.Target == RoutingTarget.Cloud && e.Qualified);
         }
     }

@@ -19,8 +19,12 @@ namespace OllamaRouter.Services;
 /// Cloud pseudo-target participates as a
 /// fixed score-0 candidate appended after all fleet targets (it therefore loses 0-vs-0 ties
 /// but beats every negative fleet score), never earns the SessionAffinityBonus, and is never
-/// leased to a session. When a request carries a session ID, the final winning target is
-/// leased back via <see cref="ISessionAffinityService"/> (failover re-binds automatically).
+/// leased to a session — however, the DispatchToLargestCapacityOnOverflow largest-capacity
+/// escape hatch runs BEFORE the score-ranked selection and preempts the Cloud pseudo-target
+/// when the fleet fails Stage 1 with context overflow (task #53: Cloud is the terminal
+/// fallback BEHIND the clamped local dispatch). When a request carries a session ID, the
+/// final winning target is leased back via <see cref="ISessionAffinityService"/> (failover
+/// re-binds automatically).
 /// </summary>
 public sealed class RoutingDecisionService : IRoutingDecisionService
 {
@@ -207,7 +211,12 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
 
     /// <summary>
     /// Runs the full two-stage pipeline and returns a detailed <see cref="RoutingDecisionResult"/>
-    /// including whether fallback was applied and candidate evaluations.
+    /// including whether fallback was applied and candidate evaluations. When no fleet candidate
+    /// is qualified and the Stage-1 failures include a context overflow, the
+    /// DispatchToLargestCapacityOnOverflow escape hatch runs BEFORE the score-ranked selection and
+    /// preempts the configured Cloud pseudo-target (the clamped largest-capacity dispatch wins;
+    /// Cloud remains the terminal fallback when the option is disabled, when no fleet candidate
+    /// can serve the overflow, or when every fallback candidate is in a failure streak — task #53).
     /// </summary>
     public async Task<RoutingDecisionResult> DecideWithEvaluationsDetailedAsync(
         int tokenCount,
@@ -239,8 +248,9 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         // A scope excludes out-of-scope fleet targets BEFORE Stage 1 (they emit no evaluation
         // artifacts and can never win), gates the Cloud pseudo-target on Cloud being allowed,
         // and — through reusing the filtered list below — restricts the Stage-1 loop, the
-        // speed-bonus post-pass and the DispatchToLargestCapacityOnOverflow escape hatch to
-        // in-scope candidates (a privacy scope must never leak to an out-of-scope relay).
+        // speed-bonus post-pass and the DispatchToLargestCapacityOnOverflow escape hatch (which
+        // preempts the Cloud pseudo-target on context overflow, task #53) to in-scope candidates
+        // (a privacy scope must never leak to an out-of-scope relay).
         var allFleetTargets = settings.GetEffectiveTargets(_logger);
         var fleetTargets = allowedLocations is null
             ? allFleetTargets
@@ -317,112 +327,43 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
                     HardwareBonus: 0,
                     EvictionPenalty: 0,
                     ConcurrencyPenalty: 0,
-                    Detail: "Cloud overflow: fixed score 0 (terminal fallback, sorted after all fleet targets).");
+                    Detail: "Cloud overflow: fixed score 0 (terminal fallback behind the largest-capacity clamp, sorted after all fleet targets).");
                 evaluations.Add(cloudEvaluation);
                 reportEvaluation(cloudEvaluation);
             }
         }
 
         // ---- Selection: highest score; ties by declaration order (stable). ----
+        //
+        // ---- Largest-capacity overflow escape hatch (task #53: precedence over Cloud). ----
+        // Runs BEFORE the normal score-ranked selection so it can preempt the Cloud
+        // pseudo-target: Cloud qualifies with a fixed score 0 whenever configured, so under
+        // the legacy `qualified.Count == 0` gate a configured Cloud silently swallowed every
+        // context-overflow decision (the expensive relay won over the clamped local dispatch).
+        // The hatch fires when NO fleet target qualified, at least one Stage-1 failure is a
+        // context overflow, and DispatchToLargestCapacityOnOverflow is enabled: the request
+        // is clamped to the largest-capacity context-overflow fleet candidate (IsFallback,
+        // "LargestCapacityOverflow"). Cloud Overflow remains the TERMINAL fallback, reached
+        // via the normal selection below when the option is disabled, when no fleet failure
+        // is a context overflow (offline / disabled / model absent / hardware incapable /
+        // pinned-Dense veto ⇒ nothing can be clamped), or when every largest-capacity
+        // fallback candidate is in a failure streak (the escape hatch defers, returning null).
+        var fleetEvaluations = evaluations.Where(e => e.Target != RoutingTarget.Cloud).ToList();
+        if (settings.DispatchToLargestCapacityOnOverflow &&
+            !fleetEvaluations.Any(e => e.Qualified) &&
+            HasContextOverflowFailure(fleetEvaluations))
+        {
+            var fallbackDecision = await TryResolveLargestCapacityFallbackAsync(
+                context, fleetTargets, evaluations, thresholds, settings, normalizedName, modelName, sessionId, cancellationToken);
+            if (fallbackDecision is not null)
+            {
+                return fallbackDecision;
+            }
+        }
+
         var qualified = evaluations.Where(e => e.Qualified).ToList();
         if (qualified.Count == 0)
         {
-            if (settings.DispatchToLargestCapacityOnOverflow)
-            {
-                var fallbackCandidates = new List<(RoutingTarget Target, OllamaTargetOptions Options, TargetModelCapability Capability, int InFlight, int Index)>();
-                for (var i = 0; i < fleetTargets.Count; i++)
-                {
-                    var targetOptions = fleetTargets[i];
-                    var target = new RoutingTarget(targetOptions.Name!);
-                    var eval = evaluations.FirstOrDefault(e => e.Target == target);
-                    if (eval is not null && !eval.Qualified && eval.DisqualifiedReason != null && eval.DisqualifiedReason.StartsWith("context overflow", StringComparison.OrdinalIgnoreCase))
-                    {
-                        var capability = await context.GetTargetCapabilityAsync(target, targetOptions.Url!, cancellationToken);
-                        if (capability is not null)
-                        {
-                            var inFlight = context.GetExecutionState(target)?.InFlightRequests ?? 0;
-                            fallbackCandidates.Add((target, targetOptions, capability, inFlight, i));
-                        }
-                    }
-                }
-
-                if (fallbackCandidates.Count > 0)
-                {
-                    var fallbackRanked = fallbackCandidates
-                        .OrderByDescending(c => ContextCapacityForFit(c.Capability, thresholds))
-                        .ThenBy(c => c.InFlight)
-                        .ThenBy(c => c.Index)
-                        .ToList();
-
-                    var maxAvailableCandidate = fallbackRanked[0];
-                    var winnerCandidate = maxAvailableCandidate;
-                    var finalFallbackWinner = winnerCandidate.Target;
-
-                    // The true largest-capacity candidate (drives the warning header's
-                    // "Max available" figure) — the MoE-aware capacity for MoE candidates,
-                    // the pre-configured CMax for dense (task #26, Option A).
-                    var maxAvailableCapacity = ContextCapacityForFit(maxAvailableCandidate.Capability, thresholds);
-
-                    var maxFailuresFallback = settings.MaxConsecutiveFailures;
-                    if (maxFailuresFallback > 0 && _streakTracker.ShouldSkip(winnerCandidate.Target, maxFailuresFallback))
-                    {
-                        var nextCandidate = fallbackRanked
-                            .Skip(1)
-                            .FirstOrDefault(c => !_streakTracker.ShouldSkip(c.Target, maxFailuresFallback));
-
-                        if (nextCandidate.Options is not null)
-                        {
-                            _logger.LogInformation(
-                                "{Model}: Target {FailedTarget} has a failure streak of {Streak} above threshold {MaxFailures}. Switching to next fallback target {NewTarget}.",
-                                normalizedName, winnerCandidate.Target, _streakTracker.GetStreak(winnerCandidate.Target), maxFailuresFallback, nextCandidate.Target);
-                            winnerCandidate = nextCandidate;
-                            finalFallbackWinner = nextCandidate.Target;
-                        }
-                        else
-                        {
-                            _logger.LogWarning(
-                                "{Model}: Target {FailedTarget} has a failure streak of {Streak} above threshold {MaxFailures}, but no subsequent fallback target is enabled or can process the request. Keeping {FailedTarget}.",
-                                normalizedName, winnerCandidate.Target, _streakTracker.GetStreak(winnerCandidate.Target), maxFailuresFallback, winnerCandidate.Target);
-                        }
-                    }
-
-                    if (_sessionAffinity is { } fallbackAffinity &&
-                        !string.IsNullOrWhiteSpace(sessionId) &&
-                        finalFallbackWinner != RoutingTarget.Cloud)
-                    {
-                        fallbackAffinity.SetAffinity(sessionId, finalFallbackWinner);
-                    }
-
-                    // The capacity actually served by the (possibly streak-switched) winner
-                    // (MoE: extensible limit; dense: pre-configured CMax) — drives the
-                    // middleware's explicit clamp and the warning header. Computed AFTER the
-                    // failure-streak switch so it reflects the final winner.
-                    var winnerCapacity = ContextCapacityForFit(winnerCandidate.Capability, thresholds);
-
-                    var margin = Math.Max(0, settings.ContextFitMarginTokens);
-                    var breakdown = BuildCandidateBreakdown(fleetTargets, evaluations, context);
-
-                    _logger.LogWarning(
-                        "Request for '{Model}' (estimated {Tokens} tokens + margin {Margin}) exceeds all fleet context capacities (Max available: {MaxAvailableTarget} with {MaxAvailableCMax}).\n" +
-                        "Dispatching best-effort to largest-capacity target '{WinnerTarget}' with num_ctx clamped to {WinnerCMax}.\n" +
-                        "Candidate breakdown:\n{Breakdown}",
-                        modelName,
-                        tokenCount,
-                        margin,
-                        maxAvailableCandidate.Options.Name,
-                        maxAvailableCapacity,
-                        winnerCandidate.Options.Name,
-                        winnerCapacity,
-                        breakdown);
-
-                    return new RoutingDecisionResult(
-                        finalFallbackWinner,
-                        IsFallback: true,
-                        FallbackStrategy: "LargestCapacityOverflow",
-                        TargetCMax: winnerCapacity);
-                }
-            }
-
             var rejectionMargin = Math.Max(0, settings.ContextFitMarginTokens);
             var rejectionBreakdown = BuildCandidateBreakdown(fleetTargets, evaluations, context);
             _logger.LogWarning(
@@ -491,6 +432,140 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
 
         return new RoutingDecisionResult(finalWinner);
     }
+
+    /// <summary>
+    /// Resolves the DispatchToLargestCapacityOnOverflow largest-capacity fallback: ranks the
+    /// context-overflow fleet candidates by fit capacity (descending; MoE-aware extensible limit
+    /// for MoE, pre-configured CMax for dense) → in-flight (ascending) → declaration index
+    /// (ascending), switches a failure-streaked top candidate to the next eligible one, writes
+    /// the session lease, and returns the IsFallback "LargestCapacityOverflow" decision whose
+    /// TargetCMax drives the middleware's explicit num_ctx clamp and warning headers.
+    /// Returns null — deferring to the terminal fallback (Cloud Overflow when configured,
+    /// otherwise the 503 NoAvailableTarget rejection) — when no context-overflow candidate has
+    /// a resolvable capability, or when the top candidate is in a failure streak and no
+    /// lower-ranked candidate passes the streak gate (task #53: a failing node is never kept).
+    /// </summary>
+    private async Task<RoutingDecisionResult?> TryResolveLargestCapacityFallbackAsync(
+        RoutingContext context,
+        IReadOnlyList<OllamaTargetOptions> fleetTargets,
+        IReadOnlyList<RoutingCandidateEvaluation> evaluations,
+        ModelThresholds? thresholds,
+        OllamaRouterOptions settings,
+        string normalizedName,
+        string modelName,
+        string? sessionId,
+        CancellationToken cancellationToken)
+    {
+        var fallbackCandidates = new List<(RoutingTarget Target, OllamaTargetOptions Options, TargetModelCapability Capability, int InFlight, int Index)>();
+        for (var i = 0; i < fleetTargets.Count; i++)
+        {
+            var targetOptions = fleetTargets[i];
+            var target = new RoutingTarget(targetOptions.Name!);
+            var eval = evaluations.FirstOrDefault(e => e.Target == target);
+            if (eval is not null && !eval.Qualified && eval.DisqualifiedReason != null && eval.DisqualifiedReason.StartsWith("context overflow", StringComparison.OrdinalIgnoreCase))
+            {
+                var capability = await context.GetTargetCapabilityAsync(target, targetOptions.Url!, cancellationToken);
+                if (capability is not null)
+                {
+                    var inFlight = context.GetExecutionState(target)?.InFlightRequests ?? 0;
+                    fallbackCandidates.Add((target, targetOptions, capability, inFlight, i));
+                }
+            }
+        }
+
+        if (fallbackCandidates.Count == 0)
+        {
+            return null;
+        }
+
+        var fallbackRanked = fallbackCandidates
+            .OrderByDescending(c => ContextCapacityForFit(c.Capability, thresholds))
+            .ThenBy(c => c.InFlight)
+            .ThenBy(c => c.Index)
+            .ToList();
+
+        var maxAvailableCandidate = fallbackRanked[0];
+        var winnerCandidate = maxAvailableCandidate;
+
+        // The true largest-capacity candidate (drives the warning header's
+        // "Max available" figure) — the MoE-aware capacity for MoE candidates,
+        // the pre-configured CMax for dense (task #26, Option A).
+        var maxAvailableCapacity = ContextCapacityForFit(maxAvailableCandidate.Capability, thresholds);
+
+        var maxFailuresFallback = settings.MaxConsecutiveFailures;
+        if (maxFailuresFallback > 0 && _streakTracker.ShouldSkip(winnerCandidate.Target, maxFailuresFallback))
+        {
+            var nextCandidate = fallbackRanked
+                .Skip(1)
+                .FirstOrDefault(c => !_streakTracker.ShouldSkip(c.Target, maxFailuresFallback));
+
+            if (nextCandidate.Options is not null)
+            {
+                _logger.LogInformation(
+                    "{Model}: Target {FailedTarget} has a failure streak of {Streak} above threshold {MaxFailures}. Switching to next fallback target {NewTarget}.",
+                    normalizedName, winnerCandidate.Target, _streakTracker.GetStreak(winnerCandidate.Target), maxFailuresFallback, nextCandidate.Target);
+                winnerCandidate = nextCandidate;
+            }
+            else
+            {
+                // Task #53: every largest-capacity fallback candidate is in a failure streak —
+                // never keep the failing node; defer to the terminal fallback.
+                _logger.LogWarning(
+                    "{Model}: Target {FailedTarget} has a failure streak of {Streak} above threshold {MaxFailures}, and no subsequent fallback target is available either. Deferring to the terminal fallback (Cloud Overflow when configured, otherwise a 503 rejection).",
+                    normalizedName, winnerCandidate.Target, _streakTracker.GetStreak(winnerCandidate.Target), maxFailuresFallback);
+                return null;
+            }
+        }
+
+        var finalFallbackWinner = winnerCandidate.Target;
+
+        if (_sessionAffinity is { } fallbackAffinity &&
+            !string.IsNullOrWhiteSpace(sessionId) &&
+            finalFallbackWinner != RoutingTarget.Cloud)
+        {
+            fallbackAffinity.SetAffinity(sessionId, finalFallbackWinner);
+        }
+
+        // The capacity actually served by the (possibly streak-switched) winner
+        // (MoE: extensible limit; dense: pre-configured CMax) — drives the
+        // middleware's explicit clamp and the warning header. Computed AFTER the
+        // failure-streak switch so it reflects the final winner.
+        var winnerCapacity = ContextCapacityForFit(winnerCandidate.Capability, thresholds);
+
+        var margin = Math.Max(0, settings.ContextFitMarginTokens);
+        var breakdown = BuildCandidateBreakdown(fleetTargets, evaluations.ToList(), context);
+
+        _logger.LogWarning(
+            "Request for '{Model}' (estimated {Tokens} tokens + margin {Margin}) exceeds all fleet context capacities (Max available: {MaxAvailableTarget} with {MaxAvailableCMax}).\n" +
+            "Dispatching best-effort to largest-capacity target '{WinnerTarget}' with num_ctx clamped to {WinnerCMax}.\n" +
+            "Candidate breakdown:\n{Breakdown}",
+            modelName,
+            context.TokenCount,
+            margin,
+            maxAvailableCandidate.Options.Name,
+            maxAvailableCapacity,
+            winnerCandidate.Options.Name,
+            winnerCapacity,
+            breakdown);
+
+        return new RoutingDecisionResult(
+            finalFallbackWinner,
+            IsFallback: true,
+            FallbackStrategy: "LargestCapacityOverflow",
+            TargetCMax: winnerCapacity);
+    }
+
+    /// <summary>
+    /// True when at least one unqualified fleet evaluation failed Stage 1 with the
+    /// "context overflow" reason (the exact prefix emitted by the context-fit check). A mixed
+    /// failure set (e.g. one offline target alongside one overflow target) still counts: the
+    /// context-overflow target stays the clamp-eligible fallback candidate while the other
+    /// failures simply carry no fallback eligibility (task #53 — preserves the legacy
+    /// mixed-failure clamp semantics pinned by the LargestCapacityFallback_* suite).
+    /// </summary>
+    private static bool HasContextOverflowFailure(IReadOnlyList<RoutingCandidateEvaluation> fleetEvaluations) =>
+        fleetEvaluations.Any(e => !e.Qualified &&
+            (e.DisqualifiedReason?.StartsWith("context overflow", StringComparison.OrdinalIgnoreCase) ?? false));
 
     // ---- Stage 1 + Stage 2 for one fleet target. ----
 
