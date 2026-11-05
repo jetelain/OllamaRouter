@@ -66,8 +66,8 @@ depends_on: []
   - `"automatic"`: Automatically merges to base branch once all pipeline stages, tests, and SAST gates pass.
 - `base_branch` *(string, optional, default: workspace default, typically "main")*: Target Git branch for the feature branch to branch from and merge into.
 - `depends_on` *(list of integers or strings, optional, default: `[]`)*: Prerequisite tasks that must complete before this task can start. Supports numeric IDs (`[ 101 ]`), markdown filenames (`[ "2026-10-20-task-alpha.md" ]`, `[ "task-alpha.md" ]`), or task slugs/titles (`[ "task-alpha" ]`, `[ "Task Alpha" ]`). Upon synchronization, NightCodeForge resolves string references to database IDs and normalizes the markdown file in-place to canonical integer IDs.
-- `id` *(integer, omit for new tasks)*: NightCodeForge database ID. Leave this field out when creating new tasks; NightCodeForge assigns it automatically upon sync.
-- `status` *(string, omit for new tasks)*: Workflow status (`Suggested`, `Open`, `InProgress`, `Review`, `Closed`, `Failed`). New tasks automatically enter `Suggested` status. Status transitions must occur through workflow gates, not manual editing.
+- `id` *(FORBIDDEN on creation)*: **DO NOT include this field when authoring new tasks.** NightCodeForge assigns it automatically upon sync and writes it back to disk. Providing an explicit `id` causes database collisions, overwrites existing tasks, or triggers duplicate intake errors.
+- `status` *(FORBIDDEN on creation)*: **DO NOT include this field when authoring new tasks.** New tasks automatically enter `Suggested` status. Status transitions must occur through workflow gates, not manual editing.
 
 ### Required Markdown Body Structure
 
