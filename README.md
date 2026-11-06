@@ -555,6 +555,26 @@ Expired user keys are rejected with 401 (expiry is enforced lazily at validation
 
 **Security notes**: the raw default key is logged at INFO on (re)generation by design (local operators capture it from the log; log files live in `logs/` next to the executable); `GET /api/router/config` reports the effective `apiSecurity` section settings but **no key material**; 401 responses and warning logs never contain key material; key comparisons are constant-time.
 
+## Router API documentation (OpenAPI)
+
+The full router management API is documented as an OpenAPI 3.1 JSON document, generated at runtime and served (in ALL environments) at:
+
+```
+GET {bind-address}/api/router/openapi.json
+```
+
+e.g. `http://localhost:11434/api/router/openapi.json`. Point any OpenAPI tooling (Swagger Editor, Redoc, code generators) at that URL. The document covers the 25 `/api/router/*` operations in seven functional groups:
+
+- **Identity & Fleet** — `/info`, `/fleet`
+- **Hardware Profiling** — `/hardware`, `/fleet/hardware` (GET + PUT)
+- **Benchmarking** — `/benchmark`, `/benchmark/results`
+- **Model Catalog & Cartography** — `/models`, `/models/{*modelName}`, `/cartography`
+- **Fleet Operations** — `/vram/reclaim`, `/fleet/unload`, `/context/evaluate`, `/models/{*tail}/preload` (POST catch-all), `/preload/preview`
+- **Setup & Configuration** — `/config`, `/targets` (POST/PUT/DELETE)
+- **API Key Security** — `/api-keys` (GET/POST/DELETE `{name}`), `/api-keys/default/rotate`
+
+The `RouterApiKey` security scheme (http/bearer/base64url — `Authorization: Bearer <key>` or `X-Api-Key: <key>`) is applied to exactly the default protected route set above; with `ApiSecurity.RequireKeyForAllEndpoints: true` every route (including the document endpoint) requires a key. The document is regenerated per request from the same AOT source-generated DTO records the endpoints use — no drift, and it works in AOT-published builds.
+
 ## Dual-Router Mesh (Desktop + Laptop)
 
 OllamaRouter is designed to run as a **symmetrical mesh**: place one router on *each* node and let every router see every physical daemon. Because a router only ever forwards **directly to a physical daemon** (it never lists a peer router as a target), the mesh is loop-free by construction — there is no router→router hop to recurse on.

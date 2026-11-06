@@ -20,6 +20,7 @@ Scenario[] scenarios =
     MonitorScenarios.UpdateTargets(),
     MonitorScenarios.ReclaimVram(),
     MonitorScenarios.ServiceUnavailableWhenNoTargets(),
+    OpenApiScenarios.GetRouterOpenApiDocument(),
     PreloadScenarios.PreloadModel()
 ];
 

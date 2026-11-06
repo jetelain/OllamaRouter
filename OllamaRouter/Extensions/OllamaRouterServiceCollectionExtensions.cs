@@ -204,6 +204,13 @@ public static class OllamaRouterServiceCollectionExtensions
             httpJsonOptions.SerializerOptions.TypeInfoResolverChain.Insert(0, OllamaRouterJsonSerializerContext.Default);
         });
 
+        // Runtime OpenAPI document for the /api/router/ management API (task #51): the .NET 10
+        // built-in generator (first-party Microsoft.AspNetCore.OpenApi package, AOT-safe) serves
+        // GET /api/router/openapi.json. Schema resolution reads IOptions<JsonOptions> configured
+        // above, so every DTO resolves through the source-generated context (named component
+        // schemas, zero drift, no reflection).
+        services.AddRouterOpenApi();
+
         // Code-based YARP configuration: routes/clusters generated from the effective fleet target list.
         var (routes, clusters) = OllamaReverseProxyConfig.Build(startupOptions);
         services.AddReverseProxy().LoadFromMemory(routes, clusters);
@@ -446,6 +453,14 @@ public static class OllamaRouterServiceCollectionExtensions
         // 2b. PROGRAMMATIC ROUTER API /api/router/info + /api/router/fleet (lightweight
         //     identity / fleet hardware topology endpoints for external tooling).
         app.MapOllamaRouterApiEndpoints();
+
+        // 2c. RUNTIME OPENAPI DOCUMENT (task #51): the /api/router/ management API description,
+        //     generated per request from the endpoint metadata + the source-generated DTO
+        //     schemas (always in sync; AOT-safe). Mapped unconditionally (ALL environments —
+        //     not Development-gated). The {documentName} route parameter keeps the pattern
+        //     single-segment (other *.json names 404) and the route intersects no existing
+        //     endpoint (the models/{*...} catch-alls live under the /models/ prefix).
+        app.MapOpenApi(RouterOpenApiConventions.DocumentRoute);
 
         // Lightweight activity monitoring UI (no VRAM impact, in-memory state only).
         app.MapOllamaMonitorEndpoints();

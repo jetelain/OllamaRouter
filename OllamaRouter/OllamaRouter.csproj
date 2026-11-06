@@ -17,6 +17,11 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Bcl.Memory" Version="10.0.12" />
+    <!-- Runtime OpenAPI document for the /api/router/ management API (task #51): the .NET 10
+         built-in generator ships as this first-party package (not framework-internal) and is
+         officially NativeAOT-compatible — schemas resolve from the source-generated
+         OllamaRouterJsonSerializerContext. -->
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.14" />
     <PackageReference Include="Microsoft.ML.Tokenizers" Version="2.0.0" />
     <PackageReference Include="Microsoft.ML.Tokenizers.Data.Cl100kBase" Version="2.0.0" />
     <PackageReference Include="Pmad.AI" Version="0.0.1" />

@@ -81,7 +81,14 @@ public static class RouterApiEndpointsExtensions
             var (fleet, features) = await BuildInfoBlocksAsync(options, serviceProvider, cancellationToken);
             return Results.Json(new RouterInfoResponse(GetRouterVersion(), true, fleet, features),
                 OllamaRouterJsonSerializerContext.Default.RouterInfoResponse);
-        });
+        })
+        .WithName("GetRouterInfo")
+        .WithTags("Identity & Fleet")
+        .WithSummary("Report the router identity, version, fleet summary and active feature flags.")
+        .WithDescription("Instantly differentiates OllamaRouter from a standard Ollama daemon (which 404s this route). "
+            + "Pure in-memory snapshot read: no statistics, no history aggregation and no blocking per-target HTTP (only the awaited "
+            + "local GPU CLI snapshot when a local workstation target is present). 'version' is the assembly informational version. "
+            + "The fleet summary counts the Cloud pseudo-target in totalTargets/onlineTargets when cloud overflow is enabled.");
 
         app.MapGet("/api/router/fleet", async (
             IOptionsMonitor<OllamaRouterOptions> options,
@@ -91,7 +98,15 @@ public static class RouterApiEndpointsExtensions
         {
             var response = await BuildFleetResponseAsync(options, targetAvailability, serviceProvider, cancellationToken);
             return Results.Json(response, OllamaRouterJsonSerializerContext.Default.RouterFleetResponse);
-        });
+        })
+        .WithName("GetRouterFleet")
+        .WithTags("Identity & Fleet")
+        .WithSummary("Full fleet hardware topology with real-time liveness and execution state.")
+        .WithDescription("Every configured target (configuration order) plus the Cloud pseudo-target (last), each with real-time "
+            + "liveness state (Online/Offline/Probing), last-probe latency, detected GPU hardware (local workstation only), "
+            + "in-flight request count, currently loaded model and the active KV-cache context lease. The Cloud pseudo-target "
+            + "is never probed or tracked: 'Online' iff cloud overflow is enabled and it never carries a loaded model, "
+            + "in-flight requests, context lease or latency measurement.");
 
         // Fleet hardware profiling engine: the local node's own profile (cached after the
         // first probe), the full fleet topology (parallel peer probes, fail-soft per node),
@@ -100,13 +115,25 @@ public static class RouterApiEndpointsExtensions
         {
             var profile = await provider.GetLocalProfileAsync(cancellationToken).ConfigureAwait(false);
             return Results.Json(profile, OllamaRouterJsonSerializerContext.Default.NodeHardwareProfile);
-        });
+        })
+        .WithName("GetRouterHardware")
+        .WithTags("Hardware Profiling")
+        .WithSummary("The local node's own hardware profile.")
+        .WithDescription("Fleet hardware profiling engine: the local node's own profile (CPU/system-memory/GPU probe, "
+            + "cached after the first probe). Read-only — no key required in default mode.");
 
         app.MapGet("/api/router/fleet/hardware", async (IFleetHardwareService fleetHardware, CancellationToken cancellationToken) =>
         {
             var nodes = await fleetHardware.GetFleetHardwareAsync(cancellationToken).ConfigureAwait(false);
             return Results.Json(new RouterFleetHardwareResponse(nodes), OllamaRouterJsonSerializerContext.Default.RouterFleetHardwareResponse);
-        });
+        })
+        .WithName("GetRouterFleetHardware")
+        .WithTags("Hardware Profiling")
+        .WithSummary("Fleet hardware topology of every fleet node.")
+        .WithDescription("The full fleet topology: parallel peer probes of the remote router daemons (their own local profile "
+            + "endpoints), fail-soft per node (unreachable nodes degrade to their last stored profile or are absent). "
+            + "The Cloud pseudo-target is never a fleet hardware node (it has no Ollama daemon to probe). Read-only — no key "
+            + "required in default mode.");
 
         app.MapPut("/api/router/fleet/hardware/{targetName}", async (HttpRequest request, string targetName, IFleetHardwareService fleetHardware, CancellationToken cancellationToken) =>
         {
@@ -141,7 +168,13 @@ public static class RouterApiEndpointsExtensions
             }
 
             return Results.Json(profile, OllamaRouterJsonSerializerContext.Default.NodeHardwareProfile);
-        });
+        })
+        .WithName("PutRouterFleetHardwareProfile")
+        .WithTags("Hardware Profiling")
+        .WithSummary("Manually store a hardware profile for a target (protected: API key required).")
+        .WithDescription("Manual profile push for bare Ollama targets without a router daemon. Request body: a NodeHardwareProfile "
+            + "JSON with a non-empty 'nodeName' (missing → 400 OllamaErrorResponse); unknown targetName → 404. On success the "
+            + "stored profile is echoed (200). Protected by the API-key middleware (default protected set).");
 
         // Model benchmarking (task #28): non-blocking run trigger (202), single-flight 409,
         // results query (including in-flight Running rows) and result clearing.
@@ -211,14 +244,27 @@ public static class RouterApiEndpointsExtensions
                 new RouterBenchmarkRunResponse(true, queuedTargets),
                 OllamaRouterJsonSerializerContext.Default.RouterBenchmarkRunResponse,
                 statusCode: StatusCodes.Status202Accepted);
-        });
+        })
+        .WithName("PostRouterBenchmarkRun")
+        .WithTags("Benchmarking")
+        .WithSummary("Queue a non-blocking model benchmark run (protected: API key required).")
+        .WithDescription("A null/absent body is valid and benchmarks ALL effective non-Cloud targets (fleet-wide zero-config flow); "
+            + "'target' names a single effective target (unknown → 404); 'roles'/'model' filter the catalog candidates "
+            + "(null/empty = all). 202 = accepted and queued non-blocking — the run loop drains the targets sequentially in the "
+            + "background and this response never waits; 409 = a run is already in progress (single-flight); 400 = malformed body. "
+            + "Protected by the API-key middleware (default protected set).");
 
         app.MapGet("/api/router/benchmark/results", (IMicroBenchmarkRunner benchmarkRunner) =>
         {
             var response = new RouterBenchmarkResultsResponse(
                 benchmarkRunner.GetAllResults());
             return Results.Json(response, OllamaRouterJsonSerializerContext.Default.RouterBenchmarkResultsResponse);
-        });
+        })
+        .WithName("GetRouterBenchmarkResults")
+        .WithTags("Benchmarking")
+        .WithSummary("List benchmark results (including in-flight Running rows).")
+        .WithDescription("Every known target result (persisted or in-flight; in-flight rows carry status \"Running\"), "
+            + "empty when nothing ever ran. Read-only — no key required in default mode.");
 
         app.MapDelete("/api/router/benchmark/results", (IMicroBenchmarkRunner benchmarkRunner) =>
         {
@@ -228,7 +274,14 @@ public static class RouterApiEndpointsExtensions
             return Results.Json(
                 new RouterBenchmarkClearedResponse(true),
                 OllamaRouterJsonSerializerContext.Default.RouterBenchmarkClearedResponse);
-        });
+        })
+        .WithName("DeleteRouterBenchmarkResults")
+        .WithTags("Benchmarking")
+        .WithSummary("Clear all benchmark results (protected: API key required).")
+        .WithDescription("In-flight runs keep their Running states: the delete applies to completed targets only and the background "
+            + "work continues for its remaining targets. Clears in-memory state + benchmarks.json + benchmark-seeded "
+            + "targets-speed.json entries (\"learned\" entries are never touched). Protected by the API-key middleware (default "
+            + "protected set).");
 
         app.MapGet("/api/router/models", async (
             IOptionsMonitor<OllamaRouterOptions> options,
@@ -238,7 +291,15 @@ public static class RouterApiEndpointsExtensions
         {
             var response = await BuildModelsListAsync(options, serviceProvider, context, cancellationToken);
             return Results.Json(response, OllamaRouterJsonSerializerContext.Default.RouterModelsResponse);
-        });
+        })
+        .WithName("GetRouterModels")
+        .WithTags("Model Catalog & Cartography")
+        .WithSummary("Zero-config model capability catalog of the merged fleet.")
+        .WithDescription("Per-model architecture classification (Dense/Moe/Unknown), parameter count, native Modelfile num_ctx and "
+            + "the router-calculated hardware-safe context ceiling (recommendedContextWindow = max CMax over the hardware-capable "
+            + "fleet targets; cloud overflow is never a ceiling contributor, only the cloudOverflowAvailable hint). The merged "
+            + "fleet model names (first-seen order) plus cloud synthesis names when Cloud overflow is available. "
+            + "Read-only — no key required in default mode.");
 
         app.MapGet("/api/router/models/{*modelName}", async (
             IOptionsMonitor<OllamaRouterOptions> options,
@@ -258,7 +319,15 @@ public static class RouterApiEndpointsExtensions
             }
 
             return Results.Json(detail, OllamaRouterJsonSerializerContext.Default.RouterModelDetailResponse);
-        });
+        })
+        .WithName("GetRouterModelDetail")
+        .WithTags("Model Catalog & Cartography")
+        .WithSummary("Model capability detail + per-target qualification matrix.")
+        .WithDescription("Registered as the catch-all GET /api/router/models/{*modelName} route so namespaced model names with "
+            + "slashes work (the segment is unescaped and trimmed of the leading '/'). Returns the summary fields plus the "
+            + "per-target qualification matrix (present / capable / context ceiling / resident / in-flight; the Cloud "
+            + "pseudo-target is never listed — it has no OllamaTargetOptions, and cloud-only models carry an empty matrix). "
+            + "Unknown model → 404 OllamaErrorResponse. Read-only — no key required in default mode.");
 
         // Fleet cartography (task #41): the model-to-node deployment map — every node's
         // hardware/context/VRAM/loaded processes, every model's catalog-sourced quantization
@@ -272,14 +341,46 @@ public static class RouterApiEndpointsExtensions
         {
             var response = await BuildCartographyResponseAsync(options, serviceProvider, context, cancellationToken);
             return Results.Json(response, OllamaRouterJsonSerializerContext.Default.RouterCartographyResponse);
-        });
+        })
+        .WithName("GetRouterCartography")
+        .WithTags("Model Catalog & Cartography")
+        .WithSummary("Fleet cartography: the model-to-node deployment map.")
+        .WithDescription("In one call: every fleet node (hardware summary, liveness, context lease allocation, VRAM totals, its "
+            + "currently loaded processes with the live /api/ps quantization — the Cloud pseudo-target row is appended last), "
+            + "every fleet model with its catalog-sourced quantization and per-node deployment matrix (present / capable / "
+            + "context ceiling / resident / loaded footprint), and a flat list of all loaded model processes. Reads in-memory "
+            + "tracker/liveness snapshots and the 30 s single-flight capability cache; it NEVER triggers a fresh /api/ps refresh. "
+            + "Read-only — no key required in default mode.");
 
         // Canonical fleet VRAM reclaim + exact alias (identical handler, parameters and
         // response shape). Both paths unload the running models on the selected effective
         // target(s) — or ALL effective targets when no target is specified (fail-soft per
         // target; the Cloud pseudo-target is never part of the effective list).
-        app.MapPost("/api/router/vram/reclaim", ReclaimVramHandler);
-        app.MapPost("/api/router/fleet/unload", ReclaimVramHandler);
+        app.MapPost("/api/router/vram/reclaim", ReclaimVramHandler)
+            .WithName("PostRouterVramReclaim")
+            .WithTags("Fleet Operations")
+            .WithSummary("Fleet VRAM reclaim: unload the running models on the selected target(s).")
+            .WithDescription("Unloads the running models on one named target (case-insensitive; unknown name → 404) or on ALL "
+                + "effective configured targets (fail-soft per target; the Cloud pseudo-target is never part of the effective "
+                + "list) when no target is specified, and optionally administratively disables the processed target(s) "
+                + "(disableTarget, default false); KV-cache leases of every processed target are reset to the baseline bucket. "
+                + "Parameters (target, disableTarget) via query string and/or an optional JSON body: an absent/empty body is "
+                + "valid, a malformed body falls through to the query values, an explicit body is authoritative per field "
+                + "(body wins over query — the vram-reclaim pattern). Fail-soft: 200 with success:false + message "
+                + "'no targets configured' when the effective target list is empty. No key required in default mode.");
+        app.MapPost("/api/router/fleet/unload", ReclaimVramHandler)
+            .WithName("PostRouterFleetUnload")
+            .WithTags("Fleet Operations")
+            .WithSummary("Exact alias of POST /api/router/vram/reclaim (identical handler, parameters and response shape).")
+            .WithDescription("EXACT alias of POST /api/router/vram/reclaim — identical handler, parameters and response shape. "
+                + "Unloads the running models on one named target (case-insensitive; unknown name → 404) or on ALL effective "
+                + "configured targets (fail-soft per target; the Cloud pseudo-target is never part of the effective list) when no "
+                + "target is specified, and optionally administratively disables the processed target(s) (disableTarget, default "
+                + "false); KV-cache leases of every processed target are reset to the baseline bucket. Parameters (target, "
+                + "disableTarget) via query string and/or an optional JSON body: an absent/empty body is valid, a malformed body "
+                + "falls through to the query values, an explicit body is authoritative per field (body wins over query). "
+                + "Fail-soft: 200 with success:false + message 'no targets configured' when the effective target list is empty. "
+                + "No key required in default mode.");
 
         app.MapPost("/api/router/context/evaluate", async (
             HttpRequest request,
@@ -326,7 +427,16 @@ public static class RouterApiEndpointsExtensions
             }
 
             return Results.Json(result, OllamaRouterJsonSerializerContext.Default.RouterContextEvaluateResponse);
-            });
+        })
+        .WithName("PostRouterContextEvaluate")
+        .WithTags("Fleet Operations")
+        .WithSummary("Stateless routing + dynamic context sizing preview.")
+        .WithDescription("Which target would service a request for the given prompt size and which num_ctx bucket would be "
+            + "injected — runs the exact production routing decision plus the sizing engine preview (no LLM inference, no "
+            + "payload rewriting, no lease mutations; only the catalog /api/tags + /api/show discovery the pipeline itself "
+            + "performs). Request body: 'model' required, 'estimatedTokens' >= 1 (otherwise 400; a malformed body falls "
+            + "through to these validation errors), 'clientRequestedNumCtx' optional (the client's static options.num_ctx). "
+            + "503 = no available routing target. No key required in default mode.");
 
         // Model pre-load (task #44): router-owned, stateless + idempotent model warm-up. The
         // POST issues ONE bounded keep_alive-aware load directly to the selected daemon (never
@@ -342,8 +452,35 @@ public static class RouterApiEndpointsExtensions
         // The GET preview likewise cannot share the model-detail catch-all's template space
         // (same template, different action = ambiguous match), so it uses the spec's
         // sanctioned fallback shape: GET /api/router/preload/preview?model=...
-        app.MapPost("/api/router/models/{*tail}", PreloadModelHandler);
-        app.MapGet("/api/router/preload/preview", PreloadPreviewHandler);
+        app.MapPost("/api/router/models/{*tail}", PreloadModelHandler)
+            .WithName("PostRouterModelPreload")
+            .WithTags("Fleet Operations")
+            .WithSummary("Router-owned model pre-load on the selected fleet target.")
+            .WithDescription("Registered as the catch-all POST /api/router/models/{*tail} route (a catch-all parameter may only "
+                + "occupy the LAST segment of a template): the mandatory trailing '/preload' suffix is sniffed to recover the "
+                + "model name — namespaced model names with slashes work, and a POST without the suffix → 404 'invalid preload "
+                + "path'. Selects the fleet target that should host the model (capability-reuse selection: enabled + online + "
+                + "present + hardware-capable + context-intent qualified, ranked idle-first, server/cloud-class-first for large "
+                + "intents, least-busy then declaration order — the Cloud pseudo-target is never a preload candidate), issues ONE "
+                + "bounded keep_alive-aware empty-prompt POST /api/generate load directly to that daemon (plus a bounded /api/ps "
+                + "residency confirmation), and reports the selection, the applied keep_alive / num_ctx and the full candidate "
+                + "evaluation. Per-node keep-alive convention: cloud/server-class = -1 (indefinite), desktop = 900 s. Parameters "
+                + "(keepAliveSeconds, contextIntentTokens, target) via query string and/or an optional JSON body: an absent/empty "
+                + "body is valid, a malformed body falls through to the query values, an explicit body is authoritative per field "
+                + "(body wins over query). Fail-soft: a failed load/confirmation is 200 with loadAccepted/residencyConfirmed "
+                + "false, never 5xx; 400 on keepAliveSeconds (must be -1 or positive) / contextIntentTokens (>= 1) validation; "
+                + "404 on unknown model/pinned target; 503 when no candidate qualified (candidates carry the skip reasons). No key "
+                + "required in default mode.");
+        app.MapGet("/api/router/preload/preview", PreloadPreviewHandler)
+            .WithName("GetRouterPreloadPreview")
+            .WithTags("Fleet Operations")
+            .WithSummary("Side-effect-free preload preview (query parameters only).")
+            .WithDescription("The EXACT same selection as the POST preload with zero daemon calls (no /api/generate load, no "
+                + "/api/ps residency confirmation — loadAccepted / residencyConfirmed / preloadDurationMs are null), paralleling "
+                + "POST /api/router/context/evaluate. Query parameters: 'model' required (400 when missing), 'keepAliveSeconds', "
+                + "'contextIntentTokens' and 'target' with the same validation and mapping as the POST (400/404/503). The model "
+                + "name in the path is not expressible here (the GET model-detail catch-all owns that template space). No key "
+                + "required in default mode.");
 
         // ------------------------------------------------------------------
         //  Dynamic fleet configuration / Setup API (task #19): in-app provisioning of the
@@ -356,12 +493,55 @@ public static class RouterApiEndpointsExtensions
             return Results.Json(
                 BuildRouterConfigResponse(options.CurrentValue),
                 OllamaRouterJsonSerializerContext.Default.RouterConfigResponse);
-        });
+        })
+        .WithName("GetRouterConfig")
+        .WithTags("Setup & Configuration")
+        .WithSummary("Full live router configuration (protected: API key required).")
+        .WithDescription("The effective fleet targets (configuration order; the Cloud pseudo-target is never listed — it is a "
+            + "relay, never a fleet member), cloud overflow, dynamic context, recording, failure resilience, pricing and the "
+            + "apiSecurity section SETTINGS (requireKeyForAllEndpoints, defaultKeyRotationHours). NO key material is ever "
+            + "exposed. Protected by the API-key middleware (default protected set).");
 
-        app.MapPut("/api/router/config", PutRouterConfigHandler);
-        app.MapPost("/api/router/targets", AddTargetHandler);
-        app.MapPut("/api/router/targets/{name}", UpdateTargetHandler);
-        app.MapDelete("/api/router/targets/{name}", DeleteTargetHandler);
+        app.MapPut("/api/router/config", PutRouterConfigHandler)
+            .WithName("PutRouterConfig")
+            .WithTags("Setup & Configuration")
+            .WithSummary("Partial per-section router configuration update (protected: API key required).")
+            .WithDescription("Update any subset of cloud / dynamicContext / recording / resilience / pricing (all five null/absent "
+                + "→ 400). Persists ONLY the provided sections to config/config.json (merge, preserving all other user keys "
+                + "including Recording:TokenMetricsCsv) and applies them to the live in-memory options immediately (no restart). "
+                + "Validation (400): negative cooldown/timeout/maxFiles/resilience values, negative pricing rates, empty "
+                + "currency. 500 = persistence failure (NO in-memory change — the file write happens first). Env vars / CLI args "
+                + "sit above config/config.json: an environment-pinned value stays effective after a PUT. Echoes the resulting "
+                + "full configuration. Protected by the API-key middleware (default protected set).");
+        app.MapPost("/api/router/targets", AddTargetHandler)
+            .WithName("PostRouterTarget")
+            .WithTags("Setup & Configuration")
+            .WithSummary("Add a new compute target to the fleet (protected: API key required).")
+            .WithDescription("Validation (400): invalid name (empty, > 64 chars, contains / \\ :, equals 'Cloud'), non-absolute / "
+                + "non-http(s) URL, maxParallel < 1; duplicate name (case-insensitive) → 409. When testConnectionFirst (default "
+                + "true) the target is probed immediately (bounded by the probe client timeout); a probe failure → 422 with a "
+                + "retry hint (nothing persisted). On success (201) the target is persisted to config/config.json (atomic, "
+                + "file-first) + applied to the live options, the model catalog is seeded and the target is immediately routable "
+                + "on the inference (completion) dispatch path. 500 = persistence failure (nothing applied). Protected by the "
+                + "API-key middleware (default protected set).");
+        app.MapPut("/api/router/targets/{name}", UpdateTargetHandler)
+            .WithName("PutRouterTarget")
+            .WithTags("Setup & Configuration")
+            .WithSummary("Update an existing target (protected: API key required).")
+            .WithDescription("Updates target properties (url, enabled, hardwareHint, maxParallel) of an existing target "
+                + "(case-insensitive lookup, unknown name → 404). Field semantics: null/absent = no change (all four null → 400); "
+                + "hardwareHint:'' clears the hint; url must be an absolute http(s) URI (trailing / stripped); maxParallel >= 1. "
+                + "Persists the merge to config/config.json (file-first, atomic) + applies to the live options — an enabled "
+                + "change takes effect on the very next routing decision (no restart). 500 = persistence failure (NO in-memory "
+                + "change). Protected by the API-key middleware (default protected set).");
+        app.MapDelete("/api/router/targets/{name}", DeleteTargetHandler)
+            .WithName("DeleteRouterTarget")
+            .WithTags("Setup & Configuration")
+            .WithSummary("Remove a target from the fleet (protected: API key required).")
+            .WithDescription("Removes the target (case-insensitive lookup, unknown name → 404) from the in-memory fleet and from "
+                + "config/config.json (file-first, atomic). Liveness slots / session-affinity leases of the removed name are "
+                + "orphaned but inert (the re-prober and routing only ever see live fleet names; leases expire by TTL). 500 = "
+                + "persistence failure (NO in-memory change). Protected by the API-key middleware (default protected set).");
 
         // ------------------------------------------------------------------
         //  API key management (task #50): every route below is key-protected by the
@@ -380,10 +560,37 @@ public static class RouterApiEndpointsExtensions
                 .ToList();
             return Results.Json(new ApiKeysListResponse(keys),
                 OllamaRouterJsonSerializerContext.Default.ApiKeysListResponse);
-        });
-        app.MapPost("/api/router/api-keys", CreateApiKeyHandler);
-        app.MapDelete("/api/router/api-keys/{name}", DeleteApiKeyHandler);
-        app.MapPost("/api/router/api-keys/default/rotate", RotateDefaultApiKeyHandler);
+        })
+        .WithName("GetRouterApiKeys")
+        .WithTags("API Key Security")
+        .WithSummary("List the user API keys, masked (protected: API key required).")
+        .WithDescription("Identity + timestamps ONLY — the response NEVER contains the hash or the raw key value. Empty keys[] "
+            + "when no user keys exist. 500 when the key store is unavailable in the host. Key management is protected by the "
+            + "API-key middleware BY DEFINITION (managing keys requires a valid key).");
+        app.MapPost("/api/router/api-keys", CreateApiKeyHandler)
+            .WithName("PostRouterApiKey")
+            .WithTags("API Key Security")
+            .WithSummary("Create a user API key (protected: API key required).")
+            .WithDescription("Body: { name, validFor? } where validFor is an INTEGER NUMBER OF HOURS (e.g. 168 = 7 days; "
+                + "omitted/null = no expiry; < 1 → 400). The raw base64url key is returned to the caller EXACTLY ONCE in the 201 "
+                + "response — only its SHA-256 hash is persisted (config/api-keys.json, 0600 on Unix). 400 invalid name/validFor; "
+                + "409 duplicate name (case-insensitive); 500 persistence failure or missing key store. Key management is "
+                + "protected by the API-key middleware BY DEFINITION.");
+        app.MapDelete("/api/router/api-keys/{name}", DeleteApiKeyHandler)
+            .WithName("DeleteRouterApiKey")
+            .WithTags("API Key Security")
+            .WithSummary("Delete a user API key (protected: API key required).")
+            .WithDescription("Case-insensitive lookup. 200 { success: true } on success; unknown name → 404 { success: false, "
+                + "error: 'API key not found: {name}' }; 500 when the key store is unavailable. Key management is protected by "
+                + "the API-key middleware BY DEFINITION.");
+        app.MapPost("/api/router/api-keys/default/rotate", RotateDefaultApiKeyHandler)
+            .WithName("PostRotateRouterDefaultApiKey")
+            .WithTags("API Key Security")
+            .WithSummary("Rotate the default API key immediately (protected: API key required).")
+            .WithDescription("Manually rotates the default key IMMEDIATELY (ignores the elapsed interval — same semantics as an "
+                + "auto-rotation tick): the previous default key is dead instantly (no grace period) and the new raw base64url "
+                + "key is returned exactly once (it is also logged at INFO by the store). 500 when the key store is unavailable. "
+                + "Key management is protected by the API-key middleware BY DEFINITION.");
 
         return app;
     }
@@ -1421,7 +1628,12 @@ public static class RouterApiEndpointsExtensions
         }
     }
 
-    private static string GetRouterVersion() =>
+    /// <summary>
+    /// The router version: the assembly informational version (AOT-preserved), reported by
+    /// <c>GET /api/router/info</c> and reused by the OpenAPI document's <c>info.version</c>
+    /// (task #51) so the two can never drift.
+    /// </summary>
+    internal static string GetRouterVersion() =>
         Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
         ?? "0.0.0";
 
