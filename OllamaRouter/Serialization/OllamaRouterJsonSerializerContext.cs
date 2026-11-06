@@ -1,4 +1,6 @@
+using System.Text.Json;
 using System.Text.Json.Serialization;
+using OllamaRouter.Converters.Dtos;
 using OllamaRouter.Endpoints;
 using OllamaRouter.Middleware;
 using OllamaRouter.Options;
@@ -94,6 +96,17 @@ namespace OllamaRouter.Serialization;
 [JsonSerializable(typeof(ApiKeyCreatedResponse))]
 [JsonSerializable(typeof(ApiKeyDeletedResponse))]
 [JsonSerializable(typeof(ApiKeyRotatedResponse))]
+// Inbound protocol converter DTOs (task #59) + raw tool-argument parse target.
+[JsonSerializable(typeof(OllamaRequestDto))]
+[JsonSerializable(typeof(OllamaChatMessageDto))]
+[JsonSerializable(typeof(OllamaToolCallDto))]
+[JsonSerializable(typeof(OllamaToolCallFunctionDto))]
+[JsonSerializable(typeof(OpenAiChatRequestDto))]
+[JsonSerializable(typeof(OpenAiChatMessageDto))]
+[JsonSerializable(typeof(OpenAiToolCallDto))]
+[JsonSerializable(typeof(OpenAiToolCallFunctionDto))]
+[JsonSerializable(typeof(OpenAiResponseFormatDto))]
+[JsonSerializable(typeof(Dictionary<string, JsonElement>))]
 // API key store file format (config/api-keys.json — hashes only; internal, same assembly).
 [JsonSerializable(typeof(OllamaRouter.Security.ApiKeyFile))]
 public partial class OllamaRouterJsonSerializerContext : JsonSerializerContext

@@ -3,9 +3,9 @@
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-	  <PublishAot>true</PublishAot>
-	  <InvariantGlobalization>true</InvariantGlobalization>
-	  <ServerGarbageCollection>false</ServerGarbageCollection>
+      <PublishAot>true</PublishAot>
+      <InvariantGlobalization>true</InvariantGlobalization>
+      <ServerGarbageCollection>false</ServerGarbageCollection>
     <ApplicationIcon>icon.ico</ApplicationIcon>
   </PropertyGroup>
 
@@ -22,6 +22,11 @@
          officially NativeAOT-compatible — schemas resolve from the source-generated
          OllamaRouterJsonSerializerContext. -->
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.14" />
+    <!-- Canonical protocol contract for the bidirectional Ollama/OpenAI translators (task #59).
+         Pinned to 10.9.0, the exact version already in the transitive closure via
+         Pmad.AI 0.0.1 -> Microsoft.Extensions.AI 10.9.0: this direct reference adds zero
+         new packages to the dependency graph. -->
+    <PackageReference Include="Microsoft.Extensions.AI.Abstractions" Version="10.9.0" />
     <PackageReference Include="Microsoft.ML.Tokenizers" Version="2.0.0" />
     <PackageReference Include="Microsoft.ML.Tokenizers.Data.Cl100kBase" Version="2.0.0" />
     <PackageReference Include="Pmad.AI" Version="0.0.1" />
