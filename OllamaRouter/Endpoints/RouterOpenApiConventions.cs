@@ -1,5 +1,16 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.OpenApi;
+using OllamaRouter.Endpoints.RouterApi.ApiKeys;
+using OllamaRouter.Endpoints.RouterApi.Benchmark;
+using OllamaRouter.Endpoints.RouterApi.Cartography;
+using OllamaRouter.Endpoints.RouterApi.Config;
+using OllamaRouter.Endpoints.RouterApi.Context;
+using OllamaRouter.Endpoints.RouterApi.Fleet;
+using OllamaRouter.Endpoints.RouterApi.Info;
+using OllamaRouter.Endpoints.RouterApi.Models;
+using OllamaRouter.Endpoints.RouterApi.Preload;
+using OllamaRouter.Endpoints.RouterApi.Targets;
+using OllamaRouter.Endpoints.RouterApi.Vram;
 using OllamaRouter.Middleware;
 using OllamaRouter.Security;
 using OllamaRouter.Services.Hardware;

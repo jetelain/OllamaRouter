@@ -1,3 +1,4 @@
+using OllamaRouter.Endpoints.RouterApi.Vram;
 using OllamaRouter.Options;
 using OllamaRouter.Services.Catalog;
 using OllamaRouter.Services.ContextSizing;

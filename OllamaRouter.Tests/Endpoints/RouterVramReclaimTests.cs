@@ -6,6 +6,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using Moq;
 using OllamaRouter.Endpoints;
+using OllamaRouter.Endpoints.RouterApi.Vram;
 using OllamaRouter.Options;
 using OllamaRouter.Serialization;
 using OllamaRouter.Tests.TestHelpers;

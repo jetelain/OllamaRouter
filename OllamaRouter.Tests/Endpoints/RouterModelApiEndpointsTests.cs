@@ -8,6 +8,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using Moq;
 using OllamaRouter.Endpoints;
+using OllamaRouter.Endpoints.RouterApi.Shared;
 using OllamaRouter.Options;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services.Catalog;
@@ -896,34 +897,34 @@ public class RouterModelApiEndpointsTests
         Assert.True(opt.FilterNamespacedModels);
 
         // Native library models and local aliases (no namespace slash)
-        Assert.True(RouterApiEndpointsExtensions.ShouldIncludeModel("llama3:8b", opt));
-        Assert.True(RouterApiEndpointsExtensions.ShouldIncludeModel("Qwen3.8-27B:latest", opt));
-        Assert.True(RouterApiEndpointsExtensions.ShouldIncludeModel("qwen2.5-coder:32b", opt));
+        Assert.True(RouterApiSharedHelpers.ShouldIncludeModel("llama3:8b", opt));
+        Assert.True(RouterApiSharedHelpers.ShouldIncludeModel("Qwen3.8-27B:latest", opt));
+        Assert.True(RouterApiSharedHelpers.ShouldIncludeModel("qwen2.5-coder:32b", opt));
 
         // Namespaced models: filtered out by default
-        Assert.False(RouterApiEndpointsExtensions.ShouldIncludeModel("jetelain/qwen3.6-35b-a3b:latest", opt));
-        Assert.False(RouterApiEndpointsExtensions.ShouldIncludeModel("user/custom-model:latest", opt));
-        Assert.False(RouterApiEndpointsExtensions.ShouldIncludeModel("registry.io/user/custom-model:tag", opt));
+        Assert.False(RouterApiSharedHelpers.ShouldIncludeModel("jetelain/qwen3.6-35b-a3b:latest", opt));
+        Assert.False(RouterApiSharedHelpers.ShouldIncludeModel("user/custom-model:latest", opt));
+        Assert.False(RouterApiSharedHelpers.ShouldIncludeModel("registry.io/user/custom-model:tag", opt));
 
         // Namespaced models: included if FilterNamespacedModels is disabled
         opt.FilterNamespacedModels = false;
-        Assert.True(RouterApiEndpointsExtensions.ShouldIncludeModel("jetelain/qwen3.6-35b-a3b:latest", opt));
+        Assert.True(RouterApiSharedHelpers.ShouldIncludeModel("jetelain/qwen3.6-35b-a3b:latest", opt));
 
         // Namespaced models: included if explicitly configured in Models
         opt.FilterNamespacedModels = true;
         opt.Models["jetelain/qwen3.6-35b-a3b"] = new ModelThresholds();
-        Assert.True(RouterApiEndpointsExtensions.ShouldIncludeModel("jetelain/qwen3.6-35b-a3b:latest", opt));
-        Assert.True(RouterApiEndpointsExtensions.ShouldIncludeModel("jetelain/qwen3.6-35b-a3b", opt));
+        Assert.True(RouterApiSharedHelpers.ShouldIncludeModel("jetelain/qwen3.6-35b-a3b:latest", opt));
+        Assert.True(RouterApiSharedHelpers.ShouldIncludeModel("jetelain/qwen3.6-35b-a3b", opt));
 
         // Namespaced models: included if configured as CloudOverflow DefaultModel
         opt.Models.Clear();
         opt.CloudOverflow.DefaultModel = "custom/cloud-model:latest";
-        Assert.True(RouterApiEndpointsExtensions.ShouldIncludeModel("custom/cloud-model:latest", opt));
-        Assert.True(RouterApiEndpointsExtensions.ShouldIncludeModel("custom/cloud-model", opt));
+        Assert.True(RouterApiSharedHelpers.ShouldIncludeModel("custom/cloud-model:latest", opt));
+        Assert.True(RouterApiSharedHelpers.ShouldIncludeModel("custom/cloud-model", opt));
 
         // Null / whitespace
-        Assert.False(RouterApiEndpointsExtensions.ShouldIncludeModel("", opt));
-        Assert.False(RouterApiEndpointsExtensions.ShouldIncludeModel("   ", opt));
+        Assert.False(RouterApiSharedHelpers.ShouldIncludeModel("", opt));
+        Assert.False(RouterApiSharedHelpers.ShouldIncludeModel("   ", opt));
     }
 
     [Fact]

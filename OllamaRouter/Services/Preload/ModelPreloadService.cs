@@ -1,6 +1,6 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using OllamaRouter.Endpoints;
+using OllamaRouter.Endpoints.RouterApi.Shared;
 using OllamaRouter.Options;
 using OllamaRouter.Services.Hardware;
 using OllamaRouter.Services.Catalog;
@@ -219,12 +219,12 @@ public sealed class ModelPreloadService : IModelPreloadService
         // branch still enumerates every target AND the cloud syntheses). Cloud-synthesis-only
         // models resolve here but then fail the per-target model-presence gate (the Cloud
         // pseudo-target is never a preload candidate) → 503 with the skip reasons.
-        var names = await RouterApiEndpointsExtensions.GetFleetModelNamesAsync(
+        var names = await RouterApiSharedHelpers.GetFleetModelNamesAsync(
             _options.CurrentValue, _availability, fleetAggregation: null, _catalogCache, context: null, cancellationToken).ConfigureAwait(false);
-        var resolved = RouterApiEndpointsExtensions.ResolveModelName(modelName, names);
+        var resolved = RouterApiSharedHelpers.ResolveModelName(modelName, names);
         if (resolved is null && _options.CurrentValue.FilterNamespacedModels)
         {
-            resolved = await RouterApiEndpointsExtensions.ResolveModelOnFleetAsync(
+            resolved = await RouterApiSharedHelpers.ResolveModelOnFleetAsync(
                 _catalogCache, effectiveTargets, modelName, cancellationToken).ConfigureAwait(false);
         }
 
@@ -332,7 +332,7 @@ public sealed class ModelPreloadService : IModelPreloadService
             }
 
             var capability = _capabilityEngine!.DeriveCapability(
-                RouterApiEndpointsExtensions.MergeMetadata(meta, primaryMetadata),
+                RouterApiSharedHelpers.MergeMetadata(meta, primaryMetadata),
                 entry.Target.Name!, entry.Target, pinnedArchitecture);
             if (!capability.HardwareCapable)
             {
