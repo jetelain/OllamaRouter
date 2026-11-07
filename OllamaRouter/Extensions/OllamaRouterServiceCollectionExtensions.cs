@@ -15,6 +15,7 @@ using OllamaRouter.Security;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services;
 using OllamaRouter.Services.Benchmarking;
+using OllamaRouter.Services.Clients;
 using OllamaRouter.Services.Hardware;
 using Yarp.ReverseProxy;
 using MsOptions = Microsoft.Extensions.Options.Options;
@@ -381,6 +382,13 @@ public static class OllamaRouterServiceCollectionExtensions
         services.AddSingleton<IActivityMonitorService, ActivityMonitorService>();
         services.AddSingleton<IInferenceRequestRecorder, InferenceRequestRecorder>();
         services.AddSingleton<ITokenMetricsRecorder, TokenMetricsRecorder>();
+
+        // OpenAI-compatible dispatch client factory (task #60): pooled per (base address, API key)
+        // with the codebase-standard 10 s PooledConnectionLifetime handlers and infinite client
+        // timeouts. Deterministically owned by the factory (no AddHttpClient registration — named
+        // clients would double-manage the same handler/client lifecycle). Task #61 resolves its
+        // per-target IChatClient from this singleton.
+        services.AddSingleton<IOpenAiChatClientFactory, OpenAiChatClientFactory>();
         services.AddSingleton<IActivityStatisticsService>(sp =>
             new ActivityStatisticsService(
                 Path.Combine(effectiveStateDirectory, "activity-statistics.json"),
