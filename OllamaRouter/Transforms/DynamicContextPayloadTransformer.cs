@@ -1,7 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using OllamaRouter.Options;
-using OllamaRouter.Services;
+using OllamaRouter.Services.ContextSizing;
 
 namespace OllamaRouter.Transforms;
 

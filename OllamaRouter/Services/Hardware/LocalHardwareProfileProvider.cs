@@ -1,7 +1,7 @@
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
-using OllamaRouter.Services;
+using OllamaRouter.Services.Process;
 
 namespace OllamaRouter.Services.Hardware;
 

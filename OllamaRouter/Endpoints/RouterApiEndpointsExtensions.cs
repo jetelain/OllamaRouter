@@ -11,7 +11,11 @@ using OllamaRouter.Middleware;
 using OllamaRouter.Options;
 using OllamaRouter.Security;
 using OllamaRouter.Serialization;
-using OllamaRouter.Services;
+using OllamaRouter.Services.Catalog;
+using OllamaRouter.Services.ContextSizing;
+using OllamaRouter.Services.Monitoring;
+using OllamaRouter.Services.Preload;
+using OllamaRouter.Services.Routing;
 using OllamaRouter.Services.Benchmarking;
 using OllamaRouter.Services.Hardware;
 

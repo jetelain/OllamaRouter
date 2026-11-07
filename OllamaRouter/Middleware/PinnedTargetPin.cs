@@ -1,4 +1,4 @@
-using OllamaRouter.Services;
+using OllamaRouter.Services.Routing;
 
 namespace OllamaRouter.Middleware;
 

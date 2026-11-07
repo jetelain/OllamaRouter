@@ -175,14 +175,14 @@ public sealed class OllamaRouterOptions
     /// <summary>
     /// Per-target failure streak threshold: a target whose uncommitted-transport and
     /// mid-stream failure streak exceeds this value is skipped as a routing candidate
-    /// (by <see cref="Services.ITargetFailureStreakService"/>) until a success resets its
+    /// (by <see cref="Services.Monitoring.ITargetFailureStreakService"/>) until a success resets its
     /// streak. Defaults to 3. Set to 0 (or negative) to disable streak-based skipping.
     /// </summary>
     public int MaxConsecutiveFailures { get; set; } = 3;
 
     /// <summary>
     /// Sliding TTL (in minutes) of the in-memory session-affinity store
-    /// (<see cref="Services.ISessionAffinityService"/>): a session/agent lease pinned to a
+    /// (<see cref="Services.Routing.ISessionAffinityService"/>): a session/agent lease pinned to a
     /// fleet target expires after this much inactivity (every hit re-arms the window).
     /// Defaults to 30. Set to 0 (or negative) to keep the safe default (the store normalizes
     /// non-positive values back to 30).
@@ -195,7 +195,7 @@ public sealed class OllamaRouterOptions
     /// Set to 0 to require an exact match.
     /// </summary>
     /// <remarks>
-    /// Deprecated: the streak-based failover (<see cref="Services.ITargetFailureStreakService"/>)
+    /// Deprecated: the streak-based failover (<see cref="Services.Monitoring.ITargetFailureStreakService"/>)
     /// no longer consults this value; it is kept for configuration binding only.
     /// </remarks>
     public int ConsecutiveFailuresTokenTolerance { get; set; } = 4000;
@@ -378,11 +378,11 @@ public sealed class OllamaTargetOptions
     /// <summary>
     /// Optional explicit location classification override (<c>"local"</c> / <c>"remote"</c> /
     /// <c>"cloud"</c>, case-insensitive) that wins over the URL-based classification of
-    /// <see cref="Services.TargetLocationClassifier"/>. Use it when a hostname resolves to a
+    /// <see cref="Services.Routing.TargetLocationClassifier"/>. Use it when a hostname resolves to a
     /// private IP but should be treated differently (or vice versa). Null (default) means the
     /// location is derived from <see cref="Url"/>.
     /// </summary>
-    public Services.TargetLocation? Location { get; set; }
+    public Services.Routing.TargetLocation? Location { get; set; }
 
     /// <summary>
     /// Optional base address of the OllamaRouter instance running on this node (e.g. <c>http://192.168.1.25:11434</c>).
@@ -446,7 +446,7 @@ public sealed class OllamaTargetOptions
     /// (<c>GET /api/router/config</c>, <c>POST /api/router/targets</c>) for Web-UI display and
     /// persisted to <c>config/config.json</c> under <c>OllamaRouter:Targets</c>.
     /// NO v1 routing consumer: location classification stays URL/VRAM-driven
-    /// (<see cref="Services.TargetLocationClassifier"/>), so the value influences no routing
+    /// (<see cref="Services.Routing.TargetLocationClassifier"/>), so the value influences no routing
     /// decision. Null (default) means unset.
     /// </summary>
     public string? HardwareHint { get; set; }
@@ -476,8 +476,8 @@ public sealed class OllamaTargetOptions
     /// Resolves the effective preload keep-alive (in seconds) for this node:
     /// an explicit <see cref="KeepAliveSeconds"/> (<c>-1</c> or positive) wins verbatim (the
     /// operator may pin -1 on a desktop-class node), otherwise the documented class convention
-    /// (see <see cref="Services.PreloadKeepAlivePolicy"/>): cloud class → -1 (indefinite),
-    /// server class (effective VRAM ≥ <see cref="Services.DynamicContextSizingEngine.ServerClassVramThresholdMB"/>)
+    /// (see <see cref="Services.Preload.PreloadKeepAlivePolicy"/>): cloud class → -1 (indefinite),
+    /// server class (effective VRAM ≥ <see cref="Services.ContextSizing.DynamicContextSizingEngine.ServerClassVramThresholdMB"/>)
     /// → -1, desktop/laptop class (known VRAM below the threshold) → 900 (15 min),
     /// unclassifiable (unknown VRAM, not cloud) → the router-level
     /// <see cref="OllamaRouterOptions.PreloadDefaultKeepAliveSeconds"/> of
@@ -494,12 +494,12 @@ public sealed class OllamaTargetOptions
             return explicitKeepAlive;
         }
 
-        var nodeClass = Services.PreloadKeepAlivePolicy.GetPreloadNodeClass(this, GetEffectiveMaxVramMB(fleetHardware));
+        var nodeClass = Services.Preload.PreloadKeepAlivePolicy.GetPreloadNodeClass(this, GetEffectiveMaxVramMB(fleetHardware));
         return nodeClass switch
         {
-            Services.PreloadNodeClass.Cloud => Services.PreloadKeepAlivePolicy.CloudAndServerKeepAliveSeconds,
-            Services.PreloadNodeClass.Server => Services.PreloadKeepAlivePolicy.CloudAndServerKeepAliveSeconds,
-            Services.PreloadNodeClass.Desktop => Services.PreloadKeepAlivePolicy.DesktopClassKeepAliveSeconds,
+            Services.Preload.PreloadNodeClass.Cloud => Services.Preload.PreloadKeepAlivePolicy.CloudAndServerKeepAliveSeconds,
+            Services.Preload.PreloadNodeClass.Server => Services.Preload.PreloadKeepAlivePolicy.CloudAndServerKeepAliveSeconds,
+            Services.Preload.PreloadNodeClass.Desktop => Services.Preload.PreloadKeepAlivePolicy.DesktopClassKeepAliveSeconds,
             _ => routerOptions.PreloadDefaultKeepAliveSeconds
         };
     }
@@ -628,7 +628,7 @@ public sealed class DynamicContextOptions
 /// <summary>
 /// Cloud Overflow (ollama.com relay) configuration. Runtime availability is the AND of
 /// <see cref="Enabled"/> here and the per-target Cloud toggle in targets.json
-/// (<see cref="Services.ITargetAvailabilityService"/>); the model to rewrite to is taken from
+/// (<see cref="Services.Routing.ITargetAvailabilityService"/>); the model to rewrite to is taken from
 /// the per-model <see cref="ModelThresholds.CloudModel"/> when set, falling back to
 /// <see cref="DefaultModel"/>.
 /// </summary>

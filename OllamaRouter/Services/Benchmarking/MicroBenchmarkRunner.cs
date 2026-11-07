@@ -8,8 +8,10 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using OllamaRouter.Options;
 using OllamaRouter.Serialization;
-using OllamaRouter.Services;
+using OllamaRouter.Services.ContextSizing;
+using OllamaRouter.Services.Routing;
 using OllamaRouter.Services.Hardware;
+using OllamaRouter.Services.Catalog;
 
 namespace OllamaRouter.Services.Benchmarking;
 

@@ -3,7 +3,11 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using OllamaRouter.Options;
 using OllamaRouter.Serialization;
-using OllamaRouter.Services;
+using OllamaRouter.Services.Catalog;
+using OllamaRouter.Services.ContextSizing;
+using OllamaRouter.Services.Monitoring;
+using OllamaRouter.Services.Process;
+using OllamaRouter.Services.Routing;
 using OllamaRouter.Services.Hardware;
 
 namespace OllamaRouter.Endpoints;

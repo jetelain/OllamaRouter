@@ -1,5 +1,7 @@
 using OllamaRouter.Options;
-using OllamaRouter.Services;
+using OllamaRouter.Services.Catalog;
+using OllamaRouter.Services.ContextSizing;
+using OllamaRouter.Services.Routing;
 
 namespace OllamaRouter.Endpoints;
 

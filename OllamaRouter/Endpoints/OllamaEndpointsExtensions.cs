@@ -3,7 +3,8 @@ using Microsoft.Extensions.Options;
 using OllamaRouter.Options;
 using OllamaRouter.Parsing;
 using OllamaRouter.ReverseProxy;
-using OllamaRouter.Services;
+using OllamaRouter.Services.Catalog;
+using OllamaRouter.Services.Routing;
 
 namespace OllamaRouter.Endpoints;
 

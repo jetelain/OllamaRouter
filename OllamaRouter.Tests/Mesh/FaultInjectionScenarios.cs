@@ -2,7 +2,8 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json.Nodes;
 using OllamaRouter.Options;
-using OllamaRouter.Services;
+using OllamaRouter.Services.Monitoring;
+using OllamaRouter.Services.Routing;
 
 namespace OllamaRouter.Tests.Mesh;
 

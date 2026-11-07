@@ -38,7 +38,7 @@ public static class OllamaReverseProxyConfig
     /// The PUBLIC session/agent sticky-routing header. Inbound: a request may carry it to
     /// identify a logical caller session (e.g. an orchestrator agent) so the router keeps
     /// its consecutive turns on the same fleet target (KV-cache stickiness via the
-    /// <see cref="Services.ISessionAffinityService"/> lease store). Outbound: the middleware
+    /// <see cref="Services.Routing.ISessionAffinityService"/> lease store). Outbound: the middleware
     /// echoes the recognized session ID back in the response.
     /// </summary>
     public const string PublicSessionIdHeader = "X-OllamaRouter-Session-Id";

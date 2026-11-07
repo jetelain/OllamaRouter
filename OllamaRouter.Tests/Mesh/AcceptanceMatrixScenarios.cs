@@ -1,7 +1,8 @@
 using System.Diagnostics;
 using System.Net;
 using OllamaRouter.ReverseProxy;
-using OllamaRouter.Services;
+using OllamaRouter.Services.Monitoring;
+using OllamaRouter.Services.Routing;
 
 namespace OllamaRouter.Tests.Mesh;
 

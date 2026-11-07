@@ -1,6 +1,5 @@
 using System.Net;
 using System.Text.Json.Nodes;
-using OllamaRouter.Services;
 
 namespace OllamaRouter.Tests.Mesh;
 

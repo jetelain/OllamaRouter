@@ -335,7 +335,7 @@ public class OllamaRouterOptionsTests
     {
         var options = new OllamaRouterOptions();
         var desktop = new OllamaTargetOptions { Name = "Desktop", Url = "http://127.0.0.1:11435", MaxVramMB = 16384, KeepAliveSeconds = -1 };
-        var cloud = new OllamaTargetOptions { Name = "Cloud", Location = OllamaRouter.Services.TargetLocation.Cloud, KeepAliveSeconds = 300 };
+        var cloud = new OllamaTargetOptions { Name = "Cloud", Location = OllamaRouter.Services.Routing.TargetLocation.Cloud, KeepAliveSeconds = 300 };
 
         // Explicit values are honored verbatim (-1 on a desktop-class node stays -1, Open Q5).
         Assert.Equal(-1, desktop.GetEffectivePreloadKeepAliveSeconds(options));
@@ -346,7 +346,7 @@ public class OllamaRouterOptionsTests
     public void GetEffectivePreloadKeepAliveSeconds_CloudClassWithoutOverride_ResolvesToIndefinite()
     {
         var options = new OllamaRouterOptions();
-        var cloud = new OllamaTargetOptions { Name = "Cloud", Location = OllamaRouter.Services.TargetLocation.Cloud, MaxVramMB = 16384 };
+        var cloud = new OllamaTargetOptions { Name = "Cloud", Location = OllamaRouter.Services.Routing.TargetLocation.Cloud, MaxVramMB = 16384 };
 
         // Cloud class wins over the (desktop-range) VRAM: resident indefinitely.
         Assert.Equal(-1, cloud.GetEffectivePreloadKeepAliveSeconds(options));
@@ -356,7 +356,7 @@ public class OllamaRouterOptionsTests
     public void GetEffectivePreloadKeepAliveSeconds_ServerVramWithoutOverride_ResolvesToIndefinite()
     {
         var options = new OllamaRouterOptions();
-        var atThreshold = new OllamaTargetOptions { Name = "Server", Url = "http://192.168.1.10:11434", MaxVramMB = OllamaRouter.Services.DynamicContextSizingEngine.ServerClassVramThresholdMB };
+        var atThreshold = new OllamaTargetOptions { Name = "Server", Url = "http://192.168.1.10:11434", MaxVramMB = OllamaRouter.Services.ContextSizing.DynamicContextSizingEngine.ServerClassVramThresholdMB };
         var aboveThreshold = new OllamaTargetOptions { Name = "Server2", Url = "http://192.168.1.11:11434", MaxVramMB = 65536 };
 
         Assert.Equal(-1, atThreshold.GetEffectivePreloadKeepAliveSeconds(options));

@@ -1,8 +1,9 @@
 using System.Text.Json;
 using Microsoft.Extensions.Logging.Abstractions;
 using OllamaRouter.Options;
-using OllamaRouter.Services;
 using OllamaRouter.Transforms;
+using OllamaRouter.Services.Catalog;
+using OllamaRouter.Services.ContextSizing;
 
 namespace OllamaRouter.Tests.Transforms;
 

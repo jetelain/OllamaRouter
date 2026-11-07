@@ -1,6 +1,9 @@
 using Microsoft.Extensions.Options;
 using OllamaRouter.Options;
-using OllamaRouter.Services;
+using OllamaRouter.Services.Catalog;
+using OllamaRouter.Services.ContextSizing;
+using OllamaRouter.Services.Monitoring;
+using OllamaRouter.Services.Routing;
 using OllamaRouter.Services.Hardware;
 
 namespace OllamaRouter.Endpoints;

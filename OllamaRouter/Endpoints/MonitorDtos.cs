@@ -1,5 +1,5 @@
 using System.Text.Json.Serialization;
-using OllamaRouter.Services;
+using OllamaRouter.Services.Monitoring;
 
 namespace OllamaRouter.Endpoints;
 

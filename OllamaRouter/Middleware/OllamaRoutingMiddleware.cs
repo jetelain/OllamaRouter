@@ -9,7 +9,10 @@ using OllamaRouter.Options;
 using OllamaRouter.Parsing;
 using OllamaRouter.ReverseProxy;
 using OllamaRouter.Serialization;
-using OllamaRouter.Services;
+using OllamaRouter.Services.Catalog;
+using OllamaRouter.Services.ContextSizing;
+using OllamaRouter.Services.Monitoring;
+using OllamaRouter.Services.Routing;
 using OllamaRouter.Transforms;
 using Yarp.ReverseProxy.Forwarder;
 

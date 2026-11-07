@@ -2,7 +2,7 @@ using System.Net;
 using System.Text;
 using System.Text.Json.Nodes;
 using OllamaRouter.ReverseProxy;
-using OllamaRouter.Services;
+using OllamaRouter.Services.Routing;
 
 namespace OllamaRouter.Tests.Mesh;
 

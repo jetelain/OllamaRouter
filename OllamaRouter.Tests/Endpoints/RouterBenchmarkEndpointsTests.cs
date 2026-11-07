@@ -12,8 +12,8 @@ using OllamaRouter.Endpoints;
 using OllamaRouter.Extensions;
 using OllamaRouter.Options;
 using OllamaRouter.Serialization;
-using OllamaRouter.Services;
 using OllamaRouter.Services.Benchmarking;
+using OllamaRouter.Services.Routing;
 
 namespace OllamaRouter.Tests.Endpoints;
 

@@ -1,6 +1,6 @@
 using System.Text.Json.Serialization;
 using OllamaRouter.Options;
-using OllamaRouter.Services;
+using OllamaRouter.Services.Routing;
 
 namespace OllamaRouter.Services.Benchmarking;
 

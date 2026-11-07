@@ -10,7 +10,10 @@ using Moq;
 using OllamaRouter.Endpoints;
 using OllamaRouter.Options;
 using OllamaRouter.Serialization;
-using OllamaRouter.Services;
+using OllamaRouter.Services.Catalog;
+using OllamaRouter.Services.Monitoring;
+using OllamaRouter.Services.Routing;
+using OllamaRouter.Services.ContextSizing;
 
 namespace OllamaRouter.Tests.Endpoints;
 

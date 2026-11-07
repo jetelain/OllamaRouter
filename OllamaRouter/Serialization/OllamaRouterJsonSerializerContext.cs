@@ -4,7 +4,7 @@ using OllamaRouter.Converters.Dtos;
 using OllamaRouter.Endpoints;
 using OllamaRouter.Middleware;
 using OllamaRouter.Options;
-using OllamaRouter.Services;
+using OllamaRouter.Services.Monitoring;
 using OllamaRouter.Services.Benchmarking;
 using OllamaRouter.Services.Hardware;
 

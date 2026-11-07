@@ -10,8 +10,11 @@ using Moq;
 using OllamaRouter.Middleware;
 using OllamaRouter.Options;
 using OllamaRouter.ReverseProxy;
-using OllamaRouter.Services;
 using Yarp.ReverseProxy.Forwarder;
+using OllamaRouter.Services.Catalog;
+using OllamaRouter.Services.ContextSizing;
+using OllamaRouter.Services.Monitoring;
+using OllamaRouter.Services.Routing;
 
 namespace OllamaRouter.Tests.Middleware;
 

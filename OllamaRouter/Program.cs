@@ -5,7 +5,7 @@ using OllamaRouter.Extensions;
 using OllamaRouter.Options;
 using OllamaRouter.ReverseProxy;
 using OllamaRouter.Serialization;
-using OllamaRouter.Services;
+using OllamaRouter.Services.Process;
 using Serilog;
 using Serilog.Events;
 
