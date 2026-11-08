@@ -245,7 +245,9 @@ public sealed class RouterConfigPersistence : IRouterConfigPersistence
                 {
                     modelNode["quantization"] = model.Quantization;
                 }
-                modelsArray.Add(modelNode);
+                // Cast selects the trim-safe Add(JsonNode?) overload; the generic Add<T>(T)
+                // is [RequiresUnreferencedCode]/[RequiresDynamicCode] (IL2026/IL3050 under AOT).
+                modelsArray.Add((JsonNode?)modelNode);
             }
 
             node["Models"] = modelsArray;

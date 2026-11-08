@@ -177,6 +177,55 @@ public class TargetApiKeyProtectionTests
     }
 
     [Fact]
+    public async Task PersistTargets_Models_PersistsContextLengthAndQuantization_OmitsBlankKeys()
+    {
+        var tempDir = await CreateTempDirAsync();
+        try
+        {
+            var options = new TestOptionsMonitor<OllamaRouterOptions>(new OllamaRouterOptions());
+            var persistence = CreatePersistence(options, tempDir, new PlainKeyProtector());
+
+            var result = await persistence.PersistTargetsAsync(new List<OllamaTargetOptions>
+            {
+                new()
+                {
+                    Name = "T",
+                    Url = "https://openrouter.ai/api",
+                    Type = TargetType.OpenAI,
+                    Provider = "openrouter",
+                    Models =
+                    [
+                        new TargetModelConfig { Name = "m1", ContextLength = 4096, Quantization = "q8_0" },
+                        new TargetModelConfig { Name = "m2", ContextLength = null, Quantization = "" }
+                    ]
+                }
+            });
+
+            Assert.True(result.Success, result.Error);
+            var root = (JsonObject)JsonNode.Parse(File.ReadAllText(persistence.ConfigFilePath))!;
+            var targetNode = (JsonObject)((JsonArray)root["OllamaRouter"]!["Targets"]!)[0]!;
+            var models = (JsonArray)targetNode["Models"]!;
+            Assert.Equal(2, models.Count);
+
+            // Both hints set → all three keys present with exact values.
+            var first = (JsonObject)models[0]!;
+            Assert.Equal("m1", first["name"]!.GetValue<string>());
+            Assert.Equal(4096, first["contextLength"]!.GetValue<int>());
+            Assert.Equal("q8_0", first["quantization"]!.GetValue<string>());
+
+            // Both hints omitted (null + empty string) → keys ABSENT, never JSON null.
+            var second = (JsonObject)models[1]!;
+            Assert.Equal("m2", second["name"]!.GetValue<string>());
+            Assert.Null(second["contextLength"]);
+            Assert.Null(second["quantization"]);
+        }
+        finally
+        {
+            Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task PersistTargets_NullKeyRemovesTheStoredNode()
     {
         var tempDir = await CreateTempDirAsync();
