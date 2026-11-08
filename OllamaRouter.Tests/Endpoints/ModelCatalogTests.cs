@@ -68,6 +68,7 @@ public class ModelCatalogTests
         builder.Services.AddSingleton(liveness.Object);
         builder.Services.AddSingleton(availability.Object);
         builder.Services.AddSingleton<IOptionsMonitor<OllamaRouterOptions>>(new TestOptionsMonitor<OllamaRouterOptions>(routerOptions));
+        builder.Services.AddSingleton<ModelCapabilityEngine>();
         builder.Services.AddSingleton<IFleetAggregationService, FleetAggregationService>();
 
         var app = builder.Build();

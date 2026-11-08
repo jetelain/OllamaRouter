@@ -30,9 +30,10 @@ public class AggregatedEndpointsTests
     public const string DesktopAuthority = "127.0.0.1:21435";
     public const string ServerAuthority = "127.0.0.1:21436";
     public const string LaptopAuthority = "127.0.0.1:21437";
+    public const string ProviderAuthority = "127.0.0.1:21438";
 
     private static async Task<(WebApplication App, HttpClient Client, FakeOllamaHttpHandler Handler, Mock<ITargetLivenessService> Liveness)>
-        CreateTestAppAsync(int? perTargetTimeoutMs = null, Dictionary<string, ModelThresholds>? models = null)
+        CreateTestAppAsync(int? perTargetTimeoutMs = null, Dictionary<string, ModelThresholds>? models = null, IList<OllamaTargetOptions>? targets = null)
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseUrls("http://127.0.0.1:0");
@@ -41,7 +42,6 @@ public class AggregatedEndpointsTests
         var httpClient = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(4) };
         var catalogClient = new OllamaModelCatalogClient(httpClient);
         var memoryCache = new MemoryCache(new MemoryCacheOptions());
-        var cache = new ModelCatalogCacheService(catalogClient, memoryCache, NullLogger<ModelCatalogCacheService>.Instance);
 
         var liveness = new Mock<ITargetLivenessService>();
         liveness
@@ -68,12 +68,12 @@ public class AggregatedEndpointsTests
 
         var options = new OllamaRouterOptions
         {
-            Targets =
-            [
-                new OllamaTargetOptions { Name = "Desktop", Url = $"http://{DesktopAuthority}" },
-                new OllamaTargetOptions { Name = "Server", Url = $"http://{ServerAuthority}" },
-                new OllamaTargetOptions { Name = "Laptop", Url = $"http://{LaptopAuthority}" }
-            ],
+            Targets = targets ?? new List<OllamaTargetOptions>
+            {
+                new() { Name = "Desktop", Url = $"http://{DesktopAuthority}" },
+                new() { Name = "Server", Url = $"http://{ServerAuthority}" },
+                new() { Name = "Laptop", Url = $"http://{LaptopAuthority}" }
+            },
             Models = models ?? new()
         };
         if (perTargetTimeoutMs is not null)
@@ -81,10 +81,19 @@ public class AggregatedEndpointsTests
             options.Aggregation.PerTargetTimeoutMs = perTargetTimeoutMs.Value;
         }
 
+        var cache = new ModelCatalogCacheService(catalogClient, memoryCache, NullLogger<ModelCatalogCacheService>.Instance, new TestOptionsMonitor<OllamaRouterOptions>(options));
+
         builder.Services.AddSingleton<MemoryCache>(memoryCache);
         builder.Services.AddSingleton<IMemoryCache>(memoryCache);
         builder.Services.AddSingleton<IOllamaModelCatalogClient>(catalogClient);
         builder.Services.AddSingleton<IModelCatalogCacheService>(cache);
+        builder.Services.AddSingleton(new ModelCapabilityEngine(
+            catalogClient,
+            memoryCache,
+            NullLogger<ModelCapabilityEngine>.Instance,
+            cache,
+            null,
+            new TestOptionsMonitor<OllamaRouterOptions>(options)));
         builder.Services.AddSingleton(liveness.Object);
         builder.Services.AddSingleton(availability.Object);
         builder.Services.AddSingleton<IOptionsMonitor<OllamaRouterOptions>>(new TestOptionsMonitor<OllamaRouterOptions>(options));
@@ -299,6 +308,162 @@ public class AggregatedEndpointsTests
             // Pristine OpenAI shape: no invented fields on /v1/models entries.
             Assert.All(dataArray, m => Assert.Null(m?["router_target"]));
             Assert.All(dataArray, m => Assert.Null(m?["__router_source_target"]));
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    // --- Mixed fleet (Ollama + OpenAI target) — task #62 -----------------------------------
+
+    [Fact]
+    public async Task MixedFleet_TagsAndV1Models_ListBothFamilies()
+    {
+        var (app, client, handler, _) = await CreateTestAppAsync(targets:
+        [
+            new OllamaTargetOptions { Name = "Desktop", Url = $"http://{DesktopAuthority}" },
+            new OllamaTargetOptions
+            {
+                Name = "Provider",
+                Url = $"http://{ProviderAuthority}",
+                Type = TargetType.OpenAI,
+                ApiKey = "sk-test",
+                Models = [new TargetModelConfig { Name = "gpt-4o", ContextLength = 98_304, Quantization = "none" }]
+            }
+        ]);
+        try
+        {
+            handler.ForAuthority(DesktopAuthority, new FakeOllamaHttpHandler.TargetBehavior
+            {
+                Responses =
+                {
+                    ["GET /api/tags"] = TagsBody("llama3"),
+                    ["GET /v1/models"] = """{"object":"list","data":[{"id":"llama3","object":"model","created":1,"owned_by":"desktop"}]}"""
+                }
+            });
+            handler.ForAuthority(ProviderAuthority, new FakeOllamaHttpHandler.TargetBehavior
+            {
+                Responses =
+                {
+                    ["GET /models"] = """{"object":"list","data":[{"id":"gpt-4o","object":"model","created":1700000000,"owned_by":"openai"}]}"""
+                }
+            });
+
+            // GET /api/tags: both families, OpenAI entries canonical (Ollama-shaped).
+            var tagsResponse = await client.GetAsync("/api/tags");
+            Assert.Equal(HttpStatusCode.OK, tagsResponse.StatusCode);
+            var tagsBody = JsonNode.Parse(await tagsResponse.Content.ReadAsStringAsync())!.AsObject()["models"]!.AsArray();
+            var names = tagsBody.Select(m => m?["name"]?.GetValue<string>()).ToList();
+            Assert.Equal(new[] { "llama3", "gpt-4o" }, names);
+            var gpt = tagsBody.Single(m => m?["name"]?.GetValue<string>() == "gpt-4o")!.AsObject();
+            Assert.Equal(0L, gpt["size"]!.GetValue<long>());
+            Assert.Equal("gpt", gpt["details"]?["family"]?.GetValue<string>());
+            Assert.Equal("none", gpt["details"]?["quantization_level"]?.GetValue<string>());
+
+            // GET /v1/models: both families, OpenAI entries verbatim.
+            var v1Response = await client.GetAsync("/v1/models");
+            Assert.Equal(HttpStatusCode.OK, v1Response.StatusCode);
+            var v1Data = JsonNode.Parse(await v1Response.Content.ReadAsStringAsync())!.AsObject()["data"]!.AsArray();
+            var ids = v1Data.Select(m => m?["id"]?.GetValue<string>()).ToList();
+            Assert.Equal(new[] { "llama3", "gpt-4o" }, ids);
+
+            // Bearer went to the OpenAI authority only.
+            Assert.False(handler.AuthorizationHeaders.ContainsKey(DesktopAuthority));
+            Assert.Contains("Bearer sk-test", handler.AuthorizationHeaders[ProviderAuthority]);
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task MixedFleet_PostApiShow_ForOpenAiHostedModel_Returns200Synthesized()
+    {
+        var (app, client, handler, _) = await CreateTestAppAsync(targets:
+        [
+            new OllamaTargetOptions { Name = "Desktop", Url = $"http://{DesktopAuthority}" },
+            new OllamaTargetOptions
+            {
+                Name = "Provider",
+                Url = $"http://{ProviderAuthority}",
+                Type = TargetType.OpenAI,
+                ApiKey = "sk-test",
+                Models = [new TargetModelConfig { Name = "gpt-4o", ContextLength = 98_304, Quantization = "none" }]
+            }
+        ]);
+        try
+        {
+            handler.ForAuthority(DesktopAuthority, new FakeOllamaHttpHandler.TargetBehavior
+            {
+                Responses = { ["GET /api/tags"] = TagsBody("llama3") }
+            });
+            handler.ForAuthority(ProviderAuthority, new FakeOllamaHttpHandler.TargetBehavior
+            {
+                Responses = { ["GET /models"] = """{"object":"list","data":[{"id":"gpt-4o","object":"model","created":1700000000}]}""" }
+            });
+
+            // POST /api/show {"model":"gpt-4o"} ⇒ 200 with the synthesized payload: the roster
+            // ContextLength (98 304) is model_info.general.context_length and the parameters
+            // block is parseable by the fleet num_ctx scoring.
+            var showResponse = await client.PostAsJsonAsync("/api/show", new { model = "gpt-4o" });
+            Assert.Equal(HttpStatusCode.OK, showResponse.StatusCode);
+            var show = JsonNode.Parse(await showResponse.Content.ReadAsStringAsync())!.AsObject();
+
+            Assert.Equal("gpt-4o", show["model"]?.GetValue<string>());
+            Assert.Equal(98_304L, show["model_info"]!["general.context_length"]!.GetValue<long>());
+            var parameters = show["parameters"]?.GetValue<string>() ?? string.Empty;
+            Assert.Contains("num_ctx 98304", parameters);
+            Assert.Equal("gpt", show["details"]!["family"]?.GetValue<string>());
+            Assert.Equal("none", show["details"]!["quantization_level"]?.GetValue<string>());
+            // The synthesized payload never touches the provider over HTTP.
+            Assert.Equal(0, handler.CountCalls(ProviderAuthority, "POST /api/show"));
+
+            // Unknown model with no hoster anywhere ⇒ 502 (unchanged behavior).
+            var unknownResponse = await client.PostAsJsonAsync("/api/show", new { model = "definitely-not-hosted" });
+            Assert.Equal(HttpStatusCode.BadGateway, unknownResponse.StatusCode);
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task MixedFleet_PostApiPs_ExcludesOpenAiTarget()
+    {
+        var (app, client, handler, _) = await CreateTestAppAsync(targets:
+        [
+            new OllamaTargetOptions { Name = "Desktop", Url = $"http://{DesktopAuthority}" },
+            new OllamaTargetOptions
+            {
+                Name = "Provider",
+                Url = $"http://{ProviderAuthority}",
+                Type = TargetType.OpenAI,
+                ApiKey = "sk-test"
+            }
+        ]);
+        try
+        {
+            handler.ForAuthority(DesktopAuthority, new FakeOllamaHttpHandler.TargetBehavior
+            {
+                Responses =
+                {
+                    ["GET /api/ps"] = """{"models":[{"name":"llama3","pid":10,"size_vram":1000}]}""",
+                    ["GET /api/tags"] = TagsBody("llama3")
+                }
+            });
+
+            var response = await client.GetAsync("/api/ps");
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var modelsArray = JsonNode.Parse(await response.Content.ReadAsStringAsync())!.AsObject()["models"]!.AsArray();
+            Assert.Single(modelsArray);
+            Assert.Equal("Desktop", modelsArray[0]!["router_target"]?.GetValue<string>());
+            Assert.Equal(0, handler.TotalCalls(ProviderAuthority));
         }
         finally
         {

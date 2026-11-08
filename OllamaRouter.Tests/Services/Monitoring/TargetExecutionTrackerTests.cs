@@ -49,6 +49,9 @@ public class TargetExecutionTrackerTests : IDisposable
             return Task.FromResult(respond(baseUrl));
         }
 
+        public Task<(JsonArray? Data, bool Succeeded)> FetchOpenAiModelsAsync(OllamaTargetOptions target, TimeSpan budget, CancellationToken cancellationToken = default)
+            => Task.FromResult<(JsonArray? Data, bool Succeeded)>((new JsonArray(), true));
+
         public Task<JsonArray> GetMergedTagsAsync(string? localUrl, string? remoteUrl, CancellationToken cancellationToken = default) => Task.FromResult(new JsonArray());
         public Task<JsonArray> GetMergedOpenAIModelsAsync(string? localUrl, string? remoteUrl, CancellationToken cancellationToken = default) => Task.FromResult(new JsonArray());
         public Task<JsonArray> GetMergedRunningModelsAsync(string? localUrl, string? remoteUrl, CancellationToken cancellationToken = default) => Task.FromResult(new JsonArray());

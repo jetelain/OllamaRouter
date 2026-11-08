@@ -13,6 +13,13 @@ namespace OllamaRouter.Endpoints;
 /// (GET /api/tags, /v1/models, /api/ps) are served by <see cref="IFleetAggregationService"/>
 /// (parallel fan-out with per-target budget + stale-while-revalidate), and
 /// POST /api/show is model-directed with a 30 s in-memory response cache.
+/// <para>
+/// Non-Ollama (OpenAI) targets (task #62) participate in the unified catalog with
+/// synthesized, canonical entries (authenticated <c>GET /models</c> listing + declared roster)
+/// and answer POST /api/show with a deterministic synthesized payload — the synthesis lives in
+/// the aggregation layer (the single owner of target resolution + caching), so these handlers
+/// stay thin pass-throughs.
+/// </para>
 /// </summary>
 public static class OllamaEndpointsExtensions
 {

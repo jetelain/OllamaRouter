@@ -29,6 +29,13 @@ public interface IFleetAggregationService
     /// slow/offline targets fall back to their cached catalog (or contribute nothing when none
     /// is cached). <paramref name="cloudSyntheses"/> (when non-null) are appended when not
     /// already present (case-insensitive <c>name</c>/<c>model</c> match).
+    /// <para>
+    /// Non-Ollama (OpenAI) targets (task #62) contribute canonical Ollama-shaped entries
+    /// synthesized from their authenticated <c>GET /models</c> listing (the source of
+    /// membership) plus their declared roster (appended when absent — the roster never hides
+    /// a live model); when the listing fails, a non-empty roster serves the roster-only
+    /// catalog and an empty roster falls back to the stale slot.
+    /// </para>
     /// </summary>
     Task<JsonArray> GetTagsFleetAsync(IReadOnlyList<JsonNode>? cloudSyntheses, HttpContext? context = null);
 
@@ -41,11 +48,13 @@ public interface IFleetAggregationService
     Task<JsonArray> GetOpenAIModelsFleetAsync(IReadOnlyList<JsonNode>? cloudSyntheses, HttpContext? context = null);
 
     /// <summary>
-    /// Returns the merged /api/ps array of the whole fleet: the union of every online target's
-    /// running models (no cross-target dedup, so the same model loaded on two daemons appears
-    /// twice). Each entry is annotated with the non-standard <c>router_target</c> field carrying
-    /// the target name, so per-target <c>size_vram</c> is distinguishable. Same budget and
-    /// stale-while-revalidate semantics as <see cref="GetTagsFleetAsync"/>.
+    /// Returns the merged /api/ps array of the whole fleet: the union of every online OLLAMA
+    /// target's running models (no cross-target dedup, so the same model loaded on two daemons
+    /// appears twice). Each entry is annotated with the non-standard <c>router_target</c> field
+    /// carrying the target name, so per-target <c>size_vram</c> is distinguishable. Same budget
+    /// and stale-while-revalidate semantics as <see cref="GetTagsFleetAsync"/>.
+    /// <para>Non-Ollama targets are excluded entirely (task #62): remote APIs have no
+    /// running-model concept, so they are never fetched and never contribute.</para>
     /// </summary>
     Task<JsonArray> GetPsFleetAsync(HttpContext? context = null);
 
@@ -68,6 +77,12 @@ public interface IFleetAggregationService
     /// additionally cached 30 s under <c>FleetAggregation:show-best:{model}</c>; a hit of
     /// either cache performs no network I/O at all. Pinned requests never touch the best
     /// cache.
+    /// <para>
+    /// Non-Ollama hosts (task #62): a permissive (empty-roster) target hosts every requested
+    /// model name; its /api/show payload is SYNTHESIZED from pure configuration (roster +
+    /// family heuristics, zero network I/O) via <see cref="SynthesizedShowBuilder"/> and flows
+    /// through the same 30 s caches.
+    /// </para>
     /// </summary>
     Task<JsonObject?> GetShowFleetAsync(string modelName, RoutingTarget? pinned, HttpContext? context = null);
 }

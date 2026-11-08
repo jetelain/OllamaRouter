@@ -2,6 +2,7 @@ using System.Net;
 using System.Text;
 using Microsoft.Extensions.DependencyInjection;
 using Moq;
+using OllamaRouter.Options;
 using OllamaRouter.Services.Catalog;
 
 namespace OllamaRouter.Tests.Services.Catalog;
@@ -635,5 +636,170 @@ public class OllamaModelCatalogClientTests
         Assert.Equal(["llama3:8b"], running);
         Assert.Equal("http://127.0.0.1:11435/api/ps", catalogHandler.LastRequest?.RequestUri?.ToString());
         Assert.Null(preloadHandler.LastRequest);
+    }
+
+    private sealed class SlowFakeHttpMessageHandler : HttpMessageHandler
+    {
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            // Simulates an unresponsive provider that observes cancellation (like a dead socket).
+            await Task.Delay(TimeSpan.FromMinutes(5), cancellationToken);
+            return new HttpResponseMessage(HttpStatusCode.OK);
+        }
+    }
+
+    private static OllamaTargetOptions OpenAiTarget(string? apiKey, string url = "http://h:8000/v1") =>
+        new() { Name = "Provider", Url = url, Type = TargetType.OpenAI, ApiKey = apiKey };
+
+    // --- FetchOpenAiModelsAsync (task #62) -------------------------------------------------
+
+    [Fact]
+    public async Task FetchOpenAiModelsAsync_ValidData_ReturnsParsedArray()
+    {
+        var (sut, _) = CreateSut(_ => JsonResponse("""{ "object": "list", "data": [ { "id": "gpt-4o" }, { "id": "llama-3.3-70b" } ] }"""));
+
+        var (data, succeeded) = await sut.FetchOpenAiModelsAsync(OpenAiTarget("sk-test"), TimeSpan.FromSeconds(4));
+
+        Assert.True(succeeded);
+        Assert.NotNull(data);
+        Assert.Equal(2, data!.Count);
+        Assert.Equal("gpt-4o", data[0]!["id"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task FetchOpenAiModelsAsync_EmptyData_IsASucceededEmptyCatalog()
+    {
+        var (sut, _) = CreateSut(_ => JsonResponse("""{ "object": "list", "data": [] }"""));
+
+        var (data, succeeded) = await sut.FetchOpenAiModelsAsync(OpenAiTarget("sk-test"), TimeSpan.FromSeconds(4));
+
+        Assert.True(succeeded);
+        Assert.NotNull(data);
+        Assert.Empty(data!);
+    }
+
+    [Fact]
+    public async Task FetchOpenAiModelsAsync_MissingDataProperty_ReturnsFailedFetch()
+    {
+        var (sut, _) = CreateSut(_ => JsonResponse("""{ "object": "list" }"""));
+
+        var (data, succeeded) = await sut.FetchOpenAiModelsAsync(OpenAiTarget("sk-test"), TimeSpan.FromSeconds(4));
+
+        Assert.False(succeeded);
+        Assert.Null(data);
+    }
+
+    [Fact]
+    public async Task FetchOpenAiModelsAsync_InvalidJson_ReturnsFailedFetch()
+    {
+        var (sut, _) = CreateSut(_ => JsonResponse("not json"));
+
+        var (data, succeeded) = await sut.FetchOpenAiModelsAsync(OpenAiTarget("sk-test"), TimeSpan.FromSeconds(4));
+
+        Assert.False(succeeded);
+        Assert.Null(data);
+    }
+
+    [Fact]
+    public async Task FetchOpenAiModelsAsync_Unauthorized_ReturnsFailedFetch()
+    {
+        var (sut, _) = CreateSut(_ => new HttpResponseMessage(HttpStatusCode.Unauthorized));
+
+        var (data, succeeded) = await sut.FetchOpenAiModelsAsync(OpenAiTarget("sk-bad"), TimeSpan.FromSeconds(4));
+
+        Assert.False(succeeded);
+        Assert.Null(data);
+    }
+
+    [Fact]
+    public async Task FetchOpenAiModelsAsync_ThrowingHandler_ReturnsFailedFetch()
+    {
+        var (sut, _) = CreateSut(_ => throw new HttpRequestException("connection refused"));
+
+        var (data, succeeded) = await sut.FetchOpenAiModelsAsync(OpenAiTarget("sk-test"), TimeSpan.FromSeconds(4));
+
+        Assert.False(succeeded);
+        Assert.Null(data);
+    }
+
+    [Fact]
+    public async Task FetchOpenAiModelsAsync_ApiKeyConfigured_SendsBearerHeader()
+    {
+        var (sut, handler) = CreateSut(_ => JsonResponse("""{ "data": [] }"""));
+
+        await sut.FetchOpenAiModelsAsync(OpenAiTarget("sk-super-secret"), TimeSpan.FromSeconds(4));
+
+        var authorization = handler.LastRequest?.Headers.Authorization;
+        Assert.NotNull(authorization);
+        Assert.Equal("Bearer", authorization!.Scheme);
+        Assert.Equal("sk-super-secret", authorization.Parameter);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task FetchOpenAiModelsAsync_ApiKeyBlank_NoAuthorizationHeader(string? apiKey)
+    {
+        var (sut, handler) = CreateSut(_ => JsonResponse("""{ "data": [] }"""));
+
+        await sut.FetchOpenAiModelsAsync(OpenAiTarget(apiKey), TimeSpan.FromSeconds(4));
+
+        Assert.Null(handler.LastRequest?.Headers.Authorization);
+    }
+
+    [Theory]
+    [InlineData("http://h:8000/v1", "http://h:8000/v1/models")]
+    [InlineData("http://h:8000", "http://h:8000/models")]
+    [InlineData("https://api.openai.com/v1", "https://api.openai.com/v1/models")]
+    [InlineData("http://h:8000/v1/", "http://h:8000/v1/models")]
+    public async Task FetchOpenAiModelsAsync_ComposesModelsPath_AgainstPathPrefixedBases(string baseUrl, string expectedUrl)
+    {
+        var (sut, handler) = CreateSut(_ => JsonResponse("""{ "data": [] }"""));
+
+        await sut.FetchOpenAiModelsAsync(OpenAiTarget("sk-test", baseUrl), TimeSpan.FromSeconds(4));
+
+        Assert.Equal(expectedUrl, handler.LastRequest?.RequestUri?.ToString());
+    }
+
+    [Fact]
+    public async Task FetchOpenAiModelsAsync_HungProvider_ReturnsFailedFetch_WithinBudget()
+    {
+        var handler = new SlowFakeHttpMessageHandler();
+        var sut = new OllamaModelCatalogClient(new HttpClient(handler));
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var (data, succeeded) = await sut.FetchOpenAiModelsAsync(OpenAiTarget("sk-test"), TimeSpan.FromMilliseconds(300));
+        sw.Stop();
+
+        Assert.False(succeeded);
+        Assert.Null(data);
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(3), $"Took {sw.Elapsed.TotalMilliseconds:F0} ms; the budget must bound the fetch.");
+    }
+
+    [Fact]
+    public async Task FetchOpenAiModelsAsync_OuterCancellation_Propagates()
+    {
+        // A hanging provider + an already-aborted caller: the cancellation must propagate
+        // (budget expiries are swallowed, but caller aborts are not).
+        var handler = new SlowFakeHttpMessageHandler();
+        var sut = new OllamaModelCatalogClient(new HttpClient(handler));
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => sut.FetchOpenAiModelsAsync(OpenAiTarget("sk-test"), TimeSpan.FromSeconds(4), cts.Token));
+    }
+
+    [Fact]
+    public async Task FetchOpenAiModelsAsync_NoUrl_ReturnsFailedFetch_WithoutHttp()
+    {
+        var (sut, handler) = CreateSut(_ => JsonResponse("""{ "data": [] }"""));
+
+        var (data, succeeded) = await sut.FetchOpenAiModelsAsync(OpenAiTarget("sk-test", ""), TimeSpan.FromSeconds(4));
+
+        Assert.False(succeeded);
+        Assert.Null(data);
+        Assert.Null(handler.LastRequest);
     }
 }

@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using OllamaRouter.Options;
 using OllamaRouter.Services.Hardware;
 using OllamaRouter.Services.ContextSizing;
@@ -93,7 +94,8 @@ public sealed class ModelCapabilityEngine(
     IMemoryCache memoryCache,
     ILogger<ModelCapabilityEngine> logger,
     IModelCatalogCacheService? keyRegistry = null,
-    IFleetHardwareService? fleetHardware = null)
+    IFleetHardwareService? fleetHardware = null,
+    IOptionsMonitor<OllamaRouterOptions>? routerOptions = null)
 {
     /// <summary>
     /// Default Ollama context window when the Modelfile omits an explicit num_ctx.
@@ -148,6 +150,14 @@ public sealed class ModelCapabilityEngine(
             return new ModelMetadata(modelName, 0, null, 0, null, null, false, null, null, null);
         }
 
+        // Non-Ollama targets have no /api/tags or /api/show: synthesize the metadata from the
+        // target's roster + family heuristics (network-free, always live so Setup-API roster
+        // edits are visible immediately — consistent with task #61's live roster resolution).
+        if (routerOptions is not null && TryResolveNonOllamaTarget(targetUrl, out var nonOllamaTarget))
+        {
+            return SynthesizeNonOllamaMetadata(nonOllamaTarget, modelName);
+        }
+
         var cacheKey = BuildCacheKey(targetUrl, catalogDigest, modelName);
         var factory = async (ICacheEntry entry) =>
         {
@@ -167,6 +177,75 @@ public sealed class ModelCapabilityEngine(
 
         return (ModelMetadata?)await memoryCache.GetOrCreateAsync(cacheKey, factory) ??
                new ModelMetadata(modelName, 0, null, 0, null, null, false, null, null, null);
+    }
+
+    /// <summary>
+    /// Synthesizes the <see cref="ModelMetadata"/> of a model hosted on a NON-OLLAMA target
+    /// from configuration only (task #62): the declared roster entry's
+    /// <see cref="TargetModelConfig.ContextLength"/> / <see cref="TargetModelConfig.Quantization"/>
+    /// hints plus the <see cref="ModelFamilyHeuristics"/> table. NO network and NO cache —
+    /// the pure in-memory walk runs on EVERY call so a Setup-API roster edit is visible
+    /// immediately. An unmatched model name degrades to the "unknown" shape
+    /// (<c>HasModelInfo</c> false) so classification takes the permissive MoE path
+    /// (decision D1: no veto can ever fire for an unknown remote model).
+    /// </summary>
+    public ModelMetadata SynthesizeNonOllamaMetadata(OllamaTargetOptions target, string modelName)
+    {
+        var rosterEntry = target?.Models is null
+            ? null
+            : target.Models.FirstOrDefault(m =>
+                !string.IsNullOrWhiteSpace(m.Name) &&
+                string.Equals(m.Name!.Trim(), modelName, StringComparison.OrdinalIgnoreCase));
+        var match = ModelFamilyHeuristics.TryMatch(modelName);
+
+        long? contextLength = rosterEntry is { ContextLength: > 0 }
+            ? (long?)rosterEntry.ContextLength
+            : match?.ContextLength is { } heuristicContext and > 0
+                ? (long?)heuristicContext
+                : null;
+
+        return new ModelMetadata(
+            ModelName: modelName,
+            WeightSizeBytes: 0,
+            ParameterCount: match?.ParameterCount,
+            ExpertCount: match?.ExpertCount ?? 0,
+            ModelFamily: match?.Family,
+            ModelfileNumCtx: null,
+            HasModelInfo: match is not null,
+            ParametersRaw: null,
+            NativeContextLength: contextLength,
+            QuantizationLevel: rosterEntry?.Quantization);
+    }
+
+    /// <summary>
+    /// Resolves the effective non-Ollama target whose URL matches <paramref name="targetUrl"/>
+    /// (case-insensitive, trailing-slash tolerant — the same match as the synthetic-roster
+    /// lookup in <c>ModelCatalogCacheService</c>). Returns false for Ollama targets,
+    /// unresolvable URLs and hosts without the optional options reference.
+    /// </summary>
+    private bool TryResolveNonOllamaTarget(string targetUrl, out OllamaTargetOptions target)
+    {
+        target = null!;
+        if (routerOptions is null || string.IsNullOrWhiteSpace(targetUrl))
+        {
+            return false;
+        }
+
+        foreach (var candidate in routerOptions.CurrentValue.GetEffectiveTargets())
+        {
+            if (candidate.Type == TargetType.Ollama || string.IsNullOrWhiteSpace(candidate.Url))
+            {
+                continue;
+            }
+
+            if (string.Equals(candidate.Url.TrimEnd('/'), targetUrl.TrimEnd('/'), StringComparison.OrdinalIgnoreCase))
+            {
+                target = candidate;
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -226,18 +305,28 @@ public sealed class ModelCapabilityEngine(
 
         var maxVram = target.GetEffectiveMaxVramMB(fleetHardware);
         var weightMB = (int)(metadata.WeightSizeBytes / 1_048_576);
-        var availableMB = maxVram.HasValue ? (int?)(maxVram.Value - weightMB) : null;
+        var isNonOllama = target.Type != TargetType.Ollama;
 
-        // Capacity hierarchy (task #25): the node's pre-configured Modelfile num_ctx wins
-        // outright; otherwise the model's native GGUF context length; otherwise the assumed
-        // 128k fallback (hardware-derived ceilings are no longer capacity sources).
-        var cMax = metadata.ModelfileNumCtx ?? AsContextInt(metadata.NativeContextLength) ?? FallbackContextWindow;
+        // Stateless remote endpoints never consume LOCAL VRAM (task #62, decision D1): the
+        // remaining-VRAM figure only makes sense for Ollama targets that would load the
+        // weights — expose null for non-Ollama targets (Ollama behavior unchanged).
+        var availableMB = (isNonOllama || maxVram is null) ? null : (int?)(maxVram.Value - weightMB);
+
+        // Capacity hierarchy (task #25, shared with SynthesizedShowBuilder): the node's
+        // pre-configured Modelfile num_ctx wins outright; otherwise the model's native context
+        // length (roster hint / family heuristic for non-Ollama targets); otherwise the
+        // assumed 128k fallback (hardware-derived ceilings are no longer capacity sources).
+        var cMax = ResolveContextCeiling(metadata);
         var nativeContextLimit = AsContextInt(metadata.NativeContextLength);
 
-        // 8gb / &lt;12000 MB hard veto for LargeDense only: MoE and SmallDense are NEVER
+        // 8gb / &lt;12000 MB hard veto for LargeDense only, and for OLLAMA targets ONLY
+        // (decision D1: stateless remote endpoints never consume local VRAM, so a
+        // synthesized LargeDense classification never hard-disqualifies a cloud-shaped target —
+        // it is reported for cartography/monitoring only). MoE and SmallDense are NEVER
         // VRAM-vetoed (MoE is capable on all targets; see the zero-config routing plan §2.1).
-        var hardwareCapable = !(architecture == ModelArchitectureKind.LargeDense &&
-                                (maxVram is null || maxVram < SmallTargetVramThresholdMB));
+        var hardwareCapable = isNonOllama ||
+            !(architecture == ModelArchitectureKind.LargeDense &&
+              (maxVram is null || maxVram < SmallTargetVramThresholdMB));
 
         return new TargetModelCapability(
             Target: targetName,
@@ -316,6 +405,15 @@ public sealed class ModelCapabilityEngine(
 
         return (kind, ArchitectureDetectionSource.DenseParameterCount);
     }
+
+    /// <summary>
+    /// The CMax capacity hierarchy (task #25 / task #62): the Modelfile num_ctx → the native
+    /// context length → the assumed 128k fallback (<see cref="FallbackContextWindow"/>).
+    /// Shared by <see cref="DeriveCapability"/> and <see cref="SynthesizedShowBuilder"/>
+    /// (internal + InternalsVisibleTo) so the two consumers can never diverge.
+    /// </summary>
+    internal static int ResolveContextCeiling(ModelMetadata metadata) =>
+        metadata.ModelfileNumCtx ?? AsContextInt(metadata.NativeContextLength) ?? FallbackContextWindow;
 
     private static int? AsContextInt(long? value)
     {

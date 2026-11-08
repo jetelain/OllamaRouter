@@ -38,6 +38,12 @@ public sealed class FakeOllamaHttpHandler : HttpMessageHandler
 
     public ConcurrentDictionary<string, int> CallCounts { get; } = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// The Authorization header values observed per authority (only recorded when present),
+    /// so tests can assert which targets received authenticated (Bearer) requests.
+    /// </summary>
+    public ConcurrentDictionary<string, List<string>> AuthorizationHeaders { get; } = new(StringComparer.Ordinal);
+
     private readonly ConcurrentDictionary<string, TargetBehavior> _behaviors = new(StringComparer.Ordinal);
 
     public FakeOllamaHttpHandler ForAuthority(string authority, TargetBehavior behavior)
@@ -77,6 +83,13 @@ public sealed class FakeOllamaHttpHandler : HttpMessageHandler
         var methodAndPath = $"{request.Method} {path}";
 
         CallCounts.AddOrUpdate($"{authority} {methodAndPath}", 1, (_, count) => count + 1);
+
+        if (request.Headers.Authorization is { } authorization)
+        {
+            AuthorizationHeaders
+                .GetOrAdd(authority, _ => new List<string>())
+                .Add(authorization.ToString());
+        }
 
         if (!_behaviors.TryGetValue(authority, out var behavior))
         {

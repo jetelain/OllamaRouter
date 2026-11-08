@@ -1,4 +1,5 @@
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Nodes;
@@ -269,6 +270,57 @@ public sealed class OllamaModelCatalogClient(HttpClient httpClient, IHttpClientF
         {
             // Budget exceeded (per-target timeout) or transport/parse failure: surface as a
             // failed fetch so the aggregation layer falls back to the cached catalog.
+            return (null, false);
+        }
+    }
+
+    public async Task<(JsonArray? Data, bool Succeeded)> FetchOpenAiModelsAsync(
+        OllamaTargetOptions target, TimeSpan budget, CancellationToken cancellationToken = default)
+    {
+        if (target is null || string.IsNullOrWhiteSpace(target.Url))
+        {
+            return (null, false);
+        }
+
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        if (budget > TimeSpan.Zero)
+        {
+            linkedCts.CancelAfter(budget);
+        }
+
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, BuildUrl(target.Url, "/models"));
+            // Bearer auth ONLY when a key is configured (matches the #61 liveness probe);
+            // the raw key is sent on the wire but appears in no log line or response.
+            if (!string.IsNullOrWhiteSpace(target.ApiKey))
+            {
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", target.ApiKey);
+            }
+
+            var response = await httpClient.SendAsync(request, linkedCts.Token);
+            if (!response.IsSuccessStatusCode)
+            {
+                // Unauthenticated (401/403) or otherwise refused: a failed fetch (the roster
+                // / stale fallback of the caller applies).
+                return (null, false);
+            }
+
+            var raw = await response.Content.ReadAsStringAsync(linkedCts.Token);
+            var json = JsonNode.Parse(raw);
+            var data = json?["data"] as JsonArray;
+            // A successful HTTP response without the expected data array (e.g. an error body)
+            // is a failed fetch, mirroring FetchArrayBoundedAsync.
+            return (data, data is not null);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // The caller itself was cancelled (e.g. client disconnect); propagate.
+            throw;
+        }
+        catch
+        {
+            // Budget exceeded (per-target timeout) or transport/parse failure.
             return (null, false);
         }
     }

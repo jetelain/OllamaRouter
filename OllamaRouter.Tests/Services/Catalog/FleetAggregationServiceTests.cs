@@ -31,6 +31,9 @@ public class FleetAggregationServiceTests : IDisposable
         ]
     };
 
+    private readonly ModelCapabilityEngine _capabilityEngine =
+        new(new Mock<IOllamaModelCatalogClient>().Object, new MemoryCache(new MemoryCacheOptions()), NullLogger<ModelCapabilityEngine>.Instance);
+
     private readonly FakeOllamaHttpHandler _handler = new();
     private readonly HttpClient _httpClient;
     private readonly OllamaModelCatalogClient _catalogClient;
@@ -44,7 +47,11 @@ public class FleetAggregationServiceTests : IDisposable
     {
         _httpClient = new HttpClient(_handler) { Timeout = TimeSpan.FromSeconds(4) };
         _catalogClient = new OllamaModelCatalogClient(_httpClient);
-        _catalogCache = new ModelCatalogCacheService(_catalogClient, _memoryCache, NullLogger<ModelCatalogCacheService>.Instance);
+        _catalogCache = new ModelCatalogCacheService(
+            _catalogClient,
+            _memoryCache,
+            NullLogger<ModelCatalogCacheService>.Instance,
+            new TestOptionsMonitor<OllamaRouterOptions>(_options));
 
         _liveness
             .Setup(t => t.EnsureKnownAsync(It.IsAny<RoutingTarget>(), It.IsAny<CancellationToken>()))
@@ -91,7 +98,8 @@ public class FleetAggregationServiceTests : IDisposable
             _liveness.Object,
             _availability.Object,
             _memoryCache,
-            NullLogger<FleetAggregationService>.Instance);
+            NullLogger<FleetAggregationService>.Instance,
+            _capabilityEngine);
     }
 
     private static string TagsBody(params (string Name, int Size)[] models)
@@ -576,5 +584,326 @@ public class FleetAggregationServiceTests : IDisposable
 
         var fanOut = CreateService().GetFanOutTargets();
         Assert.Equal(new[] { "Desktop", "Server", "Laptop" }, fanOut.Select(t => t.Name));
+    }
+
+    // --- Mixed fleet: Desktop (Ollama) + Provider (OpenAI) — task #62 ------------------------
+
+    public const string ProviderAuthority = "api.provider.example";
+    public const string ProviderUrl = $"http://{ProviderAuthority}";
+
+    private sealed class MixedFleet
+    {
+        public MemoryCache MemoryCache { get; init; } = null!;
+        public FleetAggregationService Service { get; init; } = null!;
+    }
+
+    private MixedFleet CreateMixedFleet(params (string Name, int? Ctx, string? Quant)[] roster)
+    {
+        var provider = new OllamaTargetOptions
+        {
+            Name = "Provider",
+            Url = ProviderUrl,
+            Type = TargetType.OpenAI,
+            ApiKey = "sk-test"
+        };
+        foreach (var (name, ctx, quant) in roster)
+        {
+            provider.Models.Add(new TargetModelConfig { Name = name, ContextLength = ctx, Quantization = quant });
+        }
+
+        var options = new OllamaRouterOptions
+        {
+            Targets =
+            [
+                new OllamaTargetOptions { Name = "Desktop", Url = DesktopUrl },
+                provider
+            ]
+        };
+        var memoryCache = new MemoryCache(new MemoryCacheOptions());
+        var cache = new ModelCatalogCacheService(
+            _catalogClient,
+            memoryCache,
+            NullLogger<ModelCatalogCacheService>.Instance,
+            new TestOptionsMonitor<OllamaRouterOptions>(options));
+        var service = new FleetAggregationService(
+            new TestOptionsMonitor<OllamaRouterOptions>(options),
+            _catalogClient,
+            cache,
+            _liveness.Object,
+            _availability.Object,
+            memoryCache,
+            NullLogger<FleetAggregationService>.Instance,
+            _capabilityEngine);
+        return new MixedFleet { MemoryCache = memoryCache, Service = service };
+    }
+
+    private static string ModelsDataBody(params (string Id, long Created)[] models)
+    {
+        var data = new JsonArray();
+        foreach (var (id, created) in models)
+        {
+            data.Add(new JsonObject { ["id"] = id, ["object"] = "model", ["created"] = created, ["owned_by"] = "openai" });
+        }
+
+        return new JsonObject { ["object"] = "list", ["data"] = data }.ToJsonString();
+    }
+
+    private void SeedProviderModels(params (string Id, long Created)[] models)
+    {
+        _handler.ForAuthority(ProviderAuthority, new FakeOllamaHttpHandler.TargetBehavior
+        {
+            Responses = { ["GET /models"] = ModelsDataBody(models) }
+        });
+    }
+
+    [Fact]
+    public async Task MixedFleet_GetTagsFleet_UnionInConfigOrder_OpenAiEntriesCanonical_BearerOnlyToProvider()
+    {
+        SeedTags(DesktopAuthority, ("llama3", 100), ("gpt-4o", 1));
+        SeedProviderModels(("llama3", 1_700_000_000L), ("gpt-4o-mini", 1_700_000_001L), ("llama-3.3-70b", 1_690_000_000L));
+        var fleet = CreateMixedFleet(("gpt-4o", 98_304, "none"));
+
+        var merged = await fleet.Service.GetTagsFleetAsync(null);
+
+        // Union in config order; the earlier (Ollama) entry wins on the shared names
+        // ("llama3" and "gpt-4o" exist on both targets → first-encountered wins).
+        var names = merged.Select(m => m?["name"]?.GetValue<string>()).ToList();
+        Assert.Equal(new[] { "llama3", "gpt-4o", "gpt-4o-mini", "llama-3.3-70b" }, names);
+        Assert.Equal(100L, merged.Single(m => m?["name"]?.GetValue<string>() == "llama3")!["size"]!.GetValue<long>());
+        Assert.Equal(1L, merged.Single(m => m?["name"]?.GetValue<string>() == "gpt-4o")!["size"]!.GetValue<long>());
+
+        // Provider-only entries are canonical Ollama-shaped entries (strict IDE client shape).
+        var gptMini = merged.Single(m => m?["name"]?.GetValue<string>() == "gpt-4o-mini")!.AsObject();
+        Assert.Equal("gpt-4o-mini", gptMini["model"]?.GetValue<string>());
+        Assert.Equal(0L, gptMini["size"]!.GetValue<long>());
+        Assert.Equal("gpt", gptMini["details"]!["family"]?.GetValue<string>());
+        Assert.Equal("cloud", gptMini["details"]!["quantization_level"]?.GetValue<string>());
+        Assert.True(DateTimeOffset.TryParseExact(
+            gptMini["modified_at"]!.GetValue<string>(), "o", System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.None, out var modifiedAt));
+        Assert.Equal(1_700_000_001L, modifiedAt.ToUnixTimeSeconds()); // created passthrough
+
+        var llama33 = merged.Single(m => m?["name"]?.GetValue<string>() == "llama-3.3-70b")!.AsObject();
+        Assert.Equal("llama", llama33["details"]!["family"]?.GetValue<string>());
+        Assert.Equal("70.0B", llama33["details"]!["parameter_size"]?.GetValue<string>());
+        Assert.Equal("cloud", llama33["details"]!["quantization_level"]?.GetValue<string>());
+
+        // Bearer auth went to the OpenAI authority ONLY — never to the Ollama daemon.
+        Assert.False(_handler.AuthorizationHeaders.ContainsKey(DesktopAuthority));
+        Assert.Contains("Bearer sk-test", _handler.AuthorizationHeaders[ProviderAuthority]);
+    }
+
+    [Fact]
+    public async Task MixedFleet_GetTagsFleet_RosterMerge_LiveIsMembership_RosterHintsOnly_AppendsMissing()
+    {
+        SeedTags(DesktopAuthority, ("llama3", 100));
+        SeedProviderModels(("gpt-4o", 1_700_000_000L), ("gpt-4o-mini", 1_700_000_001L));
+        var fleet = CreateMixedFleet(("gpt-4o", 98_304, "none"), ("claude-3-5-sonnet", null, null));
+
+        var merged = await fleet.Service.GetTagsFleetAsync(null);
+
+        var names = merged.Select(m => m?["name"]?.GetValue<string>()).ToList();
+        // Live ids all appear (the roster never hides a live model, e.g. gpt-4o-mini)...
+        Assert.Contains("gpt-4o-mini", names);
+        // ...roster-only entries are appended (static availability)...
+        Assert.Contains("claude-3-5-sonnet", names);
+
+        var gpt = merged.Single(m => m?["name"]?.GetValue<string>() == "gpt-4o")!;
+        Assert.Equal("none", gpt["details"]?["quantization_level"]?.GetValue<string>());
+
+        var claude = merged.Single(m => m?["name"]?.GetValue<string>() == "claude-3-5-sonnet")!;
+        Assert.Equal("claude", claude["details"]?["family"]?.GetValue<string>());
+        Assert.Equal(0L, claude["size"]!.GetValue<long>());
+    }
+
+    [Fact]
+    public async Task MixedFleet_GetTagsFleet_ProviderDown_RosterCatalogServed_WriteThrough()
+    {
+        SeedTags(DesktopAuthority, ("llama3", 100));
+        _handler.ForAuthority(ProviderAuthority, new FakeOllamaHttpHandler.TargetBehavior
+        {
+            Responses = { ["GET /models"] = "401 {\"error\":\"unauthorized\"}" }
+        });
+        var fleet = CreateMixedFleet(("gpt-4o", 98_304, "none"));
+
+        var merged = await fleet.Service.GetTagsFleetAsync(null);
+        var names = merged.Select(m => m?["name"]?.GetValue<string>()).ToList();
+
+        Assert.Contains("llama3", names);
+        Assert.Contains("gpt-4o", names); // the static roster keeps the target visible
+
+        // Write-through: the merged roster catalog was cached as the stale slot, so the next
+        // call (provider still down) is served identically.
+        var merged2 = await fleet.Service.GetTagsFleetAsync(null);
+        Assert.Contains("gpt-4o", merged2.Select(m => m?["name"]?.GetValue<string>()));
+    }
+
+    [Fact]
+    public async Task MixedFleet_GetTagsFleet_ProviderHungEmptyRoster_StaleSlotServesPreviousCatalog_WithinBudget()
+    {
+        SeedTags(DesktopAuthority, ("llama3", 100));
+        SeedProviderModels(("gpt-4o", 1_700_000_000L));
+        var fleet = CreateMixedFleet(); // permissive (empty roster)
+
+        var first = await fleet.Service.GetTagsFleetAsync(null);
+        Assert.Contains("gpt-4o", first.Select(m => m?["name"]?.GetValue<string>()));
+
+        // The provider now hangs: with an empty roster the live fetcher degrades to
+        // (null, false) and the 60 s stale slot serves the previous merged catalog.
+        _handler.Behavior(ProviderAuthority).Hang = true;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var second = await fleet.Service.GetTagsFleetAsync(null);
+        sw.Stop();
+
+        Assert.True(sw.Elapsed < TimeSpan.FromMilliseconds(1500),
+            $"Aggregation took {sw.Elapsed.TotalMilliseconds:F0} ms; a hung provider must not block.");
+        Assert.Contains("gpt-4o", second.Select(m => m?["name"]?.GetValue<string>()));
+        Assert.Contains("llama3", second.Select(m => m?["name"]?.GetValue<string>()));
+    }
+
+    [Fact]
+    public async Task MixedFleet_GetV1Models_LiveDataVerbatim_RosterOnlyAppended_CreatedZero()
+    {
+        _handler.ForAuthority(DesktopAuthority, new FakeOllamaHttpHandler.TargetBehavior
+        {
+            Responses =
+            {
+                ["GET /v1/models"] = """{"object":"list","data":[{"id":"llama3","object":"model","created":5,"owned_by":"desktop"}]}""",
+                ["GET /api/tags"] = """{"models":[{"name":"llama3"}]}"""
+            }
+        });
+        SeedProviderModels(("gpt-4o", 1_700_000_000L));
+        var fleet = CreateMixedFleet(("gpt-4o", 98_304, "none"), ("claude-3-5-sonnet", null, null));
+
+        var merged = await fleet.Service.GetOpenAIModelsFleetAsync(null);
+
+        var ids = merged.Select(m => m?["id"]?.GetValue<string>()).ToList();
+        Assert.Equal(new[] { "llama3", "gpt-4o", "claude-3-5-sonnet" }, ids);
+
+        // The live provider payload passes through verbatim (its own created/owned_by kept)...
+        var gpt = merged.Single(m => m?["id"]?.GetValue<string>() == "gpt-4o")!;
+        Assert.Equal(1_700_000_000L, gpt["created"]!.GetValue<long>());
+        Assert.Equal("openai", gpt["owned_by"]?.GetValue<string>());
+        // ...and the roster-only appendage uses the OpenAI shape with created = 0.
+        var claude = merged.Single(m => m?["id"]?.GetValue<string>() == "claude-3-5-sonnet")!;
+        Assert.Equal(0L, claude["created"]!.GetValue<long>());
+        Assert.Equal("model", claude["object"]?.GetValue<string>());
+        Assert.Equal("Provider", claude["owned_by"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task MixedFleet_GetPsFleet_NeverContactsOpenAiAuthority()
+    {
+        _handler.ForAuthority(DesktopAuthority, new FakeOllamaHttpHandler.TargetBehavior
+        {
+            Responses = { ["GET /api/ps"] = """{"models":[{"name":"llama3","pid":10,"size_vram":1000}]}""" }
+        });
+        var fleet = CreateMixedFleet(("gpt-4o", null, null));
+
+        var merged = await fleet.Service.GetPsFleetAsync();
+
+        Assert.Single(merged);
+        Assert.Equal("Desktop", merged[0]!["router_target"]?.GetValue<string>());
+        Assert.Equal(0, _handler.TotalCalls(ProviderAuthority)); // never fetched, never contributes
+    }
+
+    [Fact]
+    public async Task MixedFleet_GetShowFleet_PermissiveProvider_Synthesized_ZeroNetwork_Cached()
+    {
+        SeedTags(DesktopAuthority, ("llama3", 100));
+        var fleet = CreateMixedFleet(); // permissive: hosts every requested model name
+
+        var result = await fleet.Service.GetShowFleetAsync("gpt-4o", pinned: null);
+
+        Assert.NotNull(result);
+        Assert.Equal(0, _handler.TotalCalls(ProviderAuthority)); // zero network I/O end-to-end
+        Assert.Equal(128_000, ModelMetadataParser.ParseNumCtx(result)); // gpt-4o heuristic CMax
+        Assert.Equal(128_000L, result!["model_info"]!["general.context_length"]!.GetValue<long>());
+        Assert.Equal("gpt", result["details"]!["family"]?.GetValue<string>());
+        // Same cache path as fetched payloads (per-target key, 30 s TTL).
+        Assert.True(fleet.MemoryCache.TryGetValue<JsonObject>("FleetAggregation:show:Provider:gpt-4o", out _));
+    }
+
+    [Fact]
+    public async Task MixedFleet_GetShowFleet_StrictRoster_ListedModelIsHoster_UnlistedIsNot()
+    {
+        SeedTags(DesktopAuthority, ("llama3", 100));
+        SeedProviderModels(("gpt-4o", 1_700_000_000L));
+        var fleet = CreateMixedFleet(("gpt-4o", 98_304, null)); // strict roster
+
+        var result = await fleet.Service.GetShowFleetAsync("gpt-4o", pinned: null);
+
+        Assert.NotNull(result);
+        Assert.Equal(0, _handler.TotalCalls(ProviderAuthority)); // roster check + synthesis: no HTTP
+        Assert.Equal(98_304, ModelMetadataParser.ParseNumCtx(result)); // roster ContextLength tier
+
+        // An unlisted model: no hoster anywhere → primary fallback fetch fails → null (502).
+        var missing = await fleet.Service.GetShowFleetAsync("unlisted-model", pinned: null);
+        Assert.Null(missing);
+    }
+
+    [Fact]
+    public async Task MixedFleet_GetShowFleet_PinnedProvider_Synthesized_NoFanOut_BestCacheUntouched()
+    {
+        SeedTags(DesktopAuthority, ("llama3", 100));
+        var fleet = CreateMixedFleet(("gpt-4o", null, null));
+
+        var result = await fleet.Service.GetShowFleetAsync("gpt-4o", pinned: new RoutingTarget("Provider"));
+
+        Assert.NotNull(result);
+        Assert.Equal(0, _handler.TotalCalls(ProviderAuthority));
+        Assert.Equal(128_000, ModelMetadataParser.ParseNumCtx(result));
+        Assert.True(fleet.MemoryCache.TryGetValue<JsonObject>("FleetAggregation:show:Provider:gpt-4o", out _));
+        // Pinned requests never read or write the fleet best cache.
+        Assert.False(fleet.MemoryCache.TryGetValue<FleetShowBestEntry>("FleetAggregation:show-best:gpt-4o", out _));
+    }
+
+    [Fact]
+    public async Task MixedFleet_GetShowFleet_FleetWide_SynthesizedHosterWins_ThenBestCacheServesZeroNetwork()
+    {
+        SeedTags(DesktopAuthority, ("llama-3.3-70b", 100));
+        _handler.Behavior(DesktopAuthority).Responses["POST /api/show"] =
+            """{"parameters":"num_ctx 8192\n","details":{"family":"llama"}}""";
+        SeedProviderModels(("llama-3.3-70b", 1_690_000_000L));
+        var fleet = CreateMixedFleet(("llama-3.3-70b", null, null));
+
+        // Two hosters (Desktop via /api/tags; Provider via the strict roster) → fleet-wide scan.
+        var result = await fleet.Service.GetShowFleetAsync("llama-3.3-70b", pinned: null);
+
+        // The synthesized hoster (llama-3.3-70b heuristic CMax 131 072) beats Ollama's 8 192.
+        Assert.NotNull(result);
+        Assert.Equal(131_072, ModelMetadataParser.ParseNumCtx(result));
+        Assert.True(fleet.MemoryCache.TryGetValue<FleetShowBestEntry>("FleetAggregation:show-best:llama-3.3-70b", out var best));
+        Assert.Equal("Provider", best!.TargetName);
+        Assert.Equal(131_072, best.NumCtx);
+        // Per-target write-through of the Ollama hoster's fetched payload.
+        Assert.True(fleet.MemoryCache.TryGetValue<JsonObject>("FleetAggregation:show:Desktop:llama-3.3-70b", out _));
+        Assert.Equal(1, _handler.CountCalls(DesktopAuthority, "POST /api/show"));
+        Assert.Equal(0, _handler.TotalCalls(ProviderAuthority)); // synthesized: zero HTTP
+
+        // Second call: served from the best cache with ZERO new network I/O of any kind.
+        var callsBefore = _handler.TotalCalls(DesktopAuthority) + _handler.TotalCalls(ProviderAuthority);
+        var result2 = await fleet.Service.GetShowFleetAsync("llama-3.3-70b", pinned: null);
+        Assert.NotNull(result2);
+        Assert.Equal(131_072, ModelMetadataParser.ParseNumCtx(result2));
+        Assert.Equal(callsBefore, _handler.TotalCalls(DesktopAuthority) + _handler.TotalCalls(ProviderAuthority));
+    }
+
+    [Fact]
+    public async Task MixedFleet_GetTagsFleet_ProviderHung_RosterFallbackWithinBudget()
+    {
+        SeedTags(DesktopAuthority, ("llama3", 100));
+        _handler.ForAuthority(ProviderAuthority, new FakeOllamaHttpHandler.TargetBehavior { Hang = true });
+        var fleet = CreateMixedFleet(("gpt-4o", 98_304, "none"));
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var merged = await fleet.Service.GetTagsFleetAsync(null);
+        sw.Stop();
+
+        Assert.True(sw.Elapsed < TimeSpan.FromMilliseconds(1500),
+            $"Aggregation took {sw.Elapsed.TotalMilliseconds:F0} ms; a hung provider must not block.");
+        var names = merged.Select(m => m?["name"]?.GetValue<string>()).ToList();
+        Assert.Contains("llama3", names);
+        Assert.Contains("gpt-4o", names); // roster fallback kept the target visible
     }
 }

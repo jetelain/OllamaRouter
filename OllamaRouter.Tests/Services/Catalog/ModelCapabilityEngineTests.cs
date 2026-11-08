@@ -1,9 +1,11 @@
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using Moq;
 using System.Text.Json.Nodes;
 using OllamaRouter.Options;
 using OllamaRouter.Services.Catalog;
+using OllamaRouter.Tests.TestHelpers;
 
 namespace OllamaRouter.Tests.Services.Catalog;
 
@@ -567,6 +569,268 @@ public class ModelCapabilityEngineTests
         await engine.GetMetadataAsync(TargetUrl, "m:latest", Digest);
 
         Assert.Contains($"{ModelCatalogCacheService.CapabilityKeyPrefix}{TargetUrl}:{Digest}:m:latest", registry.RegisteredKeys);
+    }
+
+    // --- Non-Ollama capability synthesis (task #62) ----------------------------------------
+
+    private static OllamaTargetOptions OpenAiTarget(
+        string? url = TargetUrl,
+        int? maxVram = null,
+        params (string Name, int? Ctx, string? Quant)[] roster)
+    {
+        var target = new OllamaTargetOptions
+        {
+            Name = "Provider",
+            Url = url,
+            Type = TargetType.OpenAI,
+            MaxVramMB = maxVram,
+            Provider = "openai"
+        };
+        foreach (var (name, ctx, quant) in roster)
+        {
+            target.Models.Add(new TargetModelConfig { Name = name, ContextLength = ctx, Quantization = quant });
+        }
+
+        return target;
+    }
+
+    [Fact]
+    public void Synthesize_RosterContextTier_BeatsHeuristicAndFallback()
+    {
+        var engine = CreateEngine();
+        var target = OpenAiTarget(roster: ("claude-3-5-sonnet", 98_304, "Q8_0"));
+
+        var metadata = engine.SynthesizeNonOllamaMetadata(target, "claude-3-5-sonnet");
+
+        Assert.Equal(98_304L, metadata.NativeContextLength);
+        Assert.Equal(98_304, ModelCapabilityEngine.ResolveContextCeiling(metadata));
+        Assert.Equal("claude", metadata.ModelFamily);
+        Assert.Equal("Q8_0", metadata.QuantizationLevel);
+        Assert.True(metadata.HasModelInfo);
+        Assert.Null(metadata.ModelfileNumCtx);
+        Assert.Equal(0, metadata.WeightSizeBytes);
+    }
+
+    [Fact]
+    public void Synthesize_HeuristicTier_UsedWhenRosterHasNoContextHint()
+    {
+        var engine = CreateEngine();
+        var target = OpenAiTarget();
+
+        var metadata = engine.SynthesizeNonOllamaMetadata(target, "gpt-4o");
+
+        Assert.Equal(128_000L, metadata.NativeContextLength);
+        Assert.Equal(128_000, ModelCapabilityEngine.ResolveContextCeiling(metadata));
+        Assert.Equal("gpt", metadata.ModelFamily);
+        Assert.Null(metadata.ParameterCount);
+        Assert.True(metadata.HasModelInfo);
+    }
+
+    [Fact]
+    public void Synthesize_UnknownModel_PermissiveShape_FallbackCeiling()
+    {
+        var engine = CreateEngine();
+        var target = OpenAiTarget();
+
+        var metadata = engine.SynthesizeNonOllamaMetadata(target, "mystery-llm");
+
+        Assert.Null(metadata.NativeContextLength);
+        Assert.Equal(131_072, ModelCapabilityEngine.ResolveContextCeiling(metadata));
+        Assert.False(metadata.HasModelInfo);
+        Assert.Null(metadata.ModelFamily);
+        Assert.Null(metadata.ParameterCount);
+        Assert.Equal(0, metadata.ExpertCount);
+        Assert.Null(metadata.QuantizationLevel);
+    }
+
+    [Fact]
+    public void Synthesize_MoERosterEntry_CarriesExpertCountAndParameterCount()
+    {
+        var engine = CreateEngine();
+        var target = OpenAiTarget();
+
+        var metadata = engine.SynthesizeNonOllamaMetadata(target, "deepseek-v3");
+
+        Assert.Equal(671_000_000_000L, metadata.ParameterCount);
+        Assert.Equal(256L, metadata.ExpertCount);
+        Assert.Equal("deepseek", metadata.ModelFamily);
+        Assert.Equal(131_072L, metadata.NativeContextLength);
+    }
+
+    [Fact]
+    public void Synthesize_RosterLookup_IsCaseInsensitiveAndSkipsBlankNames()
+    {
+        var engine = CreateEngine();
+        var target = OpenAiTarget(roster: new (string, int?, string?)[] { ("  ", null, null), ("GPT-4O", null, "none") });
+
+        var metadata = engine.SynthesizeNonOllamaMetadata(target, "gpt-4o");
+
+        Assert.Equal("none", metadata.QuantizationLevel);
+    }
+
+    [Fact]
+    public async Task GetMetadataAsync_NonOllamaTarget_SynthesizesNetworkFree()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var options = new OllamaRouterOptions
+        {
+            Targets = [OpenAiTarget(url: $"{TargetUrl}/", roster: ("gpt-4o", null, null))]
+        };
+        var engine = new ModelCapabilityEngine(
+            catalogClient.Object,
+            new MemoryCache(new MemoryCacheOptions()),
+            NullLogger<ModelCapabilityEngine>.Instance,
+            null,
+            null,
+            new TestOptionsMonitor<OllamaRouterOptions>(options));
+
+        var metadata = await engine.GetMetadataAsync($"{TargetUrl}/", "gpt-4o", "digest-x");
+
+        Assert.Equal(128_000L, metadata.NativeContextLength);
+        Assert.Equal("gpt", metadata.ModelFamily);
+        catalogClient
+            .Verify(c => c.GetTagsWithDigestAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        catalogClient
+            .Verify(c => c.GetShowAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task GetMetadataAsync_OllamaTarget_KeepsLegacyNetworkPath()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        catalogClient
+            .Setup(c => c.GetTagsWithDigestAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((new JsonArray(), "d"));
+        catalogClient
+            .Setup(c => c.GetShowAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((JsonObject?)null);
+        var options = new OllamaRouterOptions
+        {
+            Targets = [new OllamaTargetOptions { Name = "Desktop", Url = TargetUrl }]
+        };
+        var engine = new ModelCapabilityEngine(
+            catalogClient.Object,
+            new MemoryCache(new MemoryCacheOptions()),
+            NullLogger<ModelCapabilityEngine>.Instance,
+            null,
+            null,
+            new TestOptionsMonitor<OllamaRouterOptions>(options));
+
+        await engine.GetMetadataAsync(TargetUrl, "llama3", "digest-x");
+
+        catalogClient
+            .Verify(c => c.GetTagsWithDigestAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task GetMetadataAsync_NoRouterOptions_KeepsLegacyNetworkPath()
+    {
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        catalogClient
+            .Setup(c => c.GetTagsWithDigestAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync((new JsonArray(), "d"));
+        var engine = CreateEngine(catalogClient: catalogClient);
+
+        await engine.GetMetadataAsync(TargetUrl, "llama3", "digest-x");
+
+        catalogClient
+            .Verify(c => c.GetTagsWithDigestAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    // --- Decision D1: stateless hardware-veto suppression ------------------------------------
+
+    [Fact]
+    public void DeriveCapability_NonOllama_LargeDenseUnknownVram_HardwareCapable()
+    {
+        var engine = CreateEngine();
+        // Undisclosed dense shape (gpt-4o-style): LargeDense via the conservative rule.
+        var metadata = Metadata(parameterCount: null, family: "gpt", hasModelInfo: true);
+
+        var capability = engine.DeriveCapability(metadata, "Provider", OpenAiTarget(maxVram: null), null);
+
+        Assert.Equal(ModelArchitectureKind.LargeDense, capability.Architecture);
+        Assert.True(capability.HardwareCapable, "D1: the <12 GB LargeDense veto is suppressed for non-Ollama targets.");
+        Assert.Null(capability.AvailableVramForKVCacheMB);
+    }
+
+    [Fact]
+    public void DeriveCapability_NonOllama_LargeDenseSmallVram_HardwareCapable_AvailableVramStillNull()
+    {
+        var engine = CreateEngine();
+        var metadata = Metadata(parameterCount: 27_800_000_000L, family: "qwen3", hasModelInfo: true);
+
+        var capability = engine.DeriveCapability(metadata, "Provider", OpenAiTarget(maxVram: 8_192), null);
+
+        Assert.Equal(ModelArchitectureKind.LargeDense, capability.Architecture);
+        Assert.True(capability.HardwareCapable, "D1: no VRAM-based veto can fire for non-Ollama targets.");
+        Assert.Null(capability.AvailableVramForKVCacheMB);
+    }
+
+    [Fact]
+    public void DeriveCapability_Ollama_LargeDenseUnknownVram_StillVetoed()
+    {
+        var engine = CreateEngine();
+        // Regression pin: the Ollama <12 GB LargeDense veto stays intact.
+        var metadata = Metadata(parameterCount: 27_800_000_000L, family: "qwen3", hasModelInfo: true);
+
+        var capability = engine.DeriveCapability(metadata, "t", Target(""), null);
+
+        Assert.Equal(ModelArchitectureKind.LargeDense, capability.Architecture);
+        Assert.False(capability.HardwareCapable);
+    }
+
+    [Fact]
+    public void DeriveCapability_Ollama_LargeDenseBigVram_Capable()
+    {
+        var engine = CreateEngine();
+        var metadata = Metadata(parameterCount: 27_800_000_000L, family: "qwen3", hasModelInfo: true);
+
+        var capability = engine.DeriveCapability(metadata, "t", Target("96gb"), null);
+
+        Assert.True(capability.HardwareCapable);
+        Assert.NotNull(capability.AvailableVramForKVCacheMB);
+    }
+
+    [Fact]
+    public void DeriveCapability_NonOllama_SynthesizedContextDrivesCMax()
+    {
+        var engine = CreateEngine();
+        var target = OpenAiTarget(roster: ("llama-3.3-70b", 98_304, null));
+        var metadata = engine.SynthesizeNonOllamaMetadata(target, "llama-3.3-70b");
+
+        var capability = engine.DeriveCapability(metadata, "Provider", target, null);
+
+        // Roster 98304 → CMax (beats the family's 131072); CDefault = Modelfile default 4096.
+        Assert.Equal(98_304, capability.CMax);
+        Assert.Equal(4096, capability.CDefault);
+        Assert.Equal(ModelArchitectureKind.LargeDense, capability.Architecture);
+        Assert.Equal(ArchitectureDetectionSource.DenseParameterCount, capability.Source);
+    }
+
+    [Fact]
+    public void Classify_SynthesizedMatrix_KnownFamilies()
+    {
+        var engine = CreateEngine();
+        var target = OpenAiTarget();
+
+        var llama = engine.ClassifyArchitecture(engine.SynthesizeNonOllamaMetadata(target, "llama-3.3-70b"), null);
+        var deepseek = engine.ClassifyArchitecture(engine.SynthesizeNonOllamaMetadata(target, "deepseek-v3"), null);
+        var unknown = engine.ClassifyArchitecture(engine.SynthesizeNonOllamaMetadata(target, "mystery-llm"), null);
+
+        Assert.Equal((ModelArchitectureKind.LargeDense, ArchitectureDetectionSource.DenseParameterCount), llama);
+        Assert.Equal((ModelArchitectureKind.Moe, ArchitectureDetectionSource.MoeExpertCount), deepseek);
+        Assert.Equal((ModelArchitectureKind.Moe, ArchitectureDetectionSource.PermissiveFallback), unknown);
+    }
+
+    [Theory]
+    [InlineData(null, 128_000L, 128_000)]
+    [InlineData(49_152, 8_192L, 49_152)]
+    [InlineData(null, null, 131_072)]
+    public void ResolveContextCeiling_Hierarchy_ModelfileNativeFallback(int? numCtx, long? native, int expected)
+    {
+        var metadata = new ModelMetadata("m", 0, null, 0, null, numCtx, true, null, native, null);
+
+        Assert.Equal(expected, ModelCapabilityEngine.ResolveContextCeiling(metadata));
     }
 
     private sealed class RecordingRegistry : IModelCatalogCacheService

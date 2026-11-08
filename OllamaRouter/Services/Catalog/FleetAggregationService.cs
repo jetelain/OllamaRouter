@@ -12,6 +12,15 @@ namespace OllamaRouter.Services.Catalog;
 /// Default implementation of <see cref="IFleetAggregationService"/>: parallel, budgeted
 /// fan-out over the online fleet with per-target stale-while-revalidate fallback, plus
 /// model-directed /api/show resolution with a 30 s in-memory response cache.
+/// <para>
+/// Type-aware fan-out (task #62): Ollama targets are harvested from their live
+/// <c>/api/tags</c> / <c>/v1/models</c> / <c>/api/ps</c> endpoints; non-Ollama (OpenAI)
+/// targets are harvested from an authenticated <c>GET /models</c> listing with the declared
+/// roster as membership fallback (decision D2), and contribute NOTHING to <c>/api/ps</c>
+/// (no running-model concept remotely). A model hosted on a non-Ollama target resolves
+/// <c>/api/show</c> to a deterministic synthesized payload (<see cref="SynthesizedShowBuilder"/>)
+/// with zero network I/O.
+/// </para>
 /// </summary>
 public sealed class FleetAggregationService(
     IOptionsMonitor<OllamaRouterOptions> options,
@@ -20,7 +29,8 @@ public sealed class FleetAggregationService(
     ITargetLivenessService liveness,
     ITargetAvailabilityService targetAvailability,
     IMemoryCache memoryCache,
-    ILogger<FleetAggregationService> logger) : IFleetAggregationService
+    ILogger<FleetAggregationService> logger,
+    ModelCapabilityEngine capabilityEngine) : IFleetAggregationService
 {
     // During the first 10 s after the liveness prober started, an unresolved (Unknown)
     // target is treated as fan-out-eligible (identical to the middleware's routable
@@ -61,7 +71,10 @@ public sealed class FleetAggregationService(
     public async Task<JsonArray> GetTagsFleetAsync(IReadOnlyList<JsonNode>? cloudSyntheses, HttpContext? context = null)
     {
         var merged = await AggregateAsync(context,
-            liveFetcher: (url, budget, ct) => catalogClient.FetchArrayBoundedAsync(url, "/api/tags", "models", budget, ct),
+            ollamaOnlySlots: false,
+            liveFetcher: (target, budget, ct) => target.Type == TargetType.Ollama
+                ? catalogClient.FetchArrayBoundedAsync(target.Url, "/api/tags", "models", budget, ct)
+                : FetchOpenAiTagsAsync(target, budget, ct),
             staleFetcher: url => catalogCache.GetStaleTagsAsync(url),
             writeThrough: (url, array) => catalogCache.SetStaleTags(url, array),
             dedupeKey: "name");
@@ -72,7 +85,10 @@ public sealed class FleetAggregationService(
     public async Task<JsonArray> GetOpenAIModelsFleetAsync(IReadOnlyList<JsonNode>? cloudSyntheses, HttpContext? context = null)
     {
         var merged = await AggregateAsync(context,
-            liveFetcher: (url, budget, ct) => catalogClient.FetchArrayBoundedAsync(url, "/v1/models", "data", budget, ct),
+            ollamaOnlySlots: false,
+            liveFetcher: (target, budget, ct) => target.Type == TargetType.Ollama
+                ? catalogClient.FetchArrayBoundedAsync(target.Url, "/v1/models", "data", budget, ct)
+                : FetchOpenAiModelsFleetAsync(target, budget, ct),
             staleFetcher: url => catalogCache.GetStaleV1ModelsAsync(url),
             writeThrough: (url, array) => catalogCache.SetStaleV1Models(url, array),
             dedupeKey: "id");
@@ -82,8 +98,12 @@ public sealed class FleetAggregationService(
 
     public async Task<JsonArray> GetPsFleetAsync(HttpContext? context = null)
     {
+        // /api/ps stays Ollama-only (task #62): remote APIs have no running-model concept,
+        // so non-Ollama targets are excluded from the slots entirely (never fetched, never
+        // contributing — their stale slots are never consulted either).
         var merged = await AggregateAsync(context,
-            liveFetcher: (url, budget, ct) => catalogClient.FetchArrayBoundedAsync(url, "/api/ps", "models", budget, ct),
+            ollamaOnlySlots: true,
+            liveFetcher: (target, budget, ct) => catalogClient.FetchArrayBoundedAsync(target.Url, "/api/ps", "models", budget, ct),
             staleFetcher: url => catalogCache.GetStalePsAsync(url),
             writeThrough: (url, array) => catalogCache.SetStalePs(url, array),
             // No cross-target dedupe: the same model loaded on two daemons appears twice.
@@ -149,7 +169,10 @@ public sealed class FleetAggregationService(
     /// Legacy single-fetch path (pinned target, single hoster, primary fallback): per-target
     /// cache read → budgeted fetch → write-through → log → stale-cache fallback → null. It
     /// never consults the fleet best cache, so the pinned path and the single-hoster path stay
-    /// byte-for-byte on the pre-task-#43 behavior and traffic profile.
+    /// byte-for-byte on the pre-task-#43 behavior and traffic profile. A NON-OLLAMA target
+    /// (task #62) is resolved to a SYNTHESIZED payload (no HTTP call, no budget consultation)
+    /// that flows through the SAME per-target cache path (30 s TTL) — zero network I/O
+    /// end-to-end.
     /// </summary>
     private async Task<JsonObject?> FetchShowForTargetAsync(OllamaTargetOptions target, string modelName, HttpContext? context)
     {
@@ -160,6 +183,17 @@ public sealed class FleetAggregationService(
         {
             // Cache hit: no network I/O at all.
             return (JsonObject?)cached.DeepClone();
+        }
+
+        if (target.Type != TargetType.Ollama)
+        {
+            // Stateless remote endpoint: synthesize from pure configuration (zero network,
+            // zero budget consultation) and cache like every other payload (uniform 30 s
+            // staleness after a roster edit, symmetric with every other show cache).
+            var synthesized = BuildSynthesizedShow(target, modelName);
+            memoryCache.Set(cacheKey, synthesized.DeepClone(), new MemoryCacheEntryOptions { AbsoluteExpirationRelativeToNow = ShowCacheDuration });
+            logger.LogInformation("/api/show for {ModelName} served by {Target} (synthesized, no network).", modelName, name);
+            return synthesized;
         }
 
         var budget = GetPerTargetBudget();
@@ -287,10 +321,17 @@ public sealed class FleetAggregationService(
     /// <summary>
     /// One fan-out slot of the fleet-wide /api/show scan: a budgeted GetShowAsync (already
     /// fail-soft: null on timeout/error) whose exceptions are swallowed per slot so a single
-    /// slow/down daemon never blocks the response. A client-side abort propagates.
+    /// slow/down daemon never blocks the response. A client-side abort propagates. A
+    /// NON-OLLAMA hoster (task #62) yields its SYNTHESIZED payload directly — no HTTP call,
+    /// no budget consultation (pure configuration).
     /// </summary>
     private async Task<JsonObject?> FetchShowSlotAsync(OllamaTargetOptions target, string modelName, TimeSpan budget, CancellationToken requestCt)
     {
+        if (target.Type != TargetType.Ollama)
+        {
+            return BuildSynthesizedShow(target, modelName);
+        }
+
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(requestCt);
         if (budget > TimeSpan.Zero)
         {
@@ -311,6 +352,13 @@ public sealed class FleetAggregationService(
             return null;
         }
     }
+
+    // Pure configuration → deterministic /api/show payload for a non-Ollama hoster (task #62):
+    // the synthesized metadata (roster + family heuristics) renders into a strict Ollama
+    // /api/show body whose num_ctx = the synthesized CMax (roster ContextLength → family
+    // heuristic → 131 072 fallback), so it participates in the task-#43 best-host scoring.
+    private JsonObject BuildSynthesizedShow(OllamaTargetOptions target, string modelName) =>
+        SynthesizedShowBuilder.Build(modelName, target, capabilityEngine.SynthesizeNonOllamaMetadata(target, modelName));
 
     /// <summary>
     /// Resolves the /api/show routing target(s): (1) an honored pin →
@@ -337,13 +385,18 @@ public sealed class FleetAggregationService(
             logger.LogWarning("Pinned target {Target} for /api/show is not routable (offline/disabled); falling back to model-directed selection.", pinned.Value);
         }
 
-        // (2) Every online target whose cached catalog contains the model, in effective-target
-        // (config) order (the name-set lookup is itself 30 s cached and doubles as the
-        // winner tie-break order).
+        // (2) Every online target that HOSTS the model, in effective-target (config) order
+        // (the name-set lookup is itself 30 s cached and doubles as the winner tie-break
+        // order). A PERMISSIVE non-Ollama target (empty roster) hosts every requested model
+        // name — the shared policy of the routing decision service (task #61) — so it is a
+        // hoster without any name-set lookup; strict rosters keep the roster-driven
+        // ModelExistsAsync (already network-free); Ollama targets use the live catalog.
         var hosters = new List<OllamaTargetOptions>();
         foreach (var fanOut in GetFanOutTargets())
         {
-            if (await catalogCache.ModelExistsAsync(fanOut.Url, modelName, context?.RequestAborted ?? default))
+            var isHoster = NonOllamaCatalogPolicy.IsPermissive(fanOut) ||
+                await catalogCache.ModelExistsAsync(fanOut.Url, modelName, context?.RequestAborted ?? default);
+            if (isHoster)
             {
                 hosters.Add(fanOut);
             }
@@ -400,7 +453,8 @@ public sealed class FleetAggregationService(
 
     private async Task<JsonArray> AggregateAsync(
         HttpContext? context,
-        Func<string, TimeSpan, CancellationToken, Task<(JsonArray? Array, bool Succeeded)>> liveFetcher,
+        bool ollamaOnlySlots,
+        Func<OllamaTargetOptions, TimeSpan, CancellationToken, Task<(JsonArray? Array, bool Succeeded)>> liveFetcher,
         Func<string, Task<JsonArray?>> staleFetcher,
         Action<string, JsonArray> writeThrough,
         string? dedupeKey)
@@ -410,22 +464,27 @@ public sealed class FleetAggregationService(
 
         // Online/grace targets are fetched live (in parallel, each under its own per-target
         // budget); every other enabled target is offline and contributes its cached catalog
-        // (stale-while-revalidate) without any network call.
+        // (stale-while-revalidate) without any network call. Non-Ollama (OpenAI) targets use
+        // the type-aware live fetcher (authenticated /models + roster fallback, task #62) and
+        // are excluded entirely when ollamaOnlySlots is set (/api/ps).
         var slots = effective
             .Where(t => t.Enabled &&
                         !string.Equals(t.Name, RoutingTarget.Cloud.Value, StringComparison.OrdinalIgnoreCase) &&
-                        !string.IsNullOrWhiteSpace(t.Url))
+                        !string.IsNullOrWhiteSpace(t.Url) &&
+                        (!ollamaOnlySlots || t.Type == TargetType.Ollama))
             .Select(t => (
                 Target: t.Name!,
                 Url: t.Url!.TrimEnd('/'),
+                Options: t,
                 Live: fanOut.Any(f => string.Equals(f.Name, t.Name, StringComparison.OrdinalIgnoreCase))))
             .ToList();
 
         var budget = GetPerTargetBudget();
         var requestCt = context?.RequestAborted ?? default;
 
-        // Start every slot in parallel: live slots under their own per-target budget CTS,
-        // stale slots as plain cache reads. One slow daemon can never hold up the WhenAll.
+        // Start every slot in parallel: live slots apply their own per-target budget inside
+        // the fetcher (on top of the caller's request token), stale slots as plain cache
+        // reads. One slow daemon can never hold up the WhenAll.
         var results = slots.Select(slot => (slot, Task: slot.Live
             ? FetchLiveAsync(slot, budget, requestCt, liveFetcher)
             : FetchStaleAsync(slot, staleFetcher))).ToList();
@@ -444,18 +503,16 @@ public sealed class FleetAggregationService(
 
         return merged;
 
-        async Task<JsonArray?> FetchLiveAsync((string Target, string Url, bool Live) slot, TimeSpan targetBudget, CancellationToken ct, Func<string, TimeSpan, CancellationToken, Task<(JsonArray? Array, bool Succeeded)>> fetcher)
+        async Task<JsonArray?> FetchLiveAsync((string Target, string Url, OllamaTargetOptions Options, bool Live) slot, TimeSpan targetBudget, CancellationToken ct, Func<OllamaTargetOptions, TimeSpan, CancellationToken, Task<(JsonArray? Array, bool Succeeded)>> fetcher)
         {
-            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            if (targetBudget > TimeSpan.Zero)
-            {
-                linkedCts.CancelAfter(targetBudget);
-            }
-
             (JsonArray? Array, bool Succeeded) result;
             try
             {
-                result = await fetcher(slot.Url, targetBudget, linkedCts.Token);
+                // The fetcher receives the caller's REQUEST token + its per-target budget and
+                // links the two internally, so a budget expiry is distinguishable from a
+                // client abort (the budgeted fetch swallows its own budget cancellation into
+                // (null, false), enabling the roster/stale fallbacks).
+                result = await fetcher(slot.Options, targetBudget, ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -483,7 +540,7 @@ public sealed class FleetAggregationService(
             return stale;
         }
 
-        async Task<JsonArray?> FetchStaleAsync((string Target, string Url, bool Live) slot, Func<string, Task<JsonArray?>> fetcher)
+        async Task<JsonArray?> FetchStaleAsync((string Target, string Url, OllamaTargetOptions Options, bool Live) slot, Func<string, Task<JsonArray?>> fetcher)
         {
             try
             {
@@ -493,6 +550,123 @@ public sealed class FleetAggregationService(
             {
                 logger.LogWarning(ex, "Reading the cached catalog of {Target} failed; it contributes nothing to this response.", slot.Target);
                 return null;
+            }
+        }
+    }
+
+    // One target's declared (non-blank-name) roster, in configuration order.
+    private static List<TargetModelConfig> GetRoster(OllamaTargetOptions target) =>
+        target.Models is null
+            ? []
+            : target.Models.Where(m => !string.IsNullOrWhiteSpace(m.Name)).ToList();
+
+    /// <summary>
+    /// Live /api/tags harvest of one non-Ollama target (task #62, decision D2): the LIVE
+    /// provider <c>GET /models</c> response is the source of membership (every live id
+    /// appears, converted to the canonical Ollama tag shape); roster entries NOT already
+    /// present (case-insensitive) are appended (static availability); roster hints
+    /// (Quantization) are applied to shared names by the converters. When the listing fails:
+    /// a non-empty roster serves the roster-only canonical catalog (static configuration keeps
+    /// the target visible — write-through cached); an empty (permissive) roster degrades to
+    /// (null, false) so the existing stale-slot fallback applies.
+    /// </summary>
+    private async Task<(JsonArray? Array, bool Succeeded)> FetchOpenAiTagsAsync(OllamaTargetOptions target, TimeSpan budget, CancellationToken ct)
+    {
+        var roster = GetRoster(target);
+        var (data, ok) = await catalogClient.FetchOpenAiModelsAsync(target, budget, ct);
+
+        if (ok && data is not null)
+        {
+            var tags = new JsonArray();
+            foreach (var modelNode in data)
+            {
+                if (modelNode is JsonObject obj && !string.IsNullOrWhiteSpace(obj["id"]?.GetValue<string>()))
+                {
+                    tags.Add((JsonNode)OllamaModelTagItem.FromOpenAiModel(obj, target).ToOllamaTagNode());
+                }
+            }
+
+            AppendRosterOnly(tags, roster, target, "name", (entry, t) =>
+                OllamaModelTagItem.FromRosterEntry(entry, t).ToOllamaTagNode());
+            return (tags, true);
+        }
+
+        if (roster.Count > 0)
+        {
+            var rosterTags = new JsonArray();
+            foreach (var entry in roster)
+            {
+                rosterTags.Add((JsonNode)OllamaModelTagItem.FromRosterEntry(entry, target).ToOllamaTagNode());
+            }
+
+            return (rosterTags, true);
+        }
+
+        return (null, false);
+    }
+
+    /// <summary>
+    /// Live /v1/models harvest of one non-Ollama target (task #62, decision D2): identical to
+    /// <see cref="FetchOpenAiTagsAsync"/> but in OpenAI shape — the live <c>data</c> array
+    /// passes through VERBATIM (the provider payload is already canonical) and roster-only ids
+    /// are appended as <c>ToOpenAiModelNode()</c> entries (created = 0). Same roster / stale
+    /// fallback chain.
+    /// </summary>
+    private async Task<(JsonArray? Array, bool Succeeded)> FetchOpenAiModelsFleetAsync(OllamaTargetOptions target, TimeSpan budget, CancellationToken ct)
+    {
+        var roster = GetRoster(target);
+        var (data, ok) = await catalogClient.FetchOpenAiModelsAsync(target, budget, ct);
+
+        if (ok && data is not null)
+        {
+            var models = new JsonArray();
+            foreach (var node in data)
+            {
+                if (node is not null)
+                {
+                    models.Add(node.DeepClone());
+                }
+            }
+
+            AppendRosterOnly(models, roster, target, "id", (entry, t) =>
+                (JsonObject)OllamaModelTagItem.RosterOpenAiModelNode(entry, t));
+            return (models, true);
+        }
+
+        if (roster.Count > 0)
+        {
+            var rosterModels = new JsonArray();
+            foreach (var entry in roster)
+            {
+                rosterModels.Add((JsonNode)OllamaModelTagItem.RosterOpenAiModelNode(entry, target));
+            }
+
+            return (rosterModels, true);
+        }
+
+        return (null, false);
+    }
+
+    // Appends the roster entries whose name is not already present in the (live) array
+    // (case-insensitive, decision D2: the live response is the source of membership and the
+    // roster NEVER hides a live model). The endpoint-specific node converter decides the wire
+    // shape (Ollama tag shape for /api/tags; OpenAI model node with created = 0 for
+    // /v1/models).
+    private static void AppendRosterOnly(
+        JsonArray live,
+        List<TargetModelConfig> roster,
+        OllamaTargetOptions target,
+        string key,
+        Func<TargetModelConfig, OllamaTargetOptions, JsonObject> toNode)
+    {
+        foreach (var entry in roster)
+        {
+            var name = entry.Name!.Trim();
+            var present = live.Any(e => e is JsonObject obj &&
+                string.Equals(obj[key]?.GetValue<string>(), name, StringComparison.OrdinalIgnoreCase));
+            if (!present)
+            {
+                live.Add((JsonNode)toNode(entry, target));
             }
         }
     }

@@ -98,4 +98,20 @@ public interface IOllamaModelCatalogClient
     /// slow target can fall back to its cached catalog instead of blocking the response.
     /// </summary>
     Task<(JsonArray? Array, bool Succeeded)> FetchArrayBoundedAsync(string? baseUrl, string path, string arrayPropertyName, TimeSpan budget, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Fetches the model roster of a NON-OLLAMA (OpenAI-compatible) target via an
+    /// authenticated <c>GET {base}/models</c> (task #62) — the same URL convention as the
+    /// task-#61 liveness probe, so path-prefixed bases compose correctly
+    /// (<c>http://h:8000/v1</c> ⇒ <c>GET http://h:8000/v1/models</c>). The
+    /// <c>Authorization: Bearer {ApiKey}</c> header is added ONLY when the target's
+    /// <see cref="OllamaTargetOptions.ApiKey"/> is non-blank; the raw key appears in no log
+    /// line or response. Parses the <c>data</c> array property. Failure contract identical to
+    /// <see cref="FetchArrayBoundedAsync"/>: budget overrun / transport error / non-2xx /
+    /// missing <c>data</c> property ⇒ (null, false); a caller-request cancellation (on the
+    /// OUTER <paramref name="cancellationToken"/>) propagates; a budget-expiry cancellation is
+    /// swallowed into (null, false).
+    /// </summary>
+    Task<(JsonArray? Data, bool Succeeded)> FetchOpenAiModelsAsync(
+        OllamaTargetOptions target, TimeSpan budget, CancellationToken cancellationToken = default);
 }
