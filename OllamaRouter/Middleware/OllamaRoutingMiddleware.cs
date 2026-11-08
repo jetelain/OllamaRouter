@@ -1,15 +1,23 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.IO;
+using System.IO.Pipelines;
+using System.Net;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Options;
+using OllamaRouter.Converters;
 using OllamaRouter.Options;
 using OllamaRouter.Parsing;
 using OllamaRouter.ReverseProxy;
 using OllamaRouter.Serialization;
+using OllamaRouter.Services;
 using OllamaRouter.Services.Catalog;
+using OllamaRouter.Services.Clients;
 using OllamaRouter.Services.ContextSizing;
 using OllamaRouter.Services.Monitoring;
 using OllamaRouter.Services.Routing;
@@ -41,17 +49,23 @@ public sealed class OllamaRoutingMiddleware(
     ITargetExecutionTracker executionTracker = null!,
     IContextAutoShrinkManager? contextShrinkManager = null,
     ISessionAffinityService? sessionAffinity = null,
-    ITokenMetricsRecorder? tokenMetricsRecorder = null)
+    ITokenMetricsRecorder? tokenMetricsRecorder = null,
+    OllamaChatRequestParser? ollamaRequestParser = null,
+    OpenAIChatRequestParser? openAiRequestParser = null,
+    ITargetChatClientProvider? targetChatClientProvider = null)
     {
     // During the first 10 s after the liveness prober started, an unresolved (Unknown)
     // target is treated as routable rather than offline, so a request arriving before the
     // boot probe completes is never bounced to 503 merely because probing is slow.
     private static readonly TimeSpan StartupGracePeriod = TimeSpan.FromSeconds(10);
 
-    // Pass-through transformer for the middleware-owned dispatch loop. HttpTransformer.Default
-    // (the public YARP 2.3.0 instance) is pure pass-through (headers/body flow untouched), so
-    // the already-set request headers (incl. X-Ollama-Target) reach the destination unchanged.
-    private static readonly HttpTransformer PassThroughTransformer = HttpTransformer.Default;
+    // Per-candidate request transformer for the middleware-owned dispatch loop (task #61)
+    // — see the DispatchHeaderTransformer nested class below. Replaces the previous shared
+    // HttpTransformer.Default so the loop can (a) strip the inbound Authorization header,
+    // (b) inject the target's own provider key for OpenAI-type targets, and (c) de-duplicate
+    // a /v1 destination path prefix. For Ollama targets with no key it is behaviorally
+    // identical to the old static pass-through except for the Authorization strip (a client
+    // key must never reach an unrelated daemon — same spirit as the inbound X-Ollama-Target strip).
 
     // Per-request forwarding config: a 15 min activity timeout matching the existing YARP
     // cluster config (OllamaReverseProxyConfig.ActivityTimeout). The dedicated proxy client
@@ -81,6 +95,12 @@ public sealed class OllamaRoutingMiddleware(
     // fallback's flushed headers carry the served target, not the decided primary.
     internal const string CurrentServedTargetKey = "OllamaRouter.CurrentServedTarget";
 
+    // HttpContext.Items key under which the dispatch loop publishes the dispatch PATH of the
+    // candidate it is CURRENTLY attempting ("yarp" | "converter", task #61). The pre-dispatch
+    // telemetry OnStarting closure reads it at commit time so the flushed headers carry the
+    // path of the SERVED candidate, not the decided primary.
+    internal const string CurrentServedDispatchModeKey = "OllamaRouter.CurrentServedDispatchMode";
+
     /// <summary>
     /// The Auto-Shrink Manager (Phase 3, item 2): consulted after the stateless sizing decision
     /// to apply the KV-cache-hysteresis lease (retain an expanded bucket across the cooldown /
@@ -109,6 +129,35 @@ public sealed class OllamaRoutingMiddleware(
     /// production; a no-op unless the TokenMetricsCsv export is enabled.
     /// </summary>
     private readonly ITokenMetricsRecorder? _tokenMetricsRecorder = tokenMetricsRecorder;
+
+    /// <summary>
+    /// The inbound Ollama-protocol request parser for the converter dispatch path (task #61):
+    /// an Ollama client reaching a cross-protocol target (e.g. an OpenAI target) is translated
+    /// canonical ChatMessage → IChatClient → Ollama NDJSON. Nullable for unit-test compatibility
+    /// with the pre-converter pipeline: when null (or the client provider is null) the converter
+    /// path degrades with a warning and the request skips the ineligible candidate (YARP-pure
+    /// behavior is byte-identical).
+    /// </summary>
+    private readonly OllamaChatRequestParser? _ollamaRequestParser = ollamaRequestParser;
+
+    /// <summary>
+    /// The inbound OpenAI-protocol request parser for the converter dispatch path (task #61):
+    /// an OpenAI client reaching an Ollama target (or a cloud relay daemon) is translated
+    /// canonical ChatMessage → IChatClient → OpenAI SSE. Nullable (same degradation semantics as
+    /// <see cref="_ollamaRequestParser"/>).
+    /// </summary>
+    private readonly OpenAIChatRequestParser? _openAiRequestParser = openAiRequestParser;
+
+    /// <summary>
+    /// Resolves the target's <see cref="IChatClient"/> by name for the converter dispatch path
+    /// (task #61). Nullable for unit-test compatibility; when null the converter path degrades
+    /// with a warning (every cross-protocol candidate is skipped as unconfigured).
+    /// </summary>
+    private readonly ITargetChatClientProvider? _targetChatClientProvider = targetChatClientProvider;
+
+    // One-shot guard for the converter-degradation warning (the middleware is a singleton;
+    // test hosts create fresh instances so each warns exactly once).
+    private int _converterDegradationWarned;
 
     // Last-seen raw liveness state per target, used to detect offline/online TRANSITIONS so
     // the Auto-Shrink Manager's leases are reset exactly when a daemon (re)loads (its KV cache
@@ -735,6 +784,14 @@ public sealed class OllamaRoutingMiddleware(
             }
         }
 
+        // Non-Ollama targets with an EMPTY declared model roster are permissive (task #61):
+        // the synthetic-catalog short-circuit shared with the decision service (a strict
+        // roster is served by the catalog cache itself, so the lookup below still applies).
+        if (NonOllamaCatalogPolicy.IsPermissive(pinnedOptions))
+        {
+            return true;
+        }
+
         var pinnedUrl = pinnedOptions?.Url;
         if (string.IsNullOrWhiteSpace(pinnedUrl) || string.Equals(modelName, "unknown", StringComparison.Ordinal))
         {
@@ -767,6 +824,10 @@ public sealed class OllamaRoutingMiddleware(
     {
         var body = await ReadBodyAsync(context.Request);
         var endpoint = context.Request.Path.Value ?? "/";
+        // Inbound protocol family (task #61 dual-path dispatch): classified ONCE per request;
+        // each dispatch-loop candidate is then resolved against it — same-protocol pairs take
+        // the YARP fast path, cross-protocol pairs the converter path (IChatClient + encoder).
+        var protocol = ClassifyRequestProtocol(endpoint);
 
         // Detach the request body from the client's (network) content stream immediately: the
         // dispatch loop buffers and forwards the body ASYNCHRONOUSLY, and the client is free to
@@ -1062,7 +1123,15 @@ public sealed class OllamaRoutingMiddleware(
         }
         else if (target != RoutingTarget.Cloud)
         {
-            (injectedNumCtx, sizedBody) = await TryApplyDynamicContextSizingAsync(context, target, modelName, tokenCount, body);
+            // Non-Ollama targets have no num_ctx semantics and no /api/tags: skip the sizing
+            // pass entirely (task #61) — the body goes to the dispatch loop unmodified (no
+            // wasted catalog probe either). Null options (unknown target) keeps the legacy
+            // behavior byte-identical.
+            var sizingTargetOptions = FindTargetOptions(target.Value);
+            if (sizingTargetOptions is null || sizingTargetOptions.Type == TargetType.Ollama)
+            {
+                (injectedNumCtx, sizedBody) = await TryApplyDynamicContextSizingAsync(context, target, modelName, tokenCount, body);
+            }
         }
 
         var contextModeHeader = context.Response.Headers.ContainsKey(OllamaReverseProxyConfig.TelemetryContextModeHeader)
@@ -1087,6 +1156,14 @@ public sealed class OllamaRoutingMiddleware(
         // registration. Without this, a streamed uncommitted-failover response carries the stale
         // primary header (the outer post-dispatch update is skipped once the response committed).
         context.Items[CurrentServedTargetKey] = target;
+        // Dispatch-mode telemetry (task #61): the eager value reflects the DECIDED primary's
+        // resolved path; the dispatch loop re-asserts it per candidate and the OnStarting
+        // closure below re-emits the SERVED value, so a failover that changes the protocol
+        // pair (e.g. YARP OpenAI target dies, converter Ollama target serves) reports the
+        // path actually used.
+        var decidedDispatchMode = ResolveDispatchMode(protocol, FindTargetOptions(target.Value));
+        context.Items[CurrentServedDispatchModeKey] = decidedDispatchMode;
+        context.Response.Headers[OllamaReverseProxyConfig.DispatchModeHeader] = decidedDispatchMode;
         context.Response.Headers[OllamaReverseProxyConfig.PublicTargetHeader] = telemetryTarget.ToString();
         context.Response.Headers[OllamaReverseProxyConfig.TelemetryModelHeader] = modelName;
         context.Response.Headers[OllamaReverseProxyConfig.TelemetryEstimatedTokensHeader] = tokenCount.ToString();
@@ -1108,6 +1185,10 @@ public sealed class OllamaRoutingMiddleware(
             context.Response.Headers[OllamaReverseProxyConfig.PublicTargetHeader] = effectiveServed.ToString();
             context.Response.Headers[OllamaReverseProxyConfig.TelemetryModelHeader] = modelName;
             context.Response.Headers[OllamaReverseProxyConfig.TelemetryEstimatedTokensHeader] = tokenCount.ToString();
+            if (context.Items[CurrentServedDispatchModeKey] is string servedDispatchMode)
+            {
+                context.Response.Headers[OllamaReverseProxyConfig.DispatchModeHeader] = servedDispatchMode;
+            }
             if (sessionId is not null)
             {
                 context.Response.Headers[OllamaReverseProxyConfig.PublicSessionIdHeader] = sessionId;
@@ -1172,7 +1253,7 @@ public sealed class OllamaRoutingMiddleware(
             // previous `await next(context)` YARP hand-off for completion requests; the
             // forwarder sets the same IForwarderErrorFeature on context.Features that YARP
             // did, so the response-completeness / token-extraction logic below is unchanged.
-            (servedTarget, body) = await DispatchLoopAsync(context, body, target, allowedLocations);
+            (servedTarget, body) = await DispatchLoopAsync(context, body, target, protocol, allowedLocations);
             if (servedTarget is not null && servedTarget != target && !context.Response.HasStarted)
             {
                 // Telemetry failover-correctness: the dispatch loop served a DIFFERENT target
@@ -1313,26 +1394,32 @@ public sealed class OllamaRoutingMiddleware(
         }
     }
 
-    // The middleware-owned uncommitted-retry dispatch loop (§1–§3, §6–§8).
+    // The middleware-owned uncommitted-retry dispatch loop (§1–§3, §6–§8), extended by the
+    // task #61 dual-path engine: every candidate is resolved against the request's
+    // RequestProtocol — same-protocol pairs (Ollama client ↔ Ollama target, OpenAI client ↔
+    // OpenAI target) take the YARP fast path (zero-copy forward), cross-protocol pairs take
+    // the converter path (request parser → target IChatClient → protocol encoder, inside the
+    // SAME loop so every telemetry/booking/failover semantic applies uniformly).
     //
     // Builds the ranked candidate list — the decided primary, then the remaining
     // enabled + routable + streak-ok fleet targets in configuration order, then (when Cloud
     // Overflow is available) the terminal Cloud relay step — buffers the request body as a
-    // seekable stream, and forwards to each candidate in order. An uncommitted failure
-    // (ForwarderError != None and no response bytes committed) rewinds the body, records the
-    // failure streak, applies one best-effort liveness strike, and fails over. A committed
-    // failure (response already started) is terminal: no loop. Exhausting every candidate
-    // uncommitted produces the terminal 503 all-offline diagnostics (cloud_enabled reports
-    // whether the Cloud relay step was available).
-    private async Task<(RoutingTarget? Served, string Body)> DispatchLoopAsync(HttpContext context, string body, RoutingTarget target, IReadOnlySet<TargetLocation>? allowedLocations = null)
+    // seekable stream, and dispatches to each candidate in order. A candidate that cannot
+    // serve the protocol family (OsNative — no client yet; /api/embeddings vs a non-Ollama
+    // target) is skipped with NO streak/liveness side effects. An uncommitted failure (either
+    // path) rewinds the body, records the failure streak, applies one best-effort liveness
+    // strike, and fails over. A committed failure (response already started) is terminal: no
+    // loop. Exhausting every candidate uncommitted produces the terminal 503 all-offline
+    // diagnostics (cloud_enabled reports whether the Cloud relay step was available).
+    private async Task<(RoutingTarget? Served, string Body)> DispatchLoopAsync(HttpContext context, string body, RoutingTarget target, RequestProtocol protocol, IReadOnlySet<TargetLocation>? allowedLocations = null)
     {
         var effectiveTargets = options.CurrentValue.GetEffectiveTargets(logger);
-        var targetsByName = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        var targetsByOptions = new Dictionary<string, OllamaTargetOptions>(StringComparer.OrdinalIgnoreCase);
         foreach (var t in effectiveTargets)
         {
             if (!string.IsNullOrWhiteSpace(t.Name))
             {
-                targetsByName[t.Name] = t.Url;
+                targetsByOptions[t.Name] = t;
             }
         }
 
@@ -1343,13 +1430,14 @@ public sealed class OllamaRoutingMiddleware(
             // exhausting the in-scope candidates produces the existing terminal 503 instead.
             && (allowedLocations is null || allowedLocations.Contains(TargetLocation.Cloud));
 
-        // Ranked candidate list: (routing target, destination URL).
-        var candidates = new List<(RoutingTarget Target, string Url)>();
+        // Ranked candidate list: (routing target, live target options — carrying Type,
+        // ApiKey and Url; the Cloud relay entries carry the relay NODE's options).
+        var candidates = new List<(RoutingTarget Target, OllamaTargetOptions Options)>();
         if (isCloud)
         {
             // All-offline gate handoff (or pinned Cloud): the fleet nodes are the relays
             // carrying the cloud-rewritten body (preferred relay first, then online fallbacks).
-            AddCloudRelayCandidates(effectiveTargets, targetsByName, candidates);
+            AddCloudRelayCandidates(effectiveTargets, candidates);
         }
         else
         {
@@ -1357,11 +1445,10 @@ public sealed class OllamaRoutingMiddleware(
             // loop itself is the probe). A resolved-but-nameless decision degrades gracefully
             // to the remaining ranked fleet candidates (no candidate ⇒ terminal 503 below).
             var primaryName = target.ToString();
-            if (!string.IsNullOrWhiteSpace(primaryName)
-                && targetsByName.TryGetValue(primaryName, out var primaryUrl)
-                && !string.IsNullOrWhiteSpace(primaryUrl))
+            if (!string.IsNullOrWhiteSpace(primaryName) &&
+                targetsByOptions.TryGetValue(primaryName, out var primaryOptions))
             {
-                candidates.Add((target, primaryUrl!));
+                candidates.Add((target, primaryOptions));
             }
             // Remaining eligible fleet targets in configuration order (streak-skipped and
             // offline/disabled targets are excluded).
@@ -1386,16 +1473,16 @@ public sealed class OllamaRoutingMiddleware(
                 {
                     continue;
                 }
-                if (targetsByName.TryGetValue(candidate.ToString(), out var url) && !string.IsNullOrWhiteSpace(url))
+                if (!string.IsNullOrWhiteSpace(t.Url))
                 {
-                    candidates.Add((candidate, url!));
+                    candidates.Add((candidate, t));
                 }
             }
             // Terminal Cloud relay step (Q1: a pinned/decided fleet target that fails
             // uncommitted falls through to Cloud before the terminal 503).
             if (cloudAvailable)
             {
-                AddCloudRelayCandidates(effectiveTargets, targetsByName, candidates);
+                AddCloudRelayCandidates(effectiveTargets, candidates);
             }
         }
 
@@ -1410,7 +1497,7 @@ public sealed class OllamaRoutingMiddleware(
 
         var lastAttempted = target;
         var cloudBodySwapped = false;
-        foreach (var (candidate, url) in candidates)
+        foreach (var (candidate, targetOptions) in candidates)
         {
             if (candidate == RoutingTarget.Cloud && !cloudBodySwapped)
             {
@@ -1433,37 +1520,96 @@ public sealed class OllamaRoutingMiddleware(
             {
                 bodyStream.Position = 0; // rewind before every attempt (acceptance criterion).
             }
-            lastAttempted = candidate;
-            // Publish the candidate being attempted so a successful fallback's committed
-            // response (headers flushed inside SendAsync → OnStarting) reports THIS target.
-            context.Items[CurrentServedTargetKey] = candidate;
-            var error = await forwarder
-                .SendAsync(context, url, ProxyClient, ForwarderRequestConfig, PassThroughTransformer, context.RequestAborted)
-                .AsTask();
 
-            if (error == ForwarderError.None || IsResponseCommitted(context))
-            {
-                // Committed (or error-free): this candidate produced the response. A completed
-                // success resets the target's failure streak; a complete HTTP error response from
-                // an ALIVE daemon (4xx — headers flushed, transport reliable) does NOT, per Q4.
-                if (error == ForwarderError.None && context.Response.StatusCode is >= 200 and < 400)
-                {
-                    streakTracker.RecordSuccess(candidate);
-                }
-                return (candidate, body);
-            }
-
-            // Client abort (client disconnected / request canceled): terminal, never retry,
-            // never strike the streak, never feed liveness (§7 / client-abort binding).
-            if (IsClientAbort(error) || context.RequestAborted.IsCancellationRequested)
+            // Protocol-eligibility gate (task #61): a candidate that CANNOT serve this
+            // request's protocol family is skipped WITHOUT streak or liveness side effects —
+            // the target is healthy, it simply cannot take this request (OsNative has no
+            // client implementation until tasks #63/#64; no embeddings converter exists, so
+            // /api/embeddings is Ollama-only). Failover continues to the next candidate.
+            if (!IsDispatchEligible(protocol, targetOptions.Type))
             {
                 logger.LogWarning(
-                    "Target {Target} aborted by the client ({Error}); not failing over.", candidate.ToString(), error);
-                return (candidate, body);
+                    "Candidate {Target} (type {Type}) is ineligible for {Endpoint}; skipping (no streak, no liveness effect).",
+                    candidate.ToString(), targetOptions.Type, context.Request.Path.Value);
+                continue;
             }
 
-            // Uncommitted failure: rewind (next iteration), strike the failure streak, and
-            // apply one best-effort liveness strike through the existing hysteresis (Q2).
+            lastAttempted = candidate;
+            // Publish the candidate AND the dispatch path being attempted so a successful
+            // fallback's committed response (headers flushed mid-attempt → OnStarting) reports
+            // THIS target and THIS path (yarp | converter).
+            context.Items[CurrentServedTargetKey] = candidate;
+            var useConverter = ShouldUseConverterPath(protocol, targetOptions.Type) && ConverterAvailable(protocol);
+            if (!useConverter && ShouldUseConverterPath(protocol, targetOptions.Type) &&
+                System.Threading.Interlocked.Exchange(ref _converterDegradationWarned, 1) == 0)
+            {
+                // The dispatch matrix wants the converter path but its dependencies are not wired
+                // (test hosts / degraded configuration): one warning, then the byte-identical
+                // YARP fast path for every such request (spec §6 constructor note).
+                logger.LogWarning(
+                    "The converter dispatch path is not configured; cross-protocol requests ({Protocol} to a {Type} target) fall back to the YARP fast path.",
+                    protocol, targetOptions.Type);
+            }
+            context.Items[CurrentServedDispatchModeKey] = useConverter ? "converter" : "yarp";
+            if (!context.Response.HasStarted)
+            {
+                context.Response.Headers[OllamaReverseProxyConfig.DispatchModeHeader] = (string)context.Items[CurrentServedDispatchModeKey]!;
+            }
+
+            var outcome = useConverter
+                ? await TryConverterDispatchAsync(context, bodyBytes, protocol, targetOptions, context.RequestAborted)
+                : await TryYarpDispatchAsync(context, targetOptions);
+
+            if (outcome == ConverterOutcome.FallbackToYarp)
+            {
+                // Defensive degradation (dependency vanished mid-flight, client not resolvable,
+                // or body unparseable) BEFORE any byte was committed: retry this same candidate
+                // through the YARP fast path — and re-assert the served-path telemetry so the
+                // flushed Dispatch-Mode header reports the path ACTUALLY taken (yarp).
+                logger.LogWarning(
+                    "Converter dispatch to {Target} ({Protocol}) could not be applied; degrading to the YARP fast path for this candidate.",
+                    targetOptions.Name, protocol);
+                context.Items[CurrentServedDispatchModeKey] = "yarp";
+                if (!context.Response.HasStarted)
+                {
+                    context.Response.Headers[OllamaReverseProxyConfig.DispatchModeHeader] = "yarp";
+                }
+                outcome = await TryYarpDispatchAsync(context, targetOptions);
+            }
+
+            switch (outcome)
+            {
+                case ConverterOutcome.Served:
+                    // Committed (or error-free): this candidate produced the response. A
+                    // completed success resets the target's failure streak; a complete HTTP
+                    // error response from an ALIVE daemon (4xx — headers flushed, transport
+                    // reliable) does NOT, per Q4 (converter parity: upstream HTTP errors never
+                    // reach this outcome — they surface as UpstreamHttpError below).
+                    if (context.Response.StatusCode is >= 200 and < 400)
+                    {
+                        streakTracker.RecordSuccess(candidate);
+                    }
+                    return (candidate, body);
+
+                case ConverterOutcome.ClientAborted:
+                    // Client abort (client disconnected / request canceled): terminal, never
+                    // retry, never strike the streak, never feed liveness (§7).
+                    logger.LogWarning(
+                        "Target {Target} aborted by the client; not failing over.", candidate.ToString());
+                    return (candidate, body);
+
+                case ConverterOutcome.UpstreamHttpError:
+                case ConverterOutcome.MidStreamFailure:
+                    // Terminal committed-equivalent failures: an upstream HTTP error mirrors
+                    // the YARP "complete HTTP error from an alive daemon" rule (never a
+                    // streak); a mid-stream drop carries IForwarderErrorFeature so the
+                    // post-dispatch mid-stream streak classification fires uniformly.
+                    return (candidate, body);
+            }
+
+            // Uncommitted failure (TransportFailure) — identical semantics for both dispatch
+            // paths: rewind (next iteration), strike the failure streak, and apply one
+            // best-effort liveness strike through the existing hysteresis (Q2).
             streakTracker.RecordFailure(candidate);
             // Release every session/agent lease pinned to the dying target immediately (the
             // decision service's next turn re-binds those sessions to live targets) rather
@@ -1479,7 +1625,7 @@ public sealed class OllamaRoutingMiddleware(
                 // Best-effort: never block failover on liveness bookkeeping.
             }
             logger.LogWarning(
-                "Target {Target} failed uncommitted ({Error}); failing over.", candidate.ToString(), error);
+                "Target {Target} failed uncommitted; failing over.", candidate.ToString());
         }
 
             // Every candidate failed uncommitted (dead at runtime): terminal 503 with diagnostics.
@@ -1496,11 +1642,13 @@ public sealed class OllamaRoutingMiddleware(
         // enabled effective target — tried first even when offline, per the Q3 regression lock), then
         // the remaining enabled + routable fleet nodes in configuration order. All candidates carry
         // the logical Cloud routing target (telemetry and in-flight accounting treat them as the
-        // relay); the destination URL is the fleet node's URL.
+        // relay); the options carry the relay NODE's identity (Url/Type/ApiKey), so a
+        // cross-protocol request reaching the terminal Cloud step takes the converter branch
+        // against the relay daemon (e.g. OpenAI client → OllamaChatClient → SSE) with no
+        // special-casing (task #61).
         private void AddCloudRelayCandidates(
             IReadOnlyList<OllamaTargetOptions> effectiveTargets,
-            Dictionary<string, string?> targetsByName,
-            List<(RoutingTarget Target, string Url)> candidates)
+            List<(RoutingTarget Target, OllamaTargetOptions Options)> candidates)
         {
             var preferred = options.CurrentValue.CloudOverflow.PreferredRelayTarget;
             var preferredEntry = effectiveTargets
@@ -1510,10 +1658,9 @@ public sealed class OllamaRoutingMiddleware(
                 && targetAvailability.IsEnabled((RoutingTarget)preferredEntry.Name!)
                 ? preferredEntry.Name!
                 : null;
-            if (preferredName is not null && targetsByName.TryGetValue(preferredName, out var preferredUrl)
-                && !string.IsNullOrWhiteSpace(preferredUrl))
+            if (preferredName is not null && !string.IsNullOrWhiteSpace(preferredEntry!.Url))
             {
-                candidates.Add((RoutingTarget.Cloud, preferredUrl!));
+                candidates.Add((RoutingTarget.Cloud, preferredEntry));
                 logger.LogDebug("Cloud relay resolved to preferred target {Target}.", preferredName);
             }
             else if (preferredEntry is not null)
@@ -1537,12 +1684,456 @@ public sealed class OllamaRoutingMiddleware(
                 {
                     continue;
                 }
-                if (targetsByName.TryGetValue(candidate.ToString(), out var url) && !string.IsNullOrWhiteSpace(url))
+                if (!string.IsNullOrWhiteSpace(t.Url))
                 {
-                    candidates.Add((RoutingTarget.Cloud, url!));
+                    candidates.Add((RoutingTarget.Cloud, t));
                 }
             }
         }
+
+    // ─── Task #61: dual-path (YARP / converter) dispatch engine ───────────────────────────────
+
+    /// <summary>
+    /// The inbound wire protocol family of a completion-class request. Classified once per
+    /// request by the middleware and resolved per candidate against the target's
+    /// <see cref="TargetType"/> into a dispatch path (YARP fast path vs converter path).
+    /// </summary>
+    internal enum RequestProtocol
+    {
+        /// <summary>POST /api/chat or POST /api/generate (Ollama NDJSON wire).</summary>
+        OllamaChat,
+        /// <summary>POST /v1/chat/completions (OpenAI SSE wire).</summary>
+        OpenAIChat,
+        /// <summary>POST /v1/completions (legacy completions; same-protocol family only, NEVER translated).</summary>
+        OpenAICompletions,
+        /// <summary>POST /api/embeddings (Ollama-only in v1; no embeddings converter exists).</summary>
+        OllamaEmbeddings
+    }
+
+    /// <summary>
+    /// Maps the inbound path to its protocol family. Unknown completion-class paths degrade to
+    /// the Ollama family (every Ollama target stays eligible — the legacy behavior).
+    /// </summary>
+    internal static RequestProtocol ClassifyRequestProtocol(string? path) => path switch
+    {
+        "/api/chat" => RequestProtocol.OllamaChat,
+        "/api/generate" => RequestProtocol.OllamaChat,
+        "/v1/chat/completions" => RequestProtocol.OpenAIChat,
+        "/v1/completions" => RequestProtocol.OpenAICompletions,
+        "/api/embeddings" => RequestProtocol.OllamaEmbeddings,
+        _ => RequestProtocol.OllamaChat
+    };
+
+    /// <summary>
+    /// Whether the candidate needs protocol translation for the request's protocol family
+    /// (the converter path): an Ollama client reaching an OpenAI target, or an OpenAI client
+    /// reaching an Ollama target (incl. cloud relay daemons). Same-protocol pairs and the
+    /// never-translated endpoints (/v1/completions, /api/embeddings) take the YARP fast path.
+    /// </summary>
+    internal static bool ShouldUseConverterPath(RequestProtocol protocol, TargetType targetType) => protocol switch
+    {
+        RequestProtocol.OllamaChat => targetType == TargetType.OpenAI,
+        RequestProtocol.OpenAIChat => targetType == TargetType.Ollama,
+        _ => false
+    };
+
+    /// <summary>
+    /// Whether the candidate can serve the request's protocol family AT ALL: OsNative targets
+    /// are never dispatch candidates (no client implementation until tasks #63/#64), and
+    /// /api/embeddings is Ollama-only (no embeddings converter in v1). Ineligible candidates
+    /// are skipped without streak or liveness side effects.
+    /// </summary>
+    internal static bool IsDispatchEligible(RequestProtocol protocol, TargetType targetType) => (protocol, targetType) switch
+    {
+        (_, TargetType.OsNative) => false,
+        (RequestProtocol.OllamaEmbeddings, not TargetType.Ollama) => false,
+        _ => true
+    };
+
+    /// <summary>
+    /// The dispatch-mode telemetry value ("yarp" | "converter") for a target (unknown targets
+    /// default to the Ollama type — the config binder's enum default).
+    /// </summary>
+    internal static string ResolveDispatchMode(RequestProtocol protocol, OllamaTargetOptions? options)
+        => ShouldUseConverterPath(protocol, options?.Type ?? TargetType.Ollama) ? "converter" : "yarp";
+
+    /// <summary>
+    /// Whether the converter dispatch path can run at all for the request's protocol family
+    /// (task #61 §6): the client provider AND the matching inbound parser must be wired. When
+    /// false, cross-protocol candidates degrade to the YARP fast path (byte-identical
+    /// pure-Ollama behavior on converter-less hosts — existing unit-test harnesses).
+    /// </summary>
+    private bool ConverterAvailable(RequestProtocol protocol)
+        => _targetChatClientProvider is not null &&
+           (IChatRequestConverter?)(protocol == RequestProtocol.OllamaChat ? _ollamaRequestParser : _openAiRequestParser) is not null;
+
+    /// <summary>
+    /// Looks up the live options of a named target (case-insensitive); null for unknown names
+    /// (incl. the Cloud pseudo-target). Used for the dynamic-sizing early return (non-Ollama
+    /// targets have no num_ctx semantics) and the dispatch-mode telemetry.
+    /// </summary>
+    private OllamaTargetOptions? FindTargetOptions(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return null;
+        }
+
+        foreach (var t in options.CurrentValue.GetEffectiveTargets(logger))
+        {
+            if (string.Equals(t.Name, name, StringComparison.OrdinalIgnoreCase))
+            {
+                return t;
+            }
+        }
+
+        return null;
+    }
+
+    // Outcome of a single dispatch attempt (YARP or converter); the loop maps each outcome to
+    // the SAME streak/liveness/failover semantics for both paths (task #61 failover parity).
+    private enum ConverterOutcome
+    {
+        /// <summary>Response complete and accepted — return the candidate as served.</summary>
+        Served,
+        /// <summary>Complete HTTP error from an alive upstream (committed-equivalent) — terminal, NO streak.</summary>
+        UpstreamHttpError,
+        /// <summary>Cancelled by the client — terminal, never retry, never streak.</summary>
+        ClientAborted,
+        /// <summary>Bytes were committed then the stream broke — terminal + IForwarderErrorFeature.</summary>
+        MidStreamFailure,
+        /// <summary>Failed before the first byte — rewind, streak, liveness strike, fail over.</summary>
+        TransportFailure,
+        /// <summary>
+        /// The converter path could not take this candidate (dependency not wired, client not
+        /// resolvable, body unparseable) — BEFORE any byte was written; the loop degrades this
+        /// candidate to the YARP fast path (spec: converter-less hosts keep the byte-identical
+        /// pure-Ollama behavior).
+        /// </summary>
+        FallbackToYarp
+    }
+
+    // The YARP fast-path attempt (same-protocol pair): zero-copy forward through the shared
+    // proxy client. The per-candidate DispatchHeaderTransformer strips the inbound
+    // Authorization header, injects the target's provider key (OpenAI targets) and
+    // de-duplicates a /v1 destination path prefix.
+    private async Task<ConverterOutcome> TryYarpDispatchAsync(HttpContext context, OllamaTargetOptions targetOptions)
+    {
+        var transformer = new DispatchHeaderTransformer(targetOptions.Type, targetOptions.ApiKey);
+        var error = await forwarder
+            .SendAsync(context, targetOptions.Url!, ProxyClient, ForwarderRequestConfig, transformer, context.RequestAborted)
+            .AsTask();
+
+        if (error == ForwarderError.None)
+        {
+            return ConverterOutcome.Served;
+        }
+
+        if (IsResponseCommitted(context))
+        {
+            // Mid-stream committed failure: YARP already set IForwarderErrorFeature, so the
+            // post-dispatch mid-stream streak classification fires exactly as before.
+            return ConverterOutcome.MidStreamFailure;
+        }
+
+        if (IsClientAbort(error) || context.RequestAborted.IsCancellationRequested)
+        {
+            return ConverterOutcome.ClientAborted;
+        }
+
+        return ConverterOutcome.TransportFailure;
+    }
+
+    // The converter dispatch attempt (cross-protocol pair), executed inside the dispatch loop
+    // so every existing failover/telemetry/booking semantic applies uniformly (task #61):
+    //   1. rewind the buffered body, select the request parser by INBOUND protocol, parse to
+    //      canonical (IList<ChatMessage>, ChatOptions, ModelName);
+    //   2. resolve the target's IChatClient (null ⇒ YARP degradation);
+    //   3. set the response Content-Type BEFORE the first byte; the per-attempt encoder writes
+    //      into a StreamPipeWriter over the response capturing stream installed loop-upstream
+    //      (token-tail extraction, IsResponseComplete and TryExtractActualTokens work on both
+    //      encoders' terminal frames: NDJSON done:true + counts / SSE usage + [DONE]);
+    //   4. streaming: GetStreamingResponseAsync → WriteStreamChunkAsync per update (usage is
+    //      carried as UsageContent inside update.Contents); non-streaming: GetResponseAsync →
+    //      WriteNonStreamingResponseAsync; the terminal frame carries model/duration/finish;
+    //   5. failure semantics (parity with the YARP branch): upstream HTTP error ⇒ terminal
+    //      committed-equivalent (status + protocol-shaped error body, NO streak); transport
+    //      failure before the first byte ⇒ uncommitted (rewind/strike/failover); failure
+    //      after the first byte ⇒ terminal + IForwarderErrorFeature.Exception; client abort
+    //      ⇒ terminal, never retry, never streak.
+    private async Task<ConverterOutcome> TryConverterDispatchAsync(HttpContext context, byte[] bodyBytes, RequestProtocol protocol, OllamaTargetOptions targetOptions, CancellationToken ct)
+    {
+        IChatRequestConverter parser = protocol == RequestProtocol.OllamaChat ? _ollamaRequestParser! : _openAiRequestParser!;
+        if (parser is null || _targetChatClientProvider is null)
+        {
+            logger.LogWarning(
+                "The converter dispatch path is not configured (missing parser/client provider); target {Target} degrades to the YARP fast path for {Endpoint}.",
+                targetOptions.Name, context.Request.Path.Value);
+            return ConverterOutcome.FallbackToYarp;
+        }
+
+        if (!_targetChatClientProvider.TryResolve(targetOptions.Name!, out var client) || client is null)
+        {
+            logger.LogWarning(
+                "No chat client available for target {Target} (type {Type}); degrading to the YARP fast path.",
+                targetOptions.Name, targetOptions.Type);
+            return ConverterOutcome.FallbackToYarp;
+        }
+
+        var isStreaming = ExtractStreamFlag(bodyBytes, protocol);
+        IChatResponseEncoder encoder = protocol == RequestProtocol.OllamaChat
+            ? new OllamaNdjsonResponseEncoder()
+            : new OpenAiSseResponseEncoder();
+
+        IList<ChatMessage> messages;
+        ChatOptions requestOptions;
+        string modelName;
+        try
+        {
+            (messages, requestOptions, modelName) = await parser.ParseChatRequestAsync(new MemoryStream(bodyBytes), ct);
+        }
+        catch (OperationCanceledException)
+        {
+            throw; // client abort: the outer handler classifies it.
+        }
+        catch (Exception ex)
+        {
+            // A structurally valid body should have parsed (the decision pipeline already saw it);
+            // a parse failure here degrades to the YARP fast path (uncommitted — nothing was
+            // written), which answers the request the way a native same-protocol forward would.
+            logger.LogWarning(ex, "Failed to parse the {Protocol} request body for converter dispatch to {Target}; degrading to the YARP fast path.", protocol, targetOptions.Name);
+            return ConverterOutcome.FallbackToYarp;
+        }
+
+        // The target's IChatClient resolves the model from ChatOptions.ModelId (or its own
+        // default — none here): the INBOUND request's model name is the fleet-consistent one
+        // (the routing catalog already qualified it against this target).
+        if (string.IsNullOrWhiteSpace(modelName))
+        {
+            modelName = string.Empty;
+        }
+        requestOptions.ModelId = modelName;
+
+        // Content type BEFORE the first byte (the terminal error path may still set the status
+        // while uncommitted — headers are not yet flushed). A non-streaming OpenAI-family
+        // response is a plain JSON object, not an SSE stream: reporting it as
+        // text/event-stream would make the post-dispatch completeness check wait for a
+        // [DONE] marker that never arrives and misreport a complete response as a 502.
+        context.Response.ContentType = protocol == RequestProtocol.OpenAIChat && !isStreaming
+            ? "application/json"
+            : encoder.ContentType;
+        // Clear a 502 left by a PREVIOUS candidate's failed YARP attempt (ResetUncommittedResponse
+        // restores 200 only on its own path); the capturing stream is already installed loop-upstream.
+        ResetUncommittedResponse(context);
+
+        var capturing = context.Items[CapturingStreamKey] as ResponseCapturingStream
+            ?? new ResponseCapturingStream(context.Response.Body);
+        var watch = Stopwatch.StartNew();
+        try
+        {
+            if (isStreaming)
+            {
+                // .NET 10 replaced StreamPipeWriter with the PipeWriter.Create factory; LeaveOpen keeps
+                // the middleware's capturing stream alive (it owns/restores the response body).
+                var writer = PipeWriter.Create(capturing, new StreamPipeWriterOptions(leaveOpen: true));
+                UsageDetails? usage = null;
+                ChatFinishReason? finishReason = null;
+                await foreach (var update in client.GetStreamingResponseAsync(messages, requestOptions, ct))
+                {
+                    if (update.FinishReason is { } reason)
+                    {
+                        finishReason = reason;
+                    }
+                    foreach (var content in update.Contents)
+                    {
+                        if (content is UsageContent usageContent)
+                        {
+                            usage = usageContent.Details; // carried inside the update — not re-fetched.
+                        }
+                    }
+                    await encoder.WriteStreamChunkAsync(writer, update, modelName, ct);
+                }
+                await encoder.WriteStreamEndAsync(writer, modelName, usage, watch.Elapsed, finishReason, ct);
+                await writer.CompleteAsync();
+            }
+            else
+            {
+                var response = await client.GetResponseAsync(messages, requestOptions, ct);
+                await encoder.WriteNonStreamingResponseAsync(capturing, response, modelName, watch.Elapsed, ct);
+                await capturing.FlushAsync(ct);
+            }
+
+            return ConverterOutcome.Served;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Client abort: terminal, never retry, never streak (existing isClientAborted flow
+            // in the post-dispatch block reads IForwarderErrorFeature).
+            logger.LogWarning(
+                "Converter dispatch to {Target} was cancelled by the client before completion.", targetOptions.Name);
+            context.Features.Set<IForwarderErrorFeature>(new ConverterForwarderErrorFeature(ForwarderError.RequestCanceled, null));
+            return ConverterOutcome.ClientAborted;
+        }
+        catch (Exception ex) when (ex is OpenAiHttpException or OllamaHttpException)
+        {
+            var upstreamStatus = (ex as OpenAiHttpException)?.StatusCode ?? (ex as OllamaHttpException)?.StatusCode;
+            if (upstreamStatus is not null && !IsResponseCommitted(context))
+            {
+                // Upstream HTTP error (404 model-not-found, 401, 429, …): the provider ANSWERED —
+                // committed-equivalent, mirroring the YARP "complete HTTP error from an alive
+                // daemon" rule. Terminal with the upstream status + a protocol-shaped error body;
+                // NO streak, NO liveness strike (transport was reliable).
+                context.Response.StatusCode = (int)upstreamStatus.Value;
+                await WriteProtocolShapedErrorBodyAsync(context, protocol, ex.Message);
+                return ConverterOutcome.UpstreamHttpError;
+            }
+
+            // Same exception type but no status (transport-level, e.g. connection refused for
+            // an OpenAiHttpException) or bytes already committed (mid-stream break).
+            if (IsResponseCommitted(context))
+            {
+                context.Features.Set<IForwarderErrorFeature>(new ConverterForwarderErrorFeature(ForwarderError.ResponseBodyDestination, ex));
+                logger.LogWarning(ex, "Converter stream to {Target} broke mid-stream ({Message}).", targetOptions.Name, ex.Message);
+                return ConverterOutcome.MidStreamFailure;
+            }
+
+            logger.LogWarning(ex, "Converter transport failure to {Target} before the first byte; failing over.", targetOptions.Name);
+            return ConverterOutcome.TransportFailure;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or IOException)
+        {
+            if (IsResponseCommitted(context))
+            {
+                context.Features.Set<IForwarderErrorFeature>(new ConverterForwarderErrorFeature(ForwarderError.ResponseBodyDestination, ex));
+                logger.LogWarning(ex, "Converter stream to {Target} broke mid-stream ({Message}).", targetOptions.Name, ex.Message);
+                return ConverterOutcome.MidStreamFailure;
+            }
+
+            logger.LogWarning(ex, "Converter transport failure to {Target} before the first byte; failing over.", targetOptions.Name);
+            return ConverterOutcome.TransportFailure;
+        }
+        catch (Exception ex)
+        {
+            // Safety net for unexpected encoder/client faults: classify by commit state so the
+            // loop's uniform semantics always apply (never an unhandled 500 mid-failover).
+            if (IsResponseCommitted(context))
+            {
+                context.Features.Set<IForwarderErrorFeature>(new ConverterForwarderErrorFeature(ForwarderError.ResponseBodyDestination, ex));
+                logger.LogError(ex, "Unexpected converter failure to {Target} after the first byte; marking mid-stream.", targetOptions.Name);
+                return ConverterOutcome.MidStreamFailure;
+            }
+
+            logger.LogError(ex, "Unexpected converter failure to {Target} before the first byte; failing over.", targetOptions.Name);
+            return ConverterOutcome.TransportFailure;
+        }
+    }
+
+    /// <summary>
+    /// The request's <c>stream</c> flag from the raw buffered body (top-level property only).
+    /// Default: true for the Ollama endpoints (/api/chat, /api/generate), false for the OpenAI
+    /// endpoint (/v1/chat/completions) — matching the protocol defaults (the task #59 parser
+    /// contract itself is NOT extended for this flag).
+    /// </summary>
+    internal static bool ExtractStreamFlag(byte[] body, RequestProtocol protocol)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.ValueKind == JsonValueKind.Object &&
+                doc.RootElement.TryGetProperty("stream", out var value) &&
+                value.ValueKind is JsonValueKind.True or JsonValueKind.False)
+            {
+                return value.GetBoolean();
+            }
+        }
+        catch (JsonException)
+        {
+            // Malformed body — the protocol default below applies (the parser will report it).
+        }
+
+        return protocol switch
+        {
+            RequestProtocol.OpenAIChat => false,
+            _ => true
+        };
+    }
+
+    // Writes the protocol-shaped error body for a converter-path upstream HTTP error
+    // (task #61): Ollama {"error": "..."} for the Ollama-family endpoints, the OpenAI
+    // {"error": {"message", "type", "code"}} envelope for the OpenAI-family endpoints.
+    private static async Task WriteProtocolShapedErrorBodyAsync(HttpContext context, RequestProtocol protocol, string message)
+    {
+        context.Response.ContentType = protocol == RequestProtocol.OllamaChat
+            ? "application/x-ndjson"
+            : "application/json";
+        var payload = protocol == RequestProtocol.OllamaChat
+            ? JsonSerializer.Serialize(new OllamaErrorResponse(message), OllamaRouterJsonSerializerContext.Default.OllamaErrorResponse)
+            : JsonSerializer.Serialize(
+                new OpenAiErrorResponseDto
+                {
+                    Error = new OpenAiErrorDetailDto { Message = message, Type = "upstream_error" }
+                },
+                OllamaRouterJsonSerializerContext.Default.OpenAiErrorResponseDto);
+        await context.Response.WriteAsync(payload);
+    }
+
+    // YARP 2.3.0's ForwarderErrorFeature class is INTERNAL (only IForwarderErrorFeature is
+    // public), so the converter dispatch path publishes its classification through this tiny
+    // public implementation — the post-dispatch block only reads IForwarderErrorFeature.Error
+    // (mid-stream streaks fire for any Error != None that is not a client-abort value).
+    private sealed class ConverterForwarderErrorFeature(ForwarderError error, Exception? exception) : IForwarderErrorFeature
+    {
+        public ForwarderError Error { get; } = error;
+        public Exception? Exception { get; } = exception;
+    }
+
+    // Per-candidate YARP request transformer (task #61). YARP 2.3.0's HttpTransformer base
+    // implementation copies every inbound request header into the outgoing message (skipping
+    // protocol headers); this override then (a) REMOVES the Authorization header (a client key
+    // must never reach an unrelated daemon — same spirit as the inbound X-Ollama-Target strip),
+    // (b) re-adds Authorization: Bearer {ApiKey} for OpenAI-type targets (the same-protocol
+    // fast path is the only auth-injecting path in the router), and (c) rewrites the request
+    // URI so a /v1-prefixed base address does not duplicate the segment (base
+    // http://h:8000/v1 + request /v1/chat/completions ⇒ forwarded /v1/chat/completions once).
+    // YARP composes the RequestUri AFTER this callback when it is still null, so setting it
+    // here is honored; leaving it null keeps the default composition.
+    private sealed class DispatchHeaderTransformer(TargetType targetType, string? apiKey) : HttpTransformer
+    {
+        public override async ValueTask TransformRequestAsync(
+            HttpContext httpContext, HttpRequestMessage proxyRequest, string destinationPrefix, CancellationToken cancellationToken)
+        {
+            await base.TransformRequestAsync(httpContext, proxyRequest, destinationPrefix, cancellationToken);
+
+            proxyRequest.Headers.Authorization = null;
+            if (targetType == TargetType.OpenAI && !string.IsNullOrWhiteSpace(apiKey))
+            {
+                proxyRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+            }
+
+            RewritePathPrefix(httpContext, proxyRequest, destinationPrefix);
+        }
+
+        private static void RewritePathPrefix(HttpContext httpContext, HttpRequestMessage proxyRequest, string destinationPrefix)
+        {
+            var prefixPath = new Uri(destinationPrefix, UriKind.Absolute).AbsolutePath.TrimEnd('/');
+            if (prefixPath.Length == 0)
+            {
+                return; // scheme://host[:port] only — YARP's default composition is already correct.
+            }
+
+            var inboundPath = httpContext.Request.Path.Value ?? "/";
+            if (inboundPath == prefixPath || inboundPath.StartsWith(prefixPath + "/", StringComparison.Ordinal))
+            {
+                // The inbound path already carries the destination's path prefix: strip it so the
+                // composed URI does not duplicate the segment (…/v1/v1/chat/completions).
+                var stripped = inboundPath[prefixPath.Length..]; // "" or "/chat/completions"
+                proxyRequest.RequestUri = RequestUtilities.MakeDestinationAddress(
+                    destinationPrefix,
+                    stripped.Length == 0 ? "/" : stripped,
+                    httpContext.Request.QueryString);
+            }
+        }
+    }
 
     private static bool IsResponseComplete(HttpContext context, string capturedTail, int? actualResponseTokens)
     {

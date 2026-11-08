@@ -104,6 +104,10 @@ public static class RouterTargetsEndpoints
         var maxParallel = addRequest.MaxParallel;
         var hardwareHint = addRequest.HardwareHint;
         hardwareHint = string.IsNullOrWhiteSpace(hardwareHint) ? null : hardwareHint.Trim();
+        // Task #61 heterogeneous fields (null-tolerant: JSON omission deserializes to null).
+        var apiKey = addRequest.ApiKey;
+        var provider = addRequest.Provider;
+        var declaredModels = addRequest.Models;
 
         if (name.Length == 0 || name.Length > 64 ||
             name.IndexOfAny(InvalidTargetNameChars) >= 0 ||
@@ -126,6 +130,24 @@ public static class RouterTargetsEndpoints
             return AddTargetFailure("maxParallel must be >= 1", StatusCodes.Status400BadRequest);
         }
 
+        if (!TryParseTargetType(addRequest.Type, out var targetType))
+        {
+            return AddTargetFailure(
+                $"invalid target type '{addRequest.Type}': must be 'ollama', 'openai' or 'osnative' (case-insensitive)",
+                StatusCodes.Status400BadRequest);
+        }
+
+        if (!string.IsNullOrWhiteSpace(apiKey) && targetType != TargetType.OpenAI)
+        {
+            return AddTargetFailure(
+                "apiKey can only be set on targets of type 'openai'", StatusCodes.Status400BadRequest);
+        }
+
+        if (HasBlankModelNames(declaredModels))
+        {
+            return AddTargetFailure("models must not contain blank names", StatusCodes.Status400BadRequest);
+        }
+
         if (effectiveTargets.Any(t => string.Equals(t.Name, name, StringComparison.OrdinalIgnoreCase)))
         {
             return AddTargetFailure(
@@ -133,6 +155,8 @@ public static class RouterTargetsEndpoints
         }
 
         var normalizedUrl = url.ToString().TrimEnd('/');
+        var normalizedProvider = string.IsNullOrWhiteSpace(provider) ? null : provider.Trim();
+        var modelsList = ToTargetModelConfigs(declaredModels);
 
         // The candidate list for the probe + the eventual persist (in-memory order =
         // effective targets + the new one).
@@ -144,7 +168,13 @@ public static class RouterTargetsEndpoints
             Url = normalizedUrl,
             Enabled = true,
             MaxParallel = maxParallel,
-            HardwareHint = hardwareHint
+            HardwareHint = hardwareHint,
+            Type = targetType,
+            // In-memory options always carry the UNWRAPPED key (the persistence layer wraps
+            // it for config/config.json; the bind-time unwrap restores it on the next reload).
+            ApiKey = string.IsNullOrWhiteSpace(apiKey) ? null : apiKey.Trim(),
+            Provider = normalizedProvider,
+            Models = modelsList
         });
 
         // Immediate liveness probe (coalesced, bounded by the probe client timeout). Skipped
@@ -193,17 +223,26 @@ public static class RouterTargetsEndpoints
 
         // Seed the model catalog (bounded by the catalog client's 4 s timeout; fail-soft: a
         // discovery hiccup never blocks the add — the liveness rejoin auto-refresh covers it).
+        // Non-Ollama targets (task #61) have a SYNTHETIC catalog: the seed count is the
+        // declared roster size (no /api/tags probe — the provider does not speak it).
         var modelsDiscovered = 0;
-        var catalog = serviceProvider.GetService<IModelCatalogCacheService>();
-        if (catalog is not null)
+        if (targetType == TargetType.OpenAI)
         {
-            try
+            modelsDiscovered = modelsList.Count;
+        }
+        else
+        {
+            var catalog = serviceProvider.GetService<IModelCatalogCacheService>();
+            if (catalog is not null)
             {
-                modelsDiscovered = (await catalog.RefreshAsync(normalizedUrl, cancellationToken).ConfigureAwait(false)).Count;
-            }
-            catch
-            {
-                modelsDiscovered = 0;
+                try
+                {
+                    modelsDiscovered = (await catalog.RefreshAsync(normalizedUrl, cancellationToken).ConfigureAwait(false)).Count;
+                }
+                catch
+                {
+                    modelsDiscovered = 0;
+                }
             }
         }
 
@@ -236,7 +275,18 @@ public static class RouterTargetsEndpoints
             connectionTested,
             livenessState.ToString(),
             modelsDiscovered,
-            new RouterTargetConfigDto(name, normalizedUrl, true, hardwareHint, maxParallel),
+            new RouterTargetConfigDto(
+                name,
+                normalizedUrl,
+                true,
+                hardwareHint,
+                maxParallel,
+                targetType.ToString().ToLowerInvariant(),
+                normalizedProvider,
+                modelsList.Count > 0
+                    ? modelsList.Select(m => new TargetModelDto(m.Name, m.ContextLength, m.Quantization)).ToList()
+                    : null,
+                !string.IsNullOrWhiteSpace(apiKey)),
             latencyMs),
             OllamaRouterJsonSerializerContext.Default.AddTargetResponse,
             statusCode: StatusCodes.Status201Created);
@@ -275,9 +325,29 @@ public static class RouterTargetsEndpoints
 
         if (updateRequest is null ||
             (updateRequest.Url is null && updateRequest.Enabled is null &&
-             updateRequest.HardwareHint is null && updateRequest.MaxParallel is null))
+             updateRequest.HardwareHint is null && updateRequest.MaxParallel is null &&
+             updateRequest.Type is null && updateRequest.ApiKey is null &&
+             updateRequest.Provider is null && updateRequest.Models is null))
         {
             return UpdateTargetFailure($"no target fields provided for '{name}'", StatusCodes.Status400BadRequest);
+        }
+
+        // Task #61: an explicitly provided type must be one of the known families (null/absent
+        // = no change, handled below); the apiKey/type interplay is validated AFTER the target
+        // lookup (the effective type may come from the EXISTING target when the request does
+        // not change it).
+        var typeProvided = updateRequest.Type is not null;
+        var targetTypeValue = TargetType.Ollama;
+        if (typeProvided && !TryParseTargetType(updateRequest.Type, out targetTypeValue))
+        {
+            return UpdateTargetFailure(
+                $"invalid target type '{updateRequest.Type}': must be 'ollama', 'openai' or 'osnative' (case-insensitive)",
+                StatusCodes.Status400BadRequest);
+        }
+
+        if (HasBlankModelNames(updateRequest.Models))
+        {
+            return UpdateTargetFailure("models must not contain blank names", StatusCodes.Status400BadRequest);
         }
 
         string? normalizedUrl = null;
@@ -324,6 +394,37 @@ public static class RouterTargetsEndpoints
             updated.MaxParallel = parallel;
         }
 
+        // Task #61 heterogeneous fields (partial-update semantics: null/absent = no change).
+        if (typeProvided)
+        {
+            updated.Type = targetTypeValue;
+        }
+
+        if (updateRequest.ApiKey is { } updateApiKey)
+        {
+            // "" (or blank) clears the key; a non-blank value is trimmed. An apiKey can only be
+            // set (non-blank) when the EFFECTIVE type (the request's when provided, otherwise the
+            // target's existing one) is 'openai'.
+            var effectiveType = typeProvided ? targetTypeValue : updated.Type;
+            if (!string.IsNullOrWhiteSpace(updateApiKey) && effectiveType != TargetType.OpenAI)
+            {
+                return UpdateTargetFailure(
+                    "apiKey can only be set on targets of type 'openai'", StatusCodes.Status400BadRequest);
+            }
+
+            updated.ApiKey = string.IsNullOrWhiteSpace(updateApiKey) ? null : updateApiKey.Trim();
+        }
+
+        if (updateRequest.Provider is { } updateProvider)
+        {
+            updated.Provider = string.IsNullOrWhiteSpace(updateProvider) ? null : updateProvider.Trim();
+        }
+
+        if (updateRequest.Models is { } updateModels)
+        {
+            updated.Models = ToTargetModelConfigs(updateModels);
+        }
+
         var newTargets = effectiveTargets.ToList();
         newTargets[index] = updated;
 
@@ -349,7 +450,13 @@ public static class RouterTargetsEndpoints
                 updated.Url ?? string.Empty,
                 updated.Enabled,
                 updated.HardwareHint,
-                updated.MaxParallel)),
+                updated.MaxParallel,
+                updated.Type.ToString().ToLowerInvariant(),
+                updated.Provider,
+                updated.Models is { Count: > 0 } updatedModels
+                    ? updatedModels.Select(m => new TargetModelDto(m.Name, m.ContextLength, m.Quantization)).ToList()
+                    : null,
+                !string.IsNullOrWhiteSpace(updated.ApiKey))),
             OllamaRouterJsonSerializerContext.Default.UpdateTargetResponse);
     }
 
@@ -405,6 +512,71 @@ public static class RouterTargetsEndpoints
     }
 
     private static readonly char[] InvalidTargetNameChars = ['/', '\\', ':'];
+
+    /// <summary>
+    /// Parses the Setup API wire value of a target's protocol family (task #61):
+    /// case-insensitive <c>ollama|openai|osnative</c>; null/blank defaults to
+    /// <see cref="TargetType.Ollama"/> (the config binder's enum default, so a legacy POST
+    /// without a <c>type</c> field is byte-identical).
+    /// </summary>
+    private static bool TryParseTargetType(string? raw, out TargetType type)
+    {
+        type = TargetType.Ollama;
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return true;
+        }
+
+        return Enum.TryParse<TargetType>(raw.Trim(), ignoreCase: true, out type)
+            || (raw.Trim().Length == 0);
+    }
+
+    /// <summary>
+    /// Whether any declared model of the Setup API payload has a blank name (task #61):
+    /// blank roster entries are rejected with a 400 (every consumer skips them, so accepting
+    /// them would silently drop declared models).
+    /// </summary>
+    private static bool HasBlankModelNames(IReadOnlyList<TargetModelDto>? models)
+    {
+        if (models is null)
+        {
+            return false;
+        }
+
+        return models.Any(m => string.IsNullOrWhiteSpace(m?.Name));
+    }
+
+    /// <summary>
+    /// Maps the Setup API model DTOs to the options-level declared roster (task #61),
+    /// trimming names and dropping entries whose name is blank (the caller 400s those first,
+    /// so this is defensive only). Null/absent maps to an empty roster (permissive policy).
+    /// </summary>
+    private static List<TargetModelConfig> ToTargetModelConfigs(IReadOnlyList<TargetModelDto>? models)
+    {
+        var result = new List<TargetModelConfig>();
+        if (models is null)
+        {
+            return result;
+        }
+
+        foreach (var model in models)
+        {
+            if (model is null || string.IsNullOrWhiteSpace(model.Name))
+            {
+                continue;
+            }
+
+            result.Add(new TargetModelConfig
+            {
+                Name = model.Name.Trim(),
+                ContextLength = model.ContextLength,
+                Quantization = string.IsNullOrWhiteSpace(model.Quantization) ? null : model.Quantization.Trim()
+            });
+        }
+
+        return result;
+    }
+
     /// <summary>Field-by-field copy of a target options instance (copy-on-write for PUT).</summary>
     private static OllamaTargetOptions CopyTargetOptions(OllamaTargetOptions target) => new()
     {
@@ -417,7 +589,18 @@ public static class RouterTargetsEndpoints
         SpeedFactor = target.SpeedFactor,
         MaxParallel = target.MaxParallel,
         Enabled = target.Enabled,
-        HardwareHint = target.HardwareHint
+        HardwareHint = target.HardwareHint,
+        Type = target.Type,
+        ApiKey = target.ApiKey,
+        Provider = target.Provider,
+        Models = target.Models is { Count: > 0 } existing
+            ? existing.Select(m => new TargetModelConfig
+                {
+                    Name = m.Name,
+                    ContextLength = m.ContextLength,
+                    Quantization = m.Quantization
+                }).ToList()
+            : []
     };
     private static IResult AddTargetFailure(string error, int statusCode) =>
         Results.Json(

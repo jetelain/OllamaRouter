@@ -1,7 +1,9 @@
 using System.Text.Json.Nodes;
 using Microsoft.Extensions.Caching.Memory;
 using Moq;
+using OllamaRouter.Options;
 using OllamaRouter.Services.Catalog;
+using OllamaRouter.Tests.TestHelpers;
 
 namespace OllamaRouter.Tests.Services.Catalog;
 
@@ -336,5 +338,109 @@ public class ModelCatalogCacheServiceTests
         await sut.RefreshWithDigestAsync(BaseUrl);
 
         Assert.NotNull(memoryCache.Get(keyA));
+    }
+
+    // ---- Task #61: synthetic catalog for non-Ollama targets ----
+
+    private static ModelCatalogCacheService CreateSutWithOptions(
+        Mock<IOllamaModelCatalogClient> catalogClient,
+        OllamaRouterOptions options,
+        string nonOllamaUrl = "http://provider.example.com:8000")
+    {
+        return new ModelCatalogCacheService(
+            catalogClient.Object,
+            new MemoryCache(new MemoryCacheOptions()),
+            logger: null,
+            new TestOptionsMonitor<OllamaRouterOptions>(options));
+    }
+
+    [Fact]
+    public async Task SyntheticCatalog_NonOllamaTarget_ReturnsDeclaredRoster_WithoutProbingTags()
+    {
+        var openAiUrl = "http://provider.example.com:8000";
+        var options = new OllamaRouterOptions
+        {
+            Targets = new List<OllamaTargetOptions>
+            {
+                new() { Name = "Desktop", Url = BaseUrl }, // Ollama target stays on the live path
+                new()
+                {
+                    Name = "Provider",
+                    Url = openAiUrl,
+                    Type = TargetType.OpenAI,
+                    Models =
+                    [
+                        new TargetModelConfig { Name = "openai/gpt-4o" },
+                        new TargetModelConfig { Name = "anthropic/claude-sonnet-4.5" },
+                        new TargetModelConfig { Name = "  " } // blank names are skipped (documented)
+                    ]
+                }
+            }
+        };
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var sut = CreateSutWithOptions(catalogClient, options);
+
+        var result = await sut.RefreshWithDigestAsync(openAiUrl);
+
+        Assert.Equal(2, result.Names.Count); // blank skipped
+        Assert.Contains("openai/gpt-4o", result.Names);
+        Assert.Contains("anthropic/claude-sonnet-4.5", result.Names);
+        Assert.False(string.IsNullOrEmpty(result.Digest));
+        // The daemon was NEVER probed for a non-Ollama URL.
+        catalogClient.Verify(c => c.GetTagsWithDigestAsync(openAiUrl, It.IsAny<CancellationToken>()), Times.Never);
+        catalogClient.Verify(c => c.GetTagsAsync(openAiUrl, It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task SyntheticCatalog_StrictMembership_ModelExistsHonorsRoster()
+    {
+        var openAiUrl = "http://provider.example.com:8000";
+        var options = new OllamaRouterOptions
+        {
+            Targets = new List<OllamaTargetOptions>
+            {
+                new() { Name = "Provider", Url = openAiUrl, Type = TargetType.OpenAI,
+                         Models = [new TargetModelConfig { Name = "openai/gpt-4o" }] }
+            }
+        };
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var sut = CreateSutWithOptions(catalogClient, options);
+
+        Assert.True(await sut.ModelExistsAsync(openAiUrl, "openai/gpt-4o"));
+        Assert.True(await sut.ModelExistsAsync(openAiUrl, "OPENAI/GPT-4O")); // case-insensitive
+        Assert.False(await sut.ModelExistsAsync(openAiUrl, "llama3"));      // not listed
+        catalogClient.VerifyNoOtherCalls(); // roster served entirely in-memory
+    }
+
+    [Fact]
+    public async Task SyntheticCatalog_DigestIsStableAcrossCalls_AndChangesWithRoster()
+    {
+        var openAiUrl = "http://provider.example.com:8000";
+        var options = new OllamaRouterOptions
+        {
+            Targets = new List<OllamaTargetOptions>
+            {
+                new() { Name = "Provider", Url = openAiUrl, Type = TargetType.OpenAI,
+                         Models = [new TargetModelConfig { Name = "a-model" },
+                                   new TargetModelConfig { Name = "b-model" }] }
+            }
+        };
+        var catalogClient = new Mock<IOllamaModelCatalogClient>();
+        var memoryCache = new MemoryCache(new MemoryCacheOptions());
+        var sut = new ModelCatalogCacheService(catalogClient.Object, memoryCache, null,
+            new TestOptionsMonitor<OllamaRouterOptions>(options));
+
+        var (names1, digest1) = await sut.RefreshWithDigestAsync(openAiUrl);
+        var (_, digest2) = await sut.RefreshWithDigestAsync(openAiUrl);
+        Assert.Equal(digest1, digest2); // stable across calls (change-detection friendly)
+        Assert.Equal(
+            ModelCatalogCacheService.ComputeSyntheticDigest(names1.OrderBy(n => n).ToList()),
+            digest1);
+
+        // A roster edit (rebind) changes the digest ⇒ the capability cache invalidates as if
+        // the live /api/tags digest had changed.
+        options.Targets[0].Models.Add(new TargetModelConfig { Name = "c-model" });
+        var (_, digest3) = await sut.RefreshWithDigestAsync(openAiUrl);
+        Assert.NotEqual(digest1, digest3);
     }
 }

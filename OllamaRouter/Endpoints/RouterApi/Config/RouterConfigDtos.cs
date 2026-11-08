@@ -22,14 +22,22 @@ public sealed record RouterConfigResponse(
 /// <summary>
 /// One fleet target row of <c>GET /api/router/config</c> / the target CRUD responses
 /// (task #19): the identity, the administrative enablement, the free-form hardware hint
-/// (null when unset; display-only, no v1 routing consumer) and the parallel budget.
+/// (null when unset; display-only, no v1 routing consumer) and the parallel budget. Task #61
+/// adds the protocol family <c>type</c> (lowercase enum name), the informational
+/// <c>provider</c> label (null when unset), the declared <c>models</c> roster (null when empty)
+/// and <c>apiKeyConfigured</c> — a BOOL flag; the raw or wrapped key is NEVER returned by any
+/// endpoint, log or telemetry.
 /// </summary>
 public sealed record RouterTargetConfigDto(
     [property: JsonPropertyName("name")] string Name,
     [property: JsonPropertyName("url")] string Url,
     [property: JsonPropertyName("enabled")] bool Enabled,
     [property: JsonPropertyName("hardwareHint")] string? HardwareHint,
-    [property: JsonPropertyName("maxParallel")] int MaxParallel);
+    [property: JsonPropertyName("maxParallel")] int MaxParallel,
+    [property: JsonPropertyName("type")] string Type = "ollama",
+    [property: JsonPropertyName("provider")] string? Provider = null,
+    [property: JsonPropertyName("models")] IReadOnlyList<Endpoints.RouterApi.Targets.TargetModelDto>? Models = null,
+    [property: JsonPropertyName("apiKeyConfigured")] bool ApiKeyConfigured = false);
 
 /// <summary>
 /// The cloud section of <c>GET /api/router/config</c> (task #19). Contains EXACTLY

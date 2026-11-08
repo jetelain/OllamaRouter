@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using OllamaRouter.Converters.Dtos;
 
 namespace OllamaRouter.Serialization;
 
@@ -15,8 +16,13 @@ namespace OllamaRouter.Serialization;
 [JsonSourceGenerationOptions(WriteIndented = false, PropertyNameCaseInsensitive = true)]
 [JsonSerializable(typeof(string))]
 [JsonSerializable(typeof(List<string>))]
+[JsonSerializable(typeof(double))]
+[JsonSerializable(typeof(int))]
+[JsonSerializable(typeof(long))]
+[JsonSerializable(typeof(bool))]
 [JsonSerializable(typeof(List<OpenAiContentPartDto>))]
 [JsonSerializable(typeof(OpenAiChatCompletionRequestDto))]
+[JsonSerializable(typeof(OllamaChatRequestDto))]
 public partial class WireJsonSerializerContext : JsonSerializerContext
 {
 }

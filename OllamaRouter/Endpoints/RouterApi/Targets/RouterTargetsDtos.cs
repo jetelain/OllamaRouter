@@ -5,15 +5,22 @@ namespace OllamaRouter.Endpoints.RouterApi.Targets;
 
 /// <summary>
 /// Request body of <c>PUT /api/router/targets/{name}</c> (task #19): partial target
-/// update — null/absent = no change (all four null → 400); <c>hardwareHint: ""</c> clears
+/// update — null/absent = no change (all fields null → 400); <c>hardwareHint: ""</c> clears
 /// the hint; <c>url</c> must be an absolute http(s) URI (trailing / stripped);
-/// <c>maxParallel</c> must be &gt;= 1.
+/// <c>maxParallel</c> must be &gt;= 1. Task #61 adds <c>type</c> (case-insensitive
+/// <c>ollama|openai|osnative</c>), <c>apiKey</c> (null/absent = no change, <c>""</c> clears),
+/// <c>provider</c> (<c>""</c> clears) and <c>models</c> (null/absent = no change, a provided list
+/// — possibly empty — replaces the roster).
 /// </summary>
 public sealed record UpdateTargetRequest(
     [property: JsonPropertyName("url")] string? Url = null,
     [property: JsonPropertyName("enabled")] bool? Enabled = null,
     [property: JsonPropertyName("hardwareHint")] string? HardwareHint = null,
-    [property: JsonPropertyName("maxParallel")] int? MaxParallel = null);
+    [property: JsonPropertyName("maxParallel")] int? MaxParallel = null,
+    [property: JsonPropertyName("type")] string? Type = null,
+    [property: JsonPropertyName("apiKey")] string? ApiKey = null,
+    [property: JsonPropertyName("provider")] string? Provider = null,
+    [property: JsonPropertyName("models")] IReadOnlyList<TargetModelDto>? Models = null);
 
 /// <summary>
 /// Response of <c>PUT /api/router/targets/{name}</c> (task #19): success flag + message,
@@ -29,14 +36,34 @@ public sealed record UpdateTargetResponse(
 /// (<c>name</c> ≤ 64 chars, no / \ :, not "Cloud"; <c>url</c> absolute http(s)), the
 /// optional hardware hint (empty → null), the parallel budget (default 1) and
 /// <c>testConnectionFirst</c> (default true: an immediate liveness probe runs before
-/// persisting; probe failure → 422 with a retry hint).
+/// persisting; probe failure → 422 with a retry hint). Task #61 adds the protocol family
+/// <c>type</c> (case-insensitive <c>ollama|openai|osnative</c>, default <c>ollama</c>), the
+/// upstream provider <c>apiKey</c> (required-for-behavior only on <c>openai</c>; provided on a
+/// non-<c>openai</c> target → 400), the informational <c>provider</c> label and the declared
+/// <c>models</c> roster (blank names → 400; <c>osnative</c> is accepted — config-storable,
+/// unroutable until tasks #63/#64).
 /// </summary>
 public sealed record AddTargetRequest(
     [property: JsonPropertyName("name")] string Name,
     [property: JsonPropertyName("url")] string Url,
     [property: JsonPropertyName("maxParallel")] int MaxParallel = 1,
     [property: JsonPropertyName("testConnectionFirst")] bool TestConnectionFirst = true,
-    [property: JsonPropertyName("hardwareHint")] string? HardwareHint = null);
+    [property: JsonPropertyName("hardwareHint")] string? HardwareHint = null,
+    [property: JsonPropertyName("type")] string? Type = null,
+    [property: JsonPropertyName("apiKey")] string? ApiKey = null,
+    [property: JsonPropertyName("provider")] string? Provider = null,
+    [property: JsonPropertyName("models")] IReadOnlyList<TargetModelDto>? Models = null);
+
+/// <summary>
+/// One declared model of a target's synthetic catalog (task #61) in the Setup API wire
+/// format: the model <c>name</c> (required, non-blank) plus the optional context-length and
+/// quantization hints (consumed by task #62). Mapped 1:1 to
+/// <see cref="Options.TargetModelConfig"/>.
+/// </summary>
+public sealed record TargetModelDto(
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("contextLength")] int? ContextLength = null,
+    [property: JsonPropertyName("quantization")] string? Quantization = null);
 
 /// <summary>
 /// Response of <c>POST /api/router/targets</c> (task #19): 201 with the created target +

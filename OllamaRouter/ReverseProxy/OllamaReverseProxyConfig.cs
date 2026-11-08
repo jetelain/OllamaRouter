@@ -58,6 +58,13 @@ public static class OllamaReverseProxyConfig
     public const string TelemetryEstimatedTokensHeader = "X-OllamaRouter-Estimated-Tokens";
 
     /// <summary>
+    /// Telemetry response header (task #61): the dispatch path used for the finally-served
+    /// candidate — <c>yarp</c> (same-protocol zero-copy forward) or <c>converter</c> (protocol
+    /// translation through the target's IChatClient + response encoder).
+    /// </summary>
+    public const string DispatchModeHeader = "X-OllamaRouter-Dispatch-Mode";
+
+    /// <summary>
     /// Telemetry response header: the effective <c>num_ctx</c> the router ASSIGNED to the
     /// request (dynamic context sizing injected/clamped a bucket, including any client-value
     /// clamping). Absent when no sizing decision rewrote the request.

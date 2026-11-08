@@ -387,6 +387,52 @@ public sealed class OllamaRouterOptions
 }
 
 /// <summary>
+/// Protocol family of a fleet target (task #61). Determines the dispatch path of the
+/// completion request pipeline (<see cref="Middleware.OllamaRoutingMiddleware"/>):
+/// <see cref="Ollama"/> targets are same-protocol HTTP peers of the Ollama daemon (the
+/// YARP fast path for same-protocol traffic, <c>/api/*</c> semantics everywhere),
+/// <see cref="OpenAI"/> targets speak the OpenAI-compatible HTTP API
+/// (<c>/v1/chat/completions</c>, <c>/models</c>) and are reached either through the
+/// same-protocol YARP pass-through (OpenAI-protocol inbound) or through the converter
+/// path (<c>IChatClient</c> + protocol encoders) when the inbound protocol differs.
+/// <see cref="OsNative"/> is reserved for OS/in-process model providers (tasks #63/#64):
+/// such targets store and round-trip configuration but are never dispatch candidates.
+/// A config file omitting the <c>Type</c> field binds to <see cref="Ollama"/> (enum
+/// default + binder), so existing configurations are byte-identical.
+/// </summary>
+public enum TargetType
+{
+    /// <summary>Standard Ollama daemon (default; existing behavior byte-identical).</summary>
+    Ollama = 0,
+
+    /// <summary>OpenAI-compatible HTTP API (<c>/v1/chat/completions</c>, <c>/models</c>).</summary>
+    OpenAI = 1,
+
+    /// <summary>OS/in-process provider (reserved; NOT routable until tasks #63/#64).</summary>
+    OsNative = 2
+}
+
+/// <summary>
+/// One declared model of a non-Ollama target's synthetic catalog (task #61): the model
+/// <see cref="Name"/> is the membership key for Stage-1 routing qualification (strict
+/// when the target's <see cref="OllamaTargetOptions.Models"/> list is non-empty);
+/// <see cref="ContextLength"/> and <see cref="Quantization"/> are optional informational
+/// hints consumed by the fleet aggregation of task #62. Entries with blank names are
+/// skipped by every consumer.
+/// </summary>
+public sealed class TargetModelConfig
+{
+    /// <summary>Declared model name (the routing qualification key).</summary>
+    public string Name { get; set; } = string.Empty;
+
+    /// <summary>Optional context-length hint (tokens); consumed by task #62.</summary>
+    public int? ContextLength { get; set; }
+
+    /// <summary>Optional quantization hint (e.g. "Q4_K_M"); consumed by task #62.</summary>
+    public string? Quantization { get; set; }
+}
+
+/// <summary>
 /// A single named fleet target of the router. One YARP route/cluster pair is generated per
 /// effective target, and the request is directed to it via the <c>X-Ollama-Target</c> header
 /// carrying the target <see cref="Name"/>.
@@ -421,7 +467,45 @@ public sealed class OllamaTargetOptions
     public string? RouterUrl { get; set; }
 
     /// <summary>
-    /// Explicit maximum VRAM (in MB) available on this target. When not set, the effective
+    /// Protocol family of this target (task #61). Defaults to <see cref="TargetType.Ollama"/>
+    /// — a configuration file omitting the field (or binding the value "Ollama") keeps the
+    /// exact pre-fleet behavior. <see cref="TargetType.OpenAI"/> enables the converter dispatch
+    /// path, the <c>GET /models</c> liveness probe and the eviction-penalty suppression;
+    /// <see cref="TargetType.OsNative"/> is config-storable but unroutable (tasks #63/#64).
+    /// </summary>
+    public TargetType Type { get; set; } = TargetType.Ollama;
+
+    /// <summary>
+    /// Upstream provider bearer key of this target (task #61): in-memory this always carries
+    /// the UNWRAPPED plaintext; at rest (<c>config/config.json</c>) it is stored
+    /// <c>IKeyProtector</c>-wrapped (see <see cref="TargetApiKeyUnwrapPostProcessor"/> for the
+    /// <c>v1:</c> + Base64 envelope and the corrupt-blob degradation). Only meaningful for
+    /// <see cref="TargetType.OpenAI"/> targets; the raw key appears in no log line, telemetry
+    /// header or API response (the Setup API exposes <c>apiKeyConfigured</c> only).
+    /// </summary>
+    public string? ApiKey { get; set; }
+
+    /// <summary>
+    /// Informational provider label of this target (task #61), e.g. "openrouter" or "groq":
+    /// surfaced in <c>ChatClientMetadata</c> (the provider name of the target's
+    /// <c>IChatClient</c>) and in monitoring; it has NO routing effect (location classification
+    /// stays <see cref="Services.Routing.TargetLocationClassifier"/>-driven). Null (default) = unset.
+    /// </summary>
+    public string? Provider { get; set; }
+
+    /// <summary>
+    /// Declared model roster for non-Ollama targets (task #61): the synthetic Stage-1 catalog.
+    /// A non-empty list is STRICT (a model not listed disqualifies the target from the
+    /// request); an empty list (the default) is PERMISSIVE (the catalog check short-circuits
+    /// to true — see <see cref="Services.Catalog.NonOllamaCatalogPolicy"/>) so a minimal
+    /// <c>{name, url, apiKey}</c> OpenAI target stays routable for every model name.
+    /// Ignored for <see cref="TargetType.Ollama"/> targets (their live catalog comes from
+    /// <c>/api/tags</c>).
+    /// </summary>
+    public List<TargetModelConfig> Models { get; set; } = [];
+
+    /// <summary>
+    /// Optional explicit maximum VRAM (in MB) available on this target. When not set, the effective
     /// VRAM is resolved dynamically from <see cref="Services.Hardware.IFleetHardwareService"/>.
     /// </summary>
     public int? MaxVramMB { get; set; }

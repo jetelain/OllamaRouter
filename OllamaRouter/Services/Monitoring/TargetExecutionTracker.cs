@@ -239,7 +239,10 @@ public sealed class TargetExecutionTracker : ITargetExecutionTracker
     /// Builds the refresh target list with the EXACT routable predicate shared with
     /// <see cref="FleetAggregationService"/>: enabled, non-Cloud, non-blank URL, and
     /// <c>IsOnline || (withinStartupGrace &amp;&amp; State == Unknown)</c>. Offline targets
-    /// are skipped (never queried).
+    /// are skipped (never queried). Non-Ollama targets (task #61: <c>Type != Ollama</c>)
+    /// are excluded — an OpenAI-compatible provider exposes no <c>/api/ps</c> (zero daemon
+    /// <c>/api/ps</c> calls for them); their in-flight counters are middleware-owned and
+    /// keep feeding the concurrency penalty unaffected.
     /// </summary>
     private List<(RoutingTarget Target, string Url)> GetRefreshTargets()
     {
@@ -247,6 +250,7 @@ public sealed class TargetExecutionTracker : ITargetExecutionTracker
         var entries = _liveness.GetEntries();
         return _options.CurrentValue.GetEffectiveTargets(_logger)
             .Where(t => t.Enabled &&
+                        t.Type == TargetType.Ollama &&
                         !string.Equals(t.Name, RoutingTarget.Cloud.Value, StringComparison.OrdinalIgnoreCase) &&
                         !string.IsNullOrWhiteSpace(t.Url) &&
                         (_liveness.IsOnline((RoutingTarget)t.Name!, ITargetLivenessService.DefaultTolerantCacheTtl) ||

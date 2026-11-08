@@ -183,6 +183,20 @@ public class RouterConfigEndpointsTests
             HardwareHint = "96gb"
         });
         ((OllamaTargetOptions)options.Targets[0]).HardwareHint = "16gb";
+        // Task #61: an OpenAI target with a provider key — the response may expose the
+        // apiKeyConfigured flag, NEVER the raw/wrapped key material.
+        options.Targets.Add(new OllamaTargetOptions
+        {
+            Name = "OpenRouter",
+            Url = "https://openrouter.ai/api",
+            Type = TargetType.OpenAI,
+            Provider = "openrouter",
+            ApiKey = "sk-super-secret-provider-key-123",
+            Models =
+            [
+                new TargetModelConfig { Name = "openai/gpt-4o", ContextLength = 128000, Quantization = null }
+            ]
+        });
         options.CloudOverflow = new CloudOverflowOptions { Enabled = true, DefaultModel = "glm-4.6:cloud", PreferredRelayTarget = "Local" };
         options.DynamicContext = new DynamicContextOptions
         {
@@ -203,13 +217,16 @@ public class RouterConfigEndpointsTests
         var raw = await response.Content.ReadAsStringAsync();
         response.Dispose();
 
-        // NO credential fields exist to mask: the response must not carry any key material.
-        Assert.DoesNotContain("apiKey", raw, StringComparison.OrdinalIgnoreCase);
+        // NO credential fields exist to leak: the response must not carry the raw key material;
+        // the ONLY key exposure is the apiKeyConfigured BOOL flag (task #61).
+        Assert.DoesNotContain("sk-super-secret-provider-key-123", raw, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"apiKey\"", raw, StringComparison.Ordinal);
         Assert.DoesNotContain("hasApiKey", raw, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("\"apiKeyConfigured\"", raw, StringComparison.Ordinal);
 
         var json = (JsonNode.Parse(raw)! as JsonObject)!;
         var targets = (json["targets"]! as JsonArray)!;
-        Assert.Equal(2, targets.Count);
+        Assert.Equal(3, targets.Count);
         var first = (targets[0] as JsonObject)!;
         Assert.Equal("Local", first["name"]!.GetValue<string>());
         Assert.Equal("http://127.0.0.1:11435", first["url"]!.GetValue<string>());
@@ -221,6 +238,17 @@ public class RouterConfigEndpointsTests
         Assert.False(second["enabled"]!.GetValue<bool>());
         Assert.Equal("96gb", second["hardwareHint"]!.GetValue<string>());
         Assert.Equal(4, second["maxParallel"]!.GetValue<int>());
+        Assert.Equal("ollama", second["type"]!.GetValue<string>()); // default protocol family (task #61)
+        Assert.False(second["apiKeyConfigured"]!.GetValue<bool>());
+        // The OpenAI target row: type/provider/models surfaced, key masked to a BOOL.
+        var third = (targets[2] as JsonObject)!;
+        Assert.Equal("OpenRouter", third["name"]!.GetValue<string>());
+        Assert.Equal("openai", third["type"]!.GetValue<string>());
+        Assert.Equal("openrouter", third["provider"]!.GetValue<string>());
+        Assert.True(third["apiKeyConfigured"]!.GetValue<bool>());
+        var thirdModels = (third["models"]! as JsonArray)!;
+        Assert.Equal(1, thirdModels.Count);
+        Assert.Equal("openai/gpt-4o", (thirdModels[0] as JsonObject)!["name"]!.GetValue<string>());
 
         var cloud = (json["cloud"]! as JsonObject)!;
         Assert.True(cloud["enabled"]!.GetValue<bool>());
@@ -378,6 +406,160 @@ public class RouterConfigEndpointsTests
         {
             await harness.DisposeAsync();
         }
+    }
+
+    [Fact]
+    public async Task PostTarget_OpenAiType_HeterogeneousBody_201_RoundTripsAndMasksKey()
+    {
+        // Task #61 (maintainer decision 1): the Setup API accepts type/apiKey/provider/models;
+        // the key is stored wrapped (v1: envelope — the harness falls back to the identity
+        // PlainKeyProtector), and the response NEVER contains the raw or wrapped key — only
+        // the apiKeyConfigured flag. The catalog seed count = synthetic roster size.
+        await using var harness = await CreateTestAppAsync(SingleTargetOptions());
+
+        var body = "{\"name\":\"OpenRouter\",\"url\":\"http://router:8000/v1\",\"type\":\"openai\"," +
+                   "\"apiKey\":\"sk-test-123\",\"provider\":\"openrouter\",\"testConnectionFirst\":false," +
+                   "\"models\":[{\"name\":\"openai/gpt-4o\",\"contextLength\":128000},{\"name\":\"anthropic/claude-sonnet-4.5\"}]}";
+        var json = (await PostJsonAsync(harness.Client, "/api/router/targets", body)) as JsonObject;
+        Assert.NotNull(json);
+
+        Assert.True(json!["success"]!.GetValue<bool>());
+        var target = (json["target"]! as JsonObject)!;
+        Assert.Equal("openai", target["type"]!.GetValue<string>());
+        Assert.Equal("openrouter", target["provider"]!.GetValue<string>());
+        Assert.True(target["apiKeyConfigured"]!.GetValue<bool>());
+        var models = (target["models"]! as JsonArray)!;
+        Assert.Equal(2, models.Count);
+        Assert.Equal("openai/gpt-4o", (models[0] as JsonObject)!["name"]!.GetValue<string>());
+        Assert.Equal(128000, (models[0] as JsonObject)!["contextLength"]!.GetValue<int>());
+        Assert.False(json.AsObject().ContainsKey("error"));
+        Assert.Equal(2, json["modelsDiscovered"]!.GetValue<int>()); // synthetic roster size
+
+        // The raw key must appear NOWHERE in the serialized response wire format.
+        Assert.DoesNotContain("sk-test-123", json.ToJsonString(), StringComparison.Ordinal);
+
+        // In-memory options carry the UNWRAPPED key (bind-time invariant).
+        var added = harness.Options.CurrentValue.Targets.Single(t => t.Name == "OpenRouter");
+        Assert.Equal(TargetType.OpenAI, added.Type);
+        Assert.Equal("sk-test-123", added.ApiKey);
+        Assert.Equal(2, added.Models.Count);
+
+        // Disk: the key is stored v1:-WRAPPED (identity protector in this host), never raw.
+        var file = ReadConfigFile(harness);
+        var persisted = ((file["OllamaRouter"]!["Targets"]! as JsonArray)!.OfType<JsonObject>())
+            .Single(t => t["Name"]!.GetValue<string>() == "OpenRouter");
+        var storedKey = persisted["ApiKey"]!.GetValue<string>();
+        Assert.StartsWith("v1:", storedKey, StringComparison.Ordinal);
+        Assert.DoesNotContain("sk-test-123", storedKey, StringComparison.Ordinal);
+        Assert.Equal("OpenAI", persisted["Type"]!.GetValue<string>());
+        Assert.Equal("openrouter", persisted["Provider"]!.GetValue<string>());
+        Assert.Equal(2, ((persisted["Models"]! as JsonArray)!).Count);
+    }
+
+    [Fact]
+    public async Task PostTarget_OsNativeType_AcceptedAndConfigStorable()
+    {
+        // Task #61: osnative is accepted (config-storable, unroutable until tasks #63/#64);
+        // the response carries the type so tooling can see it.
+        await using var harness = await CreateTestAppAsync(SingleTargetOptions());
+
+        var json = (await PostJsonAsync(
+            harness.Client,
+            "/api/router/targets",
+            """{"name":"OsLocal","url":"http://127.0.0.1:9999","type":"Osnative","testConnectionFirst":false}""")) as JsonObject;
+        Assert.NotNull(json);
+        Assert.True(json!["success"]!.GetValue<bool>());
+        Assert.Equal("osnative", json["target"]!["type"]!.GetValue<string>());
+        Assert.Equal(TargetType.OsNative,
+            harness.Options.CurrentValue.Targets.Single(t => t.Name == "OsLocal").Type);
+    }
+
+    [Theory]
+    [InlineData("""{"name":"X","url":"http://x","type":"ollama","apiKey":"sk-1","testConnectionFirst":false}""")]
+    [InlineData("""{"name":"X","url":"http://x","type":"osnative","apiKey":"sk-1","testConnectionFirst":false}""")]
+    public async Task PostTarget_ApiKeyOnNonOpenAiTarget_400(string body)
+    {
+        // Task #61: an apiKey is only meaningful for openai-type targets.
+        await using var harness = await CreateTestAppAsync(SingleTargetOptions());
+
+        var response = await harness.Client.PostAsync("/api/router/targets",
+            new StringContent(body, Encoding.UTF8, "application/json"));
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var json = (JsonNode.Parse(await response.Content.ReadAsStringAsync())! as JsonObject)!;
+        response.Dispose();
+        Assert.Contains("apiKey", json["error"]!.GetValue<string>(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("""{"name":"X","url":"http://x","type":"azureopenai","testConnectionFirst":false}""")]
+    [InlineData("""{"name":"X","url":"http://x","models":[{"name":"  "}],"testConnectionFirst":false}""")]
+    public async Task PostTarget_InvalidTypeOrBlankModelName_400(string body)
+    {
+        await using var harness = await CreateTestAppAsync(SingleTargetOptions());
+
+        var response = await harness.Client.PostAsync("/api/router/targets",
+            new StringContent(body, Encoding.UTF8, "application/json"));
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        response.Dispose();
+    }
+
+    [Fact]
+    public async Task PutTarget_OpenAiType_PartialUpdateAndApiKeyClear()
+    {
+        // Task #61 (AC8): PUT supports the heterogeneous fields with partial-update semantics;
+        // apiKey:"" clears the key (memory + disk node removed).
+        var options = SingleTargetOptions();
+        options.Targets.Add(new OllamaTargetOptions
+        {
+            Name = "OpenRouter",
+            Url = "http://router:8000/v1",
+            Type = TargetType.OpenAI,
+            ApiKey = "sk-old",
+            MaxParallel = 1
+        });
+        await using var harness = await CreateTestAppAsync(options);
+
+        // Partial update: type + provider + models (url/enabled untouched).
+        var updated = (await PutJsonAsync(
+            harness.Client,
+            "/api/router/targets/OpenRouter",
+            """{"type":"openai","provider":"groq","models":[{"name":"groq/llama-3.3-70b"},{"name":"","contextLength":8192}]}""")) as JsonObject;
+        // A blank model name is rejected (validation runs before the merge).
+        // (Covered by the 400 path — this request must NOT mutate anything.)
+        var unchanged = harness.Options.CurrentValue.Targets.Single(t => t.Name == "OpenRouter");
+        Assert.Equal("sk-old", unchanged.ApiKey);
+        Assert.Null(unchanged.Provider);
+
+        var valid = (await PutJsonAsync(
+            harness.Client,
+            "/api/router/targets/OpenRouter",
+            """{"provider":"groq","models":[{"name":"groq/llama-3.3-70b","contextLength":131072}]}""")) as JsonObject;
+        Assert.NotNull(valid);
+        Assert.True(valid!["success"]!.GetValue<bool>());
+        var dto = (valid["target"]! as JsonObject)!;
+        Assert.Equal("openai", dto["type"]!.GetValue<string>());
+        Assert.Equal("groq", dto["provider"]!.GetValue<string>());
+        Assert.True(dto["apiKeyConfigured"]!.GetValue<bool>()); // old key still set
+        var live = harness.Options.CurrentValue.Targets.Single(t => t.Name == "OpenRouter");
+        Assert.Equal("groq", live.Provider);
+        Assert.Equal("sk-old", live.ApiKey);
+        Assert.Single(live.Models);
+        Assert.Equal(131072, live.Models[0].ContextLength);
+
+        // Clear the key: apiKey:"" → memory null, disk node removed, flag false.
+        var cleared = (await PutJsonAsync(
+            harness.Client,
+            "/api/router/targets/OpenRouter",
+            """{"apiKey":""}""")) as JsonObject;
+        Assert.NotNull(cleared);
+        Assert.True(cleared!["success"]!.GetValue<bool>());
+        Assert.False(cleared["target"]!["apiKeyConfigured"]!.GetValue<bool>());
+        Assert.Null(harness.Options.CurrentValue.Targets.Single(t => t.Name == "OpenRouter").ApiKey);
+
+        var file = ReadConfigFile(harness);
+        var persisted = ((file["OllamaRouter"]!["Targets"]! as JsonArray)!.OfType<JsonObject>())
+            .Single(t => t["Name"]!.GetValue<string>() == "OpenRouter");
+        Assert.False(persisted.ContainsKey("ApiKey")); // cleared key must not linger on disk
     }
 
     [Theory]

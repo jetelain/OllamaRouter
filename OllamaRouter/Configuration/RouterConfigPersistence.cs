@@ -84,6 +84,7 @@ public sealed class RouterConfigPersistence : IRouterConfigPersistence
     private readonly IOptionsMonitor<OllamaRouterOptions> _options;
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger? _logger;
+    private readonly IKeyProtector _keyProtector;
 
     private readonly SemaphoreSlim _writeGate = new(1, 1);
 
@@ -93,19 +94,25 @@ public sealed class RouterConfigPersistence : IRouterConfigPersistence
     /// <summary>
     /// Creates the persistence service. The host environment is resolved DEFENSIVELY from
     /// <paramref name="serviceProvider"/> (a bare test ServiceCollection host without one falls
-    /// back to the assembly base directory).
+    /// back to the assembly base directory). <paramref name="keyProtector"/> (task #61)
+    /// wraps the per-target provider API keys at rest; a bare test host without one falls
+    /// back to <see cref="PlainKeyProtector"/> (identity wrap — the wire format is identical,
+    /// only the at-rest protection differs).
     /// </summary>
     /// <param name="options">The live options monitor (the shared configuration-bound instance in production).</param>
     /// <param name="serviceProvider">The application service provider (IHostEnvironment / IConfiguration resolution).</param>
     /// <param name="logger">Optional logger.</param>
+    /// <param name="keyProtector">Optional at-rest protector for target API keys (defaults to the identity protector).</param>
     public RouterConfigPersistence(
         IOptionsMonitor<OllamaRouterOptions> options,
         IServiceProvider serviceProvider,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        IKeyProtector? keyProtector = null)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _serviceProvider = serviceProvider ?? throw new ArgumentNullException(nameof(serviceProvider));
         _logger = logger;
+        _keyProtector = keyProtector ?? new PlainKeyProtector();
 
         var environment = serviceProvider.GetService<IHostEnvironment>();
         var contentRoot = string.IsNullOrWhiteSpace(environment?.ContentRootPath)
@@ -174,6 +181,7 @@ public sealed class RouterConfigPersistence : IRouterConfigPersistence
                 node["Enabled"] = target.Enabled;
                 node["MaxParallel"] = target.MaxParallel;
                 node["HardwareHint"] = target.HardwareHint;
+                ApplyHeterogeneousTargetFields(node, target);
                 targetsArray.Add((JsonNode?)node);
             }
 
@@ -195,6 +203,83 @@ public sealed class RouterConfigPersistence : IRouterConfigPersistence
         {
             _writeGate.Release();
         }
+    }
+
+    /// <summary>
+    /// Writes (or clears) the task #61 modeled fields of one target node: <c>Type</c> (enum
+    /// name), <c>Provider</c> (null omitted — removed when cleared so a stale value never
+    /// lingers), <c>Models</c> (array of <c>{name, contextLength?, quantization?}</c>, omitted
+    /// when empty) and <c>ApiKey</c> — stored <c>IKeyProtector</c>-wrapped in the
+    /// <c>v1:</c> + Base64 envelope (the same wire format the bind-time unwrap of
+    /// <see cref="Options.TargetApiKeyUnwrapPostProcessor"/> expects; legacy plaintext values
+    /// are re-wrapped on this write) and the node REMOVED when the key is null (a cleared key
+    /// must not linger on disk). The raw key never appears in the file in plaintext.
+    /// </summary>
+    private void ApplyHeterogeneousTargetFields(JsonObject node, OllamaTargetOptions target)
+    {
+        node["Type"] = target.Type.ToString();
+
+        if (target.Provider is { Length: > 0 } provider)
+        {
+            node["Provider"] = provider;
+        }
+        else
+        {
+            node.Remove("Provider");
+        }
+
+        var declaredModels = target.Models
+            ?.Where(m => !string.IsNullOrWhiteSpace(m?.Name))
+            .ToList();
+        if (declaredModels is { Count: > 0 })
+        {
+            var modelsArray = new JsonArray();
+            foreach (var model in declaredModels)
+            {
+                var modelNode = new JsonObject { ["name"] = model!.Name.Trim() };
+                if (model.ContextLength.HasValue)
+                {
+                    modelNode["contextLength"] = model.ContextLength.Value;
+                }
+                if (model.Quantization is { Length: > 0 })
+                {
+                    modelNode["quantization"] = model.Quantization;
+                }
+                modelsArray.Add(modelNode);
+            }
+
+            node["Models"] = modelsArray;
+        }
+        else
+        {
+            node.Remove("Models");
+        }
+
+        if (target.ApiKey is { Length: > 0 } key)
+        {
+            node["ApiKey"] = WrapKey(key);
+        }
+        else
+        {
+            node.Remove("ApiKey");
+        }
+    }
+
+    /// <summary>
+    /// Wraps one plaintext key for at rest: <c>v1:</c> + Base64(protected UTF-8 bytes).
+    /// A value already carrying the <c>v1:</c> prefix (defensive: an in-memory snapshot that
+    /// skipped the bind-time unwrap) is persisted AS-IS — re-wrapping would double-encode it
+    /// and the single unwrap pass on the next reload could not restore the plaintext. On the
+    /// normal path the in-memory options always carry the unwrapped key, so this is a no-op.
+    /// </summary>
+    private string WrapKey(string key)
+    {
+        if (key.StartsWith(TargetApiKeyUnwrapPostProcessor.WrappedPrefix, StringComparison.Ordinal))
+        {
+            return key;
+        }
+
+        return $"{TargetApiKeyUnwrapPostProcessor.WrappedPrefix}{Convert.ToBase64String(_keyProtector.Protect(System.Text.Encoding.UTF8.GetBytes(key)))}";
     }
 
     /// <inheritdoc />

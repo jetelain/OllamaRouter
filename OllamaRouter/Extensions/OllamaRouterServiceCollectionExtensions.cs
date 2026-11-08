@@ -7,6 +7,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using OllamaRouter.Configuration;
+using OllamaRouter.Converters;
 using OllamaRouter.Endpoints;
 using OllamaRouter.Middleware;
 using OllamaRouter.Options;
@@ -14,6 +15,7 @@ using OllamaRouter.ReverseProxy;
 using OllamaRouter.Security;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services.Catalog;
+using OllamaRouter.Services;
 using OllamaRouter.Services.ContextSizing;
 using OllamaRouter.Services.Monitoring;
 using OllamaRouter.Services.Preload;
@@ -98,6 +100,13 @@ public static class OllamaRouterServiceCollectionExtensions
         services.AddOptions();
         services.Configure<OllamaRouterOptions>(configuration.GetSection(OllamaRouterOptions.SectionName));
         services.AddSingleton<IPostConfigureOptions<OllamaRouterOptions>, OllamaRouterOptionsNormalizer>();
+        // Task #61 (maintainer decision 3): the bind-time unwrap of the per-target provider API
+        // keys runs AFTER the normalizer (normalization never inspects key material). The
+        // IKeyProtector registration below lives in AddOllamaRouterCore; this registration
+        // resolves it lazily through the service provider so ordering is irrelevant here.
+        services.AddSingleton<IPostConfigureOptions<OllamaRouterOptions>>(sp => new TargetApiKeyUnwrapPostProcessor(
+            sp.GetService<IKeyProtector>(),
+            sp.GetService<ILoggerFactory>()?.CreateLogger<TargetApiKeyUnwrapPostProcessor>()));
 
         if (!enableTui)
         {
@@ -239,7 +248,8 @@ public static class OllamaRouterServiceCollectionExtensions
         services.AddSingleton<IRouterConfigPersistence>(sp => new RouterConfigPersistence(
             sp.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>(),
             sp,
-            sp.GetService<ILoggerFactory>()?.CreateLogger<RouterConfigPersistence>()));
+            sp.GetService<ILoggerFactory>()?.CreateLogger<RouterConfigPersistence>(),
+            sp.GetService<IKeyProtector>()));
 
         // API key security (task #50): the at-rest protector is platform-selected at DI time
         // (DPAPI-wrapped default key on Windows; plain + 0600 permissions on Unix; unit tests
@@ -414,6 +424,20 @@ public static class OllamaRouterServiceCollectionExtensions
         // clients would double-manage the same handler/client lifecycle). Task #61 resolves its
         // per-target IChatClient from this singleton.
         services.AddSingleton<IOpenAiChatClientFactory, OpenAiChatClientFactory>();
+
+        // Task #61 dual-path dispatch engine: the Ollama IChatClient factory (pooled per base
+        // address, mirror image of the OpenAI factory above), the two stateless inbound request
+        // parsers (task #59) and the target-name → IChatClient resolver that owns the pooled
+        // factory reconciliation (its IOptionsMonitor change-callback lives here, not in the
+        // middleware).
+        services.AddSingleton<IOllamaChatClientFactory, OllamaChatClientFactory>();
+        services.AddSingleton<OllamaChatRequestParser>();
+        services.AddSingleton<OpenAIChatRequestParser>();
+        services.AddSingleton<ITargetChatClientProvider>(sp => new TargetChatClientProvider(
+            sp.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>(),
+            sp.GetRequiredService<IOpenAiChatClientFactory>(),
+            sp.GetRequiredService<IOllamaChatClientFactory>(),
+            sp.GetService<ILoggerFactory>()?.CreateLogger<TargetChatClientProvider>()));
         services.AddSingleton<IActivityStatisticsService>(sp =>
             new ActivityStatisticsService(
                 Path.Combine(effectiveStateDirectory, "activity-statistics.json"),

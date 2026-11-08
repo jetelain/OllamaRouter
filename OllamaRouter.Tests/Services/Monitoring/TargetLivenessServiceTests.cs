@@ -178,6 +178,80 @@ public class TargetLivenessServiceTests : IDisposable
         Assert.True(sut.IsOnline(RoutingTarget.Local));
     }
 
+    // ------------------------------------------------------------------
+    //  Task #61 (AC9) — OpenAI targets probe GET {base}/models with the target ApiKey
+    // ------------------------------------------------------------------
+
+    private static (TargetLivenessService Sut, CountingFakeHttpMessageHandler Handler) CreateOpenAiSut(
+        string url,
+        string? apiKey,
+        Func<HttpRequestMessage, HttpResponseMessage> respond)
+    {
+        var handler = new CountingFakeHttpMessageHandler(respond);
+        var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(2) };
+        var options = new TestOptionsMonitor<OllamaRouterOptions>(new OllamaRouterOptions
+        {
+            Targets =
+            [
+                new OllamaTargetOptions { Name = "Provider", Url = url, Type = TargetType.OpenAI, ApiKey = apiKey }
+            ]
+        });
+        var sut = new TargetLivenessService(
+            options,
+            new CountingCatalogCache(),
+            client,
+            NullLogger<TargetLivenessService>.Instance);
+        return (sut, handler);
+    }
+
+    [Fact]
+    public async Task Probe_OpenAiTarget_PathsV1PrefixedBaseAndSendsBearerKey()
+    {
+        // A /v1-prefixed base resolves to {base}/models (never {host}/models), the Bearer
+        // key rides the probe, and a 2xx puts the target Online.
+        var (sut, handler) = CreateOpenAiSut("http://provider:8000/v1", "sk-probe-1", _ => Ok());
+
+        var state = await sut.EnsureKnownAsync(new RoutingTarget("Provider"));
+
+        Assert.Equal(TargetLivenessState.Online, state);
+        var request = handler.LastRequest!;
+        Assert.Equal(HttpMethod.Get, request.Method);
+        Assert.Equal("http://provider:8000/v1/models", request.RequestUri!.ToString());
+        Assert.Equal("Bearer", request.Headers.Authorization!.Scheme);
+        Assert.Equal("sk-probe-1", request.Headers.Authorization.Parameter);
+    }
+
+    [Fact]
+    public async Task Probe_OpenAiTarget_Keyless_NoAuthorizationHeader()
+    {
+        var (sut, handler) = CreateOpenAiSut("http://provider:8000", null, _ => Ok());
+
+        await sut.EnsureKnownAsync(new RoutingTarget("Provider"));
+
+        Assert.Equal("http://provider:8000/models", handler.LastRequest!.RequestUri!.ToString());
+        Assert.Null(handler.LastRequest.Headers.Authorization);
+    }
+
+    [Fact]
+    public async Task Probe_OpenAiTarget_ProviderAuthFailure_MarksOffline()
+    {
+        // A keyless (or wrong-key) OpenAI target that the provider rejects with 401 cannot
+        // serve — the probe maps it to Offline (non-success ⇒ failure), exactly like a
+        // refused Ollama daemon.
+        var (sut, _) = CreateOpenAiSut(
+            "http://provider:8000/v1",
+            null,
+            _ => new HttpResponseMessage(HttpStatusCode.Unauthorized)
+            {
+                Content = new StringContent("{\"error\":{\"message\":\"bad key\"}}", Encoding.UTF8, "application/json")
+            });
+
+        var state = await sut.EnsureKnownAsync(new RoutingTarget("Provider"));
+
+        Assert.Equal(TargetLivenessState.Offline, state);
+        Assert.False(sut.IsOnline(new RoutingTarget("Provider")));
+    }
+
     [Fact]
     public async Task EnsureKnown_ConnectionRefused_TripsOfflineImmediatelyOnSingleProbe()
     {

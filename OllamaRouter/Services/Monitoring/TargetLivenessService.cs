@@ -274,24 +274,43 @@ public sealed class TargetLivenessService(
     }
 
     /// <summary>
-    /// Performs one <c>GET {Url}/</c> probe and classifies the outcome into a
-    /// <see cref="ProbeOutcome"/>. Bounded by the injected <see cref="HttpClient"/>
-    /// timeout (3.5 s in production); never throws — every failure maps to an
-    /// outcome so the probe loop and the middleware gate can rely on it. On success
-    /// the elapsed probe duration (milliseconds) is reported for latency reporting.
+    /// Performs one liveness probe and classifies the outcome into a
+    /// <see cref="ProbeOutcome"/>: <c>GET {Url}/</c> for Ollama-type targets and
+    /// <c>GET {base}/models</c> (with <c>Authorization: Bearer {ApiKey}</c> when a key is
+    /// set) for OpenAI-type targets (task #61 — an OpenAI-compatible provider exposes no
+    /// Ollama daemon root; a keyless target that requires auth probes non-success ⇒ Offline,
+    /// which is correct: it cannot serve). Relative resolution of <c>models</c> keeps
+    /// <c>/v1</c>-prefixed base addresses working. Bounded by the injected
+    /// <see cref="HttpClient"/> timeout (3.5 s in production); never throws — every failure
+    /// maps to an outcome so the probe loop and the middleware gate can rely on it. On
+    /// success the elapsed probe duration (milliseconds) is reported for latency reporting.
     /// </summary>
     private async Task<(ProbeOutcome Outcome, long? LatencyMs)> ProbeOnceAsync(RoutingTarget target, CancellationToken cancellationToken)
     {
-        var url = GetTargetUrl(target);
+        var targetOptions = GetTargetOptions(target);
+        var url = targetOptions?.Url;
         if (url is null)
         {
             // Unconfigured URL: treat as a connection failure (Offline), never an error.
             return (ProbeOutcome.HardError, null);
         }
 
+        var probeUri = new Uri(url, UriKind.RelativeOrAbsolute).AbsoluteUri;
+        if (targetOptions is { Type: TargetType.OpenAI })
+        {
+            // Normalize a trailing slash so relative resolution of "models" composes onto a
+            // path-prefixed base (http://h:8000/v1 ⇒ http://h:8000/v1/models, never …/models).
+            var openAiBase = new Uri(url.TrimEnd('/') + "/", UriKind.RelativeOrAbsolute);
+            probeUri = new Uri(openAiBase, "models").AbsoluteUri;
+        }
+
         try
         {
-            using var request = new HttpRequestMessage(HttpMethod.Get, new Uri(url, UriKind.RelativeOrAbsolute).AbsoluteUri);
+            using var request = new HttpRequestMessage(HttpMethod.Get, probeUri);
+            if (targetOptions is { Type: TargetType.OpenAI, ApiKey: { Length: > 0 } apiKey })
+            {
+                request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
+            }
             // ResponseHeadersRead: only the connection/headers matter for liveness;
             // the body is never buffered.
             var stopwatch = Stopwatch.StartNew();
@@ -309,10 +328,11 @@ public sealed class TargetLivenessService(
         }
     }
 
-    private string? GetTargetUrl(RoutingTarget target) =>
+    private OllamaTargetOptions? GetTargetOptions(RoutingTarget target) =>
         options.CurrentValue.GetEffectiveTargets(logger)
-            .FirstOrDefault(t => string.Equals(t.Name, target.Value, StringComparison.OrdinalIgnoreCase))
-            ?.Url;
+            .FirstOrDefault(t => string.Equals(t.Name, target.Value, StringComparison.OrdinalIgnoreCase));
+
+    private string? GetTargetUrl(RoutingTarget target) => GetTargetOptions(target)?.Url;
 
     /// <summary>
     /// Applies one probe outcome to the target's slot and returns the previous

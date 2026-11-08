@@ -1,7 +1,11 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json.Nodes;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using OllamaRouter.Options;
 
 namespace OllamaRouter.Services.Catalog;
 
@@ -19,7 +23,8 @@ namespace OllamaRouter.Services.Catalog;
 public sealed class ModelCatalogCacheService(
     IOllamaModelCatalogClient catalogClient,
     IMemoryCache memoryCache,
-    ILogger<ModelCatalogCacheService>? logger = null) : IModelCatalogCacheService
+    ILogger<ModelCatalogCacheService>? logger = null,
+    IOptionsMonitor<OllamaRouterOptions>? routerOptions = null) : IModelCatalogCacheService
 {
     internal const string CapabilityKeyPrefix = "ModelCapabilityEngine:";
 
@@ -28,6 +33,11 @@ public sealed class ModelCatalogCacheService(
     private static readonly TimeSpan CacheDuration = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan OfflineCacheDuration = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan StaleSlotDuration = TimeSpan.FromSeconds(60);
+
+    // Optional live-options reference (task #61): enables the SYNTHETIC catalog for
+    // non-Ollama targets (declared Models roster instead of /api/tags). Null-tolerant so
+    // every pre-fleet unit-test construction keeps the exact /api/tags behavior.
+    private readonly IOptionsMonitor<OllamaRouterOptions>? _routerOptions = routerOptions;
 
     // Per-instance capability cache key registry: baseUrl → (digest, recorded capability keys).
     // On digest change the recorded keys of the previous digest are removed from the shared
@@ -70,6 +80,18 @@ public sealed class ModelCatalogCacheService(
         if (string.IsNullOrEmpty(baseUrl))
         {
             return ([], string.Empty);
+        }
+
+        // Synthetic catalog (task #61): a URL belonging to a non-Ollama effective target is
+        // served from the target's declared Models roster — never a /api/tags probe (the
+        // daemon does not speak it). The digest is a stable SHA-256 over the sorted names so
+        // roster edits (rebind) are change-detected exactly like a real catalog change.
+        if (TryGetSyntheticNames(baseUrl, out var syntheticNames))
+        {
+            var syntheticDigest = ComputeSyntheticDigest(syntheticNames);
+            var syntheticResult = (syntheticNames.ToList(), syntheticDigest);
+            RefreshDigestAsync(baseUrl, syntheticResult);
+            return syntheticResult;
         }
 
         var (tags, digest) = await catalogClient.GetTagsWithDigestAsync(baseUrl, cancellationToken);
@@ -237,6 +259,14 @@ public sealed class ModelCatalogCacheService(
 
     private Task<HashSet<string>> GetModelNamesAsync(string baseUrl, CancellationToken cancellationToken)
     {
+        // Synthetic catalog (task #61): non-Ollama targets resolve their model names from the
+        // live declared roster on EVERY call (cheap in-memory walk, no cache, no network) so a
+        // Setup-API roster edit is visible on the very next decision (no TTL staleness).
+        if (TryGetSyntheticNames(baseUrl, out var synthetic))
+        {
+            return Task.FromResult(synthetic);
+        }
+
         var cacheKey = $"ModelCatalogCacheService:{baseUrl}";
 
         return memoryCache.GetOrCreateAsync(cacheKey, async entry =>
@@ -245,6 +275,74 @@ public sealed class ModelCatalogCacheService(
             entry.AbsoluteExpirationRelativeToNow = names.Count > 0 ? CacheDuration : OfflineCacheDuration;
             return names;
         })!;
+    }
+
+    // Resolves the SYNTHETIC model roster of a non-Ollama effective target whose URL matches
+    // <paramref name="baseUrl"/> (case-insensitive, trailing-slash tolerant). Returns false for
+    // Ollama targets, unresolvable URLs and hosts without the optional options reference (the
+    // exact pre-fleet /api/tags path applies). Blank roster names are skipped (documented).
+    private bool TryGetSyntheticNames(string baseUrl, out HashSet<string> names)
+    {
+        names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (_routerOptions is null || string.IsNullOrWhiteSpace(baseUrl))
+        {
+            return false;
+        }
+
+        foreach (var target in _routerOptions.CurrentValue.GetEffectiveTargets())
+        {
+            if (target.Type == TargetType.Ollama)
+            {
+                continue;
+            }
+
+            if (!UrlsMatch(target.Url, baseUrl))
+            {
+                continue;
+            }
+
+            names = ExtractSyntheticNames(target);
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool UrlsMatch(string? a, string? b)
+        => !string.IsNullOrWhiteSpace(a) && !string.IsNullOrWhiteSpace(b) &&
+           string.Equals(a.TrimEnd('/'), b.TrimEnd('/'), StringComparison.OrdinalIgnoreCase);
+
+    private static HashSet<string> ExtractSyntheticNames(OllamaTargetOptions target)
+    {
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (target.Models is null)
+        {
+            return result;
+        }
+
+        foreach (var model in target.Models)
+        {
+            if (!string.IsNullOrWhiteSpace(model.Name))
+            {
+                result.Add(model.Name.Trim());
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Stable digest of a synthetic roster: SHA-256 (lowercase hex) of the comma-joined,
+    /// case-insensitively sorted distinct names. Empty roster ⇒ SHA-256 of the empty string —
+    /// any roster edit (add/remove/rename) changes the digest (change detection on rebind).
+    /// </summary>
+    internal static string ComputeSyntheticDigest(IReadOnlyCollection<string> names)
+    {
+        var joined = string.Join(",",
+            names.Where(n => !string.IsNullOrWhiteSpace(n))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(n => n, StringComparer.OrdinalIgnoreCase));
+        return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(joined)));
     }
 
     private static HashSet<string> ExtractModelNames(JsonArray tags)

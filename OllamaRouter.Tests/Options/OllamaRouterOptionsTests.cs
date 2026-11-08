@@ -243,6 +243,85 @@ public class OllamaRouterOptionsTests
         Assert.Equal(2.0, target.GetEffectiveSpeedFactor());
     }
 
+    [Fact]
+    public void Type_DefaultsToOllama_OnNewAndBoundTargets()
+    {
+        // Task #61 (AC1/AC8): an omitted Type binds to Ollama — existing configs are
+        // byte-identical in behavior.
+        Assert.Equal(TargetType.Ollama, new OllamaTargetOptions().Type);
+        Assert.Null(new OllamaTargetOptions().ApiKey);
+        Assert.Null(new OllamaTargetOptions().Provider);
+        Assert.Empty(new OllamaTargetOptions().Models);
+
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection(
+            new Dictionary<string, string?>
+            {
+                ["OllamaRouter:Targets:0:Name"] = "legacy",
+                ["OllamaRouter:Targets:0:Url"] = "http://127.0.0.1:11434"
+            }).Build();
+        var legacy = new OllamaRouterOptions();
+        configuration.GetSection("OllamaRouter").Bind(legacy);
+
+        var legacyTarget = legacy.GetEffectiveTargets().Single();
+        Assert.Equal(TargetType.Ollama, legacyTarget.Type);
+        Assert.Null(legacyTarget.ApiKey);
+        Assert.Empty(legacyTarget.Models);
+    }
+
+    [Fact]
+    public void HeterogeneousFields_BindFromConfiguration_IncludingModelsRoster()
+    {
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection(
+            new Dictionary<string, string?>
+            {
+                ["OllamaRouter:Targets:0:Name"] = "provider",
+                ["OllamaRouter:Targets:0:Url"] = "http://h:8000/v1",
+                ["OllamaRouter:Targets:0:Type"] = "OpenAI",
+                ["OllamaRouter:Targets:0:ApiKey"] = "sk-test",
+                ["OllamaRouter:Targets:0:Provider"] = "openrouter",
+                ["OllamaRouter:Targets:0:Models:0:Name"] = "openai/gpt-4o",
+                ["OllamaRouter:Targets:0:Models:0:ContextLength"] = "128000",
+                ["OllamaRouter:Targets:0:Models:0:Quantization"] = "bfloat16",
+                ["OllamaRouter:Targets:0:Models:1:Name"] = "anthropic/claude-sonnet-4.5"
+            }).Build();
+
+        var options = new OllamaRouterOptions();
+        configuration.GetSection("OllamaRouter").Bind(options);
+
+        var target = options.GetEffectiveTargets().Single();
+        Assert.Equal(TargetType.OpenAI, target.Type);
+        Assert.Equal("sk-test", target.ApiKey);
+        Assert.Equal("openrouter", target.Provider);
+        Assert.Equal(2, target.Models.Count);
+        Assert.Equal("openai/gpt-4o", target.Models[0].Name);
+        Assert.Equal(128000, target.Models[0].ContextLength);
+        Assert.Equal("bfloat16", target.Models[0].Quantization);
+        Assert.Equal("anthropic/claude-sonnet-4.5", target.Models[1].Name);
+        Assert.Null(target.Models[1].ContextLength);
+    }
+
+    [Fact]
+    public void Type_BindsCaseInsensitively_FromConfiguredEnumNames()
+    {
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection(
+            new Dictionary<string, string?>
+            {
+                ["OllamaRouter:Targets:0:Name"] = "a",
+                ["OllamaRouter:Targets:0:Url"] = "http://a",
+                ["OllamaRouter:Targets:0:Type"] = "openai",
+                ["OllamaRouter:Targets:1:Name"] = "b",
+                ["OllamaRouter:Targets:1:Url"] = "http://b",
+                ["OllamaRouter:Targets:1:Type"] = "Osnative"
+            }).Build();
+
+        var options = new OllamaRouterOptions();
+        configuration.GetSection("OllamaRouter").Bind(options);
+
+        var targets = options.GetEffectiveTargets();
+        Assert.Equal(TargetType.OpenAI, targets[0].Type);
+        Assert.Equal(TargetType.OsNative, targets[1].Type);
+    }
+
     [Theory]
     [InlineData(-1.0)]
     [InlineData(0.0)]

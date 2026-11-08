@@ -1311,6 +1311,217 @@ public class RoutingDecisionServiceTests
     }
 
     [Fact]
+    public async Task Eviction_Suppressed_ForOpenAiTypeTarget_StatelessDetail_ConcurrencyStillApplies()
+    {
+        // Task #61 (AC7): an OpenAI-type target has no local weights — the same VRAM pressure
+        // that WOULD evict on the Ollama-type Desktop is suppressed (eviction=0, "stateless"
+        // detail); the concurrency penalty is NOT suppressed (the middleware's in-flight
+        // counters work for every type).
+        var openAiUrl = "http://cloud-ai:8000/v1";
+        var options = new OllamaRouterOptions
+        {
+            Targets = new List<OllamaTargetOptions>
+            {
+                Desktop,
+                new OllamaTargetOptions
+                {
+                    Name = "CloudAi",
+                    Url = openAiUrl,
+                    Type = TargetType.OpenAI,
+                    MaxVramMB = 16384,
+                    MaxParallel = 2 // headroom: the in-flight request is BELOW the cliff threshold
+                }
+            }
+        };
+        options.Models["qwen3.8-27B"] = new ModelThresholds();
+
+        var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        meta.Add(openAiUrl, "qwen3.8-27B", DenseShow(27_800_000_000), 16 * Gb);
+
+        var tCloudAi = new RoutingTarget("CloudAi");
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{openAiUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "CloudAi" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, inFlight: 0, ("other", 10 * Gb)),
+                [tCloudAi] = State(tCloudAi, inFlight: 1, ("other", 10 * Gb))
+            },
+            meta: meta);
+
+        await h.Decide(30_000, "qwen3.8-27B");
+
+        var cloudAi = h.Eval(tCloudAi)!;
+        Assert.True(cloudAi.Qualified);
+        Assert.Equal(0, cloudAi.EvictionPenalty); // stateless: no local weights to evict
+        Assert.Contains("eviction=0 (stateless)", cloudAi.Detail, StringComparison.Ordinal);
+        Assert.Equal(40, cloudAi.ConcurrencyPenalty); // inFlight=1 → 1×40 (NOT suppressed)
+
+        // The identical VRAM pressure on the Ollama-type Desktop still penalizes: −80.
+        var desktop = h.Eval(TDesktop)!;
+        Assert.Equal(80, desktop.EvictionPenalty);
+        Assert.DoesNotContain("(stateless)", desktop.Detail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Eviction_Suppressed_ForCloudLocatedTarget_StatelessDetail()
+    {
+        // Task #61 (AC7): the suppression is also driven by the LOCATION classification — a
+        // cloud-classified target (operator override) never evicts local weights, even though
+        // it is an Ollama-type daemon.
+        var edgeUrl = "http://edge.example.com:11434";
+        var options = new OllamaRouterOptions
+        {
+            Targets = new List<OllamaTargetOptions>
+            {
+                Desktop,
+                new OllamaTargetOptions
+                {
+                    Name = "Edge",
+                    Url = edgeUrl,
+                    Location = TargetLocation.Cloud,
+                    MaxVramMB = 16384,
+                    MaxParallel = 2
+                }
+            }
+        };
+        options.Models["qwen3.8-27B"] = new ModelThresholds();
+
+        var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
+        meta.Add(edgeUrl, "qwen3.8-27B", DenseShow(27_800_000_000), 16 * Gb);
+
+        var tEdge = new RoutingTarget("Edge");
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8-27B", $"{edgeUrl}|qwen3.8-27B" },
+            onlineTargets: new() { "Desktop", "Edge" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, inFlight: 0, ("other", 10 * Gb)),
+                [tEdge] = State(tEdge, inFlight: 0, ("other", 10 * Gb))
+            },
+            meta: meta);
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B");
+
+        var edge = h.Eval(tEdge)!;
+        Assert.True(edge.Qualified);
+        Assert.Equal(0, edge.EvictionPenalty);
+        Assert.Contains("eviction=0 (stateless)", edge.Detail, StringComparison.Ordinal);
+        Assert.Equal(80, h.Eval(TDesktop)!.EvictionPenalty); // local Ollama target still pays it
+        Assert.Equal(tEdge, winner);
+    }
+
+    [Fact]
+    public async Task Stage1_NonOllamaStrictRoster_UnlistedModel_Disqualifies()
+    {
+        // Task #61 (AC7): a non-Ollama target with a NON-EMPTY declared roster is STRICT — a
+        // model that is not listed disqualifies the target with the standard catalog reason.
+        var openAiUrl = "http://cloud-ai:8000/v1";
+        var options = new OllamaRouterOptions
+        {
+            Targets = new List<OllamaTargetOptions>
+            {
+                new OllamaTargetOptions
+                {
+                    Name = "CloudAi",
+                    Url = openAiUrl,
+                    Type = TargetType.OpenAI,
+                    Models = [new TargetModelConfig { Name = "openai/gpt-4o" }]
+                }
+            }
+        };
+        options.Models["llama3"] = new ModelThresholds();
+
+        var (h, _) = Build(
+            options,
+            withEngine: false,
+            catalogModels: new() { $"{openAiUrl}|openai/gpt-4o" }, // llama3 NOT listed
+            onlineTargets: new() { "CloudAi" });
+
+        // A single-candidate fleet whose only candidate is disqualified throws the standard
+        // NoAvailableTargetException — the evaluations are still captured by the harness.
+        await Assert.ThrowsAsync<NoAvailableTargetException>(() => h.Decide(1_000, "llama3"));
+
+        var eval = h.Eval(new RoutingTarget("CloudAi"))!;
+        Assert.False(eval.Qualified);
+        Assert.Contains("model not present in the target catalog", eval.DisqualifiedReason ?? string.Empty,
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Stage1_NonOllamaStrictRoster_ListedModel_QualifiesViaPermissiveCapabilityPath()
+    {
+        // Task #61 (AC7): a LISTED model qualifies the OpenAI target through the existing
+        // permissive-qualification path (no /api/show capability metadata exists for the
+        // remote API — score = session bonus only, eviction suppressed).
+        var openAiUrl = "http://cloud-ai:8000/v1";
+        var options = new OllamaRouterOptions
+        {
+            Targets = new List<OllamaTargetOptions>
+            {
+                new OllamaTargetOptions
+                {
+                    Name = "CloudAi",
+                    Url = openAiUrl,
+                    Type = TargetType.OpenAI,
+                    Models = [new TargetModelConfig { Name = "openai/gpt-4o" }]
+                }
+            }
+        };
+        options.Models["openai/gpt-4o"] = new ModelThresholds();
+
+        var (h, _) = Build(
+            options,
+            withEngine: false,
+            catalogModels: new() { $"{openAiUrl}|openai/gpt-4o" },
+            onlineTargets: new() { "CloudAi" });
+
+        var winner = await h.Decide(1_000, "openai/gpt-4o");
+
+        Assert.Equal(new RoutingTarget("CloudAi"), winner);
+        var eval = h.Eval(new RoutingTarget("CloudAi"))!;
+        Assert.True(eval.Qualified);
+        Assert.Equal(0, eval.EvictionPenalty);
+    }
+
+    [Fact]
+    public async Task Stage1_NonOllamaEmptyRoster_PermissiveShortCircuit()
+    {
+        // Task #61 (AC7): a non-Ollama target with an EMPTY roster is PERMISSIVE — the catalog
+        // check short-circuits to true (the minimal {name,url,apiKey} config stays routable),
+        // even though no catalog entry exists for the URL (a strict check would disqualify).
+        var openAiUrl = "http://cloud-ai:8000/v1";
+        var options = new OllamaRouterOptions
+        {
+            Targets = new List<OllamaTargetOptions>
+            {
+                new OllamaTargetOptions
+                {
+                    Name = "CloudAi",
+                    Url = openAiUrl,
+                    Type = TargetType.OpenAI // Models intentionally empty
+                }
+            }
+        };
+        options.Models["anything-at-all"] = new ModelThresholds();
+
+        var (h, _) = Build(
+            options,
+            withEngine: false,
+            catalogModels: new(), // no entries at all for this URL
+            onlineTargets: new() { "CloudAi" });
+
+        var winner = await h.Decide(1_000, "anything-at-all");
+
+        Assert.Equal(new RoutingTarget("CloudAi"), winner);
+        Assert.True(h.Eval(new RoutingTarget("CloudAi"))!.Qualified);
+    }
+
+    [Fact]
     public async Task Eviction_UnknownWeight_WithKnownVram_PessimisticOnNonServerClass()
     {
         // Known VRAM budget but a degraded /api/tags entry (weight size 0): the conservative

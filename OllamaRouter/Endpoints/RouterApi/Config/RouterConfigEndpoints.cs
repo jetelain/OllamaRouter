@@ -66,7 +66,8 @@ public static class RouterConfigEndpoints
     /// <c>PUT /api/router/config</c> echo. All values are read from the live options instance;
     /// NO key material is exposed (the API-key system of task #50 stores the default key
     /// protected in config/default-key.dat and user keys as hashes only — the response carries
-    /// the <c>apiSecurity</c> SECTION SETTINGS, never any key). The Cloud pseudo-target is not
+    /// the <c>apiSecurity</c> SECTION SETTINGS, never any key; likewise the per-target provider
+    /// keys of task #61 are masked to the <c>apiKeyConfigured</c> flag). The Cloud pseudo-target is not
     /// part of <c>targets</c> (it is a relay, never a fleet member).
     /// </summary>
     private static RouterConfigResponse BuildRouterConfigResponse(OllamaRouterOptions options)
@@ -77,7 +78,15 @@ public static class RouterConfigEndpoints
                 t.Url ?? string.Empty,
                 t.Enabled,
                 t.HardwareHint,
-                t.MaxParallel))
+                t.MaxParallel,
+                t.Type.ToString().ToLowerInvariant(),
+                t.Provider,
+                t.Models is { Count: > 0 } declared
+                    ? declared.Where(m => !string.IsNullOrWhiteSpace(m?.Name))
+                        .Select(m => new Targets.TargetModelDto(m!.Name, m.ContextLength, m.Quantization))
+                        .ToList()
+                    : null,
+                !string.IsNullOrWhiteSpace(t.ApiKey)))
             .ToList();
 
         var recording = options.Recording ?? new RecordingOptions();

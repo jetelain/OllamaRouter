@@ -926,4 +926,73 @@ public class TargetExecutionTrackerTests : IDisposable
         liveness.Setup(t => t.GetFleetTargets()).Returns(fleet);
         liveness.Setup(t => t.GetEntries()).Returns(entries);
     }
+
+    // ------------------------------------------------------------------
+    //  Task #61 (AC9) — non-Ollama targets are excluded from the /api/ps fan-out
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task Refresh_NonOllamaTargets_ExcludedFromPsFanOut_InFlightCountersStillWork()
+    {
+        var providerUrl = "http://provider.example.com:8000/v1";
+        var tProvider = new RoutingTarget("Provider");
+        var options = new OllamaRouterOptions
+        {
+            Targets =
+            [
+                new OllamaTargetOptions { Name = "Alpha", Url = AlphaUrl },
+                new OllamaTargetOptions
+                {
+                    Name = "Provider",
+                    Url = providerUrl,
+                    Type = TargetType.OpenAI,
+                    Models = [new TargetModelConfig { Name = "openai/gpt-4o" }]
+                },
+                new OllamaTargetOptions { Name = "Native", Url = "http://native:9999", Type = TargetType.OsNative }
+            ]
+        };
+
+        var liveness = new Mock<ITargetLivenessService>();
+        var fleet = new List<RoutingTarget> { Ta, tProvider, new RoutingTarget("Native") };
+        var entries = fleet
+            .ToDictionary(t => t, t => new TargetLivenessEntry(t, TargetLivenessState.Online, null, DateTimeOffset.UtcNow, null));
+        liveness.Setup(t => t.IsOnline(It.IsAny<RoutingTarget>())).Returns(true);
+        liveness.Setup(t => t.IsOnline(It.IsAny<RoutingTarget>(), It.IsAny<TimeSpan>())).Returns(true);
+        liveness.SetupGet(t => t.ServiceStartTimeUtc).Returns(DateTimeOffset.UtcNow.AddMinutes(1));
+        liveness.Setup(t => t.GetFleetTargets()).Returns(fleet);
+        liveness.Setup(t => t.GetEntries()).Returns(entries);
+
+        var catalog = new CountingCatalogClient(baseUrl =>
+        {
+            if (string.Equals(baseUrl, AlphaUrl, StringComparison.OrdinalIgnoreCase))
+            {
+                return (Ps(("llama3:latest", 4000, null)), true);
+            }
+
+            return (new JsonArray(), true); // defensive: must never be called for non-Ollama URLs
+        });
+
+        var sut = new TargetExecutionTracker(
+            new TestOptionsMonitor<OllamaRouterOptions>(options),
+            liveness.Object,
+            new Mock<ITargetAvailabilityService>().Object,
+            catalog,
+            NullLogger<TargetExecutionTracker>.Instance);
+
+        await sut.RefreshAsync();
+
+        // ZERO /api/ps calls for the OpenAI and OsNative targets — only Alpha was fanned out.
+        Assert.Single(catalog.RequestedUrls);
+        Assert.Equal(AlphaUrl.TrimEnd('/'), catalog.RequestedUrls[0]);
+
+        // The in-flight (middleware-owned) counters still function for non-Ollama targets —
+        // they feed the concurrency penalty of the routing decision.
+        sut.IncrementInFlight(tProvider);
+        sut.IncrementInFlight(tProvider);
+        sut.IncrementInFlight(Ta);
+        Assert.Equal(2, sut.GetState(tProvider)!.InFlightRequests);
+        Assert.Equal(1, sut.GetState(Ta)!.InFlightRequests);
+        sut.DecrementInFlight(tProvider);
+        Assert.Equal(1, sut.GetState(tProvider)!.InFlightRequests);
+    }
 }

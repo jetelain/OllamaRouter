@@ -594,8 +594,13 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             return Disqualified(target, "offline (liveness not Online and outside the startup grace window)");
         }
 
-        // 3. Catalog present.
-        var exists = await _modelCatalogCacheService.ModelExistsAsync(targetOptions.Url, context.ModelName, cancellationToken);
+        // 3. Catalog present. Non-Ollama targets with an EMPTY declared model roster are
+        //    PERMISSIVE (the synthetic-catalog short-circuit shared with the middleware's pin
+        //    gate — NonOllamaCatalogPolicy); a NON-EMPTY roster is STRICT (the synthetic roster
+        //    is served by the catalog cache for that URL, so the same ModelExistsAsync call
+        //    applies unmodified). Ollama targets take the exact legacy /api/tags path.
+        var exists = NonOllamaCatalogPolicy.IsPermissive(targetOptions) ||
+            await _modelCatalogCacheService.ModelExistsAsync(targetOptions.Url, context.ModelName, cancellationToken);
         if (!exists)
         {
             return Disqualified(target, "model not present in the target catalog");
@@ -658,10 +663,14 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         var affinity = isLoaded ? AffinityBonus : 0;
 
         // Eviction penalty (VRAM-sum based, Q1 resolution; a stale snapshot is still applied —
-        // better than none for anti-thrashing). The model weight comes from the same capability
-        // metadata already fetched for Stage 1 (context-cached).
-        var metadata = await context.GetModelMetadataAsync(targetOptions.Url!, cancellationToken);
-        var eviction = WouldEvict(isLoaded, loadedModels, state?.TotalVramBytes, metadata?.WeightSizeBytes, maxVramMB) ? EvictionPenalty : 0;
+        // better than none for anti-thrashing). SUPPRESSED for stateless targets (task #61):
+        // OpenAI-type targets (remote/cloud APIs) and cloud-CLASSIFIED locations have no local
+        // weights to evict — loading a model never thrashes a local KV cache, so
+        // WouldEvict is only consulted for Ollama-type, non-cloud-location targets.
+        var stateless = targetOptions.Type == TargetType.OpenAI ||
+            TargetLocationClassifier.Classify(targetOptions) == TargetLocation.Cloud;
+        var metadata = stateless ? null : await context.GetModelMetadataAsync(targetOptions.Url!, cancellationToken);
+        var eviction = stateless || !WouldEvict(isLoaded, loadedModels, state?.TotalVramBytes, metadata?.WeightSizeBytes, maxVramMB) ? 0 : EvictionPenalty;
 
         // Concurrency: (InFlight × 40) + (InFlight ≥ MaxParallel ? 100 : 0).
         var maxParallel = targetOptions.MaxParallel <= 0 ? 1 : targetOptions.MaxParallel;
@@ -679,7 +688,9 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
 
         var score = session + affinity + hardware - eviction - concurrency;
         return Scored(target, score, affinity, hardware, eviction, concurrency, session,
-            $"session={session:+#;-#;0} affinity={affinity:+#;-#;0} hardware={hardware:+#;-#;0} eviction=-{eviction} concurrency=-{concurrency} " +
+            $"session={session:+#;-#;0} affinity={affinity:+#;-#;0} hardware={hardware:+#;-#;0} " +
+            (stateless ? "eviction=0 (stateless) " : $"eviction=-{eviction} ") +
+            $"concurrency=-{concurrency} " +
             $"(inFlight={inFlight}, maxParallel={maxParallel}, loaded={loadedModels.Count}, stale={state?.Stale ?? true})");
     }
 
