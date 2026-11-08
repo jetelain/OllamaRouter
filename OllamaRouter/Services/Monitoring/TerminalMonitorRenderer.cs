@@ -141,6 +141,12 @@ public static class TerminalMonitorRenderer
         if (enableAnsi) sb.Append(Reset);
         lines.Add(sb.ToString());
 
+        // Task #45: static preload-policy legend directly under the FLEET header (gray; well
+        // under the 79-column budget). Explains the per-row keep-alive token: the CONFIGURED
+        // (router-owned) effective policy (cloud/server = -1 forever, desktop = 900 s = 15m by
+        // class convention; unclassifiable nodes take the router default).
+        lines.Add("   " + (enableAnsi ? Gray : "") + "preload: cloud/server=∞ (forever) · desktop=15m · other=router default" + (enableAnsi ? Reset : ""));
+
         lines.Add("   Target      Liveness   HW        Active Model            In Ctx");
         lines.Add("   ─────────── ────────── ───────── ─────────────────────── ── ────────────────");
 
@@ -158,13 +164,46 @@ public static class TerminalMonitorRenderer
             row.Append(' ');
             row.Append(PadRightDisplay(Truncate(item.HardwareProfile ?? "-", 9), 9));
             row.Append(' ');
-            row.Append(PadRightDisplay(Truncate(item.ActiveModel ?? "-", 23), 23));
+            // Task #45: the keep-alive token lives INSIDE the existing 23-wide Active Model cell
+            // (no new column ⇒ zero width regression): '∞' for -1, compact '45s'/'15m'/'2h' for
+            // positive seconds; the model name is truncated so name + " " + token fits 23 display
+            // columns. Cloud / null policy → cell unchanged (no token).
+            var activeModelCell = item.ActiveModel ?? "-";
+            if (item.KeepAliveSeconds is { } keepAliveSeconds)
+            {
+                var token = FormatKeepAlive(keepAliveSeconds);
+                var nameBudget = 23 - 1 - GetDisplayWidth(token);
+                activeModelCell = Truncate(activeModelCell, Math.Max(1, nameBudget)) + " " + token;
+            }
+            row.Append(PadRightDisplay(Truncate(activeModelCell, 23), 23));
             row.Append(' ');
             row.Append(item.InFlightRequests.ToString("0", CultureInfo.InvariantCulture).PadLeft(2));
             row.Append(' ');
             row.Append(Truncate(item.ContextAllocation ?? "-", 16));
             lines.Add(row.ToString());
         }
+    }
+
+    /// <summary>
+    /// Task #45: compact keep-alive token for the fleet Active Model cell:
+    /// <c>-1</c> → <c>∞</c> (resident indefinitely); positive seconds → compact
+    /// <c>45s</c> / <c>15m</c> / <c>2h</c> (rounded, InvariantCulture).
+    /// </summary>
+    private static string FormatKeepAlive(int seconds)
+    {
+        if (seconds == -1)
+        {
+            return "∞";
+        }
+        if (seconds < 60)
+        {
+            return seconds.ToString(CultureInfo.InvariantCulture) + "s";
+        }
+        if (seconds < 3600)
+        {
+            return ((int)Math.Round(seconds / 60.0, MidpointRounding.AwayFromZero)).ToString(CultureInfo.InvariantCulture) + "m";
+        }
+        return ((int)Math.Round(seconds / 3600.0, MidpointRounding.AwayFromZero)).ToString(CultureInfo.InvariantCulture) + "h";
     }
 
     // Liveness badge: Disabled (red) takes precedence, then Offline (orange), Probing

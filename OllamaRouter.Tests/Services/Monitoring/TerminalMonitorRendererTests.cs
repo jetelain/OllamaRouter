@@ -159,6 +159,77 @@ public class TerminalMonitorRendererTests
         Assert.Contains("-", cloudRow);
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Render_FleetTable_PreloadLegendLineAndKeepAliveTokenInActiveModelCell(bool enableAnsi)
+    {
+        // Task #45: (1) ONE gray legend line sits DIRECTLY under the FLEET header explaining the
+        // keep-alive convention; (2) the CONFIGURED keep-alive token lives INSIDE the existing
+        // 23-wide Active Model cell (no new column): -1 → '∞', 900 → '15m', 7200 → '2h'; the
+        // model name is truncated so name + " " + token fits 23 display columns; the Cloud row
+        // (null policy) renders its cell unchanged (no token).
+        var fleet = new List<MonitorFleetTargetItem>
+        {
+            new("Desktop", true, "Online", 0, "-", "local", "http://127.0.0.1:11435", "llama3:8b", "16gb", KeepAliveSeconds: 900),
+            new("Server", true, "Online", 1, "-", "remote", "http://192.168.1.10:11434", "qwen3.8:27b", "96gb", KeepAliveSeconds: -1),
+            new("Verbose", true, "Online", 0, "-", "local", "http://127.0.0.1:11436", "very-long-model-name:latest-tag", "8gb", KeepAliveSeconds: 7200),
+            FleetItem("Cloud", null, true, "Online", null, 0, null, "-") // null policy → no token
+        };
+
+        var state = new MonitorStateResponse(
+            CloudEnabled: true,
+            Fleet: fleet,
+            Statistics: new MonitorStatisticsStatus(
+                new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["total"] = new ActivityStatisticsTotals(0, 0, 0)
+                },
+                new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["total"] = new ActivityStatisticsTotals(0, 0, 0)
+                }),
+            InProgress: [],
+            Requests: [],
+            Cost: null,
+            Overhead: null);
+
+        var output = TerminalMonitorRenderer.Render(state, "http://localhost:11434/monitor", enableAnsi: enableAnsi);
+        var lines = output.Split(["\r\n", "\n"], StringSplitOptions.None);
+
+        // (1) The legend line is directly under the FLEET header and under the 79-column budget.
+        var fleetHeaderIdx = Array.FindIndex(lines, l => l.Contains("FLEET"));
+        Assert.True(fleetHeaderIdx >= 0);
+        var legend = lines[fleetHeaderIdx + 1];
+        Assert.Contains("preload: cloud/server=∞ (forever) · desktop=15m · other=router default", legend);
+        Assert.True(TerminalMonitorRenderer.GetDisplayWidth(legend) <= 79);
+
+        // (2) Per-row tokens inside the Active Model cell.
+        var localRow = lines.Single(l => l.Contains("llama3:8b"));
+        Assert.Contains("llama3:8b 15m", localRow);
+        var serverRow = lines.Single(l => l.Contains("qwen3.8:27b"));
+        Assert.Contains("qwen3.8:27b ∞", serverRow);
+
+        // Long name + token: the name is truncated so the whole cell stays 23 display columns.
+        var verboseRow = lines.Single(l => l.Contains("Verbose"));
+        Assert.Contains("2h", verboseRow);
+        Assert.Contains("…", verboseRow); // truncated
+        var activeModelCellStart = verboseRow.IndexOf("very-long-model-nam", StringComparison.Ordinal);
+        Assert.True(activeModelCellStart >= 0);
+
+        // Cloud (null policy): the cell is unchanged — no keep-alive token at all.
+        var cloudRow = lines.Single(l => l.Contains("Cloud") && !l.Contains("Cloud:"));
+        Assert.DoesNotContain("∞", cloudRow);
+        Assert.DoesNotContain("15m", cloudRow);
+        Assert.DoesNotContain("2h", cloudRow);
+
+        // No width regression: EVERY line stays within the 79-column budget.
+        foreach (var line in lines)
+        {
+            Assert.True(TerminalMonitorRenderer.GetDisplayWidth(line) <= 79, $"Line exceeded 79 columns: '{line}'");
+        }
+    }
+
     [Fact]
     public void Render_FleetTable_CtxColumn_ValuesOverSixteenCharsTruncateWithEllipsis()
     {
@@ -310,10 +381,12 @@ public class TerminalMonitorRendererTests
         Assert.Contains("33k", output);
 
         var lines = output.Split(["\r\n", "\n"], StringSplitOptions.None);
-        var desktopRow = lines.Single(l => l.Contains("desktop"));
-        var laptopRow = lines.Single(l => l.Contains("laptop"));
-        var server1Row = lines.Single(l => l.Contains("server1"));
-        var cloudRow = lines.Single(l => l.Contains("Cloud") && !l.Contains("Cloud:"));
+        // Fleet data rows carry the '●' liveness badge (the preload legend row under the FLEET
+        // header also mentions "desktop" and must not match the row locators).
+        var desktopRow = lines.Single(l => l.Contains("desktop") && l.Contains("\u25CF"));
+        var laptopRow = lines.Single(l => l.Contains("laptop") && l.Contains("\u25CF"));
+        var server1Row = lines.Single(l => l.Contains("server1") && l.Contains("\u25CF"));
+        var cloudRow = lines.Single(l => l.Contains("Cloud") && !l.Contains("Cloud:") && l.Contains("\u25CF"));
 
         // desktop: online, 2 in-flight, 16gb, daemon-reported 128k context.
         Assert.Contains("\u25CF Online", desktopRow);

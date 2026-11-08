@@ -8,6 +8,7 @@ using OllamaRouter.Services.Catalog;
 using OllamaRouter.Services.ContextSizing;
 using OllamaRouter.Services.Hardware;
 using OllamaRouter.Services.Monitoring;
+using OllamaRouter.Services.Preload;
 using OllamaRouter.Services.Routing;
 using System.Text.Json;
 using static OllamaRouter.Endpoints.RouterApi.Shared.RouterApiSharedHelpers;
@@ -21,8 +22,12 @@ namespace OllamaRouter.Endpoints.RouterApi.Fleet;
 /// <item><c>GET /api/router/fleet</c> — the full fleet hardware topology: every configured
 /// target (in configuration order) plus the Cloud pseudo-target (last), with real-time
 /// liveness state, last-probe latency, detected GPU hardware (local workstation only),
-/// in-flight request count, currently loaded model, the active KV-cache context lease and
-/// the active-session count within the reservation window (task #77).</item>
+/// in-flight request count, the resident model list (active model = first, full list in
+/// <c>execution.residentModels</c>), the best-effort daemon-observed keep-alive of the first
+/// resident model, the CONFIGURED effective preload keep-alive policy + source
+/// (<c>preload.keepAliveSeconds</c> / <c>preload.keepAliveSource</c>; the Cloud row carries none),
+/// the active KV-cache context lease and the active-session count within the reservation window
+/// (task #77).</item>
 /// </list>
 /// </summary>
 
@@ -44,13 +49,21 @@ public static class RouterFleetEndpoints
         })
         .WithName("GetRouterFleet")
         .WithTags("Identity & Fleet")
-        .WithSummary("Full fleet hardware topology with real-time liveness and execution state.")
+        .WithSummary("Full fleet hardware topology with real-time liveness, execution and preload-keep-alive residency state.")
         .WithDescription("Every configured target (configuration order) plus the Cloud pseudo-target (last), each with real-time "
             + "liveness state (Online/Offline/Probing), last-probe latency, detected GPU hardware (local workstation only), "
-            + "in-flight request count, currently loaded model, the active KV-cache context lease and activeSessions (the "
-            + "sessions active on the target within the SessionReservationWindowSeconds window, task #77). The Cloud "
-            + "pseudo-target is never probed or tracked: 'Online' iff cloud overflow is enabled and it never carries a "
-            + "loaded model, in-flight requests, active sessions, context lease or latency measurement.");
+            + "in-flight request count, the resident model list (execution.activeModel = FIRST loaded model, "
+            + "execution.residentModels = the FULL in-memory tracker-snapshot list, [] when idle), the best-effort daemon-observed "
+            + "keep-alive of the first resident model (execution.activeKeepAliveSeconds, omitted when the daemon does not report "
+            + "it — observed ≠ configured), the CONFIGURED router-owned effective preload keep-alive policy "
+            + "(preload.keepAliveSeconds; -1 = resident indefinitely) and its source discriminator (preload.keepAliveSource: "
+            + "explicit/class/default; omitted for the Cloud row, which never hosts models), the active KV-cache context lease "
+            + "and activeSessions (the sessions active on the target within the SessionReservationWindowSeconds window, task #77). "
+            + "The Cloud pseudo-target is never probed or tracked: 'Online' iff cloud overflow is enabled, it never carries a "
+            + "loaded model (residentModels: []), an in-flight request, an active session, a context lease, a preload policy or a "
+            + "latency measurement. The full model→node→footprint read is GET /api/router/cartography (loadedModels[]). "
+            + "Snapshot-only: no /api/ps or other daemon HTTP calls on this path (never 5xx, never hangs; stale data flagged as today). "
+            + "Read-only — no key required in default mode.");
         // Fleet hardware profiling engine: the local node's own profile (cached after the
         // first probe), the full fleet topology (parallel peer probes, fail-soft per node),
         // and the manual profile push (for bare Ollama targets without a router daemon).
@@ -178,6 +191,18 @@ public static class RouterFleetEndpoints
             var inFlight = executionState?.InFlightRequests ?? 0;
             var activeSessions = sessionAffinity is not null ? sessionAffinity.GetActiveSessionCount(routingTarget, reservationWindow) : 0;
 
+            // Task #45 (residency visibility): the FULL resident model list (tracker order, [] when
+            // idle) and the best-effort daemon-observed keep-alive of the FIRST resident model
+            // (null → omitted); snapshot-only reads, no new HTTP calls.
+            var residentModels = executionState?.LoadedModels is { } loaded
+                ? loaded.Select(m => m.Name).ToArray()
+                : [];
+            var activeKeepAliveSeconds = executionState?.LoadedModels.FirstOrDefault()?.KeepAliveSeconds;
+
+            // Task #45: the CONFIGURED (router-owned) effective preload keep-alive policy + source
+            // (shared single source of truth with the preload load path).
+            var preloadResolution = PreloadKeepAlivePolicy.ResolvePreloadKeepAlive(target, opt, fleetHardware);
+
             // speedFactor: always present; null when the effective factor is 1.0 (unset/default),
             // consistent with maxVramMB's nullable semantics.
             var speedFactor = target.GetEffectiveSpeedFactor();
@@ -238,7 +263,12 @@ public static class RouterFleetEndpoints
                     InFlightRequests: inFlight,
                     ActiveModel: activeModel,
                     ContextAllocation: FormatContextAllocation(routingTarget, leaseSnapshot),
-                    ActiveSessions: activeSessions)));
+                    ActiveSessions: activeSessions,
+                    ResidentModels: residentModels,
+                    ActiveKeepAliveSeconds: activeKeepAliveSeconds),
+                Preload: new RouterTargetPreload(
+                    KeepAliveSeconds: preloadResolution.Seconds,
+                    KeepAliveSource: preloadResolution.Source)));
         }
 
         // The Cloud pseudo-target is never probed/tracked: it is "Online" iff cloud is
@@ -264,7 +294,9 @@ public static class RouterFleetEndpoints
                 InFlightRequests: 0,
                 ActiveModel: null,
                 ContextAllocation: "baseline",
-                ActiveSessions: 0))); // Cloud is never leased (SetAffinity ignores the pseudo-target).
+                ActiveSessions: 0,
+                ResidentModels: []), // Cloud never hosts models (no policy, no observed keep-alive).
+            Preload: null));
 
         return new RouterFleetResponse(targets);
     }

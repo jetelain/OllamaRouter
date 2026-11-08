@@ -771,6 +771,78 @@ public class TargetExecutionTrackerTests : IDisposable
     }
 
     [Fact]
+    public void ParseModels_KeepAliveSeconds_ParsedBestEffort_IncludingMinusOne_FailSoft()
+    {
+        // Task #45: the daemon-observed keep_alive of each resident process is read best-effort:
+        // any integer (incl. -1 = resident indefinitely) is accepted verbatim; missing,
+        // non-numeric, JSON-null and non-object entries fail soft to null (never throw).
+        var models = new JsonArray
+        {
+            new JsonObject
+            {
+                ["name"] = "indefinite:entry",
+                ["keep_alive"] = -1
+            },
+            new JsonObject
+            {
+                ["name"] = "bounded:entry",
+                ["keep_alive"] = 300
+            },
+            new JsonObject
+            {
+                ["name"] = "missing:entry"
+            },
+            new JsonObject
+            {
+                ["name"] = "non-numeric:entry",
+                ["keep_alive"] = "5m"
+            },
+            new JsonObject
+            {
+                ["name"] = "json-null:entry",
+                ["keep_alive"] = null
+            }
+        };
+
+        var parsed = TargetExecutionTracker.ParseModels(models);
+
+        Assert.Equal(5, parsed.Count);
+        Assert.Equal(-1, parsed[0].KeepAliveSeconds);
+        Assert.Equal(300, parsed[1].KeepAliveSeconds);
+        Assert.Null(parsed[2].KeepAliveSeconds);
+        Assert.Null(parsed[3].KeepAliveSeconds);
+        Assert.Null(parsed[4].KeepAliveSeconds);
+    }
+
+    [Fact]
+    public void ParseModels_KeepAliveSeconds_DoesNotDisturbExistingFieldParsing()
+    {
+        // Task #45 regression guard: adding the keep_alive read must leave every pre-existing
+        // parse behavior (name/model fallback, size_vram, context_length/num_ctx, quantization)
+        // byte-identical.
+        var models = new JsonArray
+        {
+            new JsonObject
+            {
+                ["model"] = "fallback:entry",
+                ["size_vram"] = 4200L,
+                ["context_length"] = 128,
+                ["keep_alive"] = 300,
+                ["details"] = new JsonObject { ["quantization_level"] = "Q8_0" }
+            }
+        };
+
+        var parsed = TargetExecutionTracker.ParseModels(models);
+
+        Assert.Single(parsed);
+        Assert.Equal("fallback:entry", parsed[0].Name);
+        Assert.Equal(4200, parsed[0].SizeVramBytes);
+        Assert.Equal(128, parsed[0].ContextLength);
+        Assert.Equal("Q8_0", parsed[0].QuantizationLevel);
+        Assert.Equal(300, parsed[0].KeepAliveSeconds);
+    }
+
+    [Fact]
     public void GetState_UnseenTarget_ReturnsFillInStaleState()
     {
         var sut = CreateSimpleSut();

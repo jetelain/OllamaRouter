@@ -2,6 +2,7 @@ using Microsoft.Extensions.Options;
 using OllamaRouter.Options;
 using OllamaRouter.Services.Catalog;
 using OllamaRouter.Services.Monitoring;
+using OllamaRouter.Services.Preload;
 using OllamaRouter.Services.Routing;
 using OllamaRouter.Services.Hardware;
 
@@ -68,6 +69,15 @@ public static partial class MonitorEndpointsExtensions
             var activeModel = activeModelEntry?.Name;
             var inFlight = executionState?.InFlightRequests ?? 0;
 
+            // Task #45 (residency visibility): the FULL resident model list (tracker order,
+            // [] when idle) and the best-effort daemon-observed keep-alive of the FIRST resident
+            // model (null → omitted); snapshot-only reads, no new HTTP calls. Plus the
+            // CONFIGURED (router-owned) effective preload policy + source (shared resolver).
+            var residentModels = executionState?.LoadedModels is { } loaded
+                ? loaded.Select(m => m.Name).ToArray()
+                : [];
+            var preloadResolution = PreloadKeepAlivePolicy.ResolvePreloadKeepAlive(target, options.CurrentValue, fleetHardware);
+
             var effectiveVram = target.GetEffectiveMaxVramMB(fleetHardware);
             var hardwareProfile = effectiveVram.HasValue
                 ? (effectiveVram.Value > 1024 ? $"{Math.Round(effectiveVram.Value / 1024.0)} GB" : $"{effectiveVram.Value} MB")
@@ -90,7 +100,11 @@ public static partial class MonitorEndpointsExtensions
                 InFlightRequests: inFlight,
                 HardwareProfile: hardwareProfile,
                 ContextAllocation: FormatActualContext(activeModelEntry?.ContextLength),
-                Location: TargetLocationClassifier.ToWireValue(TargetLocationClassifier.Classify(target))));
+                Location: TargetLocationClassifier.ToWireValue(TargetLocationClassifier.Classify(target)),
+                ResidentModels: residentModels,
+                KeepAliveSeconds: preloadResolution.Seconds,
+                KeepAliveSource: preloadResolution.Source,
+                ActiveKeepAliveSeconds: activeModelEntry?.KeepAliveSeconds));
 
             periodByName[name] = statistics.Last7Days.GetValueOrDefault((RoutingTarget)name) ?? new ActivityStatisticsTotals(0, 0, 0);
         }
@@ -107,7 +121,11 @@ public static partial class MonitorEndpointsExtensions
             InFlightRequests: 0,
             HardwareProfile: null,
             ContextAllocation: "-",
-            Location: TargetLocationClassifier.ToWireValue(TargetLocation.Cloud)));
+            Location: TargetLocationClassifier.ToWireValue(TargetLocation.Cloud),
+            ResidentModels: [], // Cloud never hosts models (no policy, no observed keep-alive).
+            KeepAliveSeconds: null,
+            KeepAliveSource: null,
+            ActiveKeepAliveSeconds: null));
         periodByName[RoutingTarget.Cloud.Value] = statistics.Last7Days.GetValueOrDefault(RoutingTarget.Cloud) ?? new ActivityStatisticsTotals(0, 0, 0);
 
         var todayByName = new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase);

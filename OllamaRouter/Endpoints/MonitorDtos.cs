@@ -1,5 +1,6 @@
 using System.Text.Json.Serialization;
 using OllamaRouter.Services.Monitoring;
+using OllamaRouter.Serialization;
 
 namespace OllamaRouter.Endpoints;
 
@@ -67,6 +68,15 @@ public sealed record MonitorCostStatus(
 /// <c>1.0M</c>) — <c>-</c> when no model is loaded or the daemon does not report it; the
 /// Cloud row is always <c>-</c> — and the lowercase location classification ("local"/"remote"/
 /// "cloud"; Cloud always "cloud").
+/// <para>
+/// Task #45 (residency visibility) adds the CONFIGURED (router-owned) effective preload
+/// keep-alive policy (<c>keepAliveSeconds</c>, <c>-1</c> = indefinitely; omitted for Cloud), its
+/// source discriminator (<c>keepAliveSource</c>: explicit/class/default; omitted for Cloud), the
+/// FULL resident model list (<c>residentModels</c>, always serialized — <c>[]</c> when idle or
+/// for Cloud) and the best-effort daemon-observed keep-alive of the first resident model
+/// (<c>activeKeepAliveSeconds</c>; omitted when the daemon does not report it or no model is
+/// resident).
+/// </para>
 /// </summary>
 public sealed record MonitorFleetTargetItem(
     [property: JsonPropertyName("name")] string Name,
@@ -77,7 +87,25 @@ public sealed record MonitorFleetTargetItem(
     [property: JsonPropertyName("location")] string Location,
     [property: JsonPropertyName("url")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Url = null,
     [property: JsonPropertyName("activeModel")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? ActiveModel = null,
-    [property: JsonPropertyName("hardwareProfile")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? HardwareProfile = null);
+    [property: JsonPropertyName("hardwareProfile")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? HardwareProfile = null,
+    // Task #45 (residency visibility): the FULL resident model list per the in-memory tracker
+    // snapshot (tracker order); ALWAYS serialized as an array (empty array when idle, never
+    // null — the converter writes null as []; [] for Cloud). ActiveModel remains the FIRST
+    // loaded model (residentModels[0] == activeModel whenever non-empty).
+    [property: JsonPropertyName("residentModels")][property: JsonConverter(typeof(ResidentModelsJsonConverter))] IReadOnlyList<string>? ResidentModels = null,
+    // CONFIGURED (router-owned) effective preload keep-alive (seconds; -1 = indefinitely,
+    // serialized as the literal -1); null (→ omitted) for the Cloud pseudo-target, which has no
+    // OllamaTargetOptions and never hosts models. Resolved by the shared
+    // PreloadKeepAlivePolicy.ResolvePreloadKeepAlive (never drifts from the preload load path).
+    [property: JsonPropertyName("keepAliveSeconds")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? KeepAliveSeconds = null,
+    // Which rule produced KeepAliveSeconds: "explicit" (per-node KeepAliveSeconds override),
+    // "class" (cloud/server = -1, desktop = 900 convention) or "default" (router-level
+    // PreloadDefaultKeepAliveSeconds fallback); null (→ omitted) for Cloud.
+    [property: JsonPropertyName("keepAliveSource")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? KeepAliveSource = null,
+    // Best-effort daemon-observed keep_alive (seconds; -1 = indefinitely) of the FIRST resident
+    // model from the existing /api/ps refresh; null (→ omitted) when absent or no model is
+    // resident. Deliberately distinct from the configured KeepAliveSeconds above.
+    [property: JsonPropertyName("activeKeepAliveSeconds")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? ActiveKeepAliveSeconds = null);
 
 public sealed record MonitorStateResponse(
     [property: JsonPropertyName("cloudEnabled")] bool CloudEnabled,

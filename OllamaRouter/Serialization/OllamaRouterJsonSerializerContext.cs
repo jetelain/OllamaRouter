@@ -43,6 +43,7 @@ namespace OllamaRouter.Serialization;
 [JsonSerializable(typeof(RouterTargetItem))]
 [JsonSerializable(typeof(RouterTargetHardware))]
 [JsonSerializable(typeof(RouterTargetExecution))]
+[JsonSerializable(typeof(RouterTargetPreload))]
 [JsonSerializable(typeof(RouterModelSummary))]
 [JsonSerializable(typeof(RouterModelsResponse))]
 [JsonSerializable(typeof(RouterModelDetailResponse))]

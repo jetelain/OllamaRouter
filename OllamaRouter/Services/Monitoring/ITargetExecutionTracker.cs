@@ -16,7 +16,8 @@ using OllamaRouter.Services.Routing;
 /// <param name="SizeVramBytes">The <c>size_vram</c> field of the /api/ps entry (0 when missing/invalid).</param>
 /// <param name="ContextLength">The daemon-reported live context length (tokens) from the /api/ps <c>context_length</c> field (legacy <c>num_ctx</c> fallback when absent); null when the daemon does not report it or no longer does.</param>
 /// <param name="QuantizationLevel">Best-effort <c>details.quantization_level</c> from the /api/ps entry (the live-process quantization, authoritative for the resident model); null when absent or malformed.</param>
-public sealed record TargetLoadedModel(string Name, long SizeVramBytes, int? ContextLength = null, string? QuantizationLevel = null);
+/// <param name="KeepAliveSeconds">Best-effort daemon-observed <c>keep_alive</c> (in seconds) of this resident process as reported by /api/ps (<c>-1</c> = resident indefinitely); null when the daemon does not report it.</param>
+public sealed record TargetLoadedModel(string Name, long SizeVramBytes, int? ContextLength = null, string? QuantizationLevel = null, int? KeepAliveSeconds = null);
 
 /// <summary>
 /// Immutable per-target execution-state snapshot handed out by the

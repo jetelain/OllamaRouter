@@ -478,6 +478,150 @@ public class RouterApiEndpointsTests
     }
 
     [Fact]
+    public async Task RouterFleet_ResidencyVisibility_ExposesPreloadPolicy_ResidentModelsAndObservedKeepAlivePerNodeClass()
+    {
+        // Task #45 (acceptance 2): per configured target — preload.keepAliveSeconds == the
+        // GetEffectivePreloadKeepAliveSeconds value with keepAliveSource in {explicit,class,default}
+        // (asserted for desktop-class, server-class, an explicit-override and an unclassifiable
+        // node with a CUSTOM PreloadDefaultKeepAliveSeconds); execution.residentModels is the FULL
+        // tracker-snapshot list ([] when idle, residentModels[0] == activeModel when non-empty);
+        // execution.activeKeepAliveSeconds echoes the first resident model's OBSERVED daemon
+        // keep_alive (present → echoed incl. -1; absent → key omitted). Cloud row: preload
+        // absent, residentModels: [], activeKeepAliveSeconds absent.
+        var options = new OllamaRouterOptions
+        {
+            PreloadDefaultKeepAliveSeconds = 600, // CUSTOM router default (≠ 900) → "default" source must echo it
+            Targets =
+            [
+                new OllamaTargetOptions { Name = "Desktop", Url = "http://127.0.0.1:11435", MaxVramMB = 16384, MaxParallel = 1 },
+                new OllamaTargetOptions { Name = "Server", Url = "http://192.168.1.10:11434", MaxVramMB = 98304, MaxParallel = 4 },
+                new OllamaTargetOptions { Name = "Pinned", Url = "http://127.0.0.2:11435", MaxVramMB = 8192, MaxParallel = 1, KeepAliveSeconds = -1 },
+                new OllamaTargetOptions { Name = "Mystery", Url = "http://192.168.1.200:11434", MaxParallel = 1 } // no VRAM anywhere → unclassifiable
+            ],
+            CloudOverflow = { Enabled = true }
+        };
+
+        var now = DateTimeOffset.UtcNow;
+        await using var harness = await CreateTestAppAsync(
+            options,
+            livenessEntries: new Dictionary<RoutingTarget, TargetLivenessEntry>
+            {
+                [(RoutingTarget)"Desktop"] = Entry((RoutingTarget)"Desktop", TargetLivenessState.Online, 2),
+                [(RoutingTarget)"Server"] = Entry((RoutingTarget)"Server", TargetLivenessState.Online, 4),
+                [(RoutingTarget)"Pinned"] = Entry((RoutingTarget)"Pinned", TargetLivenessState.Online, 1),
+                [(RoutingTarget)"Mystery"] = Entry((RoutingTarget)"Mystery", TargetLivenessState.Offline)
+            },
+            executionStates: new Dictionary<RoutingTarget, TargetExecutionState>
+            {
+                [(RoutingTarget)"Desktop"] = new(
+                    (RoutingTarget)"Desktop",
+                    1,
+                    [
+                        new TargetLoadedModel("llama3:8b", 4_000_000_000, 4096, null, -1),
+                        new TargetLoadedModel("qwen:2b", 2_000_000_000, 8192, null, 300)
+                    ],
+                    6_000_000_000,
+                    now,
+                    false),
+                // Pinned: one resident model; the daemon reports a bounded keep_alive.
+                [(RoutingTarget)"Pinned"] = new(
+                    (RoutingTarget)"Pinned",
+                    0,
+                    [new TargetLoadedModel("phi3:mini", 2_500_000_000, 4096, null, 900)],
+                    2_500_000_000,
+                    now,
+                    false),
+                // Mystery: one resident model WITHOUT a daemon-reported keep_alive → activeKeepAliveSeconds omitted.
+                [(RoutingTarget)"Mystery"] = new(
+                    (RoutingTarget)"Mystery",
+                    0,
+                    [new TargetLoadedModel("mistral:7b", 4_500_000_000)],
+                    4_500_000_000,
+                    now,
+                    false)
+                // Server: NO execution state → idle (residentModels: []).
+            });
+
+        using var response = await harness.Client.GetAsync("/api/router/fleet");
+
+        Assert.Equal(System.Net.HttpStatusCode.OK, response.StatusCode);
+        var node = JsonNode.Parse(await response.Content.ReadAsStringAsync())!;
+
+        // Desktop: class convention (known VRAM below server threshold) → 900 / "class"; the FULL
+        // two-model resident list in tracker order, activeModel == residentModels[0], and the
+        // FIRST model's observed keep_alive (-1) echoed.
+        var desktop = TargetItem(node, "Desktop");
+        Assert.Equal(900, desktop["preload"]!["keepAliveSeconds"]!.GetValue<int>());
+        Assert.Equal("class", desktop["preload"]!["keepAliveSource"]!.ToString());
+        Assert.Equal(900, desktop["preload"]!["keepAliveSeconds"].GetValue<int>()); // equals GetEffectivePreloadKeepAliveSeconds
+        var desktopResident = desktop["execution"]!["residentModels"]!.AsArray().Select(n => n!.ToString()).ToArray();
+        Assert.Equal(["llama3:8b", "qwen:2b"], desktopResident);
+        Assert.Equal("llama3:8b", desktop["execution"]!["activeModel"]!.ToString());
+        Assert.Equal(desktopResident[0], desktop["execution"]!["activeModel"]!.ToString()); // residentModels[0] == activeModel
+        Assert.Equal(-1, desktop["execution"]!["activeKeepAliveSeconds"]!.GetValue<int>());
+        // Pre-existing shape stays: in-flight and the hardware section are untouched.
+        Assert.Equal("1", desktop["execution"]!["inFlightRequests"]!.ToString());
+        Assert.Equal("16384", desktop["hardware"]!["maxVramMB"]!.ToString());
+
+        // Server: server class (VRAM ≥ 32,768 MB) → -1 (the LITERAL -1, serialized, never omitted)
+        // / "class"; idle → residentModels: [] and no observed keep_alive.
+        var server = TargetItem(node, "Server");
+        Assert.Equal(-1, server["preload"]!["keepAliveSeconds"]!.GetValue<int>());
+        Assert.Equal("class", server["preload"]!["keepAliveSource"]!.ToString());
+        Assert.Empty(server["execution"]!["residentModels"]!.AsArray());
+        Assert.Null(server["execution"]!["activeModel"]);
+        Assert.Null(server["execution"]!["activeKeepAliveSeconds"]); // absent → key omitted
+
+        // Pinned: the explicit per-node override wins VERBATIM (-1 on a desktop-class node)
+        // → "explicit"; the observed value (900) is distinct from the configured policy (-1).
+        var pinned = TargetItem(node, "Pinned");
+        Assert.Equal(-1, pinned["preload"]!["keepAliveSeconds"]!.GetValue<int>());
+        Assert.Equal("explicit", pinned["preload"]!["keepAliveSource"]!.ToString());
+        Assert.Equal(["phi3:mini"], pinned["execution"]!["residentModels"]!.AsArray().Select(n => n!.ToString()).ToArray());
+        Assert.Equal(900, pinned["execution"]!["activeKeepAliveSeconds"]!.GetValue<int>());
+
+        // Mystery: unclassifiable (unknown VRAM, not cloud) → the CUSTOM router default 600
+        // / "default"; a resident model WITHOUT a daemon-reported keep_alive → key omitted.
+        var mystery = TargetItem(node, "Mystery");
+        Assert.Equal(600, mystery["preload"]!["keepAliveSeconds"]!.GetValue<int>());
+        Assert.Equal("default", mystery["preload"]!["keepAliveSource"]!.ToString());
+        Assert.Equal(["mistral:7b"], mystery["execution"]!["residentModels"]!.AsArray().Select(n => n!.ToString()).ToArray());
+        Assert.Null(mystery["execution"]!["activeKeepAliveSeconds"]); // daemon did not report it
+
+        // Cloud pseudo-target: NO policy (key absent), residentModels: [], no observed keep_alive.
+        var cloud = TargetItem(node, "Cloud");
+        Assert.Null(cloud["preload"]); // key absent, not null-valued
+        Assert.Empty(cloud["execution"]!["residentModels"]!.AsArray());
+        Assert.Null(cloud["execution"]!["activeKeepAliveSeconds"]);
+        Assert.Null(cloud["execution"]!["activeModel"]);
+    }
+
+    [Fact]
+    public async Task RouterFleet_ResidencyVisibility_SnapshotOnly_NoNewHttpClientSetupsRequired()
+    {
+        // Task #45 (acceptance 7): the new fields ride on the EXISTING in-memory tracker snapshot
+        // — with no execution tracker registered at all, the endpoint still 200s with
+        // residentModels: [] and no activeKeepAliveSeconds (no HTTP fan-out, no hang, no 5xx).
+        var options = ThreeTargetOptions();
+        await using var harness = await CreateTestAppAsync(options, registerTracker: false);
+
+        using var response = await harness.Client.GetAsync("/api/router/fleet");
+
+        Assert.Equal(System.Net.HttpStatusCode.OK, response.StatusCode);
+        var node = JsonNode.Parse(await response.Content.ReadAsStringAsync())!;
+        foreach (var targetNode in node["targets"]!.AsArray())
+        {
+            Assert.Empty(targetNode!["execution"]!["residentModels"]!.AsArray());
+            Assert.Null(targetNode["execution"]!["activeKeepAliveSeconds"]);
+        }
+        // Every configured (non-Cloud) target still carries its configured policy.
+        Assert.NotNull(TargetItem(node, "Local")["preload"]);
+        Assert.NotNull(TargetItem(node, "Server")["preload"]);
+        Assert.NotNull(TargetItem(node, "Laptop")["preload"]);
+        Assert.Null(TargetItem(node, "Cloud")["preload"]);
+    }
+
+    [Fact]
     public async Task RouterFleet_ExposesActiveSessionsPerTarget_WithinReservationWindow()
     {
         // Task #77: execution.activeSessions reports the sessions active on each target

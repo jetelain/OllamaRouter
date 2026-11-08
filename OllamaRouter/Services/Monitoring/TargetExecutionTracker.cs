@@ -371,8 +371,11 @@ public sealed class TargetExecutionTracker : ITargetExecutionTracker
     /// per-process context length in tokens that modern Ollama daemons report in /api/ps,
     /// honoring runtime <c>num_ctx</c>; missing/invalid/non-positive → null). A best-effort
     /// <c>num_ctx</c> read is kept ONLY as a legacy fallback for daemons that never emit
-    /// <c>context_length</c>, and <c>details.quantization_level</c> becomes the best-effort
-    /// <see cref="TargetLoadedModel.QuantizationLevel"/> only when present and a non-blank string.
+    /// <c>context_length</c>, <c>details.quantization_level</c> becomes the best-effort
+    /// <see cref="TargetLoadedModel.QuantizationLevel"/> only when present and a non-blank string,
+    /// and <c>keep_alive</c> becomes the best-effort observed
+    /// <see cref="TargetLoadedModel.KeepAliveSeconds"/> (any integer, including -1 = indefinitely,
+    /// is accepted as the daemon-reported value; missing/non-numeric → null).
     /// </summary>
     internal static List<TargetLoadedModel> ParseModels(JsonArray models)
     {
@@ -415,7 +418,16 @@ public sealed class TargetExecutionTracker : ITargetExecutionTracker
                 quantizationLevel = quantText;
             }
 
-            parsed.Add(new TargetLoadedModel(name, sizeVram, contextLength ?? legacyNumCtx, quantizationLevel));
+            // Best-effort daemon-observed keep_alive: any integer the daemon reports is accepted
+            // verbatim as the observed value (-1 = resident indefinitely); missing, non-numeric
+            // or null → null (never fabricated, never throws).
+            int? keepAliveSeconds = null;
+            if (obj["keep_alive"] is JsonValue keepAliveValue && keepAliveValue.TryGetValue(out int? observedKeepAlive))
+            {
+                keepAliveSeconds = observedKeepAlive;
+            }
+
+            parsed.Add(new TargetLoadedModel(name, sizeVram, contextLength ?? legacyNumCtx, quantizationLevel, keepAliveSeconds));
         }
 
         return parsed;

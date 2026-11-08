@@ -7,7 +7,6 @@
   body { font-family: Segoe UI, Arial, sans-serif; margin: 1.5rem; background: #1e1e1e; color: #ddd; }
   h1 { font-size: 1.3rem; }
   h2 { font-size: 1.05rem; color: #bbb; margin-top: 1.75rem; }
-  .fleet-table { width: 100%; margin-bottom: 0.5rem; }
   .lv-badge { display: inline-flex; align-items: center; gap: 6px; font-size: 0.85rem; }
   .lv-badge .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; }
   .lv-online .dot { background: #3ba55c; }
@@ -39,6 +38,8 @@
   .progress-seg-cloud { background-color: #c48bff; background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.22) 0 6px, transparent 6px 12px); }
   .progress-seg-neutral { background-color: #7a8aa0; background-image: repeating-linear-gradient(45deg, rgba(255,255,255,0.22) 0 6px, transparent 6px 12px); }
   .empty { color: #777; font-style: italic; padding: 0.5rem 0.75rem; }
+  .preload-legend { font-size: 0.75rem; color: #888; margin: 0 0 1rem; }
+  .fleet-table { width: 100%; margin-bottom: 0; }
   .stats-summary-row { display: flex; gap: 1rem; margin-top: 1rem; align-items: stretch; }
   .usage-ratio-container { flex: 2; min-width: 0; background: #262626; border-radius: 8px; padding: 0.85rem 1.1rem; border: 1px solid #333; display: flex; flex-direction: column; justify-content: space-between; }
   .progress-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.6rem; font-size: 0.85rem; color: #aaa; }
@@ -64,10 +65,12 @@
 <h1>OllamaRouter - Activity Monitor</h1>
 <table class="fleet-table" id="fleetTable">
   <thead>
-    <tr><th>Target</th><th>URL</th><th>HW</th><th>Liveness</th><th>Active Model</th><th>In-Flight</th><th>Context</th><th>Enabled</th></tr>
+    <tr><th>Target</th><th>URL</th><th>HW</th><th>Liveness</th><th>Active Model</th><th>Keep-Alive</th><th>In-Flight</th><th>Context</th><th>Enabled</th></tr>
   </thead>
   <tbody id="fleetRows"></tbody>
 </table>
+
+<div class="preload-legend">Preload policy: cloud/server = ∞ (forever) · desktop = 15m · unclassifiable = router default (PreloadDefaultKeepAliveSeconds)</div>
 
 <div class="reclaim-row">
   <button id="reclaimBtn" class="btn-reclaim" title="Unload all running models in local Ollama instance and disable local target (e.g. to play video games)">\uD83C\uDFAE Reclaim local VRAM</button>
@@ -204,6 +207,47 @@ function tokens(value) {
     return (value / 1000000).toFixed(1) + 'M';
   }
   return value >= 1000 ? (value / 1000).toFixed(1) + 'k' : String(value);
+}
+
+// Task #45 (residency visibility): compact rendering of the CONFIGURED preload keep-alive
+// policy (keepAliveSeconds): null (Cloud / no policy) → '-'; -1 → '∞' (resident forever);
+// positive → compact seconds/minutes/hours (rounded, 900 → '15m').
+function formatKeepAlive(seconds) {
+  if (seconds == null) {
+    return '-';
+  }
+  if (seconds === -1) {
+    return '∞';
+  }
+  if (seconds < 60) {
+    return seconds + 's';
+  }
+  if (seconds < 3600) {
+    return Math.round(seconds / 60) + 'm';
+  }
+  return Math.round(seconds / 3600) + 'h';
+}
+
+// Task #45: tooltip for the Keep-Alive cell: which rule produced the policy
+// (explicit override / class convention / router default) plus, for a positive value,
+// the human retention. Cloud (no policy) → no tooltip.
+function keepAliveTooltip(t) {
+  if (t.keepAliveSeconds == null) {
+    return '';
+  }
+  let sourceText;
+  if (t.keepAliveSource === 'explicit') {
+    sourceText = 'explicit override (KeepAliveSeconds)';
+  } else if (t.keepAliveSource === 'class') {
+    sourceText = 'class convention (cloud/server=-1, desktop=15m)';
+  } else {
+    sourceText = 'router default (PreloadDefaultKeepAliveSeconds)';
+  }
+  var text = 'keep-alive: ' + sourceText;
+  if (typeof t.keepAliveSeconds === 'number' && t.keepAliveSeconds > 0) {
+    text += ' (retained ' + formatKeepAlive(t.keepAliveSeconds) + ')';
+  }
+  return text;
 }
 
 function renderStatistics(tbodyId, today, last7Days) {
@@ -429,7 +473,25 @@ function renderFleet(fleet) {
     livenessCell.appendChild(livenessBadge(t.liveness, t.enabled));
     tr.appendChild(livenessCell);
 
-    tr.appendChild(td(t.activeModel || '-'));
+    // Active Model: the FIRST loaded model; with >1 resident model the cell shows
+    // 'activeModel+N' and the full comma-separated resident list in the tooltip.
+    const modelCell = document.createElement('td');
+    const resident = Array.isArray(t.residentModels) ? t.residentModels : [];
+    modelCell.textContent = (t.activeModel || '-') + (resident.length > 1 ? '+' + (resident.length - 1) : '');
+    if (resident.length > 1) {
+      modelCell.title = resident.join(', ');
+    }
+    tr.appendChild(modelCell);
+
+    // Keep-Alive: the CONFIGURED router-owned policy (∞ = -1 forever; Cloud → '-').
+    const keepAliveCell = document.createElement('td');
+    keepAliveCell.textContent = formatKeepAlive(t.keepAliveSeconds);
+    const keepAliveTitle = keepAliveTooltip(t);
+    if (keepAliveTitle) {
+      keepAliveCell.title = keepAliveTitle;
+    }
+    tr.appendChild(keepAliveCell);
+
     tr.appendChild(td(String(t.inFlightRequests), 'num'));
     tr.appendChild(td(t.contextAllocation || '-'));
 

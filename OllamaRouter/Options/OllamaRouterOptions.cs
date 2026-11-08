@@ -657,26 +657,16 @@ public sealed class OllamaTargetOptions
     /// <see cref="OllamaRouterOptions.PreloadDefaultKeepAliveSeconds"/> of
     /// <paramref name="routerOptions"/>. Fail-safe: never throws (invalid explicit values
     /// normalized away by <see cref="OllamaRouterOptions.Normalize"/> fall through to the
-    /// convention).
+    /// convention). Delegates to
+    /// <see cref="Services.Preload.PreloadKeepAlivePolicy.ResolvePreloadKeepAlive(OllamaTargetOptions, OllamaRouterOptions, Hardware.IFleetHardwareService?)"/>
+    /// (the shared single source of truth also serialized by the fleet/monitor residency-
+    /// visibility surfaces) so the int and the <c>keepAliveSource</c> discriminator can never
+    /// drift.
     /// </summary>
     public int GetEffectivePreloadKeepAliveSeconds(
         OllamaRouterOptions routerOptions,
-        Services.Hardware.IFleetHardwareService? fleetHardware = null)
-    {
-        if (KeepAliveSeconds is { } explicitKeepAlive && (explicitKeepAlive == -1 || explicitKeepAlive > 0))
-        {
-            return explicitKeepAlive;
-        }
-
-        var nodeClass = Services.Preload.PreloadKeepAlivePolicy.GetPreloadNodeClass(this, GetEffectiveMaxVramMB(fleetHardware));
-        return nodeClass switch
-        {
-            Services.Preload.PreloadNodeClass.Cloud => Services.Preload.PreloadKeepAlivePolicy.CloudAndServerKeepAliveSeconds,
-            Services.Preload.PreloadNodeClass.Server => Services.Preload.PreloadKeepAlivePolicy.CloudAndServerKeepAliveSeconds,
-            Services.Preload.PreloadNodeClass.Desktop => Services.Preload.PreloadKeepAlivePolicy.DesktopClassKeepAliveSeconds,
-            _ => routerOptions.PreloadDefaultKeepAliveSeconds
-        };
-    }
+        Services.Hardware.IFleetHardwareService? fleetHardware = null) =>
+        Services.Preload.PreloadKeepAlivePolicy.ResolvePreloadKeepAlive(this, routerOptions, fleetHardware).Seconds;
 
     /// <summary>
     /// Resolves the base URL of the OllamaRouter instance running on this target node.

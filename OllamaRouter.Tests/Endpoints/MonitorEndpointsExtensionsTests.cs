@@ -524,6 +524,146 @@ public class MonitorEndpointsExtensionsTests
         }
     }
 
+    [Fact]
+    public async Task GetMonitorApi_ResidencyVisibility_ExposesPolicy_ResidentModelsAndObservedKeepAlive()
+    {
+        // Task #45 (acceptance 3): monitor fleet rows carry keepAliveSeconds + keepAliveSource
+        // + residentModels + activeKeepAliveSeconds with the same values/omission rules as the
+        // fleet API (Cloud: policy fields absent, residentModels: []), source-serialized
+        // through OllamaRouterJsonSerializerContext (the test app injects it).
+        var options = new OllamaRouterOptions
+        {
+            PreloadDefaultKeepAliveSeconds = 450, // CUSTOM router default → "default" source echoes it
+            Targets =
+            [
+                new OllamaTargetOptions { Name = "Desktop", Url = "http://127.0.0.1:11435", MaxVramMB = 16384 },
+                new OllamaTargetOptions { Name = "Server", Url = "http://192.168.1.10:11434", MaxVramMB = 98304 },
+                new OllamaTargetOptions { Name = "Pinned", Url = "http://127.0.0.2:11435", MaxVramMB = 8192, KeepAliveSeconds = -1 },
+                new OllamaTargetOptions { Name = "Mystery", Url = "http://192.168.1.200:11434" } // unclassifiable
+            ]
+        };
+
+        var tracker = new Mock<ITargetExecutionTracker>();
+        var now = DateTimeOffset.UtcNow;
+        tracker.Setup(t => t.GetState(It.IsAny<RoutingTarget>())).Returns<RoutingTarget>(target => target.Value switch
+        {
+            "Desktop" => new TargetExecutionState(
+                (RoutingTarget)"Desktop", 1,
+                [
+                    new TargetLoadedModel("llama3:8b", 4_000_000_000, 4096, null, -1),
+                    new TargetLoadedModel("qwen:2b", 2_000_000_000, 8192, null, 300)
+                ],
+                6_000_000_000, now, false),
+            "Pinned" => new TargetExecutionState(
+                (RoutingTarget)"Pinned", 0,
+                [new TargetLoadedModel("phi3:mini", 2_500_000_000, 4096, null, 900)],
+                2_500_000_000, now, false),
+            "Mystery" => new TargetExecutionState(
+                (RoutingTarget)"Mystery", 0,
+                [new TargetLoadedModel("mistral:7b", 4_500_000_000)], // no daemon-reported keep_alive
+                4_500_000_000, now, false),
+            _ => null // Server: idle
+        });
+
+        var (app, client, _) = await CreateTestAppAsync(options: options, executionTracker: tracker.Object);
+        try
+        {
+            var response = await client.GetAsync("/monitor/api");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var json = await response.Content.ReadFromJsonAsync<JsonObject>();
+            var fleet = json!["fleet"]!.AsArray();
+            var rowByName = fleet.ToDictionary(r => r!["name"]!.GetValue<string>(), r => r!);
+
+            // Desktop: class convention 900 / "class"; FULL two-model resident list; the FIRST
+            // model's observed keep_alive (-1) echoed.
+            var desktop = rowByName["Desktop"];
+            Assert.Equal(900, desktop["keepAliveSeconds"]!.GetValue<int>());
+            Assert.Equal("class", desktop["keepAliveSource"]!.GetValue<string>());
+            Assert.Equal(["llama3:8b", "qwen:2b"], desktop["residentModels"]!.AsArray().Select(n => n!.GetValue<string>()).ToArray());
+            Assert.Equal("llama3:8b", desktop["activeModel"]!.GetValue<string>()); // residentModels[0] == activeModel
+            Assert.Equal(-1, desktop["activeKeepAliveSeconds"]!.GetValue<int>());
+
+            // Server: server class → the literal -1 (never omitted) / "class"; idle → [].
+            var server = rowByName["Server"];
+            Assert.Equal(-1, server["keepAliveSeconds"]!.GetValue<int>());
+            Assert.Equal("class", server["keepAliveSource"]!.GetValue<string>());
+            Assert.Empty(server["residentModels"]!.AsArray());
+            Assert.Null(server["activeKeepAliveSeconds"]); // no resident model
+
+            // Pinned: explicit override wins verbatim → "explicit"; observed (900) ≠ configured (-1).
+            var pinned = rowByName["Pinned"];
+            Assert.Equal(-1, pinned["keepAliveSeconds"]!.GetValue<int>());
+            Assert.Equal("explicit", pinned["keepAliveSource"]!.GetValue<string>());
+            Assert.Equal(["phi3:mini"], pinned["residentModels"]!.AsArray().Select(n => n!.GetValue<string>()).ToArray());
+            Assert.Equal(900, pinned["activeKeepAliveSeconds"]!.GetValue<int>());
+
+            // Mystery: unclassifiable → CUSTOM router default 450 / "default"; no daemon
+            // keep_alive reported → key omitted.
+            var mystery = rowByName["Mystery"];
+            Assert.Equal(450, mystery["keepAliveSeconds"]!.GetValue<int>());
+            Assert.Equal("default", mystery["keepAliveSource"]!.GetValue<string>());
+            Assert.Equal(["mistral:7b"], mystery["residentModels"]!.AsArray().Select(n => n!.GetValue<string>()).ToArray());
+            Assert.Null(mystery["activeKeepAliveSeconds"]);
+
+            // Cloud: policy fields ABSENT (keys omitted), residentModels: [].
+            var cloud = rowByName["Cloud"];
+            Assert.Null(cloud["keepAliveSeconds"]);
+            Assert.Null(cloud["keepAliveSource"]);
+            Assert.Null(cloud["activeKeepAliveSeconds"]);
+            Assert.NotNull(cloud["residentModels"]); // ALWAYS serialized (even for Cloud)
+            Assert.Empty(cloud["residentModels"]!.AsArray());
+
+            // Existing monitor fields stay: in-flight and context allocation untouched.
+            Assert.Equal(1, desktop["inFlightRequests"]?.GetValue<int>());
+            Assert.Equal("4k", desktop["contextAllocation"]?.GetValue<string>());
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task GetMonitorApi_ResidencyVisibility_NoTracker_ResidentModelsIsEmptyArray_AndPolicyStillResolved()
+    {
+        // Task #45: with NO execution tracker registered the rows still serialize residentModels
+        // as an empty ARRAY (never null, never omitted) and the configured policy is still
+        // resolved (snapshot-only enrichment, never a 5xx / hang).
+        var options = new OllamaRouterOptions
+        {
+            Targets = [new OllamaTargetOptions { Name = "Local", Url = "http://127.0.0.1:11435", MaxVramMB = 16384 }]
+        };
+
+        var (app, client, _) = await CreateTestAppAsync(options: options);
+        try
+        {
+            var response = await client.GetAsync("/monitor/api");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var json = await response.Content.ReadFromJsonAsync<JsonObject>();
+            var fleet = json!["fleet"]!.AsArray();
+
+            var local = fleet[0]!;
+            Assert.NotNull(local["residentModels"]);
+            Assert.Empty(local["residentModels"]!.AsArray());
+            Assert.Equal(900, local["keepAliveSeconds"]!.GetValue<int>());
+            Assert.Equal("class", local["keepAliveSource"]!.GetValue<string>());
+            Assert.Null(local["activeKeepAliveSeconds"]);
+
+            var cloud = fleet[1]!;
+            Assert.Empty(cloud["residentModels"]!.AsArray());
+            Assert.Null(cloud["keepAliveSeconds"]);
+            Assert.Null(cloud["keepAliveSource"]);
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
     [Theory]
     [InlineData(4096, "4k")]
     [InlineData(8192, "8k")]
@@ -822,6 +962,19 @@ public class MonitorEndpointsExtensionsTests
             // The fleet-row span must derive its color class from the location lookup, not the raw name.
             Assert.Contains("span.className = 'target-' + targetColorClass(target);", html);
             Assert.DoesNotContain("const targetIcons", html);
+
+            // Task #45 (residency visibility): the fleet table gains a Keep-Alive column
+            // (after Active Model), the compact formatKeepAlive helper (∞ for -1, 15m for 900),
+            // the +N multi-resident display with the comma-separated tooltip list, and the
+            // static preload-policy legend line below the fleet table.
+            Assert.Contains("<th>Active Model</th><th>Keep-Alive</th><th>In-Flight</th>", html);
+            Assert.Contains("formatKeepAlive", html);
+            Assert.Contains("keepAliveSeconds", html);
+            Assert.Contains("keepAliveSource", html);
+            Assert.Contains("t.residentModels", html);
+            Assert.Contains("preload-legend", html);
+            Assert.Contains("Preload policy: cloud/server = ∞ (forever) · desktop = 15m · unclassifiable = router default (PreloadDefaultKeepAliveSeconds)", html);
+            Assert.Contains("return '∞';", html); // -1 (forever) renders ∞
         }
         finally
         {

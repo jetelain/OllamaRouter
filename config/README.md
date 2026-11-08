@@ -32,6 +32,10 @@ Standard .NET configuration keys for the `OllamaRouter` section — the same JSO
 }
 ```
 
+## Preload keep-alive visibility
+
+Both preload-keep-alive settings are surfaced live by the monitoring surfaces (task #45): `GET /api/router/fleet` reports the resolved policy per node as `preload.keepAliveSeconds` + `preload.keepAliveSource` (`"explicit"` for a per-node `KeepAliveSeconds`, `"class"` for the server/cloud = -1 / desktop = 900 convention, `"default"` for the `PreloadDefaultKeepAliveSeconds` fallback), and the web monitor / TUI render it in the Keep-Alive column (∞ for `-1`, `15m` for 900). The full resident model list per node (`residentModels`) and the daemon-observed `keep_alive` of the first resident model (`activeKeepAliveSeconds`) ride the same rows.
+
 ## Override precedence
 
 Values later in the chain win:
