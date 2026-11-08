@@ -140,6 +140,9 @@ public sealed class ModelPreloadService : IModelPreloadService
         if (executeLoad)
         {
             var started = Environment.TickCount64;
+            // The bounded load call rides the dedicated "PreloadLoad" client (timeout =
+            // OllamaRouterOptions.PreloadLoadTimeoutSeconds, default 20 s, LIVE); a load that
+            // misses the bound fails soft into outcome.Error below.
             var outcome = await _catalogClient.PreloadModelAsync(selected.Url, resolvedName, appliedKeepAlive, appliedNumCtx, cancellationToken).ConfigureAwait(false);
             durationMs = Environment.TickCount64 - started;
             loadAccepted = outcome.Accepted;
@@ -148,9 +151,9 @@ public sealed class ModelPreloadService : IModelPreloadService
                 _logger.LogWarning("Preload load call to '{Target}' for '{Model}' not accepted: {Error}", selected.Name, resolvedName, outcome.Error);
             }
 
-            // Bounded, best-effort residency confirmation (the same 4 s client bound; fail-soft
-            // list → false). A failed confirmation reports false but never fails the request —
-            // the load call itself is the contract.
+            // Bounded, best-effort residency confirmation (the 4 s catalog client bound; fail-
+            // soft list → false). A failed confirmation reports false but never fails the
+            // request — the load call itself is the contract.
             var running = await _catalogClient.GetRunningModelNamesAsync(selected.Url, cancellationToken).ConfigureAwait(false);
             var normalized = RoutingDecisionService.NormalizeModelName(resolvedName);
             residencyConfirmed = running.Any(name =>

@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text;
+using Microsoft.Extensions.DependencyInjection;
 using Moq;
 using OllamaRouter.Services.Catalog;
 
@@ -527,5 +528,112 @@ public class OllamaModelCatalogClientTests
             cancellationToken.Register(() => tcs.TrySetCanceled(cancellationToken));
             return tcs.Task;
         }
+    }
+
+    // ------------------------------------------------------------------
+    //  Preload load client wiring (task #75): ONLY PreloadModelAsync rides the dedicated
+    //  "PreloadLoad" client; every other catalog call keeps the injected 4 s catalog client.
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// A handler that delays every response by <paramref name="delay"/> (a simulated slow
+    /// daemon, e.g. a large-model cold load) before handing to <paramref name="respond"/>; the
+    /// delay is cancellation-aware so a client timeout surfaces as a cancellation exactly like
+    /// a real stalled peer.
+    /// </summary>
+    private sealed class DelayingHttpMessageHandler(TimeSpan delay, Func<HttpRequestMessage, HttpResponseMessage> respond) : HttpMessageHandler
+    {
+        public HttpRequestMessage? LastRequest { get; private set; }
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            LastRequest = request;
+            await Task.Delay(delay, cancellationToken);
+            return respond(request);
+        }
+    }
+
+    private static IHttpClientFactory BuildPreloadLoadFactory(TimeSpan timeout, HttpMessageHandler preloadHandler)
+    {
+        var services = new ServiceCollection();
+        services.AddHttpClient(OllamaModelCatalogClient.PreloadLoadClientName, client =>
+        {
+            client.Timeout = timeout;
+        })
+        .ConfigurePrimaryHttpMessageHandler(() => preloadHandler);
+        return services.BuildServiceProvider().GetRequiredService<IHttpClientFactory>();
+    }
+
+    [Fact]
+    public async Task PreloadModelAsync_WithoutPreloadClientFactory_FallsBackToInjectedCatalogClient()
+    {
+        var (sut, handler) = CreateSut(_ => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("{}", Encoding.UTF8, "application/json") });
+
+        var outcome = await sut.PreloadModelAsync("http://127.0.0.1:11435", "llama3:8b", 900, 8192);
+
+        Assert.True(outcome.Accepted);
+        Assert.Equal("http://127.0.0.1:11435/api/generate", handler.LastRequest?.RequestUri?.ToString());
+    }
+
+    [Fact]
+    public async Task PreloadModelAsync_SlowLoadPastOldFourSecondBound_IsAcceptedByTwentySecondPreloadClient()
+    {
+        // AC2: the simulated daemon answers after ~4.5 s — comfortably past the OLD 4 s catalog
+        // client bound. The DI-built "PreloadLoad" client carries the configured 20 s timeout,
+        // so the load must SUCCEED, while the injected catalog client observes ZERO requests
+        // (it is no longer used for loads).
+        var catalogHandler = new FakeHttpMessageHandler(_ => throw new InvalidOperationException("the 4 s catalog client must not be used for the preload load call"));
+        var preloadHandler = new DelayingHttpMessageHandler(TimeSpan.FromMilliseconds(4500), _ => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("{}", Encoding.UTF8, "application/json") });
+        var factory = BuildPreloadLoadFactory(TimeSpan.FromSeconds(20), preloadHandler);
+        var sut = new OllamaModelCatalogClient(new HttpClient(catalogHandler), factory);
+
+        var started = Environment.TickCount64;
+        var outcome = await sut.PreloadModelAsync("http://127.0.0.1:11435", "big-model:latest", -1, 262144);
+        var elapsedMs = Environment.TickCount64 - started;
+
+        Assert.True(outcome.Accepted);
+        Assert.Null(outcome.Error);
+        Assert.InRange(elapsedMs, 4000, 20_000); // the ~4.5 s slow load completed (the old 4 s bound would have canceled it)
+        Assert.Null(catalogHandler.LastRequest); // the catalog client was never touched for the load
+        Assert.Equal("http://127.0.0.1:11435/api/generate", preloadHandler.LastRequest?.RequestUri?.ToString());
+    }
+
+    [Fact]
+    public async Task PreloadModelAsync_LoadSlowerThanPreloadBound_FailSoftCancellationWithoutThrow()
+    {
+        // AC4: the "PreloadLoad" client is bounded to 1 s while the simulated load takes ~5 s —
+        // the call must complete in ~1 s (NOT the old 4 s catalog bound) with a fail-soft
+        // PreloadOutcome(accepted: false, cancellation message), never throwing.
+        var factory = BuildPreloadLoadFactory(TimeSpan.FromSeconds(1),
+            new DelayingHttpMessageHandler(TimeSpan.FromSeconds(5), _ => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("{}", Encoding.UTF8, "application/json") }));
+        var sut = new OllamaModelCatalogClient(
+            new HttpClient(new FakeHttpMessageHandler(_ => throw new InvalidOperationException("must not be called"))),
+            factory);
+
+        var started = Environment.TickCount64;
+        var outcome = await sut.PreloadModelAsync("http://127.0.0.1:11435", "big-model:latest", -1, 262144);
+        var elapsedMs = Environment.TickCount64 - started;
+
+        Assert.False(outcome.Accepted);
+        Assert.NotNull(outcome.Error);
+        Assert.Contains("canceled", outcome.Error, StringComparison.OrdinalIgnoreCase);
+        Assert.InRange(elapsedMs, 0, 4000); // bounded by the 1 s preload client timeout
+    }
+
+    [Fact]
+    public async Task NonLoadCatalogCalls_StillRideTheInjectedCatalogClient_NotThePreloadClient()
+    {
+        // AC3: the /api/ps residency call (and every other non-load call) keeps the injected
+        // catalog client; the dedicated "PreloadLoad" client sees no requests.
+        var preloadHandler = new FakeHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("{}", Encoding.UTF8, "application/json") });
+        var factory = BuildPreloadLoadFactory(TimeSpan.FromSeconds(20), preloadHandler);
+        var catalogHandler = new FakeHttpMessageHandler(_ => JsonResponse("""{ "models": [ { "name": "llama3:8b" } ] }"""));
+        var sut = new OllamaModelCatalogClient(new HttpClient(catalogHandler), factory);
+
+        var running = await sut.GetRunningModelNamesAsync("http://127.0.0.1:11435");
+
+        Assert.Equal(["llama3:8b"], running);
+        Assert.Equal("http://127.0.0.1:11435/api/ps", catalogHandler.LastRequest?.RequestUri?.ToString());
+        Assert.Null(preloadHandler.LastRequest);
     }
 }

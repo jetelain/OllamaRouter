@@ -147,4 +147,38 @@ public class MeshPreloadScenarios
             }
         }
     }
+
+    [Fact]
+    public async Task Preload_SlowGeneratePastOldFourSecondBound_IsAcceptedUnderDefaultTwentySecondLoadBound()
+    {
+        // AC2 E2E (task #75): the fake daemon answers POST /api/generate after ~5 s (a
+        // large-model cold-load simulation) — comfortably past the OLD 4 s catalog client bound,
+        // well inside the default PreloadLoadTimeoutSeconds (20 s). With default options the
+        // preload must 200 with loadAccepted=true (under the old 4 s bound it would have been
+        // accepted=false + the HttpClient.Timeout cancellation message) and the residency check
+        // (still on the 4 s catalog client) must confirm the model.
+        var server = new FakeOllamaDaemon("server", [SmallDense("preload-slow:latest", 270_000)], capacity: 2) { MaxVramMB = 98_304 };
+        await server.StartAsync();
+        await using var serverD = server;
+        await using var router = await MeshRouter.StartAsync("R-preload-slow", [server], cloudEnabled: false);
+
+        Assert.True(await MeshTestHelpers.WaitAllOnlineAsync(router, TimeSpan.FromSeconds(10)),
+            "all daemons must come Online before preload is exercised");
+
+        server.SetGenerateDelay(TimeSpan.FromSeconds(5));
+
+        var started = Environment.TickCount64;
+        using var response = await router.Client.PostAsync(
+            "/api/router/models/preload-slow:latest/preload?contextIntentTokens=260000", content: null);
+        var elapsedMs = Environment.TickCount64 - started;
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = ReadJson(response).AsObject()!;
+        Assert.Equal("server", body["selectedTarget"]!.GetValue<string>());
+        Assert.True((bool)body["loadAccepted"]!); // would be false under the old 4 s bound
+        Assert.True((bool)body["residencyConfirmed"]!); // the /api/ps check keeps the 4 s client bound
+        Assert.InRange(elapsedMs, 4500, 30_000); // the ~5 s slow load completed (not canceled at 4 s)
+
+        server.ResetBehavior();
+    }
 }

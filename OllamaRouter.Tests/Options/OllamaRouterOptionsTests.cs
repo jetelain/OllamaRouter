@@ -327,6 +327,81 @@ public class OllamaRouterOptionsTests
     }
 
     // ------------------------------------------------------------------
+    //  Preload load-call timeout (task #75)
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public void PreloadLoadTimeoutSeconds_DefaultsTo20()
+    {
+        var options = new OllamaRouterOptions();
+
+        Assert.Equal(20, options.PreloadLoadTimeoutSeconds);
+        Assert.Equal(20, OllamaRouterOptions.DefaultPreloadLoadTimeoutSeconds);
+    }
+
+    [Fact]
+    public void Normalize_PreloadLoadTimeoutSeconds_NonPositiveValuesNormalizeToDefault_PositiveValuesKept()
+    {
+        var zero = new OllamaRouterOptions { PreloadLoadTimeoutSeconds = 0 };
+        zero.Normalize();
+        Assert.Equal(20, zero.PreloadLoadTimeoutSeconds);
+
+        var negative = new OllamaRouterOptions { PreloadLoadTimeoutSeconds = -5 };
+        negative.Normalize();
+        Assert.Equal(20, negative.PreloadLoadTimeoutSeconds);
+
+        var raised = new OllamaRouterOptions { PreloadLoadTimeoutSeconds = 60 };
+        raised.Normalize();
+        Assert.Equal(60, raised.PreloadLoadTimeoutSeconds); // AC5: raising it takes effect without code changes
+    }
+
+    [Fact]
+    public void PreloadLoadTimeoutSeconds_BindsFromConfigJsonFile()
+    {
+        // The real config.json layer (AddJsonFile, the user-owned config/config.json shape):
+        // the new top-level key binds like every other top-level option.
+        var configDir = Path.Combine(Path.GetTempPath(), $"ollamarouter-cfg-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(configDir);
+        try
+        {
+            File.WriteAllText(Path.Combine(configDir, "config.json"),
+                """{ "OllamaRouter": { "PreloadLoadTimeoutSeconds": 42 } }""");
+
+            var configuration = new ConfigurationBuilder()
+                .SetBasePath(configDir)
+                .AddJsonFile("config.json", optional: false, reloadOnChange: false)
+                .Build();
+
+            var options = configuration.GetSection(OllamaRouterOptions.SectionName).Get<OllamaRouterOptions>();
+
+            Assert.NotNull(options);
+            Assert.Equal(42, options!.PreloadLoadTimeoutSeconds);
+        }
+        finally
+        {
+            try { Directory.Delete(configDir, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+        }
+    }
+
+    [Fact]
+    public void AddOllamaRouter_ConfigOverload_BindsPreloadLoadTimeoutSeconds_NormalizesNonPositiveOnBind()
+    {
+        var services = new Microsoft.Extensions.DependencyInjection.ServiceCollection();
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["OllamaRouter:PreloadLoadTimeoutSeconds"] = "0"
+        }).Build();
+
+        OllamaRouter.Extensions.OllamaRouterServiceCollectionExtensions.AddOllamaRouter(
+            services, configuration, stateDirectory: null, enableTui: false);
+
+        using var provider = services.BuildServiceProvider();
+        var value = provider.GetRequiredService<Microsoft.Extensions.Options.IOptionsMonitor<OllamaRouterOptions>>().CurrentValue;
+
+        Assert.Equal(20, value.PreloadLoadTimeoutSeconds); // normalizer clamp on bind
+    }
+
+    // ------------------------------------------------------------------
     //  Preload keep-alive resolver + normalization (task #44)
     // ------------------------------------------------------------------
 

@@ -101,6 +101,7 @@ public sealed class FakeOllamaDaemon : IAsyncDisposable
     private volatile int _chatModeArg;
     private volatile int _livenessDelayMs;
     private volatile int _chatStreamDelayMs;
+    private volatile int _generateDelayMs;
     private volatile int _abortCount;
 
     /// <summary>Diagnostic: number of times the chat handler took an abort path (AbortBeforeCommit / StreamNThenAbort).</summary>
@@ -155,12 +156,16 @@ public sealed class FakeOllamaDaemon : IAsyncDisposable
     /// <summary>Applies a delay before the chat response body is written (holds the request in flight on the router).</summary>
     public void SetChatStreamDelay(TimeSpan delay) => _chatStreamDelayMs = (int)delay.TotalMilliseconds;
 
+    /// <summary>Applies a delay to the <c>POST /api/generate</c> preload load response (simulates a slow large-model cold load against the preload load-client timeout).</summary>
+    public void SetGenerateDelay(TimeSpan delay) => _generateDelayMs = (int)delay.TotalMilliseconds;
+
     public void ResetBehavior()
     {
         _chatMode = ChatMode.Ok;
         _chatModeArg = 0;
         _livenessDelayMs = 0;
         _chatStreamDelayMs = 0;
+        _generateDelayMs = 0;
         _abortCount = 0;
         lock (_loadedLock)
         {
@@ -330,6 +335,19 @@ public sealed class FakeOllamaDaemon : IAsyncDisposable
         // body's keep_alive + options.num_ctx are recorded for the observation surface below.
         app.MapPost("/api/generate", async context =>
         {
+            var delay = _generateDelayMs;
+            if (delay > 0)
+            {
+                try
+                {
+                    await Task.Delay(delay, context.RequestAborted);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+            }
+
             var model = ReadModel(context.Request);
             if (model is not null)
             {

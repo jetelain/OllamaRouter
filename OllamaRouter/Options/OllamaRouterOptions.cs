@@ -14,7 +14,7 @@ namespace OllamaRouter.Options;
 /// <c>ContextFitMarginTokens</c>, <c>DispatchToLargestCapacityOnOverflow</c>,
 /// <c>FilterNamespacedModels</c>, <c>TokenEstimationOverheadFactor</c>, <c>Models:{model}.*</c>
 /// thresholds, <c>CloudOverflow.*</c>, <c>Recording.*</c> (incl. <c>TokenMetricsCsv</c>),
-/// <c>Aggregation.PerTargetTimeoutMs</c>, <c>DynamicContext.*</c>,
+/// <c>Aggregation.PerTargetTimeoutMs</c>, <c>PreloadLoadTimeoutSeconds</c>, <c>DynamicContext.*</c>,
 /// <c>TerminalMonitoring.RefreshIntervalSeconds</c>, <c>ApiSecurity.*</c>, <c>Pricing.*</c> and per-EXISTING-target
 /// attributes (<c>Enabled</c>, <c>MaxParallel</c>, <c>MaxVramMB</c>, <c>SpeedFactor</c>,
 /// <c>Location</c>).
@@ -45,6 +45,11 @@ namespace OllamaRouter.Options;
 public sealed class OllamaRouterOptions
 {
     public const string SectionName = "OllamaRouter";
+
+    /// <summary>
+    /// The <see cref="PreloadLoadTimeoutSeconds"/> default (20 s).
+    /// </summary>
+    public const int DefaultPreloadLoadTimeoutSeconds = 20;
 
     /// <summary>
     /// Per-model routing thresholds, keyed by model name (e.g. "llama3", "qwen3:8b").
@@ -129,6 +134,23 @@ public sealed class OllamaRouterOptions
     /// Ollama default" policy) and positive values are kept as-is.
     /// </summary>
     public int PreloadDefaultKeepAliveSeconds { get; set; } = 900;
+
+    /// <summary>
+    /// Timeout (in seconds) that bounds ONLY the preload load call (<c>POST /api/generate</c>,
+    /// <c>stream=false</c>, empty prompt) of the model preload endpoints
+    /// (<c>POST /api/router/models/{*modelName}/preload</c>): a cold load of a large model (e.g.
+    /// a 27B model with a large <c>num_ctx</c> and <c>keep_alive -1</c>) regularly exceeds the
+    /// 4 s bound of the shared catalog client, so the load call rides a dedicated HttpClient
+    /// whose timeout is this value. Every OTHER catalog call (tags/show/ps, catalog seeding on
+    /// target add) keeps the 4 s catalog client bound, so a stalled peer daemon never slows
+    /// routing or catalog fan-out. LIVE: the dedicated client reads this value from
+    /// <c>IOptionsMonitor&lt;OllamaRouterOptions&gt;</c> at each load call, so a
+    /// <c>config/config.json</c> change applies to the NEXT load call without a restart.
+    /// Defaults to <see cref="DefaultPreloadLoadTimeoutSeconds"/> (20 s); values &lt;= 0 are
+    /// normalized to the default by <see cref="Normalize"/>. A load that still misses the bound
+    /// is reported as not accepted (fail-soft, <c>accepted=false</c>), never a 5xx.
+    /// </summary>
+    public int PreloadLoadTimeoutSeconds { get; set; } = DefaultPreloadLoadTimeoutSeconds;
 
     /// <summary>
     /// When true and all enabled fleet targets fail Stage-1 context qualification,
@@ -338,6 +360,13 @@ public sealed class OllamaRouterOptions
         if (PreloadDefaultKeepAliveSeconds <= -2)
         {
             PreloadDefaultKeepAliveSeconds = 900;
+        }
+
+        // Preload load-call timeout (task #75): bounds ONLY the bounded preload load POST; a
+        // non-positive value is invalid → the 20 s default.
+        if (PreloadLoadTimeoutSeconds <= 0)
+        {
+            PreloadLoadTimeoutSeconds = DefaultPreloadLoadTimeoutSeconds;
         }
 
         foreach (var target in Targets)

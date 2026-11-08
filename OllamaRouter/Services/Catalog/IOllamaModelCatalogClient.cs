@@ -1,4 +1,5 @@
 using System.Text.Json.Nodes;
+using OllamaRouter.Options;
 using OllamaRouter.Services.Preload;
 
 namespace OllamaRouter.Services.Catalog;
@@ -73,9 +74,12 @@ public interface IOllamaModelCatalogClient
     /// Modelfile default, avoiding a needless KV reallocation). Fail-soft like
     /// <see cref="UnloadModelAsync"/>: returns <see cref="PreloadOutcome"/>(false, error) on
     /// missing url/model, non-2xx, or transport/parse failure — never throws. The call is
-    /// bounded by the client's own timeout (default 4 s); a large-model cold load that misses
-    /// the bound is reported as not accepted (fail-soft), which the router surfaces without a
-    /// 5xx. See <c>POST /api/router/models/{*modelName}/preload</c> (task #44).
+    /// bounded by the dedicated <c>"PreloadLoad"</c> client timeout
+    /// (<see cref="OllamaRouterOptions.PreloadLoadTimeoutSeconds"/>, default 20 s, LIVE — a
+    /// config change applies to the next load call without a restart); a large-model cold load
+    /// that misses the bound is reported as not accepted (fail-soft), which the router surfaces
+    /// without a 5xx. Every OTHER catalog call keeps the 4 s catalog client bound.
+    /// See <c>POST /api/router/models/{*modelName}/preload</c> (task #44, #75).
     /// </summary>
     Task<PreloadOutcome> PreloadModelAsync(string? baseUrl, string modelName, int keepAliveSeconds, int? numCtx, CancellationToken cancellationToken = default);
 

@@ -266,6 +266,24 @@ public static class OllamaRouterServiceCollectionExtensions
             client.Timeout = TimeSpan.FromSeconds(4);
         });
 
+        // Dedicated preload LOAD client (task #75): ONLY the bounded preload load call (POST
+        // /api/generate, stream=false, empty prompt) rides this client — a large-model cold load
+        // regularly exceeds the 4 s catalog bound above, so the load call gets its own
+        // configurable timeout (OllamaRouterOptions.PreloadLoadTimeoutSeconds, default 20 s).
+        // The (IServiceProvider, HttpClient) delegate reads the LIVE IOptionsMonitor, and
+        // IHttpClientFactory.CreateClient re-runs the delegate on every call (a cheap new
+        // wrapper over a pooled handler), so a config/config.json change of
+        // PreloadLoadTimeoutSeconds applies to the NEXT load call without a restart; the
+        // defensive > 0 guard covers options-overload hosts that skip Normalize(). Every other
+        // catalog call (tags/show/ps, catalog seeding) keeps the untouched 4 s catalog client
+        // above.
+        services.AddHttpClient(OllamaModelCatalogClient.PreloadLoadClientName, (sp, client) =>
+        {
+            var seconds = sp.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>().CurrentValue.PreloadLoadTimeoutSeconds;
+            client.Timeout = TimeSpan.FromSeconds(seconds > 0 ? seconds : OllamaRouterOptions.DefaultPreloadLoadTimeoutSeconds);
+        })
+        .ConfigurePrimaryHttpMessageHandler(_ => new SocketsHttpHandler { PooledConnectionLifetime = TimeSpan.FromSeconds(10) });
+
         // Dedicated liveness probe client: 3.5 s default timeout and a 10 s pooled-connection lifetime so a
         // sleeping-then-woken machine with a changed IP does not keep hitting dead pooled sockets.
         services.AddHttpClient("LivenessProbe", client =>
@@ -340,11 +358,13 @@ public static class OllamaRouterServiceCollectionExtensions
         services.AddSingleton<ModelCapabilityEngine>();
         services.AddSingleton<IOllamaProcessLauncher, OllamaProcessLauncher>();
 
-        // Model pre-load (task #44): the router-owned, stateless/idempotent model warm-up
-        // (selection reuses the capability stack; the bounded load call + /api/ps residency
-        // confirmation ride the existing IOllamaModelCatalogClient client — no new HttpClient
-        // registration). All enrichment dependencies are nullable-tolerant so minimal test
-        // hosts keep working (defensive, like every other endpoint in this graph).
+        // Model pre-load (task #44; task #75): the router-owned, stateless/idempotent model
+        // warm-up (selection reuses the capability stack). The bounded load call rides the
+        // dedicated "PreloadLoad" client registered above (timeout = PreloadLoadTimeoutSeconds,
+        // default 20 s, LIVE) while the /api/ps residency confirmation keeps the 4 s catalog
+        // client — a stalled daemon never holds a preload request past the load bound + one
+        // short poll. All enrichment dependencies are nullable-tolerant so minimal test hosts
+        // keep working (defensive, like every other endpoint in this graph).
         services.AddSingleton<IModelPreloadService>(sp => new ModelPreloadService(
             sp.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>(),
             sp.GetRequiredService<IOllamaModelCatalogClient>(),

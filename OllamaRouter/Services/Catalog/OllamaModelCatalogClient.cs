@@ -1,6 +1,8 @@
+using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Nodes;
+using OllamaRouter.Options;
 using OllamaRouter.Services.Preload;
 
 namespace OllamaRouter.Services.Catalog;
@@ -9,9 +11,32 @@ namespace OllamaRouter.Services.Catalog;
 /// HTTP implementation of <see cref="IOllamaModelCatalogClient"/>. Failed network calls are
 /// caught and treated as empty catalogs / model not loaded, so as not to block routing when
 /// one of the instances is unavailable.
+/// <para>
+/// <see cref="PreloadModelAsync"/> is the ONE call that does NOT ride the injected 4 s catalog
+/// client: a cold load of a large model regularly exceeds that bound, so the load POST is
+/// created per call from the optional <c>preloadLoadClientFactory</c> under the name
+/// <see cref="PreloadLoadClientName"/> — a dedicated client whose timeout is
+/// <see cref="OllamaRouterOptions.PreloadLoadTimeoutSeconds"/> (default 20 s, LIVE at each load
+/// call). Without a factory (direct unit-test construction) the injected client is used, so
+/// existing call sites keep their historical behavior. Every other method (tags/show/ps,
+/// fleets, catalog seeding) keeps the 4 s catalog client.
+/// </para>
 /// </summary>
-public sealed class OllamaModelCatalogClient(HttpClient httpClient) : IOllamaModelCatalogClient
+public sealed class OllamaModelCatalogClient(HttpClient httpClient, IHttpClientFactory? preloadLoadClientFactory = null) : IOllamaModelCatalogClient
 {
+    /// <summary>
+    /// Name of the dedicated preload load HttpClient whose timeout is
+    /// <see cref="OllamaRouterOptions.PreloadLoadTimeoutSeconds"/> (default 20 s); ONLY
+    /// <see cref="PreloadModelAsync"/> rides it — every other catalog call keeps the 4 s catalog
+    /// client.
+    /// </summary>
+    public const string PreloadLoadClientName = "PreloadLoad";
+
+    /// <summary>
+    /// The injected shared catalog client (the 4 s bound for every non-load catalog call).
+    /// </summary>
+    internal HttpClient CatalogHttp { get; } = httpClient;
+
     public async Task<JsonArray> GetMergedTagsAsync(string? localUrl, string? remoteUrl, CancellationToken cancellationToken = default)
     {
         var localTask = GetTagsAsync(localUrl, cancellationToken);
@@ -174,7 +199,14 @@ public sealed class OllamaModelCatalogClient(HttpClient httpClient) : IOllamaMod
             }
 
             using var content = new StringContent(payload.ToJsonString(), Encoding.UTF8, "application/json");
-            var response = await httpClient.PostAsync(BuildUrl(baseUrl, "/api/generate"), content, cancellationToken);
+            // The bounded load call rides the dedicated "PreloadLoad" client (its timeout is
+            // OllamaRouterOptions.PreloadLoadTimeoutSeconds, default 20 s, read live per call);
+            // without a factory (direct unit-test construction) the injected catalog client is
+            // used, preserving the historical behavior.
+            var client = preloadLoadClientFactory is { } factory
+                ? factory.CreateClient(PreloadLoadClientName)
+                : httpClient;
+            var response = await client.PostAsync(BuildUrl(baseUrl, "/api/generate"), content, cancellationToken);
             return response.IsSuccessStatusCode
                 ? new PreloadOutcome(true)
                 : new PreloadOutcome(false, $"http {(int)response.StatusCode}");
