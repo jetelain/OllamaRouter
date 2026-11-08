@@ -4,12 +4,16 @@ namespace OllamaRouter.Endpoints.RouterApi.Vram;
 
 /// <summary>
 /// Optional request body of <c>POST /api/router/vram/reclaim</c> / <c>POST /api/router/fleet/unload</c>:
-/// the target name to unload (null/absent = all effective targets) and whether to
-/// administratively disable the processed target(s) (default false). The same parameters are
-/// also accepted as query string values; body values win when both are present.
+/// the target name to unload (null/absent = all effective targets), the optional machine-location
+/// selector (<c>location</c>; only "local" is supported, case-insensitive — selects every
+/// <c>TargetLocation.Local</c>-classified effective target; a <c>target</c> name, when present,
+/// wins and <c>location</c> is ignored), and whether to administratively disable the processed
+/// target(s) (default false). The same parameters are also accepted as query string values;
+/// body values win when both are present.
 /// </summary>
 public sealed record RouterVramReclaimRequest(
     [property: JsonPropertyName("target")] string? Target = null,
+    [property: JsonPropertyName("location")] string? Location = null,
     [property: JsonPropertyName("disableTarget")] bool DisableTarget = false);
 
 /// <summary>

@@ -351,13 +351,18 @@ internal static class RouterOpenApiDocumentTransformer
                 requestDescription:
                     "Optional: an absent/empty body is valid, a malformed body falls through to the " +
                     "query values, and an explicit body is authoritative per field (body wins over " +
-                    "query: the vram-reclaim pattern). 'target' null/absent = ALL effective targets " +
-                    "(fail-soft per target; the Cloud pseudo-target is never part of the effective " +
-                    "list); 'disableTarget' default false.",
+                    "query: the vram-reclaim pattern). 'target' null/absent + 'location' null/absent = " +
+                    "ALL effective targets (fail-soft per target; the Cloud pseudo-target is never part " +
+                    "of the effective list); 'target' wins over 'location' (location is ignored, even if " +
+                    "unsupported — no 400); 'location' supports only \"local\" (case-insensitive; selects " +
+                    "every TargetLocation.Local-classified effective target; zero Local matches or an empty " +
+                    "fleet → 404 'target not found: local'; any other value → 400, validated before the " +
+                    "empty-fleet check); 'disableTarget' default false.",
                 responses:
                 [
-                    ("200", typeof(RouterVramReclaimResponse), "Reclaim report (fail-soft: success:false + message \"no targets configured\" when the effective target list is empty; unreachable daemons fail soft per target)."),
-                    ("404", typeof(OllamaErrorResponse), "target not found: {target}")
+                    ("200", typeof(RouterVramReclaimResponse), "Reclaim report (fail-soft: success:false + message \"no targets configured\" when the effective target list is empty, named-target and fleet-wide paths only; unreachable daemons fail soft per target)."),
+                    ("400", typeof(OllamaErrorResponse), "location not supported: {location} — only \"local\" is supported; the value is ignored when a target name is given"),
+                    ("404", typeof(OllamaErrorResponse), "target not found: {target} / target not found: local")
                 ]),
 
             ["POST /api/router/fleet/unload"] = new(requestBodyType: typeof(RouterVramReclaimRequest),
@@ -365,13 +370,18 @@ internal static class RouterOpenApiDocumentTransformer
                     "Exact alias of POST /api/router/vram/reclaim (identical handler, parameters and " +
                     "response shape). Optional: an absent/empty body is valid, a malformed body falls " +
                     "through to the query values, and an explicit body is authoritative per field " +
-                    "(body wins over query). 'target' null/absent = ALL effective targets (fail-soft " +
-                    "per target; the Cloud pseudo-target is never part of the effective list); " +
-                    "'disableTarget' default false.",
+                    "(body wins over query). 'target' null/absent + 'location' null/absent = ALL effective " +
+                    "targets (fail-soft per target; the Cloud pseudo-target is never part of the effective " +
+                    "list); 'target' wins over 'location' (location is ignored, even if unsupported — no " +
+                    "400); 'location' supports only \"local\" (case-insensitive; selects every " +
+                    "TargetLocation.Local-classified effective target; zero Local matches or an empty fleet " +
+                    "→ 404 'target not found: local'; any other value → 400, validated before the " +
+                    "empty-fleet check); 'disableTarget' default false.",
                 responses:
                 [
-                    ("200", typeof(RouterVramReclaimResponse), "Unload report (fail-soft: success:false + message \"no targets configured\" when the effective target list is empty; unreachable daemons fail soft per target)."),
-                    ("404", typeof(OllamaErrorResponse), "target not found: {target}")
+                    ("200", typeof(RouterVramReclaimResponse), "Unload report (fail-soft: success:false + message \"no targets configured\" when the effective target list is empty, named-target and fleet-wide paths only; unreachable daemons fail soft per target)."),
+                    ("400", typeof(OllamaErrorResponse), "location not supported: {location} — only \"local\" is supported; the value is ignored when a target name is given"),
+                    ("404", typeof(OllamaErrorResponse), "target not found: {target} / target not found: local")
                 ]),
 
             ["POST /api/router/context/evaluate"] = new(requestBodyType: typeof(RouterContextEvaluateRequest),

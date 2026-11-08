@@ -18,14 +18,21 @@ namespace OllamaRouter.Tests.Endpoints;
 
 /// <summary>
 /// Tests for the fleet VRAM reclaim endpoints <c>POST /api/router/vram/reclaim</c>
-/// (canonical) and <c>POST /api/router/fleet/unload</c> (exact alias): fleet-wide or
-/// single-target model unloading (fail-soft), optional administrative target disabling,
-/// KV-cache lease reset, and the structured per-target response.
+/// (canonical) and <c>POST /api/router/fleet/unload</c> (exact alias): fleet-wide, single-target,
+/// or local-machine (location=local) model unloading (fail-soft), optional administrative target
+/// disabling, KV-cache lease reset, and the structured per-target response.
 /// </summary>
 public class RouterVramReclaimTests
 {
     private const string DesktopUrl = "http://127.0.0.1:11501";
     private const string ServerUrl = "http://127.0.0.1:11502";
+
+    // Mixed-location fleet URLs: LoopA (loopback ⇒ Local), OverrideB (non-loopback URL with an
+    // explicit Location override ⇒ Local), RemoteC (RFC 1918 ⇒ Remote), CloudD (public host ⇒ Cloud).
+    private const string LoopAUrl = "http://127.0.0.1:11511";
+    private const string OverrideBUrl = "http://10.0.0.5:11434";
+    private const string RemoteCUrl = "http://192.168.1.50:11434";
+    private const string CloudDUrl = "http://gpu.example.net:11434";
 
     private sealed class Harness : IAsyncDisposable
     {
@@ -62,9 +69,55 @@ public class RouterVramReclaimTests
         ]
     };
 
+    /// <summary>
+    /// Mixed-location fleet: LoopA (URL-classified Local), OverrideB (explicit
+    /// <see cref="TargetLocation.Local"/> override on a non-loopback URL), RemoteC (Remote),
+    /// CloudD (Cloud) — in this configured order.
+    /// </summary>
+    private static OllamaRouterOptions MixedLocationFleet() => new()
+    {
+        Targets =
+        [
+            new OllamaTargetOptions { Name = "LoopA", Url = LoopAUrl },
+            new OllamaTargetOptions { Name = "OverrideB", Url = OverrideBUrl, Location = TargetLocation.Local },
+            new OllamaTargetOptions { Name = "RemoteC", Url = RemoteCUrl },
+            new OllamaTargetOptions { Name = "CloudD", Url = CloudDUrl }
+        ]
+    };
+
+    /// <summary>
+    /// Fleet with no Local-classified targets (used for the
+    /// "target not found: local" 404 case).
+    /// </summary>
+    private static OllamaRouterOptions NonLocalFleet() => new()
+    {
+        Targets =
+        [
+            new OllamaTargetOptions { Name = "RemoteC", Url = RemoteCUrl },
+            new OllamaTargetOptions { Name = "CloudD", Url = CloudDUrl }
+        ]
+    };
+
+    private static void SetupMixedCatalog(Mock<IOllamaModelCatalogClient> catalogClient)
+    {
+        catalogClient
+            .Setup(c => c.StopRunningModelsAsync(LoopAUrl, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { "local-model-a" });
+        catalogClient
+            .Setup(c => c.StopRunningModelsAsync(OverrideBUrl, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { "local-model-b" });
+        catalogClient
+            .Setup(c => c.StopRunningModelsAsync(RemoteCUrl, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { "remote-model-c" });
+        catalogClient
+            .Setup(c => c.StopRunningModelsAsync(CloudDUrl, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new[] { "cloud-model-d" });
+    }
+
     private static async Task<Harness> CreateTestAppAsync(
         OllamaRouterOptions? options = null,
-        Mock<IContextAutoShrinkManager>? shrinkManager = null)
+        Mock<IContextAutoShrinkManager>? shrinkManager = null,
+        Action<Mock<IOllamaModelCatalogClient>>? configureCatalogClient = null)
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseUrls("http://127.0.0.1:0");
@@ -77,12 +130,19 @@ public class RouterVramReclaimTests
 
         var availability = new Mock<ITargetAvailabilityService>();
         var catalogClient = new Mock<IOllamaModelCatalogClient>();
-        catalogClient
-            .Setup(c => c.StopRunningModelsAsync(DesktopUrl, It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new[] { "qwen2.5-coder:32b" });
-        catalogClient
-            .Setup(c => c.StopRunningModelsAsync(ServerUrl, It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new[] { "qwen3.8-27b" });
+        if (configureCatalogClient is null)
+        {
+            catalogClient
+                .Setup(c => c.StopRunningModelsAsync(DesktopUrl, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { "qwen2.5-coder:32b" });
+            catalogClient
+                .Setup(c => c.StopRunningModelsAsync(ServerUrl, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new[] { "qwen3.8-27b" });
+        }
+        else
+        {
+            configureCatalogClient(catalogClient);
+        }
 
         builder.Services.AddSingleton<IOptionsMonitor<OllamaRouterOptions>>(optionsMonitor);
         builder.Services.AddSingleton(availability.Object);
@@ -433,5 +493,477 @@ public class RouterVramReclaimTests
         Assert.Equal(
             new HashSet<string> { "target", "unloadedModels", "disabled" },
             ((IDictionary<string, JsonNode?>)first).Keys.ToHashSet());
+    }
+
+    // ------------------------------------------------------------------
+    //  location=local (local-machine) selection
+    // ------------------------------------------------------------------
+
+    private static async Task<(HttpStatusCode Status, JsonObject Json)> SendAsync(
+        HttpClient client, string url, string? body = null)
+    {
+        var response = body is null
+            ? await client.PostAsync(url, new StringContent(""))
+            : await client.SendAsync(
+                new HttpRequestMessage(HttpMethod.Post, url) { Content = new StringContent(body) });
+        var json = ParseObject(JsonNode.Parse(await response.Content.ReadAsStringAsync()));
+        return (response.StatusCode, json);
+    }
+
+    [Fact]
+    public async Task QueryLocationLocal_SelectsOnlyLocalTargets_InConfiguredOrder()
+    {
+        var harness = await CreateTestAppAsync(
+            MixedLocationFleet(), configureCatalogClient: SetupMixedCatalog);
+        try
+        {
+            var (status, json) = await SendAsync(
+                harness.Client, "/api/router/vram/reclaim?location=local");
+
+            Assert.Equal(HttpStatusCode.OK, status);
+            Assert.Equal("true", json["success"]!.ToString());
+            Assert.Equal("2", json["totalUnloaded"]!.ToString());
+            Assert.Null(json["message"]);
+
+            // ONLY the Local-classified targets (URL-loopback + explicit override),
+            // in configured order — RemoteC/CloudD never appear.
+            var targets = (JsonArray)json["targets"]!;
+            Assert.Equal(2, targets.Count);
+            var loopA = (JsonObject)targets[0]!;
+            Assert.Equal("LoopA", loopA["target"]!.GetValue<string>());
+            Assert.Equal(new[] { "local-model-a" }, UnloadedModels(loopA));
+            var overrideB = (JsonObject)targets[1]!;
+            Assert.Equal("OverrideB", overrideB["target"]!.GetValue<string>());
+            Assert.Equal(new[] { "local-model-b" }, UnloadedModels(overrideB));
+
+            harness.CatalogClient.Verify(
+                c => c.StopRunningModelsAsync(LoopAUrl, It.IsAny<CancellationToken>()), Times.Once);
+            harness.CatalogClient.Verify(
+                c => c.StopRunningModelsAsync(OverrideBUrl, It.IsAny<CancellationToken>()), Times.Once);
+            harness.CatalogClient.Verify(
+                c => c.StopRunningModelsAsync(RemoteCUrl, It.IsAny<CancellationToken>()), Times.Never);
+            harness.CatalogClient.Verify(
+                c => c.StopRunningModelsAsync(CloudDUrl, It.IsAny<CancellationToken>()), Times.Never);
+        }
+        finally
+        {
+            await harness.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task BodyLocationLocal_SelectsOnlyLocalTargets()
+    {
+        var harness = await CreateTestAppAsync(
+            MixedLocationFleet(), configureCatalogClient: SetupMixedCatalog);
+        try
+        {
+            var (status, json) = await SendAsync(
+                harness.Client, "/api/router/vram/reclaim", "{\"location\":\"local\"}");
+
+            Assert.Equal(HttpStatusCode.OK, status);
+            var targets = (JsonArray)json["targets"]!;
+            Assert.Equal(2, targets.Count);
+            Assert.Equal("LoopA", ((JsonObject)targets[0]!)["target"]!.GetValue<string>());
+            Assert.Equal("OverrideB", ((JsonObject)targets[1]!)["target"]!.GetValue<string>());
+
+            harness.CatalogClient.Verify(
+                c => c.StopRunningModelsAsync(LoopAUrl, It.IsAny<CancellationToken>()), Times.Once);
+            harness.CatalogClient.Verify(
+                c => c.StopRunningModelsAsync(OverrideBUrl, It.IsAny<CancellationToken>()), Times.Once);
+            harness.CatalogClient.Verify(
+                c => c.StopRunningModelsAsync(It.Is<string>(x =>
+                    string.Equals(x, RemoteCUrl) || string.Equals(x, CloudDUrl)),
+                    It.IsAny<CancellationToken>()), Times.Never);
+        }
+        finally
+        {
+            await harness.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task BodyLocationUnsupported_WinsOverQuery_Returns400()
+    {
+        // An explicit non-empty body field is authoritative per field (body wins over query):
+        // the unsupported body value must 400 despite the supported query value.
+        var harness = await CreateTestAppAsync(
+            MixedLocationFleet(), configureCatalogClient: SetupMixedCatalog);
+        try
+        {
+            var (status, json) = await SendAsync(
+                harness.Client, "/api/router/vram/reclaim?location=local", "{\"location\":\"remote\"}");
+
+            Assert.Equal(HttpStatusCode.BadRequest, status);
+            Assert.Equal("location not supported: remote", json["error"]!.GetValue<string>());
+
+            harness.CatalogClient.Verify(
+                c => c.StopRunningModelsAsync(It.IsAny<string?>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+        }
+        finally
+        {
+            await harness.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task BodyLocationLocal_WinsOverUnsupportedQuery_ReturnsLocalSelection()
+    {
+        var harness = await CreateTestAppAsync(
+            MixedLocationFleet(), configureCatalogClient: SetupMixedCatalog);
+        try
+        {
+            var (status, json) = await SendAsync(
+                harness.Client, "/api/router/vram/reclaim?location=remote", "{\"location\":\"local\"}");
+
+            Assert.Equal(HttpStatusCode.OK, status);
+            Assert.Equal("2", json["totalUnloaded"]!.ToString());
+            var targets = (JsonArray)json["targets"]!;
+            Assert.Equal(2, targets.Count);
+            Assert.Equal("LoopA", ((JsonObject)targets[0]!)["target"]!.GetValue<string>());
+            Assert.Equal("OverrideB", ((JsonObject)targets[1]!)["target"]!.GetValue<string>());
+        }
+        finally
+        {
+            await harness.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task MalformedBody_LocationQueryValue_StillUsed()
+    {
+        var harness = await CreateTestAppAsync(
+            MixedLocationFleet(), configureCatalogClient: SetupMixedCatalog);
+        try
+        {
+            // A malformed JSON body falls through to the query values (the vram-reclaim pattern).
+            var (status, json) = await SendAsync(
+                harness.Client, "/api/router/vram/reclaim?location=local", "{\"location\": ");
+
+            Assert.Equal(HttpStatusCode.OK, status);
+            Assert.Equal("true", json["success"]!.ToString());
+            Assert.Equal("2", json["totalUnloaded"]!.ToString());
+        }
+        finally
+        {
+            await harness.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task TargetName_WinsOverUnsupportedLocation_No400()
+    {
+        var harness = await CreateTestAppAsync(
+            MixedLocationFleet(), configureCatalogClient: SetupMixedCatalog);
+        try
+        {
+            var (status, json) = await SendAsync(
+                harness.Client, "/api/router/vram/reclaim?target=LoopA&location=remote");
+
+            // Named selection is unchanged and wins over ANY location value — no 400.
+            Assert.Equal(HttpStatusCode.OK, status);
+            var targets = (JsonArray)json["targets"]!;
+            Assert.Single(targets);
+            Assert.Equal("LoopA", ((JsonObject)targets[0]!)["target"]!.GetValue<string>());
+
+            harness.CatalogClient.Verify(
+                c => c.StopRunningModelsAsync(LoopAUrl, It.IsAny<CancellationToken>()), Times.Once);
+            harness.CatalogClient.Verify(
+                c => c.StopRunningModelsAsync(It.Is<string>(x => !string.Equals(x, LoopAUrl)),
+                    It.IsAny<CancellationToken>()), Times.Never);
+        }
+        finally
+        {
+            await harness.DisposeAsync();
+        }
+    }
+
+    [Theory]
+    [InlineData("LOCAL")]
+    [InlineData("Local")]
+    [InlineData("%20local%20")] // surrounding whitespace (URL-encoded)
+    [InlineData("lOcAl")]
+    public async Task LocationLocal_CaseAndWhitespaceInsensitive(string encodedLocation)
+    {
+        var harness = await CreateTestAppAsync(
+            MixedLocationFleet(), configureCatalogClient: SetupMixedCatalog);
+        try
+        {
+            var (status, json) = await SendAsync(
+                harness.Client, $"/api/router/vram/reclaim?location={encodedLocation}");
+
+            Assert.Equal(HttpStatusCode.OK, status);
+            var targets = (JsonArray)json["targets"]!;
+            Assert.Equal(2, targets.Count);
+            Assert.Equal("LoopA", ((JsonObject)targets[0]!)["target"]!.GetValue<string>());
+            Assert.Equal("OverrideB", ((JsonObject)targets[1]!)["target"]!.GetValue<string>());
+        }
+        finally
+        {
+            await harness.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task LocationEmptyString_TreatedAsAbsent_FleetWide()
+    {
+        var harness = await CreateTestAppAsync(
+            MixedLocationFleet(), configureCatalogClient: SetupMixedCatalog);
+        try
+        {
+            // ?location= (empty) is treated as absent → fleet-wide behavior unchanged.
+            var (status, json) = await SendAsync(
+                harness.Client, "/api/router/vram/reclaim?location=");
+
+            Assert.Equal(HttpStatusCode.OK, status);
+            Assert.Equal("true", json["success"]!.ToString());
+            Assert.Equal("4", json["totalUnloaded"]!.ToString());
+            var targets = (JsonArray)json["targets"]!;
+            Assert.Equal(4, targets.Count);
+            Assert.Equal("LoopA", ((JsonObject)targets[0]!)["target"]!.GetValue<string>());
+            Assert.Equal("CloudD", ((JsonObject)targets[3]!)["target"]!.GetValue<string>());
+        }
+        finally
+        {
+            await harness.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task LocationLocal_NoLocalTargets_Returns404()
+    {
+        var harness = await CreateTestAppAsync(NonLocalFleet());
+        try
+        {
+            var (status, json) = await SendAsync(
+                harness.Client, "/api/router/vram/reclaim?location=local");
+
+            Assert.Equal(HttpStatusCode.NotFound, status);
+            Assert.Equal("target not found: local", json["error"]!.GetValue<string>());
+
+            // The catalog client is never touched when no Local target matches.
+            harness.CatalogClient.Verify(
+                c => c.StopRunningModelsAsync(It.IsAny<string?>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+        }
+        finally
+        {
+            await harness.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task LocationLocal_EmptyFleet_Returns404_NotFailSoft()
+    {
+        var harness = await CreateTestAppAsync(new OllamaRouterOptions());
+        try
+        {
+            // An empty fleet with explicit location=local 404s (NOT the 200 fail-soft).
+            var (status, json) = await SendAsync(
+                harness.Client, "/api/router/vram/reclaim?location=local");
+
+            Assert.Equal(HttpStatusCode.NotFound, status);
+            Assert.Equal("target not found: local", json["error"]!.GetValue<string>());
+        }
+        finally
+        {
+            await harness.DisposeAsync();
+        }
+    }
+
+    [Theory]
+    [InlineData("remote", "location not supported: remote")]
+    [InlineData("cloud", "location not supported: cloud")]
+    [InlineData("Lokal", "location not supported: Lokal")] // typo: trimmed echo
+    public async Task LocationUnsupported_Returns400_OllamaErrorResponse(string value, string expectedError)
+    {
+        var harness = await CreateTestAppAsync(
+            MixedLocationFleet(), configureCatalogClient: SetupMixedCatalog);
+        try
+        {
+            var (status, json) = await SendAsync(
+                harness.Client, $"/api/router/vram/reclaim?location={value}");
+
+            Assert.Equal(HttpStatusCode.BadRequest, status);
+            Assert.Equal(expectedError, json["error"]!.GetValue<string>());
+            Assert.Null(json["success"]);
+
+            harness.CatalogClient.Verify(
+                c => c.StopRunningModelsAsync(It.IsAny<string?>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+        }
+        finally
+        {
+            await harness.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task LocationUnsupported_EmptyFleet_StillReturns400()
+    {
+        // The 400 is validated BEFORE the empty-fleet check.
+        var harness = await CreateTestAppAsync(new OllamaRouterOptions());
+        try
+        {
+            var (status, json) = await SendAsync(
+                harness.Client, "/api/router/vram/reclaim?location=remote");
+
+            Assert.Equal(HttpStatusCode.BadRequest, status);
+            Assert.Equal("location not supported: remote", json["error"]!.GetValue<string>());
+        }
+        finally
+        {
+            await harness.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task LocationLocal_DisableTargetTrue_DisablesEveryLocalTarget_AndResetsLeases()
+    {
+        var shrinkManager = new Mock<IContextAutoShrinkManager>();
+        var harness = await CreateTestAppAsync(
+            MixedLocationFleet(), shrinkManager, SetupMixedCatalog);
+        try
+        {
+            var (status, json) = await SendAsync(
+                harness.Client, "/api/router/vram/reclaim?location=local&disableTarget=true");
+
+            Assert.Equal(HttpStatusCode.OK, status);
+            var targets = (JsonArray)json["targets"]!;
+            Assert.Equal(2, targets.Count);
+            Assert.Equal("true", ((JsonObject)targets[0]!)["disabled"]!.ToString());
+            Assert.Equal("true", ((JsonObject)targets[1]!)["disabled"]!.ToString());
+
+            // One persisted availability update per processed (Local) target — never for
+            // the non-Local targets.
+            harness.Availability.Verify(
+                t => t.Update(It.Is<IReadOnlyDictionary<string, bool>>(d =>
+                    d.Count == 1 && d.Any(kv =>
+                        string.Equals(kv.Key, "LoopA", StringComparison.OrdinalIgnoreCase) && !kv.Value))),
+                Times.Once);
+            harness.Availability.Verify(
+                t => t.Update(It.Is<IReadOnlyDictionary<string, bool>>(d =>
+                    d.Count == 1 && d.Any(kv =>
+                        string.Equals(kv.Key, "OverrideB", StringComparison.OrdinalIgnoreCase) && !kv.Value))),
+                Times.Once);
+            harness.Availability.VerifyNoOtherCalls();
+
+            // KV-cache leases reset for every processed (Local) target only.
+            shrinkManager.Verify(s => s.ResetTargetLeases(new RoutingTarget("LoopA")), Times.Once);
+            shrinkManager.Verify(s => s.ResetTargetLeases(new RoutingTarget("OverrideB")), Times.Once);
+            shrinkManager.VerifyNoOtherCalls();
+        }
+        finally
+        {
+            await harness.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task LocationLocal_UnreachableLocalDaemon_FailSoft()
+    {
+        var harness = await CreateTestAppAsync(MixedLocationFleet(), configureCatalogClient:
+            catalogClient =>
+            {
+                SetupMixedCatalog(catalogClient);
+                // LoopA daemon unreachable: StopRunningModelsAsync is fail-soft ⇒ empty list
+                // (overrides the mixed-catalog setup).
+                catalogClient
+                    .Setup(c => c.StopRunningModelsAsync(LoopAUrl, It.IsAny<CancellationToken>()))
+                    .ReturnsAsync(Array.Empty<string>());
+            });
+        try
+        {
+            var (status, json) = await SendAsync(
+                harness.Client, "/api/router/vram/reclaim?location=local");
+
+            Assert.Equal(HttpStatusCode.OK, status);
+            Assert.Equal("true", json["success"]!.ToString());
+            Assert.Equal("1", json["totalUnloaded"]!.ToString());
+            var targets = (JsonArray)json["targets"]!;
+            Assert.Equal(2, targets.Count);
+            var loopA = (JsonObject)targets[0]!;
+            Assert.Equal("LoopA", loopA["target"]!.GetValue<string>());
+            Assert.Empty(UnloadedModels(loopA));
+            var overrideB = (JsonObject)targets[1]!;
+            Assert.Equal("OverrideB", overrideB["target"]!.GetValue<string>());
+            Assert.Equal(new[] { "local-model-b" }, UnloadedModels(overrideB));
+        }
+        finally
+        {
+            await harness.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task FleetUnload_Alias_LocationParity()
+    {
+        // location=local → 200 Local-only selection; unsupported location → 400 (alias path).
+        var harness = await CreateTestAppAsync(
+            MixedLocationFleet(), configureCatalogClient: SetupMixedCatalog);
+        try
+        {
+            var (status, json) = await SendAsync(
+                harness.Client, "/api/router/fleet/unload?location=local");
+
+            Assert.Equal(HttpStatusCode.OK, status);
+            var targets = (JsonArray)json["targets"]!;
+            Assert.Equal(2, targets.Count);
+            Assert.Equal("LoopA", ((JsonObject)targets[0]!)["target"]!.GetValue<string>());
+            Assert.Equal("OverrideB", ((JsonObject)targets[1]!)["target"]!.GetValue<string>());
+            Assert.Null(json["message"]);
+
+            var (badStatus, badJson) = await SendAsync(
+                harness.Client, "/api/router/fleet/unload?location=remote");
+
+            Assert.Equal(HttpStatusCode.BadRequest, badStatus);
+            Assert.Equal("location not supported: remote", badJson["error"]!.GetValue<string>());
+        }
+        finally
+        {
+            await harness.DisposeAsync();
+        }
+
+        // No-Local fleet → 404 'target not found: local' (alias path).
+        var noLocalHarness = await CreateTestAppAsync(NonLocalFleet());
+        try
+        {
+            var (status, json) = await SendAsync(
+                noLocalHarness.Client, "/api/router/fleet/unload?location=local");
+
+            Assert.Equal(HttpStatusCode.NotFound, status);
+            Assert.Equal("target not found: local", json["error"]!.GetValue<string>());
+
+            noLocalHarness.CatalogClient.Verify(
+                c => c.StopRunningModelsAsync(It.IsAny<string?>(), It.IsAny<CancellationToken>()),
+                Times.Never);
+        }
+        finally
+        {
+            await noLocalHarness.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task TargetNamePresent_EmptyFleet_LocationIgnored_FailSoftUnchanged()
+    {
+        // Named selection on an empty fleet keeps the existing 200 fail-soft, even with
+        // a present (unsupported) location value.
+        var harness = await CreateTestAppAsync(new OllamaRouterOptions());
+        try
+        {
+            var (status, json) = await SendAsync(
+                harness.Client, "/api/router/vram/reclaim?target=Desktop&location=remote");
+
+            Assert.Equal(HttpStatusCode.OK, status);
+            Assert.Equal("false", json["success"]!.ToString());
+            Assert.Equal("no targets configured", json["message"]!.GetValue<string>());
+            Assert.Empty((JsonArray)json["targets"]!);
+        }
+        finally
+        {
+            await harness.DisposeAsync();
+        }
     }
 }
