@@ -40,6 +40,12 @@ public sealed class DaemonModel
     public int? ModelfileNumCtx { get; init; }
     /// <summary>Optional native GGUF context length surfaced as <c>model_info["&lt;family&gt;.context_length"]</c>.</summary>
     public long? NativeContextLength { get; init; }
+    /// <summary>
+    /// The live per-process context length (tokens) that modern Ollama daemons report in
+    /// <c>/api/ps</c> entries; null = legacy daemon that omits the field (the default, so all
+    /// existing fixtures keep the legacy behavior).
+    /// </summary>
+    public long? ContextLength { get; init; }
     public string Family { get; init; } = "llama";
 }
 
@@ -515,13 +521,20 @@ public sealed class FakeOllamaDaemon : IAsyncDisposable
             for (var i = 0; i < _loaded.Count; i++)
             {
                 var name = _loaded[i];
+                var model = _models.FirstOrDefault(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase));
                 var entry = new JsonObject
                 {
                     ["name"] = name,
                     ["model"] = name,
                     ["pid"] = 1000 + i,
-                    ["size_vram"] = _models.FirstOrDefault(m => string.Equals(m.Name, name, StringComparison.OrdinalIgnoreCase))?.SizeBytes ?? 0
+                    ["size_vram"] = model?.SizeBytes ?? 0
                 };
+                // Modern daemons report the live per-process context length; null omits the
+                // field entirely (legacy-daemon behavior).
+                if (model?.ContextLength is { } ctxLen)
+                {
+                    entry["context_length"] = ctxLen;
+                }
                 models.Add(entry);
             }
 

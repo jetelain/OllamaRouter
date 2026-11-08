@@ -2,6 +2,7 @@ using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 
 namespace OllamaRouter.E2ETests.Scenarios;
 
@@ -85,6 +86,20 @@ internal static class MonitorScenarios
             !string.Equals(fleetArray[^1]?["name"]?.GetValue<string>(), "Cloud", StringComparison.OrdinalIgnoreCase))
         {
             return "Expected the 'Cloud' pseudo-target to be the last entry of the fleet array.";
+        }
+
+        // The fleet context column now carries the daemon-REPORTED context size (task #73):
+        // either "-" (no model loaded / daemon does not report it / Cloud row) or a compact
+        // token value ("512", "4k", "33k", "1.3M"). Holds whether or not the live daemon
+        // emits context_length; the old lease text (e.g. "262.1k (expanded)") must be gone.
+        var contextShape = new Regex("^(\\d+)(\\.\\d+)?[kM]?$", RegexOptions.Compiled);
+        foreach (var entry in fleetArray)
+        {
+            var value = entry?["contextAllocation"]?.GetValue<string>();
+            if (value != "-" && !contextShape.IsMatch(value))
+            {
+                return $"Fleet entry '{entry?["name"]?.GetValue<string>()}' has unexpected contextAllocation shape '{value}' (expected '-' or a compact token value like '512', '4k', '1.3M').";
+            }
         }
 
         var stats = node["statistics"];

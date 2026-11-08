@@ -176,7 +176,7 @@ public class TargetExecutionTrackerTests : IDisposable
             var obj = new JsonObject { ["name"] = name, ["size_vram"] = sizeVram };
             if (ctx.HasValue)
             {
-                obj["num_ctx"] = ctx.Value;
+                obj["context_length"] = ctx.Value;
             }
 
             array.Add(obj);
@@ -609,7 +609,7 @@ public class TargetExecutionTrackerTests : IDisposable
             {
                 ["name"] = "full:entry",
                 ["size_vram"] = 123L,
-                ["num_ctx"] = 4096
+                ["context_length"] = 4096
             },
             new JsonObject
             {
@@ -635,6 +635,101 @@ public class TargetExecutionTrackerTests : IDisposable
         Assert.Equal("bad-vram:entry", parsed[2].Name);
         Assert.Equal(0L, parsed[2].SizeVramBytes);
         Assert.Null(parsed[2].ContextLength);
+    }
+
+    [Fact]
+    public void ParseModels_ContextLength_PresentIsParsed_AbsentIsNullOr()
+    {
+        var models = new JsonArray
+        {
+            new JsonObject
+            {
+                ["name"] = "reported:entry",
+                ["context_length"] = 32768
+            },
+            new JsonObject
+            {
+                ["name"] = "absent:entry"
+            }
+        };
+
+        var parsed = TargetExecutionTracker.ParseModels(models);
+
+        Assert.Equal(32768, parsed[0].ContextLength);
+        Assert.Null(parsed[1].ContextLength);
+    }
+
+    [Fact]
+    public void ParseModels_ContextLength_NonNumericOrNonPositive_IsNull()
+    {
+        var models = new JsonArray
+        {
+            new JsonObject
+            {
+                ["name"] = "non-numeric:entry",
+                ["context_length"] = "not-a-number"
+            },
+            new JsonObject
+            {
+                ["name"] = "zero:entry",
+                ["context_length"] = 0
+            },
+            new JsonObject
+            {
+                ["name"] = "negative:entry",
+                ["context_length"] = -64
+            },
+            new JsonObject
+            {
+                ["name"] = "wrong-type:entry",
+                ["context_length"] = 4096.0
+            }
+        };
+
+        var parsed = TargetExecutionTracker.ParseModels(models);
+
+        Assert.All(parsed, m => Assert.Null(m.ContextLength));
+    }
+
+    [Fact]
+    public void ParseModels_LegacyNumCtxFallback_OnlyWhenContextLengthAbsent()
+    {
+        var models = new JsonArray
+        {
+            // context_length absent → the legacy num_ctx fallback is used.
+            new JsonObject
+            {
+                ["name"] = "legacy:entry",
+                ["num_ctx"] = 8192
+            },
+            // Both present → context_length wins.
+            new JsonObject
+            {
+                ["name"] = "both:entry",
+                ["context_length"] = 4096,
+                ["num_ctx"] = 8192
+            },
+            // context_length present but invalid → falls back to num_ctx.
+            new JsonObject
+            {
+                ["name"] = "invalid-ctx:entry",
+                ["context_length"] = "oops",
+                ["num_ctx"] = 2048
+            },
+            // Only an invalid num_ctx (no context_length) → null.
+            new JsonObject
+            {
+                ["name"] = "bad-legacy:entry",
+                ["num_ctx"] = "oops"
+            }
+        };
+
+        var parsed = TargetExecutionTracker.ParseModels(models);
+
+        Assert.Equal(8192, parsed[0].ContextLength);
+        Assert.Equal(4096, parsed[1].ContextLength);
+        Assert.Equal(2048, parsed[2].ContextLength);
+        Assert.Null(parsed[3].ContextLength);
     }
 
     [Fact]

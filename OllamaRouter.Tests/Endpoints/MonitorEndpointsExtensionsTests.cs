@@ -323,7 +323,7 @@ public class MonitorEndpointsExtensionsTests
             Assert.Equal("Offline", local["liveness"]?.GetValue<string>()); // no models in the cache mock
             Assert.Equal(0, local["inFlightRequests"]?.GetValue<int>());
             Assert.Equal("-", local["hardwareProfile"]?.GetValue<string>()); // legacy synthesized hint
-            Assert.Equal("-", local["contextAllocation"]?.GetValue<string>()); // no leases
+            Assert.Equal("-", local["contextAllocation"]?.GetValue<string>()); // no loaded model
 
             var cloud = fleet[1]!;
             Assert.Equal("Cloud", cloud["name"]?.GetValue<string>());
@@ -332,7 +332,7 @@ public class MonitorEndpointsExtensionsTests
             Assert.False(cloud["enabled"]?.GetValue<bool>()); // availability flag false; cloud not configured
             Assert.Equal("Offline", cloud["liveness"]?.GetValue<string>()); // cloud models not configured
             Assert.Equal(0, cloud["inFlightRequests"]?.GetValue<int>());
-            Assert.Equal("baseline", cloud["contextAllocation"]?.GetValue<string>());
+            Assert.Equal("-", cloud["contextAllocation"]?.GetValue<string>());
 
             // statistics periods contain one entry per target plus the reserved "total" key.
             var today = json["statistics"]?["today"]!;
@@ -524,16 +524,70 @@ public class MonitorEndpointsExtensionsTests
         }
     }
 
-    [Fact]
-    public async Task GetMonitorApi_WithContextLeases_ShowsExpandedAndBaselineAllocations()
+    [Theory]
+    [InlineData(4096, "4k")]
+    [InlineData(8192, "8k")]
+    [InlineData(32768, "33k")]
+    [InlineData(4500, "5k")] // midpoint: AwayFromZero (banker's rounding would give "4k")
+    [InlineData(128000, "128k")]
+    [InlineData(131072, "131k")]
+    [InlineData(1000000, "1.0M")]
+    [InlineData(1310720, "1.3M")]
+    [InlineData(512, "512")]
+    public async Task GetMonitorApi_ActualContext_FormatsDaemonReportedContextLength(int tokens, string expected)
     {
+        var tracker = new Mock<ITargetExecutionTracker>();
+        tracker.Setup(t => t.GetState(RoutingTarget.Local)).Returns(new TargetExecutionState(
+            RoutingTarget.Local,
+            InFlightRequests: 0,
+            LoadedModels: [new TargetLoadedModel("llama3.2:latest", 4_000_000_000, ContextLength: tokens)],
+            TotalVramBytes: 4_000_000_000,
+            LastRefreshedAtUtc: DateTimeOffset.UtcNow,
+            Stale: false));
+
+        // A live auto-shrink lease on the SAME target/model must be ignored: the monitor now
+        // shows only the daemon-reported context size.
+        var (app, client, _) = await CreateTestAppAsync(
+            executionTracker: tracker.Object,
+            contextShrinkManager: new ContextAutoShrinkManager());
+        try
+        {
+            var response = await client.GetAsync("/monitor/api");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var json = await response.Content.ReadFromJsonAsync<JsonObject>();
+            var fleet = json!["fleet"]!.AsArray();
+
+            Assert.Equal("llama3.2:latest", fleet[0]!["activeModel"]?.GetValue<string>());
+            Assert.Equal(expected, fleet[0]!["contextAllocation"]?.GetValue<string>());
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task GetMonitorApi_LoadedModelWithoutContextLength_ShowsDash_LeaseIgnored()
+    {
+        // Legacy daemon: a model is loaded but the daemon did not report context_length
+        // (ContextLength null). An EXPANDED auto-shrink lease is present on the same
+        // target/model but must NOT be used as a fallback — the row shows "-".
+        var tracker = new Mock<ITargetExecutionTracker>();
+        tracker.Setup(t => t.GetState(RoutingTarget.Local)).Returns(new TargetExecutionState(
+            RoutingTarget.Local,
+            InFlightRequests: 0,
+            LoadedModels: [new TargetLoadedModel("llama3.2:latest", 4_000_000_000)],
+            TotalVramBytes: 4_000_000_000,
+            LastRefreshedAtUtc: DateTimeOffset.UtcNow,
+            Stale: false));
+
+        // Give the shrink manager a genuinely expanded lease (same setup as the pre-change
+        // lease-allocation test) so the "-" below proves the lease is ignored, not absent.
         var shrinkManager = new ContextAutoShrinkManager();
         var now = DateTimeOffset.UtcNow;
         var dynamic = new DynamicContextOptions();
-
-        // "Local" has an expanded lease (MoE two-bucket ladder, task #26: the pre-configured
-        // baseline is 184,320 and the single extensible bucket is the native limit 262,144;
-        // a 195,000-token prompt exceeds the baseline so the engine expands to 262,144).
         var moeCapability = new TargetModelCapability(
             RoutingTarget.Local.Value,
             ModelArchitectureKind.Moe,
@@ -551,7 +605,9 @@ public class MonitorEndpointsExtensionsTests
             195_000,
             now);
 
-        var (app, client, _) = await CreateTestAppAsync(contextShrinkManager: shrinkManager);
+        var (app, client, _) = await CreateTestAppAsync(
+            executionTracker: tracker.Object,
+            contextShrinkManager: shrinkManager);
         try
         {
             var response = await client.GetAsync("/monitor/api");
@@ -560,14 +616,45 @@ public class MonitorEndpointsExtensionsTests
             var json = await response.Content.ReadFromJsonAsync<JsonObject>();
             var fleet = json!["fleet"]!.AsArray();
 
-            // Expanded lease: "<bucket>k (expanded)".
-            var localContext = fleet[0]!["contextAllocation"]?.GetValue<string>()!;
-            Assert.EndsWith(" (expanded)", localContext);
-            Assert.StartsWith("262.1k", localContext);
+            Assert.Equal("llama3.2:latest", fleet[0]!["activeModel"]?.GetValue<string>());
+            Assert.Equal("-", fleet[0]!["contextAllocation"]?.GetValue<string>());
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
 
-            // No leases: baseline implied ("-"). Cloud: always "baseline".
-            // (The legacy synthesized fleet only has Local in this test app.)
-            Assert.Equal("baseline", fleet[1]!["contextAllocation"]?.GetValue<string>());
+    [Fact]
+    public async Task GetMonitorApi_MultipleModels_ContextMatchesFirstLoadedModel()
+    {
+        // Row consistency: with two models loaded the context shown belongs to the FIRST
+        // loaded model — the same entry that drives the activeModel column.
+        var tracker = new Mock<ITargetExecutionTracker>();
+        tracker.Setup(t => t.GetState(RoutingTarget.Local)).Returns(new TargetExecutionState(
+            RoutingTarget.Local,
+            InFlightRequests: 0,
+            LoadedModels:
+            [
+                new TargetLoadedModel("first:latest", 2_000_000_000, ContextLength: 4096),
+                new TargetLoadedModel("second:latest", 2_000_000_000, ContextLength: 32768)
+            ],
+            TotalVramBytes: 4_000_000_000,
+            LastRefreshedAtUtc: DateTimeOffset.UtcNow,
+            Stale: false));
+
+        var (app, client, _) = await CreateTestAppAsync(executionTracker: tracker.Object);
+        try
+        {
+            var response = await client.GetAsync("/monitor/api");
+
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var json = await response.Content.ReadFromJsonAsync<JsonObject>();
+            var fleet = json!["fleet"]!.AsArray();
+
+            Assert.Equal("first:latest", fleet[0]!["activeModel"]?.GetValue<string>());
+            Assert.Equal("4k", fleet[0]!["contextAllocation"]?.GetValue<string>());
         }
         finally
         {

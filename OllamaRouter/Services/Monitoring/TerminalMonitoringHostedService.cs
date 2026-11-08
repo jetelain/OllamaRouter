@@ -4,7 +4,6 @@ using OllamaRouter.Endpoints;
 using OllamaRouter.Options;
 using OllamaRouter.Services.Hardware;
 using OllamaRouter.Services.Catalog;
-using OllamaRouter.Services.ContextSizing;
 using OllamaRouter.Services.Routing;
 using OllamaRouter.Services.Process;
 
@@ -22,7 +21,6 @@ public sealed class TerminalMonitoringHostedService : BackgroundService
     private readonly IModelCatalogCacheService _modelCatalogCache;
     private readonly ITargetLivenessService _targetLiveness;
     private readonly ITargetExecutionTracker _targetExecutionTracker;
-    private readonly IContextAutoShrinkManager _contextAutoShrinkManager;
     private readonly IOptionsMonitor<OllamaRouterOptions> _options;
     private readonly IHostApplicationLifetime _lifetime;
     private readonly IFleetHardwareService? _fleetHardware;
@@ -34,7 +32,6 @@ public sealed class TerminalMonitoringHostedService : BackgroundService
         IModelCatalogCacheService modelCatalogCache,
         ITargetLivenessService targetLiveness,
         ITargetExecutionTracker targetExecutionTracker,
-        IContextAutoShrinkManager contextAutoShrinkManager,
         IOptionsMonitor<OllamaRouterOptions> options,
         IHostApplicationLifetime lifetime,
         IFleetHardwareService? fleetHardware = null)
@@ -45,7 +42,6 @@ public sealed class TerminalMonitoringHostedService : BackgroundService
         _modelCatalogCache = modelCatalogCache;
         _targetLiveness = targetLiveness;
         _targetExecutionTracker = targetExecutionTracker;
-        _contextAutoShrinkManager = contextAutoShrinkManager;
         _options = options;
         _lifetime = lifetime;
         _fleetHardware = fleetHardware;
@@ -141,7 +137,6 @@ public sealed class TerminalMonitoringHostedService : BackgroundService
                         includeOverhead: false,
                         liveness: _targetLiveness,
                         executionTracker: _targetExecutionTracker,
-                        contextShrinkManager: _contextAutoShrinkManager,
                         fleetHardware: _fleetHardware).ConfigureAwait(false);
 
                     var monitorUrl = _options.CurrentValue.BindAddress.TrimEnd('/').Replace("+", "localhost") + "/monitor";

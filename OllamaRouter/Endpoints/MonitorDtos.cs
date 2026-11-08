@@ -63,8 +63,10 @@ public sealed record MonitorCostStatus(
 /// One row of the ordered multi-target fleet view (configured targets first, Cloud last):
 /// identity, enablement, liveness (Online/Offline/Probing), the currently loaded model and
 /// in-flight request count (execution tracker; Cloud always null/0), the hardware profile,
-/// the current context bucket allocation (auto-shrink lease; Cloud always "baseline"), and
-/// the lowercase location classification ("local"/"remote"/"cloud"; Cloud always "cloud").
+/// the ACTIVE model's daemon-reported context size in compact token format (e.g. <c>4k</c>,
+/// <c>1.0M</c>) — <c>-</c> when no model is loaded or the daemon does not report it; the
+/// Cloud row is always <c>-</c> — and the lowercase location classification ("local"/"remote"/
+/// "cloud"; Cloud always "cloud").
 /// </summary>
 public sealed record MonitorFleetTargetItem(
     [property: JsonPropertyName("name")] string Name,

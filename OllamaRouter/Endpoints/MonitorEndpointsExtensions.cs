@@ -14,9 +14,10 @@ namespace OllamaRouter.Endpoints;
 
 /// <summary>
 /// Lightweight, dependency-free monitoring UI: shows the multi-target fleet (per-target
-/// liveness, active model, in-flight requests, hardware profile, and context allocation) plus
-/// requests currently in progress and the recent request history with model, estimated and
-/// actual tokens, and elapsed time. It reads in-memory state from
+/// liveness, active model, in-flight requests, hardware profile, and the actual context size
+/// (daemon-reported via /api/ps <c>context_length</c>)) plus requests currently in progress
+/// and the recent request history with model, estimated and actual tokens, and elapsed time.
+/// It reads in-memory state from
 /// <see cref="IActivityMonitorService"/> and aggregated token statistics (persisted, current day
 /// and last 7 days) from <see cref="IActivityStatisticsService"/>, so it has no impact on VRAM.
 /// </summary>
@@ -45,7 +46,6 @@ public static partial class MonitorEndpointsExtensions
                 includeOverhead: true,
                 liveness: serviceProvider.GetService<ITargetLivenessService>(),
                 executionTracker: serviceProvider.GetService<ITargetExecutionTracker>(),
-                contextShrinkManager: serviceProvider.GetService<IContextAutoShrinkManager>(),
                 fleetHardware: serviceProvider.GetService<IFleetHardwareService>());
 
             return Results.Json(monitorResponse, OllamaRouterJsonSerializerContext.Default.MonitorStateResponse);

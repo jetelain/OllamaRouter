@@ -1,7 +1,6 @@
 using Microsoft.Extensions.Options;
 using OllamaRouter.Options;
 using OllamaRouter.Services.Catalog;
-using OllamaRouter.Services.ContextSizing;
 using OllamaRouter.Services.Monitoring;
 using OllamaRouter.Services.Routing;
 using OllamaRouter.Services.Hardware;
@@ -20,7 +19,6 @@ public static partial class MonitorEndpointsExtensions
         bool includeOverhead = true,
         ITargetLivenessService? liveness = null,
         ITargetExecutionTracker? executionTracker = null,
-        IContextAutoShrinkManager? contextShrinkManager = null,
         IFleetHardwareService? fleetHardware = null)
     {
         var snapshot = activityMonitor.GetSnapshot();
@@ -31,7 +29,6 @@ public static partial class MonitorEndpointsExtensions
 
         var effectiveTargets = options.CurrentValue.GetEffectiveTargets();
         var livenessEntries = liveness?.GetEntries();
-        var leaseSnapshot = contextShrinkManager?.GetLeaseSnapshot();
 
         // Ordered fleet list: configured targets first (configuration order), Cloud always last.
         // (Invalid Targets entries were already warned about at startup; this read-only path
@@ -65,7 +62,10 @@ public static partial class MonitorEndpointsExtensions
             }
 
             var executionState = executionTracker?.GetState((RoutingTarget)name);
-            var activeModel = executionState?.LoadedModels.FirstOrDefault()?.Name;
+            // The ACTIVE model entry is the FIRST loaded model; it drives BOTH the ActiveModel
+            // name and the actual context value so the two columns can never disagree rows.
+            var activeModelEntry = executionState?.LoadedModels.FirstOrDefault();
+            var activeModel = activeModelEntry?.Name;
             var inFlight = executionState?.InFlightRequests ?? 0;
 
             var effectiveVram = target.GetEffectiveMaxVramMB(fleetHardware);
@@ -89,14 +89,14 @@ public static partial class MonitorEndpointsExtensions
                 ActiveModel: activeModel,
                 InFlightRequests: inFlight,
                 HardwareProfile: hardwareProfile,
-                ContextAllocation: FormatContextAllocation((RoutingTarget)name, leaseSnapshot),
+                ContextAllocation: FormatActualContext(activeModelEntry?.ContextLength),
                 Location: TargetLocationClassifier.ToWireValue(TargetLocationClassifier.Classify(target))));
 
             periodByName[name] = statistics.Last7Days.GetValueOrDefault((RoutingTarget)name) ?? new ActivityStatisticsTotals(0, 0, 0);
         }
 
         // The Cloud pseudo-target is never probed/tracked: it is "Online" iff cloud is enabled,
-        // never has a loaded model or in-flight requests, and never carries a context lease.
+        // never has a loaded model or in-flight requests, and never has a daemon-reported context.
         var cloudFlag = targets.Flags.TryGetValue(RoutingTarget.Cloud, out var cloudEnabledFlag) ? cloudEnabledFlag : cloudEnabled;
         fleet.Add(new MonitorFleetTargetItem(
             Name: RoutingTarget.Cloud.Value,
@@ -106,7 +106,7 @@ public static partial class MonitorEndpointsExtensions
             ActiveModel: null,
             InFlightRequests: 0,
             HardwareProfile: null,
-            ContextAllocation: "baseline",
+            ContextAllocation: "-",
             Location: TargetLocationClassifier.ToWireValue(TargetLocation.Cloud)));
         periodByName[RoutingTarget.Cloud.Value] = statistics.Last7Days.GetValueOrDefault(RoutingTarget.Cloud) ?? new ActivityStatisticsTotals(0, 0, 0);
 
@@ -150,36 +150,31 @@ public static partial class MonitorEndpointsExtensions
                 : null);
     }
 
-    // Renders the current context allocation for one fleet target from the lease snapshot:
-    // any expanded lease -> "<maxBucket>k (expanded)"; a single lease at baseline ->
-    // "<bucket>k (baseline)"; no leases at all -> "-" (baseline implied). Cloud is "baseline".
-    private static string FormatContextAllocation(
-        RoutingTarget target,
-        IReadOnlyDictionary<RoutingTarget, IReadOnlyList<ContextLeaseView>>? leaseSnapshot)
+    /// <summary>
+    /// Renders the active model's daemon-reported context size in compact token format:
+    /// < 1,000 → raw integer (e.g. "512"); < 1,000,000 → nearest whole k (e.g. 4,096 → "4k",
+    /// 32,768 → "33k"); ≥ 1,000,000 → 1-decimal M (e.g. 1,310,720 → "1.3M"). InvariantCulture.
+    /// Null (no model loaded, or the daemon did not report context_length) → "-" — the lease
+    /// allocation is intentionally NOT used as a fallback.
+    /// </summary>
+    private static string FormatActualContext(int? tokens)
     {
-        if (target == RoutingTarget.Cloud || leaseSnapshot is null ||
-            !leaseSnapshot.TryGetValue(target, out var leases) || leases.Count == 0)
+        if (tokens is null or <= 0)
         {
-            return target == RoutingTarget.Cloud ? "baseline" : "-";
+            return "-";
         }
 
-        if (leases.Any(lease => lease.IsExpanded))
-        {
-            return $"{FormatBucketTokens(leases.Max(lease => lease.ActiveBucket))} (expanded)";
-        }
+        var v = tokens.Value;
 
-        return $"{FormatBucketTokens(leases[0].ActiveBucket)} (baseline)";
-    }
-
-    private static string FormatBucketTokens(int tokens)
-    {
-        if (tokens >= 1_000_000)
+        if (v >= 1_000_000)
         {
-            return (tokens / 1_000_000.0).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + "M";
+            return (v / 1_000_000.0).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + "M";
         }
-        return tokens >= 1_000
-            ? (tokens / 1_000.0).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + "k"
-            : tokens.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        if (v >= 1_000)
+        {
+            return Math.Round(v / 1000.0, 0, MidpointRounding.AwayFromZero).ToString(System.Globalization.CultureInfo.InvariantCulture) + "k";
+        }
+        return v.ToString(System.Globalization.CultureInfo.InvariantCulture);
     }
 
     public static MonitorCostStatus? CalculateCostStatus(

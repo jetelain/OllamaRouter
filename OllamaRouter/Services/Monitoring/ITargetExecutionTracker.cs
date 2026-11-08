@@ -5,14 +5,16 @@ using OllamaRouter.Services.Routing;
 /// One model process currently loaded in memory on a target, as reported by
 /// <c>GET /api/ps</c> of that target's Ollama daemon.
 /// <para>
-/// Ollama's /api/ps does NOT expose the per-process context length;
-/// <see cref="ContextLength"/> is therefore best-effort (null when not present in
-/// the payload) and may be enriched by later phases (e.g. from /api/show capabilities).
+/// <see cref="ContextLength"/> is the LIVE per-process context length in tokens: modern
+/// Ollama daemons report it as <c>context_length</c> in /api/ps (honoring the runtime
+/// <c>num_ctx</c>), and it is null on older daemons that omit the field (or report it
+/// invalid/non-positive). A best-effort <c>num_ctx</c> read is kept only as a legacy
+/// fallback for daemons that never emit <c>context_length</c>.
 /// </para>
 /// </summary>
 /// <param name="Name">The model name + tag as reported by /api/ps (e.g. "llama3:latest").</param>
 /// <param name="SizeVramBytes">The <c>size_vram</c> field of the /api/ps entry (0 when missing/invalid).</param>
-/// <param name="ContextLength">Best-effort context length (tokens) when discoverable; null otherwise.</param>
+/// <param name="ContextLength">The daemon-reported live context length (tokens) from the /api/ps <c>context_length</c> field (legacy <c>num_ctx</c> fallback when absent); null when the daemon does not report it or no longer does.</param>
 /// <param name="QuantizationLevel">Best-effort <c>details.quantization_level</c> from the /api/ps entry (the live-process quantization, authoritative for the resident model); null when absent or malformed.</param>
 public sealed record TargetLoadedModel(string Name, long SizeVramBytes, int? ContextLength = null, string? QuantizationLevel = null);
 

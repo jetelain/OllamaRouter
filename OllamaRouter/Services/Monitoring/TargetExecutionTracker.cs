@@ -363,9 +363,11 @@ public sealed class TargetExecutionTracker : ITargetExecutionTracker
     /// <summary>
     /// Fail-soft <c>JsonNode</c> parsing of a /api/ps payload: <c>name</c> (falling back to
     /// <c>model</c>) is the model name, <c>size_vram</c> is parsed as long (missing/invalid → 0),
-    /// <c>num_ctx</c> becomes the best-effort <see cref="TargetLoadedModel.ContextLength"/>
-    /// only when present and numeric (Ollama does not expose it today; later phases may), and
-    /// <c>details.quantization_level</c> becomes the best-effort
+    /// <c>context_length</c> becomes the <see cref="TargetLoadedModel.ContextLength"/> (the live
+    /// per-process context length in tokens that modern Ollama daemons report in /api/ps,
+    /// honoring runtime <c>num_ctx</c>; missing/invalid/non-positive → null). A best-effort
+    /// <c>num_ctx</c> read is kept ONLY as a legacy fallback for daemons that never emit
+    /// <c>context_length</c>, and <c>details.quantization_level</c> becomes the best-effort
     /// <see cref="TargetLoadedModel.QuantizationLevel"/> only when present and a non-blank string.
     /// </summary>
     internal static List<TargetLoadedModel> ParseModels(JsonArray models)
@@ -385,10 +387,20 @@ public sealed class TargetExecutionTracker : ITargetExecutionTracker
                 sizeVram = vram.Value;
             }
 
+            // Live per-process context length: modern daemons report context_length in /api/ps.
+            // Non-positive values are daemon bugs, not displayable contexts, so they read as null.
             int? contextLength = null;
+            if (obj["context_length"] is JsonValue ctxLenValue && ctxLenValue.TryGetValue(out int? ctxLen) && ctxLen is > 0)
+            {
+                contextLength = ctxLen.Value;
+            }
+
+            // Legacy best-effort fallback (kept behind the ?? below): only used when the real
+            // context_length field is absent or invalid on older daemons.
+            int? legacyNumCtx = null;
             if (obj["num_ctx"] is JsonValue ctxValue && ctxValue.TryGetValue(out int? ctx) && ctx.HasValue)
             {
-                contextLength = ctx.Value;
+                legacyNumCtx = ctx.Value;
             }
 
             string? quantizationLevel = null;
@@ -399,7 +411,7 @@ public sealed class TargetExecutionTracker : ITargetExecutionTracker
                 quantizationLevel = quantText;
             }
 
-            parsed.Add(new TargetLoadedModel(name, sizeVram, contextLength, quantizationLevel));
+            parsed.Add(new TargetLoadedModel(name, sizeVram, contextLength ?? legacyNumCtx, quantizationLevel));
         }
 
         return parsed;

@@ -37,7 +37,7 @@ public class TerminalMonitorRendererTests
         string? remoteActiveModel = null,
         string localContext = "-",
         string remoteContext = "-",
-        string cloudContext = "baseline",
+        string cloudContext = "-",
         ActivityStatisticsTotals? todayLocal = null,
         ActivityStatisticsTotals? todayRemote = null,
         ActivityStatisticsTotals? todayCloud = null,
@@ -106,7 +106,7 @@ public class TerminalMonitorRendererTests
         {
             FleetItem("Local", "http://127.0.0.1:11435", true, "Online", "qwen3:8b", 0, "16gb,2.0x", "-"),
             FleetItem("Remote", "http://192.168.1.2:11434", true, "Online", null, 0, "96gb", "-"),
-            FleetItem("Cloud", null, true, "Online", null, 0, null, "baseline")
+            FleetItem("Cloud", null, true, "Online", null, 0, null, "-")
         };
 
         var state = new MonitorStateResponse(
@@ -157,6 +157,45 @@ public class TerminalMonitorRendererTests
         // Cloud row: null profile renders "-".
         var cloudRow = lines.Single(l => l.Contains("Cloud") && !l.Contains("Cloud:"));
         Assert.Contains("-", cloudRow);
+    }
+
+    [Fact]
+    public void Render_FleetTable_CtxColumn_ValuesOverSixteenCharsTruncateWithEllipsis()
+    {
+        // The Ctx column is 16-wide: a ContextAllocation over 16 display chars truncates to
+        // 15 chars + "…"; a compact daemon-reported value like "128k" renders intact.
+        var fleet = new List<MonitorFleetTargetItem>
+        {
+            FleetItem("verbose", "http://192.168.1.10:11434", true, "Online", "model:latest", 0, "16gb", "12345678901234567"),
+            FleetItem("compact", "http://192.168.1.11:11434", true, "Online", "model:latest", 0, "16gb", "128k")
+        };
+
+        var state = new MonitorStateResponse(
+            CloudEnabled: false,
+            Fleet: fleet,
+            Statistics: new MonitorStatisticsStatus(
+                new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["total"] = new ActivityStatisticsTotals(0, 0, 0)
+                },
+                new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["total"] = new ActivityStatisticsTotals(0, 0, 0)
+                }),
+            InProgress: [],
+            Requests: [],
+            Cost: null,
+            Overhead: null);
+
+        var output = TerminalMonitorRenderer.Render(state, "http://localhost:11434/monitor", enableAnsi: false);
+        var lines = output.Split(["\r\n", "\n"], StringSplitOptions.None);
+
+        var verboseRow = lines.Single(l => l.Contains("verbose"));
+        Assert.Contains("123456789012345…", verboseRow);
+
+        var compactRow = lines.Single(l => l.Contains("compact"));
+        Assert.Contains("128k", compactRow);
+        Assert.DoesNotContain("…", compactRow);
     }
 
     private static MonitorCostStatus Cost(double savings, double cloudCost, params (string Name, double Savings)[] perTarget)
@@ -218,10 +257,10 @@ public class TerminalMonitorRendererTests
     {
         var fleet = new List<MonitorFleetTargetItem>
         {
-            FleetItem("desktop", "http://192.168.1.10:11434", true, "Online", "llama3.2:latest", 2, "16gb", "65.5k (expanded)"),
+            FleetItem("desktop", "http://192.168.1.10:11434", true, "Online", "llama3.2:latest", 2, "16gb", "128k"),
             FleetItem("laptop", "http://192.168.1.11:11434", true, "Offline", null, 0, null, "-"),
-            FleetItem("server1", "http://192.168.1.12:11434", true, "Probing", "qwen3:8b", 1, "96gb", "32.8k (baseline)"),
-            FleetItem("Cloud", null, true, "Offline", null, 0, null, "baseline")
+            FleetItem("server1", "http://192.168.1.12:11434", true, "Probing", "qwen3:8b", 1, "96gb", "33k"),
+            FleetItem("Cloud", null, true, "Offline", null, 0, null, "-")
         };
 
         var state = new MonitorStateResponse(
@@ -262,13 +301,13 @@ public class TerminalMonitorRendererTests
         Assert.Contains("\u25CF Offline", output);
         Assert.Contains("\u25CF Probing", output);
 
-        // In-flight counts, hardware profiles, models and context allocations.
+        // In-flight counts, hardware profiles, models and daemon-reported context sizes.
         Assert.Contains("llama3.2:latest", output);
         Assert.Contains("qwen3:8b", output);
         Assert.Contains("16gb", output);
         Assert.Contains("96gb", output);
-        Assert.Contains("65.5k (expanded)", output);
-        Assert.Contains("32.8k (baseline)", output);
+        Assert.Contains("128k", output);
+        Assert.Contains("33k", output);
 
         var lines = output.Split(["\r\n", "\n"], StringSplitOptions.None);
         var desktopRow = lines.Single(l => l.Contains("desktop"));
@@ -276,25 +315,25 @@ public class TerminalMonitorRendererTests
         var server1Row = lines.Single(l => l.Contains("server1"));
         var cloudRow = lines.Single(l => l.Contains("Cloud") && !l.Contains("Cloud:"));
 
-        // desktop: online, 2 in-flight, 16gb, expanded context.
+        // desktop: online, 2 in-flight, 16gb, daemon-reported 128k context.
         Assert.Contains("\u25CF Online", desktopRow);
         Assert.Contains(" 2 ", " " + desktopRow.TrimEnd() + " ");
         Assert.Contains("16gb", desktopRow);
-        Assert.Contains("65.5k (expanded)", desktopRow);
+        Assert.Contains("128k", desktopRow);
 
-        // laptop: offline, 0 in-flight, no hardware profile, no lease.
+        // laptop: offline, 0 in-flight, no hardware profile, no loaded model.
         Assert.Contains("\u25CF Offline", laptopRow);
         Assert.EndsWith("0 -", laptopRow.TrimEnd());
         Assert.DoesNotContain("●", laptopRow.Replace("\u25CF Offline", ""));
 
-        // server1: probing, 1 in-flight, 96gb, baseline lease.
+        // server1: probing, 1 in-flight, 96gb, daemon-reported 33k context.
         Assert.Contains("\u25CF Probing", server1Row);
         Assert.Contains("96gb", server1Row);
-        Assert.Contains("32.8k (baseline)", server1Row);
+        Assert.Contains("33k", server1Row);
 
-        // Cloud row: offline (cloud disabled), no models, "baseline" context.
+        // Cloud row: offline (cloud disabled), no models, "-" context.
         Assert.Contains("\u25CF Offline", cloudRow);
-        Assert.Contains("baseline", cloudRow);
+        Assert.DoesNotContain("baseline", cloudRow, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -486,8 +525,8 @@ public class TerminalMonitorRendererTests
             localInFlight: 2,
             remoteInFlight: 0,
             localActiveModel: "qwen2.5-coder:32b-instruct-q4_K_M",
-            localContext: "262.1k (expanded)",
-            remoteContext: "32.8k (baseline)",
+            localContext: "262k",
+            remoteContext: "33k",
             todayLocal: new ActivityStatisticsTotals(120, 450000, 120000),
             todayRemote: new ActivityStatisticsTotals(80, 890000, 340000),
             todayCloud: new ActivityStatisticsTotals(15, 230000, 45000),
@@ -518,12 +557,12 @@ public class TerminalMonitorRendererTests
         // 5 configured targets (with long names and long models) + Cloud; long values truncate.
         var fleet = new List<MonitorFleetTargetItem>
         {
-            FleetItem("workstation-primary", "http://192.168.1.10:11434", true, "Online", "llama-3.2-70b-instruct-fp8-tensorrt", 3, "16gb", "262.1k (expanded)"),
+            FleetItem("workstation-primary", "http://192.168.1.10:11434", true, "Online", "llama-3.2-70b-instruct-fp8-tensorrt", 3, "16gb", "262k"),
             FleetItem("laptop", "http://192.168.1.11:11434", false, "Probing", null, 0, null, "-"),
-            FleetItem("server-rack-one", "http://192.168.1.12:11434", true, "Online", "qwen3:8b", 1, "96gb", "184.3k (expanded)"),
+            FleetItem("server-rack-one", "http://192.168.1.12:11434", true, "Online", "qwen3:8b", 1, "96gb", "184k"),
             FleetItem("mac-mini-studio", "http://192.168.1.13:11434", true, "Offline", null, 0, "16384 MB", "-"),
             FleetIndexItem(5),
-            FleetItem("Cloud", null, true, "Online", null, 0, null, "baseline")
+            FleetItem("Cloud", null, true, "Online", null, 0, null, "-")
         };
 
         var state = new MonitorStateResponse(
@@ -580,7 +619,7 @@ public class TerminalMonitorRendererTests
         var fleet = new List<MonitorFleetTargetItem>
         {
             FleetItem("desktop", "http://192.168.1.5:11434", true, "Online"),
-            FleetItem("Cloud", null, true, "Online", null, 0, null, "baseline")
+            FleetItem("Cloud", null, true, "Online", null, 0, null, "-")
         };
 
         var state = new MonitorStateResponse(
@@ -612,7 +651,7 @@ public class TerminalMonitorRendererTests
         {
             FleetItem("remote", "http://example.com:11434", true, "Online"),
             FleetItem("Local", "http://127.0.0.1:11434", true, "Online"),
-            FleetItem("Cloud", null, true, "Online", null, 0, null, "baseline")
+            FleetItem("Cloud", null, true, "Online", null, 0, null, "-")
         };
 
         var state = new MonitorStateResponse(
@@ -680,7 +719,7 @@ public class TerminalMonitorRendererTests
         var fleet = new List<MonitorFleetTargetItem>
         {
             FleetItem("desktop", "http://192.168.1.5:11434", true, "Online"),
-            FleetItem("Cloud", null, true, "Online", null, 0, null, "baseline")
+            FleetItem("Cloud", null, true, "Online", null, 0, null, "-")
         };
 
         var state = new MonitorStateResponse(
