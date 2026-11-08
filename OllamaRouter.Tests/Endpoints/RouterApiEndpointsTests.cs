@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using Moq;
+using Microsoft.Extensions.Logging.Abstractions;
 using OllamaRouter.Endpoints;
 using OllamaRouter.Options;
 using OllamaRouter.Serialization;
@@ -78,7 +79,8 @@ public class RouterApiEndpointsTests
         bool registerShrinkManager = true,
         bool registerGpuVramProvider = true,
         bool registerCatalogCache = false,
-        IFleetHardwareService? fleetHardware = null)
+        IFleetHardwareService? fleetHardware = null,
+        ISessionAffinityService? sessionAffinity = null)
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseUrls("http://127.0.0.1:0");
@@ -151,6 +153,10 @@ public class RouterApiEndpointsTests
         if (registerCatalogCache)
         {
             builder.Services.AddSingleton(catalogCache.Object);
+        }
+        if (sessionAffinity is not null)
+        {
+            builder.Services.AddSingleton(sessionAffinity);
         }
 
         if (fleetHardware is not null)
@@ -427,6 +433,7 @@ public class RouterApiEndpointsTests
         Assert.Equal("16384", local["hardware"]!["maxVramMB"]!.ToString());
         Assert.Equal("1", local["hardware"]!["maxParallel"]!.ToString());
         Assert.Equal("2", local["execution"]!["inFlightRequests"]!.ToString());
+        Assert.Equal("0", local["execution"]!["activeSessions"]!.ToString()); // no session leases in this harness
         Assert.Equal("qwen2.5-coder:32b", local["execution"]!["activeModel"]!.ToString());
         Assert.Equal("65.5k (expanded)", local["execution"]!["contextAllocation"]!.ToString());
 
@@ -465,8 +472,47 @@ public class RouterApiEndpointsTests
         Assert.Null(cloud["hardware"]!["maxVramMB"]);
         Assert.Equal("10", cloud["hardware"]!["maxParallel"]!.ToString());
         Assert.Equal("0", cloud["execution"]!["inFlightRequests"]!.ToString());
+        Assert.Equal("0", cloud["execution"]!["activeSessions"]!.ToString()); // Cloud is never leased
         Assert.Null(cloud["execution"]!["activeModel"]);
         Assert.Equal("baseline", cloud["execution"]!["contextAllocation"]!.ToString());
+    }
+
+    [Fact]
+    public async Task RouterFleet_ExposesActiveSessionsPerTarget_WithinReservationWindow()
+    {
+        // Task #77: execution.activeSessions reports the sessions active on each target
+        // within the SessionReservationWindowSeconds window (Cloud stays 0 — never leased).
+        var options = ThreeTargetOptions();
+        var affinity = new SessionAffinityService(
+            new TestOptionsMonitor<OllamaRouterOptions>(options),
+            NullLogger<SessionAffinityService>.Instance);
+        affinity.SetAffinity("ncf-task62", RoutingTarget.Local);
+        affinity.SetAffinity("ncf-task76", RoutingTarget.Local);
+
+        await using var harness = await CreateTestAppAsync(
+            options,
+            livenessEntries: new Dictionary<RoutingTarget, TargetLivenessEntry>
+            {
+                [RoutingTarget.Local] = Entry(RoutingTarget.Local, TargetLivenessState.Online, 1)
+            },
+            sessionAffinity: affinity);
+
+        using var response = await harness.Client.GetAsync("/api/router/fleet");
+
+        Assert.Equal(System.Net.HttpStatusCode.OK, response.StatusCode);
+        var node = JsonNode.Parse(await response.Content.ReadAsStringAsync());
+
+        var local = TargetItem(node, "Local");
+        Assert.Equal("2", local["execution"]!["activeSessions"]!.ToString()); // both fresh leases on Local
+
+        var server = TargetItem(node, "Server");
+        Assert.Equal("0", server["execution"]!["activeSessions"]!.ToString());
+
+        var laptop = TargetItem(node, "Laptop");
+        Assert.Equal("0", laptop["execution"]!["activeSessions"]!.ToString());
+
+        var cloud = TargetItem(node, "Cloud");
+        Assert.Equal("0", cloud["execution"]!["activeSessions"]!.ToString());
     }
 
     [Fact]

@@ -9,8 +9,9 @@ namespace OllamaRouter.Tests.Services.Routing;
 /// <summary>
 /// Tests for the thread-safe sliding-TTL session-affinity store
 /// (<see cref="SessionAffinityService"/>): case-insensitive round-trip, sliding TTL with an
-/// injected clock, single-session removal, target-wide invalidation, and the bounded lazy
-/// sweep on large tables.
+/// injected clock, single-session removal, target-wide invalidation, the bounded lazy
+/// sweep on large tables, and the task #77 read-only active-session reservation-window
+/// queries (occupancy counts, other-session reservation, self-exemption, TTL non-refresh).
 /// </summary>
 public class SessionAffinityServiceTests
 {
@@ -238,6 +239,144 @@ public class SessionAffinityServiceTests
         Assert.True(service.TryGetAffinity("agent-1", out _));
 
         clock.Advance(TimeSpan.FromMinutes(31));
+        Assert.False(service.TryGetAffinity("agent-1", out _));
+    }
+
+    // ==================================================================
+    // Task #77 — active-session reservation window (read-only queries)
+    // ==================================================================
+
+    [Fact]
+    public void GetActiveSessionCount_FreshLease_CountedWithinWindow()
+    {
+        var (service, _) = Build();
+        var t1 = new RoutingTarget("aiserver1");
+
+        service.SetAffinity("agent-1", t1);
+
+        Assert.Equal(1, service.GetActiveSessionCount(t1, TimeSpan.FromSeconds(30)));
+        // A different target is never counted (case-insensitive name match).
+        Assert.Equal(0, service.GetActiveSessionCount(new RoutingTarget("aiserver2"), TimeSpan.FromSeconds(30)));
+        Assert.Equal(0, service.GetActiveSessionCount(new RoutingTarget("AISERVER9"), TimeSpan.FromSeconds(30)));
+    }
+
+    [Fact]
+    public void GetActiveSessionCount_WindowElapsed_NotCounted_RepinRestores()
+    {
+        var (service, clock) = Build();
+        var t1 = new RoutingTarget("aiserver1");
+        service.SetAffinity("agent-1", t1);
+
+        clock.Advance(TimeSpan.FromSeconds(31)); // 1 s past the 30 s window
+
+        Assert.Equal(0, service.GetActiveSessionCount(t1, TimeSpan.FromSeconds(30)));
+
+        // A re-pin re-arms the sliding timestamp and counts again.
+        service.SetAffinity("agent-1", t1);
+        Assert.Equal(1, service.GetActiveSessionCount(t1, TimeSpan.FromSeconds(30)));
+    }
+
+    [Fact]
+    public void GetActiveSessionCount_MultipleSessionsSameTarget_Counted_OthersUnaffected()
+    {
+        var (service, _) = Build();
+        var t1 = new RoutingTarget("aiserver1");
+        var t2 = new RoutingTarget("aiserver2");
+
+        service.SetAffinity("agent-1", t1);
+        service.SetAffinity("agent-2", t1);
+        service.SetAffinity("agent-3", t2);
+
+        Assert.Equal(2, service.GetActiveSessionCount(t1, TimeSpan.FromSeconds(30)));
+        Assert.Equal(1, service.GetActiveSessionCount(t2, TimeSpan.FromSeconds(30)));
+    }
+
+    [Fact]
+    public void GetActiveSessionCount_ZeroOrNegativeWindow_AlwaysZero()
+    {
+        var (service, _) = Build();
+        var t1 = new RoutingTarget("aiserver1");
+        service.SetAffinity("agent-1", t1);
+
+        Assert.Equal(0, service.GetActiveSessionCount(t1, TimeSpan.Zero));
+        Assert.Equal(0, service.GetActiveSessionCount(t1, TimeSpan.FromSeconds(-5)));
+    }
+
+    [Fact]
+    public void IsTargetReservedByOtherSession_OtherSessionActive_True()
+    {
+        var (service, _) = Build();
+        var t1 = new RoutingTarget("aiserver1");
+        service.SetAffinity("agent-1", t1);
+
+        Assert.True(service.IsTargetReservedByOtherSession(t1, "agent-2", TimeSpan.FromSeconds(30)));
+    }
+
+    [Fact]
+    public void IsTargetReservedByOtherSession_OwnSessionExempt_False_CaseInsensitive()
+    {
+        var (service, _) = Build();
+        var t1 = new RoutingTarget("aiserver1");
+        service.SetAffinity("AGENT-1", t1);
+
+        // The leaser's own lease never counts as "another active session" (case-insensitive
+        // ID match) — sticky affinity on the session's own target is preserved.
+        Assert.False(service.IsTargetReservedByOtherSession(t1, "agent-1", TimeSpan.FromSeconds(30)));
+        Assert.False(service.IsTargetReservedByOtherSession(t1, "Agent-1", TimeSpan.FromSeconds(30)));
+    }
+
+    [Fact]
+    public void IsTargetReservedByOtherSession_WindowElapsed_False()
+    {
+        var (service, clock) = Build();
+        var t1 = new RoutingTarget("aiserver1");
+        service.SetAffinity("agent-1", t1);
+
+        clock.Advance(TimeSpan.FromSeconds(31));
+
+        Assert.False(service.IsTargetReservedByOtherSession(t1, "agent-2", TimeSpan.FromSeconds(30)));
+    }
+
+    [Fact]
+    public void IsTargetReservedByOtherSession_NullOrBlankCurrentSession_AnyActiveLeaseCounts()
+    {
+        var (service, _) = Build();
+        var t1 = new RoutingTarget("aiserver1");
+        service.SetAffinity("agent-1", t1);
+
+        Assert.True(service.IsTargetReservedByOtherSession(t1, null, TimeSpan.FromSeconds(30)));
+        Assert.True(service.IsTargetReservedByOtherSession(t1, "", TimeSpan.FromSeconds(30)));
+        Assert.True(service.IsTargetReservedByOtherSession(t1, "   ", TimeSpan.FromSeconds(30)));
+    }
+
+    [Fact]
+    public void IsTargetReservedByOtherSession_AfterInvalidateTarget_False()
+    {
+        var (service, _) = Build();
+        var t1 = new RoutingTarget("aiserver1");
+        service.SetAffinity("agent-1", t1);
+
+        service.InvalidateTarget(t1);
+
+        Assert.False(service.IsTargetReservedByOtherSession(t1, "agent-2", TimeSpan.FromSeconds(30)));
+        Assert.Equal(0, service.GetActiveSessionCount(t1, TimeSpan.FromSeconds(30)));
+    }
+
+    [Fact]
+    public void Queries_AreReadOnly_DoesNotRefreshSlidingTtl()
+    {
+        // A reservation-window query must NOT re-arm the sliding TTL (evaluating candidates
+        // for session 2 must never extend session 1's reservation): the lease still expires
+        // exactly 30 minutes after the last REAL touch, even though queries ran at +29 min.
+        var (service, clock) = Build(ttlMinutes: 30);
+        var t1 = new RoutingTarget("aiserver1");
+        service.SetAffinity("agent-1", t1);
+
+        clock.Advance(TimeSpan.FromMinutes(29)); // inside the 30-min TTL, far outside any window
+        Assert.Equal(0, service.GetActiveSessionCount(t1, TimeSpan.FromSeconds(30)));
+        Assert.False(service.IsTargetReservedByOtherSession(t1, "agent-2", TimeSpan.FromSeconds(30)));
+
+        clock.Advance(TimeSpan.FromMinutes(2));  // 31 min since the last real touch
         Assert.False(service.TryGetAffinity("agent-1", out _));
     }
 }

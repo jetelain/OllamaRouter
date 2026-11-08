@@ -134,14 +134,16 @@ A target is eligible for routing if and only if:
 #### Stage 2: Scoring Formula
 Among qualified candidates, the router selects the node with the highest score:
 
-$$\text{Score} = \text{AffinityBonus}(+100) + \text{HardwareBonus}(+20) - \text{EvictionPenalty}(-80) - \text{ConcurrencyPenalty}$$
+$$\text{Score} = \text{AffinityBonus}(+100) + \text{HardwareBonus}(+20) - \text{EvictionPenalty}(-80) - \text{ConcurrencyPenalty} - \text{OtherSessionPenalty}$$
+
+*(Task #77: the recalibrated `ConcurrencyPenalty` (cliff 100 → 220, i.e. $-260$ at $\text{MaxParallel} = 1$) plus the new `OtherSessionPenalty` (default $-120$) applied when the candidate is reserved by ANOTHER active session within the `SessionReservationWindowSeconds` window (default 30 s; the request's own lease is exempt) — superseded by task #77.)*
 
 | Component | Value | Condition / Rationale |
 | :--- | :--- | :--- |
 | **AffinityBonus** | **+100** | Target currently has the requested model actively loaded in memory (verified via `/api/ps`). Eliminates load latency. |
 | **HardwareBonus** | **+20** | Role-matching and anti-eviction offloading bonus:<br/>• Architect dense $\le 48\text{k} \rightarrow$ Desktop bonus.<br/>• Long context prompts $> 48\text{k} \rightarrow$ Server bonus.<br/>• MoE developer / Small Dense ($< 14\text{B}$) $\rightarrow$ Laptop offload bonus *when Desktop is holding a dense model hot or is busy*, protecting Desktop VRAM for Architect. When Desktop is idle and no dense model is hot, MoE requests run on Desktop at full 118 t/s. |
 | **EvictionPenalty** | **-80** | Target has a *different* model loaded in memory that would be evicted by loading this model (e.g. loading MoE on Desktop when Desktop has 27B loaded incurs $-80$, ensuring Laptop [score 0 or +100] wins without penalizing standalone MoE). |
-| **ConcurrencyPenalty** | **-40 per req<br/>+ Single-GPU Cliff (-100)** | $\text{TargetMaxParallel}$ is the target's `MaxParallel` configuration value (default 1; see §2.1). Calibrated to eliminate single-GPU queueing:<br/>$$\text{ConcurrencyPenalty} = (\text{InFlightCount} \times 40) + (\text{InFlightCount} \ge \text{TargetMaxParallel} \mathbin{?} 100 : 0)$$<br/>*(On Desktop with $\text{MaxParallel} = 1$: 1 active request incurs $-140$. Score drops from $+120$ to $-20$. An idle Server [score 0] immediately wins the 2nd concurrent request, preventing queueing).* |
+| **ConcurrencyPenalty** | **-40 per req<br/>+ MaxParallel Cliff (default -220)** | $\text{TargetMaxParallel}$ is the target's `MaxParallel` configuration value (default 1; see §2.1). Calibrated to eliminate single-GPU queueing:<br/>$$\text{ConcurrencyPenalty} = (\text{InFlightCount} \times 40) + (\text{InFlightCount} \ge \text{TargetMaxParallel} \mathbin{?} \text{MaxParallelCliffPenalty}[220] : 0)$$<br/>*(On Desktop with $\text{MaxParallel} = 1$: 1 active request incurs $-260$. Score drops from $+120$ to $-140$; the cliff was recalibrated from -100 (the original $-140$) by task #77 so a SATURATED LEASED node can never beat an idle qualified candidate. An idle Server [score 0] immediately wins the 2nd concurrent request, preventing queueing).* |
 
 *Tie-Breaker Rule*: If scores are equal, selection follows the declaration order in `appsettings.json` Targets list.
 
@@ -482,8 +484,8 @@ gantt
    - Implement hysteresis lease: retain expanded bucket for `AutoShrinkCooldownTurns` normal turns or `AutoShrinkIdleTimeoutSeconds` before shrinking, preserving prompt prefix cache.
    - Trigger immediate auto-shrink when prompt drops $< 50\%$ baseline or cooldown counter expires.
 3. **Affinity Scoring Pipeline (`RoutingDecisionService`):**
-   - Implement candidate scoring formula with calibrated single-GPU concurrency cliff:
-     $$\text{Score} = \text{AffinityBonus}(+100) + \text{HardwareBonus}(+20) - \text{EvictionPenalty}(-80) - \text{ConcurrencyPenalty}$$
+    - Implement candidate scoring formula with calibrated single-GPU concurrency cliff (task #77: cliff recalibrated 100 → 220 and the $-120$ `OtherSessionPenalty` session-contention term added):
+      $$\text{Score} = \text{AffinityBonus}(+100) + \text{HardwareBonus}(+20) - \text{EvictionPenalty}(-80) - \text{ConcurrencyPenalty} - \text{OtherSessionPenalty}$$
    - Award offloading bonus to Laptop for MoE and SmallDense when Desktop is holding 27B hot or busy.
    - Allow idle Desktop to win standalone MoE requests for full 118 t/s execution.
 4. **Per-Target Failover, Streak Tracking & `IHttpForwarder` Retry Loop:**
@@ -494,7 +496,7 @@ gantt
 #### Test Deliverables:
 - Simulation tests of Architect $\leftrightarrow$ Developer interleaved turns: verify zero model evictions when two compatible targets are online.
 - Auto-shrink tests: verify MoE prompt sequence 195k $\rightarrow$ 175k retains 262,144 (preserving KV cache), and subsequent 30k prompt triggers auto-shrink to 184,320.
-- High-concurrency routing tests verifying parallel requests spill to Server instead of queueing on Desktop due to the $-140$ single-GPU busy penalty.
+- High-concurrency routing tests verifying parallel requests spill to Server instead of queueing on Desktop due to the $-260$ MaxParallel busy penalty (task #77 recalibration, superseding the original $-140$ single-GPU busy penalty).
 - Tests verifying uncommitted request retry (Target A connection refused $\rightarrow$ retried on Target B $\rightarrow$ 200 OK).
 
 ---
@@ -552,7 +554,7 @@ gantt
 | **Model Incompatibility** | Send request for `Qwen3.8-27B:latest` with Desktop busy or offline. | Request routes to AI Server or Cloud Overflow. It **never** routes to Laptop. |
 | **Hot-Model Affinity** | Keep `Qwen3.8-27B:latest` loaded on Desktop and `Qwen3.6-35B-A3B-Code:latest` on Laptop. Send interleaved Architect and Developer requests. | Zero model unloads or weight reloads occur. Architect runs on Desktop; Developer runs on Laptop concurrently. |
 | **Standalone MoE Speed** | Send `Qwen3.6-35B-A3B-Code:latest` request when Desktop is idle and no 27B model is hot. | Request routes to Desktop for 100–118 t/s execution; does not handicap execution to Laptop (35 t/s). |
-| **Concurrency Spill** | Send 2 concurrent requests for `Qwen3.8-27B:latest` while Desktop is busy. | Single-GPU busy penalty ($-140$) drops Desktop score to $-20$; second request spills immediately to Server (score 0) without queueing on Desktop. |
+| **Concurrency Spill** | Send 2 concurrent requests for `Qwen3.8-27B:latest` while Desktop is busy. | MaxParallel busy penalty ($-260$; task #77 recalibration of the original $-140$ single-GPU busy penalty) drops Desktop score to $-140$; second request spills immediately to Server (score 0) without queueing on Desktop. |
 | **Uncommitted Failover** | Kill target daemon immediately as request arrives. | Request body rewinds and executes successfully on the next capable target via `IHttpForwarder.SendAsync` before headers commit. |
 | **Client Pinning** | Send request with `X-OllamaRouter-Target: laptop`. | Request routes strictly to Laptop if eligible and online; returns telemetry header `X-OllamaRouter-Target: laptop`. |
 | **Mesh Operation** | Run OllamaRouter on both Desktop and Laptop. | Both instances can access all online daemons without circular routing or deadlock. |

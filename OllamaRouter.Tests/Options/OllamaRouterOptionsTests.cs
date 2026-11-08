@@ -176,6 +176,68 @@ public class OllamaRouterOptionsTests
     }
 
     [Fact]
+    public void SessionReservationOptions_Defaults()
+    {
+        var options = new OllamaRouterOptions();
+
+        Assert.Equal(OllamaRouterOptions.DefaultSessionReservationWindowSeconds, options.SessionReservationWindowSeconds);
+        Assert.Equal(30, options.SessionReservationWindowSeconds);
+        Assert.Equal(120, options.OtherSessionReservationPenalty);
+        Assert.Equal(220, options.MaxParallelCliffPenalty);
+    }
+
+    [Fact]
+    public void Normalize_NegativeSessionReservationOptions_ResetToDefaults()
+    {
+        // Task #77: negative reservation-window / contention / cliff values are invalid and
+        // reset to their defaults on normalize (re-applied on every config reload).
+        var options = new OllamaRouterOptions
+        {
+            SessionReservationWindowSeconds = -5,
+            OtherSessionReservationPenalty = -1,
+            MaxParallelCliffPenalty = -99
+        };
+
+        options.Normalize();
+
+        Assert.Equal(OllamaRouterOptions.DefaultSessionReservationWindowSeconds, options.SessionReservationWindowSeconds);
+        Assert.Equal(120, options.OtherSessionReservationPenalty);
+        Assert.Equal(220, options.MaxParallelCliffPenalty);
+    }
+
+    [Fact]
+    public void Normalize_ZeroSessionReservationOptions_StayZero_Disabled()
+    {
+        // 0 is a meaningful opt-out (the reservation window / contention / cliff terms are
+        // disabled) and must survive normalization; positive custom values are kept too.
+        var options = new OllamaRouterOptions
+        {
+            SessionReservationWindowSeconds = 0,
+            OtherSessionReservationPenalty = 0,
+            MaxParallelCliffPenalty = 0
+        };
+
+        options.Normalize();
+
+        Assert.Equal(0, options.SessionReservationWindowSeconds);
+        Assert.Equal(0, options.OtherSessionReservationPenalty);
+        Assert.Equal(0, options.MaxParallelCliffPenalty);
+
+        var custom = new OllamaRouterOptions
+        {
+            SessionReservationWindowSeconds = 15,
+            OtherSessionReservationPenalty = 80,
+            MaxParallelCliffPenalty = 250
+        };
+
+        custom.Normalize();
+
+        Assert.Equal(15, custom.SessionReservationWindowSeconds);
+        Assert.Equal(80, custom.OtherSessionReservationPenalty);
+        Assert.Equal(250, custom.MaxParallelCliffPenalty);
+    }
+
+    [Fact]
     public void ContextFitMarginTokens_BindsFromConfiguration()
     {
         var configuration = new Microsoft.Extensions.Configuration.ConfigurationBuilder()

@@ -17,7 +17,8 @@ namespace OllamaRouter.Tests.Services.Routing;
 /// <summary>
 /// Tests for the two-stage hot-model affinity scoring pipeline (Phase 3, item 3):
 /// Stage-1 candidate qualification + Stage-2 calibrated scoring
-/// (Affinity +100, Hardware +20, Eviction -80, Concurrency (InFlight×40)+(cliff?100:0)),
+/// (Affinity +100, Hardware +20, Eviction -80, Concurrency (InFlight×40)+(cliff?220:0)
+/// recalibrated by task #77, OtherSessionPenalty -120 within the reservation window),
 /// declaration-order tie-break, and the Cloud fixed-score-0 terminal fallback (which is
 /// preempted by the DispatchToLargestCapacityOnOverflow clamped dispatch on context
 /// overflow — task #53 precedence).
@@ -250,7 +251,7 @@ public class RoutingDecisionServiceTests
     };
 
     // ==================================================================
-    // AC3 — concurrency spill: busy Desktop (-20) vs idle Server (0)
+    // AC3 — concurrency spill: busy Desktop (-140) vs idle Server (0)
     // ==================================================================
 
     [Fact]
@@ -279,16 +280,16 @@ public class RoutingDecisionServiceTests
         Assert.Equal(100, desktop.AffinityBonus);  // 27B is hot on Desktop
         Assert.Equal(20, desktop.HardwareBonus);   // desktop-class: 30k + 8,192 = 38,192 ≤ the desktop's own 131,072 fallback CMax
         Assert.Equal(0, desktop.EvictionPenalty);  // requested model already loaded
-        Assert.Equal(140, desktop.ConcurrencyPenalty); // 1 in-flight ×40 + cliff(1≥1)×100
-        Assert.Equal(-20, desktop.Score);          // 120 − 140 (documented AC3 example)
+        Assert.Equal(260, desktop.ConcurrencyPenalty); // 1 in-flight ×40 + cliff(1≥1)×220 (task #77)
+        Assert.Equal(-140, desktop.Score);          // 120 − 260 (documented AC3 example, task #77 recalibrated)
 
         var server = h.Eval(TServer)!;
         Assert.True(server.Qualified);
         // 30k tokens (30,000 + 8,192 = 38,192) fits the desktop's OWN capacity (the 16 GB
         // unpinned target's 131,072 assumed fallback), so the +20 role bonus goes to the
         // desktop class, not the server class: Server scores 0 vs
-        // Desktop's −20 (120 − 140, the documented AC3 example) ⇒ the second concurrent
-        // 27B request spills immediately to the idle Server.
+        // Desktop's −140 (120 − 260, the documented AC3 example recalibrated by task #77)
+        // ⇒ the second concurrent 27B request spills immediately to the idle Server.
         Assert.Equal(0, server.HardwareBonus);
         Assert.Equal(0, server.Score);
     }
@@ -1133,7 +1134,7 @@ public class RoutingDecisionServiceTests
     {
         // The Desktop holds NO dense model hot but HAS 1 in-flight request (busy per the Q2
         // resolution InFlight > 0) → the MoE offload bonus kicks in on the Laptop (+20), which
-        // beats the busy Desktop's −140 concurrency penalty and the Server's 0.
+        // beats the busy Desktop's −260 concurrency penalty (task #77) and the Server's 0.
         var meta = AddMoe(new MetaMap(), "moe1", 35_000_000_000);
         var (h, _) = Build(
             FleetOptions("moe1"),
@@ -1151,8 +1152,8 @@ public class RoutingDecisionServiceTests
         var winner = await h.Decide(30_000, "moe1");
 
         Assert.Equal(20, h.Eval(TLaptop)!.HardwareBonus); // offload justified by busy desktop
-        Assert.Equal(140, h.Eval(TDesktop)!.ConcurrencyPenalty);
-        Assert.Equal(-140, h.Eval(TDesktop)!.Score);
+        Assert.Equal(260, h.Eval(TDesktop)!.ConcurrencyPenalty); // task #77 cliff: 40 + 220
+        Assert.Equal(-260, h.Eval(TDesktop)!.Score);
         Assert.Equal(TLaptop, winner);
     }
 
@@ -1555,7 +1556,7 @@ public class RoutingDecisionServiceTests
     [Fact]
     public async Task Cloud_AllFleetNegativeScores_CloudBeatsNegativeFleet()
     {
-        // Desktop saturated (1 in-flight, MaxParallel 1 ⇒ −140), Laptop/Server offline, Cloud
+        // Desktop saturated (1 in-flight, MaxParallel 1 ⇒ −260; task #77), Laptop/Server offline, Cloud
         // configured: the fixed score-0 Cloud candidate beats the negative fleet score.
         var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
         var (h, _) = Build(
@@ -1568,9 +1569,9 @@ public class RoutingDecisionServiceTests
 
         var winner = await h.Decide(30_000, "qwen3.8-27B");
 
-        // Desktop: 0 affinity + 20 role - 0 eviction - 140 concurrency = -120; Cloud's fixed
+        // Desktop: 0 affinity + 20 role - 0 eviction - 260 concurrency = -240; Cloud's fixed
         // score 0 beats the negative fleet score.
-        Assert.Equal(-120, h.Eval(TDesktop)!.Score);
+        Assert.Equal(-240, h.Eval(TDesktop)!.Score);
         Assert.Equal(0, h.Eval(RoutingTarget.Cloud)!.Score);
         Assert.Equal(RoutingTarget.Cloud, winner);
     }
@@ -1706,13 +1707,14 @@ public class RoutingDecisionServiceTests
     }
 
     [Theory]
-    [InlineData(2, 2, 180)]  // MaxParallel 2, 2 in-flight: 2×40 + cliff(2≥2)×100 = 180
+    [InlineData(2, 2, 300)]  // MaxParallel 2, 2 in-flight: 2×40 + cliff(2≥2)×220 = 300 (task #77)
     [InlineData(1, 2, 40)]   // MaxParallel 2, 1 in-flight: 1×40, no cliff = 40
-    [InlineData(1, 1, 140)]  // MaxParallel 1, 1 in-flight: 1×40 + cliff = 140 (AC3)
-    [InlineData(3, 2, 220)]  // MaxParallel 2, 3 in-flight: 3×40 + cliff = 220
+    [InlineData(1, 1, 260)]  // MaxParallel 1, 1 in-flight: 1×40 + cliff 220 = 260 (AC3, task #77)
+    [InlineData(3, 2, 340)]  // MaxParallel 2, 3 in-flight: 3×40 + cliff = 340
     public async Task ConcurrencyPenalty_ScalesWithInFlightAndCliff(int inFlight, int maxParallel, int expectedPenalty)
     {
-        // The concurrency penalty is (InFlight × 40) + (InFlight ≥ MaxParallel ? 100 : 0). A
+        // The concurrency penalty is (InFlight × 40) +
+        // (InFlight ≥ MaxParallel ? MaxParallelCliffPenalty[220] : 0) (task #77). A
         // single-target fleet isolates the term under test (nothing else scores).
         var single = new OllamaTargetOptions { Name = "S", Url = "http://s:11434", MaxVramMB = 98304, MaxParallel = maxParallel };
         var ts = new RoutingTarget("S");
@@ -1813,10 +1815,22 @@ public class RoutingDecisionServiceTests
     // failover rebinding, Cloud never leased, 32 GB server class
     // ==================================================================
 
-    private static SessionAffinityService CreateSessionAffinity() =>
+    private sealed class FakeClock
+    {
+        private DateTimeOffset _now;
+
+        public FakeClock() => _now = DateTimeOffset.UtcNow;
+
+        public void Advance(TimeSpan delta) => _now += delta;
+
+        public DateTimeOffset Tick() => _now;
+    }
+
+    private static SessionAffinityService CreateSessionAffinity(Func<DateTimeOffset>? clock = null) =>
         new SessionAffinityService(
             new TestOptionsMonitor<OllamaRouterOptions>(new OllamaRouterOptions { SessionAffinityTtlMinutes = 30 }),
-            NullLogger<SessionAffinityService>.Instance);
+            NullLogger<SessionAffinityService>.Instance,
+            clock);
 
     [Fact]
     public async Task SessionAffinity_Stickiness_OutRanksHotModelAffinity()
@@ -1871,8 +1885,9 @@ public class RoutingDecisionServiceTests
     {
         // agent-1 (turn 1) binds aiserver1. agent-2 turn 1 with aiserver1 carrying in-flight
         // concurrency: agent-2's best is still aiserver2 (the pinned target of agent-1 does
-        // NOT leak its bonus to agent-2; aiserver1's −140 concurrency makes aiserver2 win).
-        // Interleaved turns keep each session on its own bound target.
+        // NOT leak its bonus to agent-2; aiserver1's −380 (task #77: −260 cliff + −120
+        // contention — the fresh agent-1 lease is within the reservation window) makes
+        // aiserver2 win). Interleaved turns keep each session on its own bound target.
         var s1 = new OllamaTargetOptions { Name = "aiserver1", Url = "http://as1:11434", MaxVramMB = 98304, MaxParallel = 1 };
         var s2 = new OllamaTargetOptions { Name = "aiserver2", Url = "http://as2:11434", MaxVramMB = 98304, MaxParallel = 1 };
         var t1 = new RoutingTarget("aiserver1");
@@ -1898,8 +1913,9 @@ public class RoutingDecisionServiceTests
         var a1 = await h.Decide(30_000, "qwen3.8-27B", "agent-1");
         Assert.Equal(t1, a1);
 
-        // agent-2 turn 1: aiserver1 is now busy (in-flight 1, MaxParallel 1 ⇒ −140);
-        // agent-2 has no lease → aiserver2 (0) beats aiserver1 (−140) → aiserver2 (leased).
+        // agent-2 turn 1: aiserver1 is now busy (in-flight 1, MaxParallel 1 ⇒ −260 cliff, plus
+        // −120 contention for agent-1's fresh lease ⇒ −380); agent-2 has no lease → aiserver2
+        // (0) beats aiserver1 (−380) → aiserver2 (leased).
         h.States[t1] = State(t1, inFlight: 1);
         var b1 = await h.Decide(30_000, "qwen3.8-27B", "agent-2");
         Assert.Equal(t2, b1);
@@ -1919,6 +1935,422 @@ public class RoutingDecisionServiceTests
         Assert.Equal(t2, b2);
         Assert.Equal(0, h.Eval(t1)!.SessionAffinityBonus);
         Assert.Equal(150, h.Eval(t2)!.SessionAffinityBonus);
+    }
+
+    // ==================================================================
+    // Task #77 — active-session reservation window + recalibrated
+    // concurrency cliff (session-contention scoring)
+    // ==================================================================
+
+    // Shared fixture: two server-class targets (MaxVramMB 98304 ⇒ server class, HardwareBonus
+    // 0 everywhere — the request fits every node's own CMax), dense model pinned per node.
+    // 30,000 tokens (38,192 with the 8,192 margin) fits the pinned CMaxes (49,152 / 262,144).
+    private static (OllamaRouterOptions Options, OllamaTargetOptions Opt1, OllamaTargetOptions Opt2, RoutingTarget T1, RoutingTarget T2, MetaMap Meta)
+        ContentionFixture(int pinned1, int pinned2, int maxParallel1 = 1, int maxParallel2 = 1, Action<OllamaRouterOptions>? configure = null)
+    {
+        var opt1 = new OllamaTargetOptions { Name = "aiserver1", Url = "http://as1:11434", MaxVramMB = 98304, MaxParallel = maxParallel1 };
+        var opt2 = new OllamaTargetOptions { Name = "aiserver2", Url = "http://as2:11434", MaxVramMB = 98304, MaxParallel = maxParallel2 };
+        var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { opt1, opt2 } };
+        options.Models["qwen3.8-27B"] = new ModelThresholds();
+        configure?.Invoke(options);
+        var meta = new MetaMap();
+        meta.Add(opt1.Url!, "qwen3.8-27B", PinnedDenseShow(27_800_000_000, modelfileNumCtx: pinned1), 16 * Gb);
+        meta.Add(opt2.Url!, "qwen3.8-27B", PinnedDenseShow(27_800_000_000, modelfileNumCtx: pinned2), 16 * Gb);
+        return (options, opt1, opt2, new RoutingTarget("aiserver1"), new RoutingTarget("aiserver2"), meta);
+    }
+
+    [Fact]
+    public async Task SessionContention_RecentlyActiveLease_NewSessionChoosesIdleColdTarget()
+    {
+        // Spec unit test 1: s1 leased aiserver1 5 s ago (inside the 30 s window); the model
+        // is HOT on aiserver1. New session s2 must claim the idle cold aiserver2 instead of
+        // latching onto the reserved hot node (100 hot − 120 contention = −20 < idle 0).
+        var (options, opt1, opt2, t1, t2, meta) = ContentionFixture(pinned1: 49_152, pinned2: 49_152);
+        var clock = new FakeClock();
+        var affinity = CreateSessionAffinity(clock: clock.Tick);
+        affinity.SetAffinity("s1", t1);
+        clock.Advance(TimeSpan.FromSeconds(5));
+
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{opt1.Url}|qwen3.8-27B", $"{opt2.Url}|qwen3.8-27B" },
+            onlineTargets: new() { "aiserver1", "aiserver2" },
+            states: new()
+            {
+                [t1] = State(t1, inFlight: 0, ("qwen3.8-27B", 16 * Gb)), // s1's model hot on aiserver1
+                [t2] = State(t2, inFlight: 0)                            // aiserver2 idle + cold
+            },
+            meta: meta,
+            sessionAffinity: affinity);
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B", "s2");
+
+        Assert.Equal(t2, winner);
+        Assert.Equal(120, h.Eval(t1)!.OtherSessionPenalty);
+        Assert.Equal(-20, h.Eval(t1)!.Score);      // 100 hot − 120 contention
+        Assert.Equal(0, h.Eval(t2)!.OtherSessionPenalty);
+        Assert.Equal(0, h.Eval(t2)!.Score);        // idle + unreserved
+        Assert.Contains("contention=-120", h.Eval(t1)!.Detail);
+        Assert.Contains("reservedBy=1 in 30s", h.Eval(t1)!.Detail);
+        // s2's lease latched onto the idle target, not the reserved one.
+        Assert.True(affinity.TryGetAffinity("s2", out var pinned));
+        Assert.Equal(t2, pinned);
+    }
+
+    [Fact]
+    public async Task SessionContention_WindowExpired_NewSessionMayLatchHotTarget()
+    {
+        // Same fixture as above, but the lease is 31 s old (the 30 s window lapsed): the
+        // reservation no longer shields the hot node and s2 latches it at +100.
+        var (options, opt1, opt2, t1, t2, meta) = ContentionFixture(pinned1: 49_152, pinned2: 49_152);
+        var clock = new FakeClock();
+        var affinity = CreateSessionAffinity(clock: clock.Tick);
+        affinity.SetAffinity("s1", t1);
+        clock.Advance(TimeSpan.FromSeconds(31));
+
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{opt1.Url}|qwen3.8-27B", $"{opt2.Url}|qwen3.8-27B" },
+            onlineTargets: new() { "aiserver1", "aiserver2" },
+            states: new()
+            {
+                [t1] = State(t1, inFlight: 0, ("qwen3.8-27B", 16 * Gb)),
+                [t2] = State(t2, inFlight: 0)
+            },
+            meta: meta,
+            sessionAffinity: affinity);
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B", "s2");
+
+        Assert.Equal(t1, winner);
+        Assert.Equal(0, h.Eval(t1)!.OtherSessionPenalty);   // window elapsed ⇒ unreserved
+        Assert.Equal(100, h.Eval(t1)!.Score);               // hot, unreserved
+        Assert.Equal(0, h.Eval(t2)!.Score);
+    }
+
+    [Fact]
+    public async Task SessionContention_SaturatedLeasedNode_YieldsForOwnAndOtherSessions()
+    {
+        // Spec unit test 2: aiserver1 saturated (in-flight 1, MaxParallel 1) AND leased+hot
+        // for s1. Both s1's OWN queued turn and s2's turn drop to the idle aiserver2
+        // (queueing behind the saturated node would thrash its KV cache either way).
+        var (options, opt1, opt2, t1, t2, meta) = ContentionFixture(pinned1: 49_152, pinned2: 49_152);
+        var clock = new FakeClock();
+        var affinity = CreateSessionAffinity(clock: clock.Tick);
+        affinity.SetAffinity("s1", t1);
+        clock.Advance(TimeSpan.FromSeconds(5));
+
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{opt1.Url}|qwen3.8-27B", $"{opt2.Url}|qwen3.8-27B" },
+            onlineTargets: new() { "aiserver1", "aiserver2" },
+            states: new()
+            {
+                [t1] = State(t1, inFlight: 1, ("qwen3.8-27B", 16 * Gb)), // saturated + hot
+                [t2] = State(t2, inFlight: 0)
+            },
+            meta: meta,
+            sessionAffinity: affinity);
+
+        // s1's own next request: SELF-EXEMPT (no contention on its own lease), but the
+        // recalibrated cliff dominates: 150 + 100 − 260 − 0 = −10 < aiserver2's idle 0.
+        var own = await h.Decide(30_000, "qwen3.8-27B", "s1");
+        Assert.Equal(t2, own);
+        Assert.Equal(0, h.Eval(t1)!.OtherSessionPenalty);    // self-exempt
+        Assert.Equal(260, h.Eval(t1)!.ConcurrencyPenalty);   // 1 × 40 + cliff 220
+        Assert.Equal(-10, h.Eval(t1)!.Score);                // 150 + 100 − 260
+
+        // s2's request: the saturated node is ALSO reserved by s1's fresh lease:
+        // 100 − 260 − 120 = −280 < aiserver2's idle 0.
+        affinity.SetAffinity("s1", t1); // re-pin (the decision above rebound s1 to the winner)
+        var other = await h.Decide(30_000, "qwen3.8-27B", "s2");
+        Assert.Equal(t2, other);
+        Assert.Equal(120, h.Eval(t1)!.OtherSessionPenalty);
+        Assert.Equal(260, h.Eval(t1)!.ConcurrencyPenalty);
+        Assert.Equal(-280, h.Eval(t1)!.Score);               // 100 − 260 − 120
+        Assert.Equal(0, h.Eval(t2)!.Score);
+    }
+
+    [Fact]
+    public async Task SaturatedCliff_LeasedHotSaturated_DropsBelowIdleQualifiedAndCloud()
+    {
+        // The task's headline regression at the evaluation level: a saturated leased+hot node
+        // scores 150 + 100 − 260 = −10 — below the idle qualified candidate (0) AND below the
+        // configured Cloud pseudo-target (fixed 0). The idle fleet target wins the 0-vs-0 tie
+        // over Cloud by declaration order.
+        var (options, opt1, opt2, t1, t2, meta) = ContentionFixture(pinned1: 49_152, pinned2: 49_152);
+        options.Models["qwen3.8-27B"].CloudModel = "deepseek-v3.1:671b-cloud";
+        var clock = new FakeClock();
+        var affinity = CreateSessionAffinity(clock: clock.Tick);
+        affinity.SetAffinity("s1", t1);
+        clock.Advance(TimeSpan.FromSeconds(5));
+
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{opt1.Url}|qwen3.8-27B", $"{opt2.Url}|qwen3.8-27B" },
+            onlineTargets: new() { "aiserver1", "aiserver2" },
+            states: new()
+            {
+                [t1] = State(t1, inFlight: 1, ("qwen3.8-27B", 16 * Gb)),
+                [t2] = State(t2, inFlight: 0)
+            },
+            meta: meta,
+            sessionAffinity: affinity);
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B", "s1");
+
+        var leased = h.Eval(t1)!;
+        Assert.Equal(150, leased.SessionAffinityBonus);
+        Assert.Equal(100, leased.AffinityBonus);
+        Assert.Equal(260, leased.ConcurrencyPenalty);
+        Assert.Equal(-10, leased.Score);        // 150 + 100 − 260 < 0 — the inversion is fixed
+        Assert.Equal(0, h.Eval(t2)!.Score);
+        Assert.Equal(0, h.Eval(RoutingTarget.Cloud)!.Score);
+        Assert.Equal(t2, winner);               // idle fleet target beats both −10 and Cloud (0)
+    }
+
+    [Fact]
+    public async Task SessionContention_SoleQualifiedTargetReserved_StillRoutesThere()
+    {
+        // Graceful degradation: a single-target fleet whose only qualified candidate is
+        // reserved by another session still routes there (the −120 candidate wins by default)
+        // — never a spurious 503.
+        var (options, opt1, _, t1, _, meta) = ContentionFixture(pinned1: 49_152, pinned2: 262_144);
+        options.Targets = new List<OllamaTargetOptions> { opt1 }; // trim to the single target
+        var clock = new FakeClock();
+        var affinity = CreateSessionAffinity(clock: clock.Tick);
+        affinity.SetAffinity("s1", t1);
+        clock.Advance(TimeSpan.FromSeconds(5));
+
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{opt1.Url}|qwen3.8-27B" },
+            onlineTargets: new() { "aiserver1" },
+            states: new() { [t1] = State(t1, inFlight: 0, ("qwen3.8-27B", 16 * Gb)) },
+            meta: meta,
+            sessionAffinity: affinity);
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B", "s2");
+
+        Assert.Equal(t1, winner);
+        Assert.Equal(120, h.Eval(t1)!.OtherSessionPenalty);
+        Assert.Equal(-20, h.Eval(t1)!.Score);   // 100 − 120, still the (only) qualified candidate
+        Assert.True(affinity.TryGetAffinity("s2", out var pinned));
+        Assert.Equal(t1, pinned);
+    }
+
+    [Fact]
+    public async Task SessionContention_NoSessionId_LegacyStatelessScores()
+    {
+        // Sessionless (header-less) requests never see the contention term: with another
+        // session's fresh lease on the sole idle target, the score stays the legacy 0 and
+        // the OtherSessionPenalty field is 0.
+        var (options, opt1, opt2, t1, t2, meta) = ContentionFixture(pinned1: 49_152, pinned2: 49_152);
+        var clock = new FakeClock();
+        var affinity = CreateSessionAffinity(clock: clock.Tick);
+        affinity.SetAffinity("other-agent", t1);
+        clock.Advance(TimeSpan.FromSeconds(5));
+
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{opt1.Url}|qwen3.8-27B", $"{opt2.Url}|qwen3.8-27B" },
+            onlineTargets: new() { "aiserver1", "aiserver2" },
+            states: new() { [t1] = State(t1, inFlight: 0), [t2] = State(t2, inFlight: 0) },
+            meta: meta,
+            sessionAffinity: affinity);
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B", (string?)null);
+
+        Assert.Equal(t1, winner); // 0-0 declaration-order tie (both idle + cold + unpenalized)
+        Assert.Equal(0, h.Eval(t1)!.OtherSessionPenalty);
+        Assert.Equal(0, h.Eval(t1)!.Score);
+    }
+
+    [Fact]
+    public async Task SessionContention_WindowDisabled_ZeroSeconds_LegacyLatchBehavior()
+    {
+        // SessionReservationWindowSeconds = 0 disables the reservation window: the legacy
+        // hot-latch behavior returns (s2 latches the hot reserved node at +100).
+        var (options, opt1, opt2, t1, t2, meta) = ContentionFixture(
+            pinned1: 49_152, pinned2: 49_152, configure: o => o.SessionReservationWindowSeconds = 0);
+        var clock = new FakeClock();
+        var affinity = CreateSessionAffinity(clock: clock.Tick);
+        affinity.SetAffinity("s1", t1);
+        clock.Advance(TimeSpan.FromSeconds(5));
+
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{opt1.Url}|qwen3.8-27B", $"{opt2.Url}|qwen3.8-27B" },
+            onlineTargets: new() { "aiserver1", "aiserver2" },
+            states: new()
+            {
+                [t1] = State(t1, inFlight: 0, ("qwen3.8-27B", 16 * Gb)),
+                [t2] = State(t2, inFlight: 0)
+            },
+            meta: meta,
+            sessionAffinity: affinity);
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B", "s2");
+
+        Assert.Equal(t1, winner);
+        Assert.Equal(0, h.Eval(t1)!.OtherSessionPenalty);
+        Assert.Equal(100, h.Eval(t1)!.Score);   // legacy hot latch restored
+    }
+
+    [Fact]
+    public async Task SessionContention_PenaltyDisabled_ZeroConfigured_LegacyLatchBehavior()
+    {
+        // OtherSessionReservationPenalty = 0 disables the contention term (the window can
+        // still report occupancy, but the penalty never applies): same +100 hot latch.
+        var (options, opt1, opt2, t1, t2, meta) = ContentionFixture(
+            pinned1: 49_152, pinned2: 49_152, configure: o => o.OtherSessionReservationPenalty = 0);
+        var clock = new FakeClock();
+        var affinity = CreateSessionAffinity(clock: clock.Tick);
+        affinity.SetAffinity("s1", t1);
+        clock.Advance(TimeSpan.FromSeconds(5));
+
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{opt1.Url}|qwen3.8-27B", $"{opt2.Url}|qwen3.8-27B" },
+            onlineTargets: new() { "aiserver1", "aiserver2" },
+            states: new()
+            {
+                [t1] = State(t1, inFlight: 0, ("qwen3.8-27B", 16 * Gb)),
+                [t2] = State(t2, inFlight: 0)
+            },
+            meta: meta,
+            sessionAffinity: affinity);
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B", "s2");
+
+        Assert.Equal(t1, winner);
+        Assert.Equal(0, h.Eval(t1)!.OtherSessionPenalty);
+        Assert.Equal(100, h.Eval(t1)!.Score);
+    }
+
+    [Fact]
+    public async Task MaxParallelCliff_BelowCap_SessionStickinessPreserved()
+    {
+        // Below MaxParallel the recalibrated cliff never fires: the leased+hot node at
+        // 1 in-flight with MaxParallel 2 still scores 150 + 100 − 40 = +210 and keeps the
+        // session (only the per-in-flight 40 applies).
+        var (options, opt1, opt2, t1, t2, meta) = ContentionFixture(
+            pinned1: 49_152, pinned2: 49_152, maxParallel1: 2, maxParallel2: 1);
+        var clock = new FakeClock();
+        var affinity = CreateSessionAffinity(clock: clock.Tick);
+        affinity.SetAffinity("s1", t1);
+        clock.Advance(TimeSpan.FromSeconds(5));
+
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{opt1.Url}|qwen3.8-27B", $"{opt2.Url}|qwen3.8-27B" },
+            onlineTargets: new() { "aiserver1", "aiserver2" },
+            states: new()
+            {
+                [t1] = State(t1, inFlight: 1, ("qwen3.8-27B", 16 * Gb)), // 1 < MaxParallel 2: no cliff
+                [t2] = State(t2, inFlight: 0)
+            },
+            meta: meta,
+            sessionAffinity: affinity);
+
+        var winner = await h.Decide(30_000, "qwen3.8-27B", "s1");
+
+        Assert.Equal(t1, winner);
+        Assert.Equal(40, h.Eval(t1)!.ConcurrencyPenalty); // 1 × 40, no cliff below the cap
+        Assert.Equal(0, h.Eval(t1)!.OtherSessionPenalty);
+        Assert.Equal(210, h.Eval(t1)!.Score);             // 150 + 100 − 40
+    }
+
+    [Fact]
+    public async Task Simulation_ThreeConcurrentSessions_ThreeNodes_Distribute1To1To1()
+    {
+        // Spec simulation: Local (pinned 48k) + Remote (262k) + Remote2 (262k), all
+        // MaxParallel 1, 30,000-token context (fits every node) and 3 distinct sessions
+        // cleanly distribute 1:1:1 — the contention term keeps each new session off the
+        // reserved/saturated nodes, and the interleaved steady state never rebinds a lease.
+        var local = new OllamaTargetOptions { Name = "Local", Url = "http://local1:11434", MaxVramMB = 98304, MaxParallel = 1 };
+        var remote = new OllamaTargetOptions { Name = "Remote", Url = "http://remote1:11434", MaxVramMB = 98304, MaxParallel = 1 };
+        var remote2 = new OllamaTargetOptions { Name = "Remote2", Url = "http://remote2:11434", MaxVramMB = 98304, MaxParallel = 1 };
+        var options = new OllamaRouterOptions { Targets = new List<OllamaTargetOptions> { local, remote, remote2 } };
+        options.Models["qwen3.8-27B"] = new ModelThresholds();
+        var meta = new MetaMap();
+        meta.Add(local.Url!, "qwen3.8-27B", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 49_152), 16 * Gb);
+        meta.Add(remote.Url!, "qwen3.8-27B", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 262_144), 16 * Gb);
+        meta.Add(remote2.Url!, "qwen3.8-27B", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 262_144), 16 * Gb);
+
+        var tl = new RoutingTarget("Local");
+        var tr = new RoutingTarget("Remote");
+        var tr2 = new RoutingTarget("Remote2");
+        var clock = new FakeClock();
+        var affinity = CreateSessionAffinity(clock: clock.Tick);
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{local.Url}|qwen3.8-27B", $"{remote.Url}|qwen3.8-27B", $"{remote2.Url}|qwen3.8-27B" },
+            onlineTargets: new() { "Local", "Remote", "Remote2" },
+            states: new()
+            {
+                [tl] = State(tl, inFlight: 0),
+                [tr] = State(tr, inFlight: 0),
+                [tr2] = State(tr2, inFlight: 0)
+            },
+            meta: meta,
+            sessionAffinity: affinity);
+
+        // (a) s-A claims Local on the 0-0-0 declaration-order tie.
+        Assert.Equal(tl, await h.Decide(30_000, "qwen3.8-27B", "s-A"));
+        h.States[tl] = State(tl, inFlight: 1, ("qwen3.8-27B", 16 * Gb)); // Local busy + hot
+
+        // (b) s-B: Local = 100 hot − 260 cliff − 120 contention = −280 ⇒ Remote (0) wins
+        // (Remote beats Remote2's 0 by declaration order).
+        Assert.Equal(tr, await h.Decide(30_000, "qwen3.8-27B", "s-B"));
+        Assert.Equal(-280, h.Eval(tl)!.Score);
+        Assert.Equal(120, h.Eval(tl)!.OtherSessionPenalty);
+        h.States[tr] = State(tr, inFlight: 1, ("qwen3.8-27B", 16 * Gb)); // Remote busy + hot
+
+        // (c) s-C: Local −280, Remote −280 ⇒ Remote2 (0) wins.
+        Assert.Equal(tr2, await h.Decide(30_000, "qwen3.8-27B", "s-C"));
+        Assert.Equal(-280, h.Eval(tl)!.Score);
+        Assert.Equal(-280, h.Eval(tr)!.Score);
+        Assert.Equal(0, h.Eval(tr2)!.Score);
+
+        // Interleaved steady state: every node idle again, each model hot on its home node.
+        h.States[tl] = State(tl, inFlight: 0, ("qwen3.8-27B", 16 * Gb));
+        h.States[tr] = State(tr, inFlight: 0, ("qwen3.8-27B", 16 * Gb));
+        h.States[tr2] = State(tr2, inFlight: 0, ("qwen3.8-27B", 16 * Gb));
+
+        // s-A stays on Local (150 + 100, SELF-EXEMPT — no contention on its own target);
+        // the other nodes' hot models are reserved (100 − 120 = −20).
+        Assert.Equal(tl, await h.Decide(30_000, "qwen3.8-27B", "s-A"));
+        Assert.Equal(250, h.Eval(tl)!.Score);
+        Assert.Equal(0, h.Eval(tl)!.OtherSessionPenalty);
+        Assert.Equal(-20, h.Eval(tr)!.Score);
+        Assert.Equal(-20, h.Eval(tr2)!.Score);
+
+        Assert.Equal(tr, await h.Decide(30_000, "qwen3.8-27B", "s-B"));
+        Assert.Equal(250, h.Eval(tr)!.Score);
+        Assert.Equal(0, h.Eval(tr)!.OtherSessionPenalty);
+        Assert.Equal(-20, h.Eval(tl)!.Score);
+
+        Assert.Equal(tr2, await h.Decide(30_000, "qwen3.8-27B", "s-C"));
+        Assert.Equal(250, h.Eval(tr2)!.Score);
+        Assert.Equal(0, h.Eval(tr2)!.OtherSessionPenalty);
+        Assert.Equal(-20, h.Eval(tl)!.Score);
+        Assert.Equal(-20, h.Eval(tr)!.Score);
+
+        // 1:1:1 lease map — no lease rebind at any point of the interleave.
+        Assert.True(affinity.TryGetAffinity("s-A", out var a)); Assert.Equal(tl, a);
+        Assert.True(affinity.TryGetAffinity("s-B", out var b)); Assert.Equal(tr, b);
+        Assert.True(affinity.TryGetAffinity("s-C", out var c)); Assert.Equal(tr2, c);
     }
 
     [Fact]
@@ -2276,8 +2708,8 @@ public class RoutingDecisionServiceTests
     [Fact]
     public async Task Speed_FastNodeAtConcurrencyCliff_LosesToIdleHotSlowerNode()
     {
-        // Desktop (SpeedFactor 2.0) at its MaxParallel cliff (1 in-flight ⇒ −140):
-        // 150 + 20 role − 140 = 30 < Server hot 100 ⇒ the idle hot slower node wins.
+        // Desktop (SpeedFactor 2.0) at its MaxParallel cliff (1 in-flight ⇒ −260; task #77):
+        // 150 + 20 role − 260 = −90 < Server hot 100 ⇒ the idle hot slower node wins.
         var meta = AddDense(new MetaMap(), "qwen3.8-27B", 27_800_000_000);
         var (h, _) = Build(
             SpeedOptions("qwen3.8-27B", desktopSpeed: 2.0, serverSpeed: 1.0),
@@ -2286,7 +2718,7 @@ public class RoutingDecisionServiceTests
             onlineTargets: new() { "Desktop", "Server" },
             states: new()
             {
-                [TDesktop] = State(TDesktop, inFlight: 1), // MaxParallel 1 ⇒ cliff −140
+                [TDesktop] = State(TDesktop, inFlight: 1), // MaxParallel 1 ⇒ cliff −260 (task #77)
                 [TServer] = State(TServer, 0, ("qwen3.8-27B", 16 * Gb))
             },
             meta: meta);
@@ -2294,8 +2726,8 @@ public class RoutingDecisionServiceTests
         var winner = await h.Decide(30_000, "qwen3.8-27B");
 
         Assert.Equal(150, h.Eval(TDesktop)!.SpeedBonus);
-        Assert.Equal(140, h.Eval(TDesktop)!.ConcurrencyPenalty);
-        Assert.Equal(30, h.Eval(TDesktop)!.Score);   // 150 + 20 role − 140 = 30
+        Assert.Equal(260, h.Eval(TDesktop)!.ConcurrencyPenalty); // task #77 cliff: 40 + 220
+        Assert.Equal(-90, h.Eval(TDesktop)!.Score);   // 150 + 20 role − 260 = −90
         Assert.Equal(100, h.Eval(TServer)!.Score);
         Assert.Equal(TServer, winner);
     }

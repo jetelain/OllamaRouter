@@ -7,11 +7,13 @@ namespace OllamaRouter.Services.Routing;
 /// the Cloud pseudo-target when Cloud Overflow is eligible). Fleet candidates that fail a
 /// Stage-1 hard qualification carry <see cref="Qualified"/> false and <see cref="Score"/>
 /// null; qualified candidates carry the calibrated score
-/// <c>Score = SpeedBonus(+0…150, per-decision normalized) + SessionAffinityBonus(+150) + AffinityBonus(+100) + HardwareBonus(+20) − EvictionPenalty(−80) − ConcurrencyPenalty</c>
+/// <c>Score = SpeedBonus(+0…150, per-decision normalized) + SessionAffinityBonus(+150) + AffinityBonus(+100) + HardwareBonus(+20) − EvictionPenalty(−80) − ConcurrencyPenalty − OtherSessionPenalty</c>
 /// (the per-decision normalized SpeedBonus rewards the fastest-configured qualified candidate;
 /// maxHint ≤ 1.0 ⇒ every SpeedBonus = 0, legacy byte-identical; the Cloud pseudo-target
-/// always carries the fixed score 0, a SessionAffinityBonus of 0, a SpeedBonus of 0, and
-/// is never leased). Selection is the stable sort
+/// always carries the fixed score 0, a SessionAffinityBonus of 0, a SpeedBonus of 0, an
+/// OtherSessionPenalty of 0, and is never leased; the OtherSessionPenalty — task #77 —
+/// penalizes a candidate reserved by ANOTHER active session within the reservation window,
+/// never the request's own lease). Selection is the stable sort
 /// by (score descending, declaration index ascending), so equal scores resolve by
 /// declaration order and the Cloud candidate (sorted after all fleet targets) loses
 /// 0-vs-0 ties.
@@ -23,7 +25,7 @@ namespace OllamaRouter.Services.Routing;
 /// <param name="AffinityBonus">+100 when the requested model is already loaded on the target.</param>
 /// <param name="HardwareBonus">+20 on a role-matching target (see the scoring pipeline rules).</param>
 /// <param name="EvictionPenalty">+80 (applied negatively) when the load would evict a different model.</param>
-/// <param name="ConcurrencyPenalty">(InFlight × 40) + (InFlight ≥ MaxParallel ? 100 : 0), applied negatively.</param>
+/// <param name="ConcurrencyPenalty">(InFlight × 40) + (InFlight ≥ MaxParallel ? MaxParallelCliffPenalty[default 220] : 0), applied negatively (task #77 recalibrated the cliff from 100 to 220).</param>
 /// <param name="Detail">Free-form human-readable breakdown for logs and tests.</param>
 /// <param name="SessionAffinityBonus">
 /// +150 when the candidate matches the request's active session lease (KV-cache stickiness);
@@ -32,6 +34,13 @@ namespace OllamaRouter.Services.Routing;
 /// <param name="SpeedBonus">
 /// +0…150 per-decision-normalized speed bonus (see the scoring formula); always 0 for the
 /// Cloud pseudo-target and for candidates with no configured factor.
+/// </param>
+/// <param name="OtherSessionPenalty">
+/// Task #77: the fixed penalty (default 120, applied negatively) when the candidate is
+/// reserved by ANOTHER active session within the reservation window (the request carries a
+/// non-blank session ID and the target holds a fresh lease for a different session — the
+/// request's own lease is exempt). 0 for sessionless requests, unreserved targets,
+/// disabled windows/penalties, and always 0 for the Cloud pseudo-target (never leased).
 /// </param>
 public sealed record RoutingCandidateEvaluation(
     RoutingTarget Target,
@@ -44,4 +53,5 @@ public sealed record RoutingCandidateEvaluation(
     int ConcurrencyPenalty,
     string? Detail,
     int SessionAffinityBonus = 0,
-    int SpeedBonus = 0);
+    int SpeedBonus = 0,
+    int OtherSessionPenalty = 0);

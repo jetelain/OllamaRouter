@@ -14,10 +14,18 @@ namespace OllamaRouter.Services.Routing;
 /// qualifies every effective fleet target (admin enabled, liveness online with the 10 s
 /// startup grace, catalog presence, hardware capability, context fit), Stage 2 scores the
 /// qualified candidates with the calibrated formula
-/// <c>Score = SpeedBonus(+0…150, per-decision normalized) + SessionAffinityBonus(+150) + AffinityBonus(+100) + HardwareBonus(+20) − EvictionPenalty(−80) − ConcurrencyPenalty</c>,
+/// <c>Score = SpeedBonus(+0…150, per-decision normalized) + SessionAffinityBonus(+150) + AffinityBonus(+100) + HardwareBonus(+20) − EvictionPenalty(−80) − ConcurrencyPenalty − OtherSessionPenalty</c>,
 
 /// where the per-decision normalized SpeedBonus rewards the fastest-configured qualified fleet
-/// candidate (maxHint ≤ 1.0 ⇒ every SpeedBonus = 0, legacy byte-identical). The highest score wins with
+/// candidate (maxHint ≤ 1.0 ⇒ every SpeedBonus = 0, legacy byte-identical), the recalibrated
+/// ConcurrencyPenalty (task #77) is
+/// <c>(InFlight × 40) + (InFlight ≥ MaxParallel ? MaxParallelCliffPenalty[default 220] : 0)</c>
+/// (a saturated leased node at MaxParallel 1 now scores 150 + 100 − 260 = −10, BELOW an idle
+/// qualified candidate — the pre-recalibration +110 inversion), and the OtherSessionPenalty
+/// (task #77, default −120) penalizes a candidate reserved by ANOTHER active session within
+/// the reservation window (OllamaRouterOptions.SessionReservationWindowSeconds, default 30 s)
+/// — the request's own lease is exempt (sticky affinity preserved) and sessionless requests
+/// (blank sessionId) never see the term. The highest score wins with
 /// equal scores resolved by declaration order in the <see cref="OllamaRouterOptions.Targets"/> list. The
 /// Cloud pseudo-target participates as a
 /// fixed score-0 candidate appended after all fleet targets (it therefore loses 0-vs-0 ties
@@ -43,9 +51,6 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
     /// <summary>Concurrency penalty per in-flight request.</summary>
     private const int ConcurrencyPenaltyPerInFlight = 40;
 
-    /// <summary>Concurrency cliff penalty when the target's MaxParallel is reached.</summary>
-    private const int ConcurrencyCliffPenalty = 100;
-
     /// <summary>Session affinity bonus: the candidate is this session's leased (sticky) target.</summary>
     private const int SessionAffinityBonus = 150;
 
@@ -55,7 +60,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
     /// AffinityBonus (+100) so the fastest cold node beats a hot slower node, to sit below
     /// SessionAffinity + Affinity (250) so a session-leased hot node still wins, and to keep
     /// an evicting fast candidate (150 − 80 = 70) or a MaxParallel-cliff candidate
-    /// (150 − 140 = 10) below a hot slower node (100).
+    /// (150 − 260 = −110; task #77 recalibrated cliff) below a hot slower node (100).
     /// </summary>
     private const int SpeedBonusMax = 150;
 
@@ -142,8 +147,8 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             modelName,
             clientRequestedNumCtx,
             evaluation => _logger.LogDebug(
-                "{Model}: Candidate {Target} qualified={Qualified} score={Score}: session={Session} {Detail}",
-                NormalizeModelName(modelName), evaluation.Target, evaluation.Qualified, evaluation.Score, evaluation.SessionAffinityBonus, evaluation.Detail),
+                "{Model}: Candidate {Target} qualified={Qualified} score={Score}: session={Session} contention={Contention} {Detail}",
+                NormalizeModelName(modelName), evaluation.Target, evaluation.Qualified, evaluation.Score, evaluation.SessionAffinityBonus, evaluation.OtherSessionPenalty, evaluation.Detail),
             cancellationToken,
             sessionId);
     }
@@ -160,8 +165,8 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             modelName,
             clientRequestedNumCtx,
             evaluation => _logger.LogDebug(
-                "{Model}: Candidate {Target} qualified={Qualified} score={Score}: session={Session} {Detail}",
-                NormalizeModelName(modelName), evaluation.Target, evaluation.Qualified, evaluation.Score, evaluation.SessionAffinityBonus, evaluation.Detail),
+                "{Model}: Candidate {Target} qualified={Qualified} score={Score}: session={Session} contention={Contention} {Detail}",
+                NormalizeModelName(modelName), evaluation.Target, evaluation.Qualified, evaluation.Score, evaluation.SessionAffinityBonus, evaluation.OtherSessionPenalty, evaluation.Detail),
             cancellationToken,
             sessionId,
             allowedLocations: null);
@@ -180,8 +185,8 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             modelName,
             clientRequestedNumCtx,
             evaluation => _logger.LogDebug(
-                "{Model}: Candidate {Target} qualified={Qualified} score={Score}: session={Session} {Detail}",
-                NormalizeModelName(modelName), evaluation.Target, evaluation.Qualified, evaluation.Score, evaluation.SessionAffinityBonus, evaluation.Detail),
+                "{Model}: Candidate {Target} qualified={Qualified} score={Score}: session={Session} contention={Contention} {Detail}",
+                NormalizeModelName(modelName), evaluation.Target, evaluation.Qualified, evaluation.Score, evaluation.SessionAffinityBonus, evaluation.OtherSessionPenalty, evaluation.Detail),
             cancellationToken,
             sessionId,
             allowedLocations);
@@ -233,6 +238,11 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         var settings = _options.CurrentValue;
         var normalizedName = NormalizeModelName(modelName);
         settings.Models.TryGetValue(normalizedName, out var thresholds);
+
+        // ---- Reservation window (task #77): resolved ONCE per decision and shared by every
+        // per-candidate contention check. A non-positive configured window normalizes to 0
+        // (Normalize resets negatives to 30), which disables the contention term entirely. ----
+        var reservationWindow = TimeSpan.FromSeconds(Math.Max(0, settings.SessionReservationWindowSeconds));
 
         var context = new RoutingContext(
             tokenCount,
@@ -293,7 +303,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         var offloadSlotTaken = false;
         foreach (var targetOptions in fleetTargets)
         {
-            var evaluation = await EvaluateFleetTargetAsync(context, targetOptions, offloadSlotTaken, pinnedTarget, cancellationToken);
+            var evaluation = await EvaluateFleetTargetAsync(context, targetOptions, offloadSlotTaken, pinnedTarget, reservationWindow, cancellationToken);
             // The MoE/SmallDense offload slot is single per decision: once the first
             // small-class target has claimed it (when justified), later ones never get the
             // HardwareBonus (role slot is single, per the scoring plan §1.2).
@@ -577,6 +587,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         OllamaTargetOptions targetOptions,
         bool offloadSlotTaken,
         RoutingTarget? pinnedTarget,
+        TimeSpan reservationWindow,
         CancellationToken cancellationToken)
     {
         var target = new RoutingTarget(targetOptions.Name!);
@@ -625,8 +636,12 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             }
 
             var permissiveSession = pinnedTarget is not null && target == pinnedTarget ? SessionAffinityBonus : 0;
-            return Scored(target, permissiveSession, 0, 0, 0, 0, permissiveSession,
-                "permissive qualification (no capability metadata discoverable)");
+            var permissiveContention = ComputeOtherSessionPenalty(context, target, reservationWindow);
+            return Scored(target, permissiveSession - permissiveContention, 0, 0, 0, 0, permissiveSession,
+                $"permissive qualification (no capability metadata discoverable) " +
+                $"session={permissiveSession:+#;-#;0} contention=-{permissiveContention}" +
+                FormatReservationState(context, target, reservationWindow, permissiveContention),
+                otherSessionPenalty: permissiveContention);
         }
 
         if (!DynamicContextSizingEngine.IsHardwareSuitable(capability))
@@ -672,9 +687,13 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         var metadata = stateless ? null : await context.GetModelMetadataAsync(targetOptions.Url!, cancellationToken);
         var eviction = stateless || !WouldEvict(isLoaded, loadedModels, state?.TotalVramBytes, metadata?.WeightSizeBytes, maxVramMB) ? 0 : EvictionPenalty;
 
-        // Concurrency: (InFlight × 40) + (InFlight ≥ MaxParallel ? 100 : 0).
+        // Concurrency (task #77 recalibration): (InFlight × 40) +
+        // (InFlight ≥ MaxParallel ? MaxParallelCliffPenalty[default 220] : 0) — the live cliff
+        // keeps a saturated leased node (150 + 100 − 260 = −10) below every idle qualified
+        // candidate when parallel capacity exists elsewhere in the fleet.
         var maxParallel = targetOptions.MaxParallel <= 0 ? 1 : targetOptions.MaxParallel;
-        var concurrency = inFlight * ConcurrencyPenaltyPerInFlight + (inFlight >= maxParallel ? ConcurrencyCliffPenalty : 0);
+        var concurrency = inFlight * ConcurrencyPenaltyPerInFlight +
+            (inFlight >= maxParallel ? Math.Max(0, _options.CurrentValue.MaxParallelCliffPenalty) : 0);
 
         // Hardware role bonus (request architecture + fleet-wide hot/busy facts). The MoE/
         // SmallDense offload slot is single per decision: only the FIRST small-class target in
@@ -686,12 +705,61 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         // earlier with no bonus — no affinity rescue).
         var session = pinnedTarget is not null && target == pinnedTarget ? SessionAffinityBonus : 0;
 
-        var score = session + affinity + hardware - eviction - concurrency;
+        // Active-session contention (task #77): a candidate reserved by ANOTHER active session
+        // within the reservation window is penalized so a new session latches onto an idle,
+        // unreserved target instead of thrashing the reserved target's KV cache. The request's
+        // own lease is exempt (the query is self-exempting by session ID), sessionless requests
+        // never see the term, and a missing affinity service or disabled window/penalty ⇒ 0.
+        var contention = ComputeOtherSessionPenalty(context, target, reservationWindow);
+
+        var score = session + affinity + hardware - eviction - concurrency - contention;
         return Scored(target, score, affinity, hardware, eviction, concurrency, session,
             $"session={session:+#;-#;0} affinity={affinity:+#;-#;0} hardware={hardware:+#;-#;0} " +
             (stateless ? "eviction=0 (stateless) " : $"eviction=-{eviction} ") +
             $"concurrency=-{concurrency} " +
-            $"(inFlight={inFlight}, maxParallel={maxParallel}, loaded={loadedModels.Count}, stale={state?.Stale ?? true})");
+            $"contention=-{contention} " +
+            $"(inFlight={inFlight}, maxParallel={maxParallel}, loaded={loadedModels.Count}, stale={state?.Stale ?? true}" +
+            FormatReservationState(context, target, reservationWindow, contention) + ")", otherSessionPenalty: contention);
+    }
+
+    /// <summary>
+    /// Stage-2 OtherSessionPenalty (task #77): the fixed live penalty
+    /// (<see cref="OllamaRouterOptions.OtherSessionReservationPenalty"/>, default 120) when the
+    /// request carries a non-blank session ID, the reservation window is enabled, and the
+    /// candidate is reserved by ANOTHER active session within the window (own lease exempt —
+    /// sticky affinity on the session's own target is preserved). Sessionless requests,
+    /// missing services, disabled windows/penalties and unreserved targets all yield 0.
+    /// </summary>
+    private int ComputeOtherSessionPenalty(RoutingContext context, RoutingTarget target, TimeSpan reservationWindow)
+    {
+        if (string.IsNullOrWhiteSpace(context.SessionId) ||
+            reservationWindow <= TimeSpan.Zero ||
+            _sessionAffinity is not { } sessionAffinity ||
+            _options.CurrentValue.OtherSessionReservationPenalty <= 0)
+        {
+            return 0;
+        }
+
+        return sessionAffinity.IsTargetReservedByOtherSession(target, context.SessionId, reservationWindow)
+            ? _options.CurrentValue.OtherSessionReservationPenalty
+            : 0;
+    }
+
+    /// <summary>
+    /// Observability suffix for the <see cref="RoutingCandidateEvaluation.Detail"/> / debug
+    /// logs (task #77): appends ", reservedBy={k} in {w}s" inside the parenthesized state
+    /// only when the contention penalty was actually applied; empty otherwise (the always-
+    /// present `contention=-{n}` token already reports the term's state).
+    /// </summary>
+    private string FormatReservationState(RoutingContext context, RoutingTarget target, TimeSpan reservationWindow, int contention)
+    {
+        if (contention <= 0 || string.IsNullOrWhiteSpace(context.SessionId) || reservationWindow <= TimeSpan.Zero || _sessionAffinity is not { } sessionAffinity)
+        {
+            return string.Empty;
+        }
+
+        var active = sessionAffinity.GetActiveSessionCount(target, reservationWindow);
+        return $", reservedBy={active} in {Math.Max(0, (int)reservationWindow.TotalSeconds)}s";
     }
 
     // Permissive-fallback veto: operator pinned Models[model].Architecture = "Dense" (unknown
@@ -955,7 +1023,8 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
     /// </list>
     /// Calibration interplay (all vs a hot slower node at +100): fast cold winner 150 > 100;
     /// fast + evicting 150 − 80 = 70 < 100 (anti-thrash preserved); fast + MaxParallel cliff
-    /// 150 − 140 = 10 < 100; session-leased hot 150 + 100 = 250 > 150 (stickiness preserved).
+    /// 150 − 260 = −110 < 100 (task #77 recalibrated cliff); session-leased hot 150 + 100 = 250
+    /// > 150 (stickiness preserved).
     /// Disqualified fleet evaluations and the Cloud pseudo-target never receive a speed bonus.
     /// </summary>
     private void ApplySpeedBonuses(List<RoutingCandidateEvaluation> fleetEvaluations, IReadOnlyList<OllamaTargetOptions> fleetTargets)
@@ -1022,7 +1091,8 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         int concurrency,
         int sessionAffinity,
         string detail,
-        int speedBonus = 0)
+        int speedBonus = 0,
+        int otherSessionPenalty = 0)
     {
         return new RoutingCandidateEvaluation(
             target,
@@ -1035,7 +1105,8 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             ConcurrencyPenalty: concurrency,
             Detail: detail,
             SessionAffinityBonus: sessionAffinity,
-            SpeedBonus: speedBonus);
+            SpeedBonus: speedBonus,
+            OtherSessionPenalty: otherSessionPenalty);
     }
 
     /// <summary>

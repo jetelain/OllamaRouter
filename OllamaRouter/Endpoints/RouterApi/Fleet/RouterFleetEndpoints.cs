@@ -21,7 +21,8 @@ namespace OllamaRouter.Endpoints.RouterApi.Fleet;
 /// <item><c>GET /api/router/fleet</c> — the full fleet hardware topology: every configured
 /// target (in configuration order) plus the Cloud pseudo-target (last), with real-time
 /// liveness state, last-probe latency, detected GPU hardware (local workstation only),
-/// in-flight request count, currently loaded model and the active KV-cache context lease.</item>
+/// in-flight request count, currently loaded model, the active KV-cache context lease and
+/// the active-session count within the reservation window (task #77).</item>
 /// </list>
 /// </summary>
 
@@ -46,9 +47,10 @@ public static class RouterFleetEndpoints
         .WithSummary("Full fleet hardware topology with real-time liveness and execution state.")
         .WithDescription("Every configured target (configuration order) plus the Cloud pseudo-target (last), each with real-time "
             + "liveness state (Online/Offline/Probing), last-probe latency, detected GPU hardware (local workstation only), "
-            + "in-flight request count, currently loaded model and the active KV-cache context lease. The Cloud pseudo-target "
-            + "is never probed or tracked: 'Online' iff cloud overflow is enabled and it never carries a loaded model, "
-            + "in-flight requests, context lease or latency measurement.");
+            + "in-flight request count, currently loaded model, the active KV-cache context lease and activeSessions (the "
+            + "sessions active on the target within the SessionReservationWindowSeconds window, task #77). The Cloud "
+            + "pseudo-target is never probed or tracked: 'Online' iff cloud overflow is enabled and it never carries a "
+            + "loaded model, in-flight requests, active sessions, context lease or latency measurement.");
         // Fleet hardware profiling engine: the local node's own profile (cached after the
         // first probe), the full fleet topology (parallel peer probes, fail-soft per node),
         // and the manual profile push (for bare Ollama targets without a router daemon).
@@ -137,6 +139,12 @@ public static class RouterFleetEndpoints
         var modelCatalogCache = serviceProvider.GetService<IModelCatalogCacheService>();
         var fleetHardware = serviceProvider.GetService<IFleetHardwareService>();
 
+        // Active-session reservation window (task #77): per-target active-session counts within
+        // the window; the null-safe service resolution keeps the endpoint live when the store
+        // is not registered (count 0).
+        var sessionAffinity = serviceProvider.GetService<ISessionAffinityService>();
+        var reservationWindow = TimeSpan.FromSeconds(Math.Max(0, opt.SessionReservationWindowSeconds));
+
         var targets = new List<RouterTargetItem>(effectiveTargets.Count + 1);
         foreach (var target in effectiveTargets)
         {
@@ -168,6 +176,7 @@ public static class RouterFleetEndpoints
             var executionState = executionTracker?.GetState(routingTarget);
             var activeModel = executionState?.LoadedModels.FirstOrDefault()?.Name;
             var inFlight = executionState?.InFlightRequests ?? 0;
+            var activeSessions = sessionAffinity is not null ? sessionAffinity.GetActiveSessionCount(routingTarget, reservationWindow) : 0;
 
             // speedFactor: always present; null when the effective factor is 1.0 (unset/default),
             // consistent with maxVramMB's nullable semantics.
@@ -228,12 +237,13 @@ public static class RouterFleetEndpoints
                 Execution: new RouterTargetExecution(
                     InFlightRequests: inFlight,
                     ActiveModel: activeModel,
-                    ContextAllocation: FormatContextAllocation(routingTarget, leaseSnapshot))));
+                    ContextAllocation: FormatContextAllocation(routingTarget, leaseSnapshot),
+                    ActiveSessions: activeSessions)));
         }
 
         // The Cloud pseudo-target is never probed/tracked: it is "Online" iff cloud is
         // enabled, never has a loaded model or in-flight requests, and never carries a
-        // context lease or a latency measurement.
+        // context lease, an active session (it is never leased) or a latency measurement.
         var cloudEnabled = opt.CloudOverflow.Enabled;
         var cloudFlag = availability.Flags.TryGetValue(RoutingTarget.Cloud, out var cloudEnabledFlag) ? cloudEnabledFlag : cloudEnabled;
         targets.Add(new RouterTargetItem(
@@ -253,7 +263,8 @@ public static class RouterFleetEndpoints
             Execution: new RouterTargetExecution(
                 InFlightRequests: 0,
                 ActiveModel: null,
-                ContextAllocation: "baseline")));
+                ContextAllocation: "baseline",
+                ActiveSessions: 0))); // Cloud is never leased (SetAffinity ignores the pseudo-target).
 
         return new RouterFleetResponse(targets);
     }

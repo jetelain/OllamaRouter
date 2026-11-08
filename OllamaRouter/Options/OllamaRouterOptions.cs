@@ -11,7 +11,8 @@ namespace OllamaRouter.Options;
 /// through <c>IOptionsMonitor&lt;OllamaRouterOptions&gt;</c>, so behavioral options are LIVE at
 /// runtime (an on-disk <c>config/config.json</c> change rebinds on the next dispatch / loop
 /// iteration, no restart required): <c>MaxConsecutiveFailures</c>, <c>SessionAffinityTtlMinutes</c>,
-/// <c>ContextFitMarginTokens</c>, <c>DispatchToLargestCapacityOnOverflow</c>,
+/// <c>SessionReservationWindowSeconds</c>, <c>OtherSessionReservationPenalty</c>,
+/// <c>MaxParallelCliffPenalty</c>, <c>ContextFitMarginTokens</c>, <c>DispatchToLargestCapacityOnOverflow</c>,
 /// <c>FilterNamespacedModels</c>, <c>TokenEstimationOverheadFactor</c>, <c>Models:{model}.*</c>
 /// thresholds, <c>CloudOverflow.*</c>, <c>Recording.*</c> (incl. <c>TokenMetricsCsv</c>),
 /// <c>Aggregation.PerTargetTimeoutMs</c>, <c>PreloadLoadTimeoutSeconds</c>, <c>DynamicContext.*</c>,
@@ -50,6 +51,12 @@ public sealed class OllamaRouterOptions
     /// The <see cref="PreloadLoadTimeoutSeconds"/> default (20 s).
     /// </summary>
     public const int DefaultPreloadLoadTimeoutSeconds = 20;
+
+    /// <summary>
+    /// The <see cref="SessionReservationWindowSeconds"/> default (30 s): the inter-turn gap
+    /// (tool calls, compiles, I/O waits) during which a session's target stays "reserved".
+    /// </summary>
+    public const int DefaultSessionReservationWindowSeconds = 30;
 
     /// <summary>
     /// Per-model routing thresholds, keyed by model name (e.g. "llama3", "qwen3:8b").
@@ -212,6 +219,40 @@ public sealed class OllamaRouterOptions
     public int SessionAffinityTtlMinutes { get; set; } = 30;
 
     /// <summary>
+    /// Active-session reservation window (in seconds, task #77): a fleet target that served a
+    /// session within this window is treated as RESERVED/contended when a DIFFERENT session
+    /// evaluates it in Stage 2 (that candidate takes the
+    /// <see cref="OtherSessionReservationPenalty"/>, keeping a new workload off a target whose
+    /// KV cache is still hot for the other session). Covers the typical inter-turn agent gap
+    /// (tool calls, compiles, I/O waits) during which <c>InFlightRequests == 0</c> but the
+    /// target's KV cache still belongs to the previous session. Defaults to 30 (covers a
+    /// typical agent tool loop); set to 0 to disable the reservation window entirely (the
+    /// contention penalty never applies). Negative values normalize back to 30 by
+    /// <see cref="Normalize"/> (re-applied on every config reload). LIVE.
+    /// </summary>
+    public int SessionReservationWindowSeconds { get; set; } = DefaultSessionReservationWindowSeconds;
+
+    /// <summary>
+    /// Stage-2 contention penalty (task #77): the fixed penalty applied to a candidate that is
+    /// reserved by ANOTHER active session within <see cref="SessionReservationWindowSeconds"/>
+    /// (the request carries a non-blank session ID and the target holds a fresh lease for a
+    /// different session; the request's own lease is exempt — sticky affinity is preserved on
+    /// the session's own target). Calibrated at 120 to flip the sign of a hot-but-reserved
+    /// target (100 hot − 120 = −20 &lt; the idle cold candidate's 0). Set to 0 to disable the
+    /// term; negative values normalize back to 120 by <see cref="Normalize"/>. LIVE.
+    /// </summary>
+    public int OtherSessionReservationPenalty { get; set; } = 120;
+
+    /// <summary>
+    /// Stage-2 concurrency CLIFF term (task #77 recalibration): added to the per-in-flight
+    /// concurrency penalty (40 per in-flight request) when the target is at or above its
+    /// <c>MaxParallel</c> cap (a saturated leased node must no longer beat an idle qualified
+    /// candidate: 150 + 100 − (1 × 40 + 220) = −10 &lt; 0). Set to 0 to disable the cliff term;
+    /// negative values normalize back to 220 by <see cref="Normalize"/>. LIVE.
+    /// </summary>
+    public int MaxParallelCliffPenalty { get; set; } = 220;
+
+    /// <summary>
     /// Allowed difference in estimated prompt tokens between adjacent requests
     /// to consider them part of the same retry streak. Defaults to 4000.
     /// Set to 0 to require an exact match.
@@ -344,13 +385,33 @@ public sealed class OllamaRouterOptions
 
     /// <summary>
     /// Normalizes the root section after config binding: clamps a negative
-    /// <see cref="ContextFitMarginTokens"/> to 0. Never throws.
+    /// <see cref="ContextFitMarginTokens"/> to 0; a negative
+    /// <see cref="SessionReservationWindowSeconds"/>/<see cref="OtherSessionReservationPenalty"/>
+    /// /<see cref="MaxParallelCliffPenalty"/> resets to its default (0 stays 0 = disabled).
+    /// Never throws.
     /// </summary>
     public void Normalize()
     {
         if (ContextFitMarginTokens < 0)
         {
             ContextFitMarginTokens = 0;
+        }
+
+        // Task #77: reservation window / contention / cliff tuning — a negative value is
+        // invalid (reset to the default); 0 is meaningful (the term is disabled).
+        if (SessionReservationWindowSeconds < 0)
+        {
+            SessionReservationWindowSeconds = DefaultSessionReservationWindowSeconds;
+        }
+
+        if (OtherSessionReservationPenalty < 0)
+        {
+            OtherSessionReservationPenalty = 120;
+        }
+
+        if (MaxParallelCliffPenalty < 0)
+        {
+            MaxParallelCliffPenalty = 220;
         }
 
         // Preload keep-alive normalization: the router-level last-resort default keeps -1

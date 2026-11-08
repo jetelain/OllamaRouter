@@ -11,7 +11,10 @@ namespace OllamaRouter.Services.Routing;
 /// (case-insensitive session-ID keys) with a bounded lazy sweep on access — no background
 /// hosted service (max ~100 entries swept per operation, and only when the table holds more
 /// than 100 entries, so small tables never pay a sweep cost). The clock is injectable so
-/// tests advance time deterministically.
+/// tests advance time deterministically. The active-session reservation-window queries
+/// (task #77: <see cref="GetActiveSessionCount"/>, <see cref="IsTargetReservedByOtherSession"/>)
+/// are read-only O(leases) scans — they consult the sliding <c>LastAccessUtc</c> timestamps
+/// but never refresh the TTL or mutate the table.
 /// </summary>
 public sealed class SessionAffinityService : ISessionAffinityService
 {
@@ -122,6 +125,66 @@ public sealed class SessionAffinityService : ISessionAffinityService
         }
 
         _logger.LogDebug("Invalidated all session affinity leases pinned to {Target}.", target.Value);
+    }
+
+    // ---- Active-session reservation window (task #77): read-only, no TTL refresh. ----
+
+    /// <summary>
+    /// True when <paramref name="lease"/> points at <paramref name="target"/> (case-insensitive)
+    /// and its last access is within <paramref name="window"/> of <paramref name="now"/>.
+    /// Window membership implies a non-expired lease: the window (default 30 s) is always far
+    /// below the lease TTL (default 30 min), so no extra TTL check is required.
+    /// </summary>
+    private static bool IsActiveOn(RoutingTarget target, SessionLease lease, DateTimeOffset now, TimeSpan window) =>
+        lease.Target == target && now - lease.LastAccessUtc <= window;
+
+    /// <inheritdoc />
+    public int GetActiveSessionCount(RoutingTarget target, TimeSpan window)
+    {
+        if (window <= TimeSpan.Zero)
+        {
+            return 0;
+        }
+
+        var now = _clock();
+        var count = 0;
+        foreach (var lease in _leases.Values)
+        {
+            if (IsActiveOn(target, lease, now, window))
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    /// <inheritdoc />
+    public bool IsTargetReservedByOtherSession(RoutingTarget target, string? currentSessionId, TimeSpan window)
+    {
+        if (window <= TimeSpan.Zero)
+        {
+            return false;
+        }
+
+        var now = _clock();
+        foreach (var (sessionId, lease) in _leases)
+        {
+            // Self-exemption: the request's own lease (case-insensitive ID match) is never an
+            // "other active session" — sticky affinity on the session's own target is intact.
+            if (!string.IsNullOrWhiteSpace(currentSessionId) &&
+                string.Equals(sessionId, currentSessionId, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (IsActiveOn(target, lease, now, window))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     // Bounded lazy sweep: evict TTL-expired leases, at most <see cref="SweepMaxEntries"/> per

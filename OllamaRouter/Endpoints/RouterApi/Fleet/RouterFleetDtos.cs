@@ -30,4 +30,5 @@ public sealed record RouterTargetHardware(
 public sealed record RouterTargetExecution(
     [property: JsonPropertyName("inFlightRequests")] int InFlightRequests,
     [property: JsonPropertyName("activeModel")] string? ActiveModel,
-    [property: JsonPropertyName("contextAllocation")] string ContextAllocation);
+    [property: JsonPropertyName("contextAllocation")] string ContextAllocation,
+    [property: JsonPropertyName("activeSessions")] int ActiveSessions = 0);
