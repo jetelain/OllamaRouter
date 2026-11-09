@@ -173,6 +173,59 @@ internal static class OpenApiScenarios
             return $"Expected {ExpectedOperations.Length} unique operationIds, got {operationIds.Count}.";
         }
 
+        // Task #87: the session 200 schemas expose the session-level actualCloudCost/cost
+        // properties (the AOT source-generator inlines the nested item schemas, so the list
+        // row and per-target row are checked on the inlined 'items' objects), and the
+        // per-target row carries NEITHER (session-level only).
+        if (document["components"] is not JsonObject components
+            || components["schemas"] is not JsonObject schemas)
+        {
+            return "Missing 'components.schemas' section.";
+        }
+
+        JsonObject? FindItemsProperties(JsonObject? schema, string property)
+        {
+            if (schema?["properties"] is not JsonObject properties
+                || properties[property] is not JsonObject arrayProperty
+                || arrayProperty["items"] is not JsonObject items
+                || items["properties"] is not JsonObject itemProperties)
+            {
+                return null;
+            }
+
+            return itemProperties;
+        }
+
+        if (schemas["RouterSessionUsageListResponse"] is not JsonObject listSchema)
+        {
+            return "Missing the RouterSessionUsageListResponse component schema.";
+        }
+
+        if (FindItemsProperties(listSchema, "sessions") is not JsonObject listItemProperties
+            || listItemProperties["actualCloudCost"] is null
+            || listItemProperties["cost"] is null)
+        {
+            return "The session list row schema is missing the 'actualCloudCost' and/or 'cost' properties.";
+        }
+
+        if (schemas["RouterSessionUsageDetailResponse"] is not JsonObject detailSchema
+            || detailSchema["properties"] is not JsonObject detailProperties)
+        {
+            return "Missing the RouterSessionUsageDetailResponse component schema or its 'properties'.";
+        }
+
+        if (detailProperties["actualCloudCost"] is null || detailProperties["cost"] is null)
+        {
+            return "The session detail schema is missing the top-level 'actualCloudCost' and/or 'cost' properties.";
+        }
+
+        if (FindItemsProperties(detailSchema, "perTarget") is not JsonObject perTargetProperties
+            || perTargetProperties["actualCloudCost"] is not null
+            || perTargetProperties["cost"] is not null)
+        {
+            return "The per-target row schema must NOT carry 'actualCloudCost'/'cost' (session-level only).";
+        }
+
         return null;
     });
 }

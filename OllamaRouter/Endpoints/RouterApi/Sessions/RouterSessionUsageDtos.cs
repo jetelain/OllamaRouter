@@ -8,7 +8,12 @@ namespace OllamaRouter.Endpoints.RouterApi.Sessions;
 /// tokens are CACHED INCLUSIVE; cached are reported separately as a subset) and the cost
 /// figures computed at READ time from the currently configured pricing (4-decimal rounding,
 /// never clamped; Cloud targets contribute their token value to <see cref="CloudValue"/> but
-/// no electricity/savings). The cost fields are null-omitted when no token price rate is
+/// no electricity/savings). <see cref="ActualCloudCost"/> is the Cloud pseudo-target's OWN
+/// token value — the actual money paid to cloud (<c>0.0</c> when the Cloud target was never
+/// used; distinct from the all-cloud <see cref="CloudValue"/> baseline, which values EVERY
+/// token at cloud rates). <see cref="Cost"/> is the session's total actual spend,
+/// <c>round(actualCloudCost + electricityCost, 4)</c> (cloud spend + local power) — NOT the
+/// savings-vs-baseline figure. The cost fields are null-omitted when no token price rate is
 /// configured (<c>Pricing.IsConfigured</c> is false — the monitor hides its whole cost section
 /// in that case).
 /// </summary>
@@ -22,7 +27,9 @@ public sealed record RouterSessionUsageItem(
     [property: JsonPropertyName("lastSeenAt")] DateTimeOffset LastSeenAt,
     [property: JsonPropertyName("cloudValue")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] double? CloudValue,
     [property: JsonPropertyName("electricityCost")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] double? ElectricityCost,
-    [property: JsonPropertyName("savings")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] double? Savings);
+    [property: JsonPropertyName("savings")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] double? Savings,
+    [property: JsonPropertyName("actualCloudCost")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] double? ActualCloudCost,
+    [property: JsonPropertyName("cost")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] double? Cost);
 
 /// <summary>
 /// Response of <c>GET /api/router/monitor/sessions</c> (task #85): the stored per-session
@@ -56,10 +63,12 @@ public sealed record RouterSessionUsageTargetItem(
 
 /// <summary>
 /// Response of <c>GET /api/router/monitor/sessions/{sessionId}</c> (task #85): the session's
-/// totals at the top level (same fields as <see cref="RouterSessionUsageItem"/>) plus the
-/// per-target breakdown — configured fleet order, Cloud last, any historical
-/// (since-renamed/removed) targets appended after. Unknown session ⇒ 404
-/// <c>OllamaErrorResponse</c>.
+/// totals at the top level (same fields as <see cref="RouterSessionUsageItem"/>, including the
+/// session-level <c>actualCloudCost</c> — the Cloud target's own token value / actual cloud
+/// spend — and <c>cost</c> — the total actual spend,
+/// <c>round(actualCloudCost + electricityCost, 4)</c>) plus the per-target breakdown —
+/// configured fleet order, Cloud last, any historical (since-renamed/removed) targets appended
+/// after. Unknown session ⇒ 404 <c>OllamaErrorResponse</c>.
 /// </summary>
 public sealed record RouterSessionUsageDetailResponse(
     [property: JsonPropertyName("currency")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Currency,
@@ -73,4 +82,6 @@ public sealed record RouterSessionUsageDetailResponse(
     [property: JsonPropertyName("cloudValue")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] double? CloudValue,
     [property: JsonPropertyName("electricityCost")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] double? ElectricityCost,
     [property: JsonPropertyName("savings")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] double? Savings,
+    [property: JsonPropertyName("actualCloudCost")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] double? ActualCloudCost,
+    [property: JsonPropertyName("cost")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] double? Cost,
     [property: JsonPropertyName("perTarget")] IReadOnlyList<RouterSessionUsageTargetItem> PerTarget);

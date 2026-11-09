@@ -47,11 +47,16 @@ public static class RouterSessionUsageEndpoints
             + "eviction is driven by request traffic only). Each row carries the session's accumulated "
             + "token totals (inputTokens are cached-INCLUSIVE; cachedInputTokens are reported separately "
             + "as a subset) and cumulative GPU time (elapsedMs) plus cost figures (cloudValue, "
-            + "electricityCost, savings) computed at READ time from the CURRENTLY configured Pricing "
-            + "(cached-token pricing + electricity subtraction; Cloud targets contribute their token value "
-            + "to cloudValue but no electricity/savings; 4-decimal rounding, never clamped) — a pricing "
+            + "electricityCost, savings, actualCloudCost, cost) computed at READ time from the CURRENTLY configured "
+            + "Pricing (cached-token pricing + electricity subtraction; Cloud targets contribute their token value "
+            + "to cloudValue but no electricity/savings; 4-decimal rounding, never clamped). cloudValue is the "
+            + "all-cloud BASELINE (every token — local and cloud — valued at cloud rates); actualCloudCost is "
+            + "the Cloud target's OWN token value — the actual money paid to cloud (0.0 when the Cloud target "
+            + "was never used); cost = actualCloudCost + electricityCost — the session's total actual spend "
+            + "(cloud spend + local power), a distinct figure from the savings-vs-baseline savings. A pricing "
             + "change re-prices every stored session immediately. When no token price rate is configured "
-            + "the currency/cloudValue/electricityCost/savings fields are omitted (token totals are always "
+            + "the currency/cloudValue/electricityCost/savings/actualCloudCost/cost fields are omitted (token "
+            + "totals are always "
             + "present). The store is a bounded LRU (OllamaRouter:SessionUsageMaxSessions, default 1000, "
             + "live) and in-memory-only; requests without a session ID are never stored; failed requests "
             + "contribute nothing; successful completions without daemon-reported usage contribute elapsed "
@@ -79,7 +84,10 @@ public static class RouterSessionUsageEndpoints
             + "so session IDs containing slashes work (the segment is unescaped and trimmed of the leading "
             + "'/'; lookup is case-insensitive). Returns the session's accumulated token totals and cost "
             + "figures (computed at read time from the currently configured Pricing — see "
-            + "GetRouterSessionUsageList for the cost semantics) at the top level plus the per-target "
+            + "GetRouterSessionUsageList for the cost semantics, including the top-level session-level "
+            + "actualCloudCost — the Cloud target's own token value / actual cloud spend, 0.0 when the Cloud "
+            + "target was never used — and cost = actualCloudCost + electricityCost, the total actual spend) "
+            + "at the top level (actualCloudCost/cost are NOT on the per-target rows) plus the per-target "
             + "breakdown (per-row tokens, elapsedMs, cloudValue, electricityCost, savings; configured "
             + "fleet order, Cloud last, historical since-renamed/removed targets appended after; the Cloud "
             + "row carries electricityCost 0 and savings 0 when present). Unknown/absent session → 404 "
@@ -107,7 +115,8 @@ public static class RouterSessionUsageEndpoints
         int requests = 0, input = 0, cached = 0, output = 0;
         var elapsedMs = 0.0;
         double cloudValue = 0.0, electricity = 0.0, savings = 0.0;
-        foreach (var cost in perTarget.Values)
+        double actualCloudCost = 0.0;
+        foreach (var (target, cost) in perTarget)
         {
             requests += cost.Totals.Requests;
             input += cost.Totals.InputTokens;
@@ -121,6 +130,13 @@ public static class RouterSessionUsageEndpoints
                 cloudValue += value;
                 electricity += powerCost;
                 savings += saved;
+                // The Cloud row's per-target cloudValue is its OWN token value (already 4-dec
+                // rounded upstream) — the actual money paid to cloud (actualCloudCost = 0.0 when
+                // the session never used the Cloud target).
+                if (target == RoutingTarget.Cloud)
+                {
+                    actualCloudCost = value;
+                }
             }
         }
 
@@ -134,7 +150,9 @@ public static class RouterSessionUsageEndpoints
             snapshot.LastSeenUtc,
             currency is null ? null : Math.Round(cloudValue, 4),
             currency is null ? null : Math.Round(electricity, 4),
-            currency is null ? null : Math.Round(savings, 4));
+            currency is null ? null : Math.Round(savings, 4),
+            currency is null ? null : actualCloudCost,
+            currency is null ? null : Math.Round(actualCloudCost + electricity, 4));
     }
 
     private static RouterSessionUsageDetailResponse BuildSessionDetail(
@@ -192,6 +210,8 @@ public static class RouterSessionUsageEndpoints
             item.CloudValue,
             item.ElectricityCost,
             item.Savings,
+            item.ActualCloudCost,
+            item.Cost,
             rows);
     }
 

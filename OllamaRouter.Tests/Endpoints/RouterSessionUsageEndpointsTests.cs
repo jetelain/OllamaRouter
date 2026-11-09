@@ -144,6 +144,16 @@ public class RouterSessionUsageEndpointsTests
         Assert.NotNull(s1["cloudValue"]);
         Assert.NotNull(s1["electricityCost"]);
         Assert.NotNull(s1["savings"]);
+        Assert.NotNull(s1["actualCloudCost"]);
+        Assert.NotNull(s1["cost"]);
+
+        // Cloud-free identity: neither session used the Cloud target ⇒ actualCloudCost 0.0
+        // and cost == electricityCost (round(0.0 + electricity, 4) == the 4-dec electricity).
+        Assert.Equal(0.0, s1["actualCloudCost"]!.GetValue<double>());
+        Assert.Equal(s1["electricityCost"]!.GetValue<double>(), s1["cost"]!.GetValue<double>());
+        var s2Row = sessions[1]!.AsObject();
+        Assert.Equal(0.0, s2Row["actualCloudCost"]!.GetValue<double>());
+        Assert.Equal(s2Row["electricityCost"]!.GetValue<double>(), s2Row["cost"]!.GetValue<double>());
     }
 
     // ------------------------------------------------------------------
@@ -188,6 +198,12 @@ public class RouterSessionUsageEndpointsTests
         Assert.Equal(0.0, cloud["electricityCost"]!.GetValue<double>()); // Q1 = A
         Assert.Equal(0.0, cloud["savings"]!.GetValue<double>());
         Assert.NotNull(cloud["cloudValue"]);
+
+        // actualCloudCost/cost are TOP-LEVEL session fields only — never on the per-target rows.
+        Assert.Null(perTarget[0]!["actualCloudCost"]);
+        Assert.Null(perTarget[1]!["cost"]);
+        Assert.NotNull(node["actualCloudCost"]);
+        Assert.NotNull(node["cost"]);
 
         // Top-level totals = sums over the per-target rows.
         Assert.Equal(4, node["requests"]!.GetValue<int>());
@@ -245,6 +261,75 @@ public class RouterSessionUsageEndpointsTests
         Assert.Equal(expectedTotalCloudValue, node["cloudValue"]!.GetValue<double>(), 4);
         Assert.Equal(expectedTotalElectricity, node["electricityCost"]!.GetValue<double>(), 4);
         Assert.Equal(expectedTotalSavings, node["savings"]!.GetValue<double>(), 4);
+
+        // actualCloudCost = the Cloud row's OWN token value (1k in @0.20 + 100 out @0.80 =
+        // 0.00028) — the actual money paid to cloud; DISTINCT from the all-cloud cloudValue
+        // baseline (0.0057 Desktop + 0.00028 Cloud = 0.00598), which values the local row too.
+        Assert.Equal(0.00028, node["actualCloudCost"]!.GetValue<double>(), 4);
+        Assert.Equal(0.00598, node["cloudValue"]!.GetValue<double>(), 4);
+        Assert.Equal(cloud["cloudValue"]!.GetValue<double>(), node["actualCloudCost"]!.GetValue<double>(), 4);
+        Assert.NotEqual(node["cloudValue"]!.GetValue<double>(), node["actualCloudCost"]!.GetValue<double>());
+
+        // cost = round(actualCloudCost + electricityCost, 4) = the ACTUAL spend (0.00028 +
+        // 0.0005 electricity) — NOT the savings-vs-baseline figure (0.0052).
+        Assert.Equal(0.00078, node["cost"]!.GetValue<double>(), 4);
+        Assert.Equal(0.0052, node["savings"]!.GetValue<double>(), 4);
+        Assert.NotEqual(node["cost"]!.GetValue<double>(), node["savings"]!.GetValue<double>());
+    }
+
+    [Fact]
+    public async Task Detail_CloudOnlySession_ActualCloudCostEqualsCloudValue_CostEqualsActualCloudCost()
+    {
+        await using var harness = await CreateAppAsync(OptionsWithPricing());
+        harness.Store.Record(Entry("s1", RoutingTarget.Cloud, actualPrompt: 1_000, actualResponse: 100, elapsedMs: 4_000));
+
+        using var response = await harness.Client.GetAsync("/api/router/monitor/sessions/s1");
+        var node = JsonNode.Parse(await response.Content.ReadAsStringAsync())!;
+
+        var actualCloudCost = node["actualCloudCost"]!.GetValue<double>();
+        Assert.Equal(0.00028, actualCloudCost, 4); // Cloud's own token value (1k in @0.20 + 100 out @0.80)
+        Assert.Equal(0.0, node["electricityCost"]!.GetValue<double>()); // no local targets ⇒ no power
+        Assert.Equal(0.00028, node["cost"]!.GetValue<double>(), 4); // cloud-only: cost == actualCloudCost
+
+        // Cloud-only contrast case: the all-cloud baseline IS the Cloud row's own value.
+        Assert.Equal(actualCloudCost, node["cloudValue"]!.GetValue<double>(), 4);
+    }
+
+    [Fact]
+    public async Task Detail_Rounding_CostRoundedLast_FromRoundedParts_NeverClamped()
+    {
+        var options = new OllamaRouterOptions
+        {
+            Targets =
+            [
+                new OllamaTargetOptions { Name = "Desktop", Url = "http://127.0.0.1:11435" },
+                new OllamaTargetOptions { Name = "Server", Url = "http://192.168.1.10:11434" }
+            ],
+            // 0.3333/M produces raw values beyond 4 decimals (no cached rate ⇒ cached falls
+            // back to the input rate; irrelevant here — no cached tokens).
+            Pricing = new PricingOptions
+            {
+                PromptPricePerMillion = 0.3333,
+                CompletionPricePerMillion = 0.3333,
+                Currency = "$"
+            }
+        };
+        await using var harness = await CreateAppAsync(options);
+        harness.Store.Record(Entry("s1", (RoutingTarget)"Desktop", actualPrompt: 1_111_111, actualResponse: 0, elapsedMs: 1_000_000));
+        harness.Store.Record(Entry("s1", RoutingTarget.Cloud, actualPrompt: 1_111_111, actualResponse: 0, elapsedMs: 4_000));
+
+        using var response = await harness.Client.GetAsync("/api/router/monitor/sessions/s1");
+        var node = JsonNode.Parse(await response.Content.ReadAsStringAsync())!;
+
+        // Raw 0.370333… ⇒ actualCloudCost 0.3703; raw electricity (1000 s @ 150 W @ 0.20/kWh =
+        // 0.008333…) ⇒ 0.0083 — per-target 4-decimal rounding first.
+        Assert.Equal(0.3703, node["actualCloudCost"]!.GetValue<double>(), 4);
+        Assert.Equal(0.0083, node["electricityCost"]!.GetValue<double>(), 4);
+
+        // cost = round(0.3703 + 0.0083, 4) = 0.3786 from the ROUNDED parts, rounded LAST;
+        // the unrounded 0.378666… (→ 0.3787) is NOT emitted, and no clamping applies.
+        Assert.Equal(0.3786, node["cost"]!.GetValue<double>(), 4);
+        Assert.NotEqual(0.3787, node["cost"]!.GetValue<double>(), 4);
     }
 
     [Fact]
@@ -288,6 +373,13 @@ public class RouterSessionUsageEndpointsTests
             Math.Round(monitorStatus.CloudOverflowCost +
                        Math.Round(MonitorEndpointsExtensions.TokenCost(byTarget[(RoutingTarget)"Desktop"], 0.20, 0.05, 0.80), 4), 4),
             node["cloudValue"]!.GetValue<double>(), 4);
+
+        // Session-level actualCloudCost/cost parity with the monitor's cost status (same
+        // formula: the Cloud row's own token value; cost rounds the rounded parts last).
+        Assert.Equal(monitorStatus.CloudOverflowCost, node["actualCloudCost"]!.GetValue<double>(), 4);
+        Assert.Equal(
+            Math.Round(monitorStatus.CloudOverflowCost + monitorStatus.ElectricityCost, 4),
+            node["cost"]!.GetValue<double>(), 4);
     }
 
     [Fact]
@@ -314,9 +406,23 @@ public class RouterSessionUsageEndpointsTests
         Assert.Null(node["cloudValue"]);
         Assert.Null(node["electricityCost"]);
         Assert.Null(node["savings"]);
+        Assert.Null(node["actualCloudCost"]);
+        Assert.Null(node["cost"]);
         Assert.Null(node["perTarget"]!.AsArray()[0]!["cloudValue"]);
         Assert.Null(node["perTarget"].AsArray()[0]!["electricityCost"]);
         Assert.Null(node["perTarget"].AsArray()[0]!["savings"]);
+
+        // The list rows omit the new fields too (token totals always present).
+        using var listResponse = await harness.Client.GetAsync("/api/router/monitor/sessions");
+        Assert.Equal(HttpStatusCode.OK, listResponse.StatusCode);
+        var listNode = JsonNode.Parse(await listResponse.Content.ReadAsStringAsync())!;
+        Assert.Null(listNode["currency"]);
+        var listRow = listNode["sessions"]!.AsArray()[0]!.AsObject();
+        Assert.Equal(10, listRow["inputTokens"]!.GetValue<int>());
+        Assert.Equal(5, listRow["outputTokens"]!.GetValue<int>());
+        Assert.Null(listRow["cloudValue"]);
+        Assert.Null(listRow["actualCloudCost"]);
+        Assert.Null(listRow["cost"]);
     }
 
     [Fact]
@@ -344,6 +450,12 @@ public class RouterSessionUsageEndpointsTests
         var expected = Math.Round((10_000 - 2_000) / 1_000_000.0 * 10.0 + 2_000 / 1_000_000.0 * 10.0 + 5_000 / 1_000_000.0 * 10.0, 4);
         Assert.Equal(expected, secondNode["cloudValue"]!.GetValue<double>(), 4);
         Assert.NotEqual(firstValue, secondNode["cloudValue"]!.GetValue<double>());
+
+        // The new fields re-price on the read too: no Cloud usage ⇒ actualCloudCost stays
+        // 0.0 and cost stays the (unchanged) electricity cost of the local row.
+        Assert.Equal(0.0, secondNode["actualCloudCost"]!.GetValue<double>());
+        Assert.Equal(secondNode["electricityCost"]!.GetValue<double>(), secondNode["cost"]!.GetValue<double>());
+        Assert.Equal(firstNode["cost"]!.GetValue<double>(), secondNode["cost"]!.GetValue<double>(), 4);
     }
 
     [Fact]

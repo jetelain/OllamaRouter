@@ -590,6 +590,69 @@ public class RouterOpenApiDocumentTests
     }
 
     [Fact]
+    public async Task Document_SessionSchemas_CarryActualCloudCostAndCost_OnSessionLevelOnly_AndDescriptionsMentionThem()
+    {
+        await using var harness = await DocHarness.StartAsync(requireKeyForAllEndpoints: false);
+        var document = await FetchDocumentAsync(harness);
+        var components = (JsonObject)document["components"]!;
+        var schemas = (JsonObject)components["schemas"]!;
+
+        // Follow the 200 $refs of the two session operations into the component schemas.
+        // (The AOT source-generator INLINES the nested item schemas — the list row and the
+        // per-target row are not separately-named components, so the properties are checked
+        // on the inlined 'items' objects.)
+        var listOperation = GetOperation(document, "GET", "/api/router/monitor/sessions");
+        var detailOperation = GetOperation(document, "GET", "/api/router/monitor/sessions/{sessionId}");
+        var listRef = listOperation.ResponseRef("200");
+        var detailRef = detailOperation.ResponseRef("200");
+        Assert.True(listRef!.EndsWith("/RouterSessionUsageListResponse", StringComparison.Ordinal), $"got '{listRef}'");
+        Assert.True(detailRef!.EndsWith("/RouterSessionUsageDetailResponse", StringComparison.Ordinal), $"got '{detailRef}'");
+
+        var listSchema = (JsonObject)schemas["RouterSessionUsageListResponse"]!;
+        var detailSchema = (JsonObject)schemas["RouterSessionUsageDetailResponse"]!;
+
+        var listItems = (JsonObject)((JsonObject)listSchema["properties"]!["sessions"]!)["items"]!;
+        var listItemProperties = (JsonObject)listItems["properties"]!;
+        var detailProperties = (JsonObject)detailSchema["properties"]!;
+        var perTargetItems = (JsonObject)((JsonObject)detailProperties["perTarget"]!)["items"]!;
+        var perTargetProperties = (JsonObject)perTargetItems["properties"]!;
+
+        // The new props live on the SESSION-LEVEL schemas (list rows + detail top level) as
+        // nullable numbers, and are ABSENT from the per-target row schema.
+        foreach (var properties in new[] { listItemProperties, detailProperties })
+        {
+            Assert.Contains("actualCloudCost", JsonObjectKeys(properties));
+            Assert.Contains("cost", JsonObjectKeys(properties));
+
+            foreach (var property in new[] { "actualCloudCost", "cost" })
+            {
+                var typeNode = properties[property]!["type"];
+                var types = typeNode is JsonArray typeArray
+                    ? typeArray.Select(t => t!.GetValue<string>()!).ToArray()
+                    : [typeNode!.GetValue<string>()!];
+                Assert.True(types.Contains("number", StringComparer.Ordinal),
+                    $"'{property}' must be a number schema (got [{string.Join(",", types)}])");
+                Assert.True(types.Contains("null", StringComparer.Ordinal),
+                    $"'{property}' must be a nullable number schema (got [{string.Join(",", types)}])");
+            }
+        }
+
+        Assert.DoesNotContain("actualCloudCost", JsonObjectKeys(perTargetProperties));
+        Assert.DoesNotContain("cost", JsonObjectKeys(perTargetProperties));
+
+        // Both operation descriptions document the two new fields + the omission rule.
+        var listDescription = listOperation.Description!;
+        var detailDescription = detailOperation.Description!;
+        foreach (var description in new[] { listDescription, detailDescription })
+        {
+            Assert.Contains("actualCloudCost", description, StringComparison.Ordinal);
+            Assert.Contains("cost", description, StringComparison.Ordinal);
+        }
+        Assert.Contains("savings/actualCloudCost/cost fields are omitted", listDescription, StringComparison.Ordinal);
+        Assert.Contains("actualCloudCost/cost are NOT on the per-target rows", detailDescription, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Document_Endpoint_RequiresKey_Only_WhenRequireKeyForAllEndpoints_IsSet()
     {
         // Default mode: the document is public (read-only; no security requirement).

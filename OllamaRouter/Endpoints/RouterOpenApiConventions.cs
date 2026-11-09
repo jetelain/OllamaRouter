@@ -516,13 +516,13 @@ internal static class RouterOpenApiDocumentTransformer
             ["GET /api/router/monitor/sessions"] = new(typeof(RouterSessionUsageListResponse),
                 responses:
                 [
-                    ("200", typeof(RouterSessionUsageListResponse), "The stored per-session aggregates, most-recently-active first (token totals always present; currency/cloudValue/electricityCost/savings omitted when no token price rate is configured).")
+                    ("200", typeof(RouterSessionUsageListResponse), "The stored per-session aggregates, most-recently-active first (token totals always present; currency/cloudValue/electricityCost/savings/actualCloudCost/cost omitted when no token price rate is configured; actualCloudCost = the Cloud target's own token value / actual cloud spend, 0.0 when no cloud usage; cost = actualCloudCost + electricityCost = the actual money spent).")
                 ]),
 
             ["GET /api/router/monitor/sessions/*"] = new(typeof(RouterSessionUsageDetailResponse),
                 responses:
                 [
-                    ("200", typeof(RouterSessionUsageDetailResponse), "The session's totals plus the per-target breakdown (configured fleet order, Cloud last, historical targets appended after; cost figures computed at read time from the currently configured Pricing; the Cloud row carries electricityCost 0 and savings 0)."),
+                    ("200", typeof(RouterSessionUsageDetailResponse), "The session's totals (including the top-level actualCloudCost — the Cloud target's own token value / actual cloud spend — and cost = actualCloudCost + electricityCost, the total actual spend) plus the per-target breakdown (configured fleet order, Cloud last, historical targets appended after; cost figures computed at read time from the currently configured Pricing; the Cloud row carries electricityCost 0 and savings 0)."),
                     ("404", typeof(OllamaErrorResponse), "session not found: {sessionId}")
                 ])
         };
