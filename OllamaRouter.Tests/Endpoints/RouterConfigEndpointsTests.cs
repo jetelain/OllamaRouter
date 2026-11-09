@@ -562,6 +562,135 @@ public class RouterConfigEndpointsTests
         Assert.False(persisted.ContainsKey("ApiKey")); // cleared key must not linger on disk
     }
 
+    // ------------------------------------------------------------------
+    //  Task #84: per-target powerWatts CRUD
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task PostTarget_PowerWatts_PersistedEchoedAndApplied()
+    {
+        var options = SingleTargetOptions();
+        await using var harness = await CreateTestAppAsync(options);
+
+        var json = (await PostJsonAsync(
+            harness.Client,
+            "/api/router/targets",
+            "{\"name\":\"Laptop\",\"url\":\"http://192.168.1.105:11435\",\"maxParallel\":1,\"testConnectionFirst\":false,\"powerWatts\":130}")) as JsonObject;
+        Assert.NotNull(json);
+        Assert.True(json!["success"]!.GetValue<bool>());
+
+        // Echoed in the created-target DTO.
+        var target = (json["target"]! as JsonObject)!;
+        Assert.Equal(130, target["powerWatts"]!.GetValue<double>());
+
+        // Applied to the live in-memory options.
+        Assert.Equal(130, harness.Options.CurrentValue.Targets.Single(t => t.Name == "Laptop").PowerWatts);
+
+        // Persisted under the documented PascalCase key.
+        var file = ReadConfigFile(harness);
+        var persisted = ((file["OllamaRouter"]!["Targets"]! as JsonArray)!.OfType<JsonObject>())
+            .Single(t => t["Name"]!.GetValue<string>() == "Laptop");
+        Assert.Equal(130, persisted["PowerWatts"]!.GetValue<double>());
+    }
+
+    [Fact]
+    public async Task PostTarget_NegativePowerWatts_400_NotPersisted()
+    {
+        var options = SingleTargetOptions();
+        await using var harness = await CreateTestAppAsync(options);
+
+        var response = await harness.Client.PostAsync("/api/router/targets",
+            new StringContent("{\"name\":\"Laptop\",\"url\":\"http://192.168.1.105:11435\",\"testConnectionFirst\":false,\"powerWatts\":-5}", Encoding.UTF8, "application/json"));
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var json = (JsonNode.Parse(await response.Content.ReadAsStringAsync())! as JsonObject)!;
+        response.Dispose();
+        Assert.False(json["success"]!.GetValue<bool>());
+        Assert.Contains("powerWatts", json["error"]!.GetValue<string>(), StringComparison.OrdinalIgnoreCase);
+        Assert.Single(harness.Options.CurrentValue.Targets); // nothing applied
+    }
+
+    [Fact]
+    public async Task PostTarget_ZeroPowerWatts_Accepted()
+    {
+        // 0 W (a zero-consumption node) is a VALID power draw.
+        var options = SingleTargetOptions();
+        await using var harness = await CreateTestAppAsync(options);
+
+        var json = (await PostJsonAsync(
+            harness.Client,
+            "/api/router/targets",
+            "{\"name\":\"Virtual\",\"url\":\"http://192.168.1.106:11435\",\"testConnectionFirst\":false,\"powerWatts\":0}")) as JsonObject;
+        Assert.NotNull(json);
+        Assert.True(json!["success"]!.GetValue<bool>());
+        Assert.Equal(0, json["target"]?["powerWatts"]?.GetValue<double>());
+    }
+
+    [Fact]
+    public async Task PostTarget_NoPowerWatts_EchoesJsonNull_KeyAbsentFromDisk()
+    {
+        var options = SingleTargetOptions();
+        await using var harness = await CreateTestAppAsync(options);
+
+        var json = (await PostJsonAsync(
+            harness.Client,
+            "/api/router/targets",
+            "{\"name\":\"Laptop\",\"url\":\"http://192.168.1.105:11435\",\"testConnectionFirst\":false}")) as JsonObject;
+        Assert.NotNull(json);
+        Assert.True(json!["success"]!.GetValue<bool>());
+
+        var target = (json["target"]! as JsonObject)!;
+        Assert.True(target.ContainsKey("powerWatts")); // member present…
+        Assert.Null(target["powerWatts"]);             // …as JSON null (unset).
+
+        var file = ReadConfigFile(harness);
+        var persisted = ((file["OllamaRouter"]!["Targets"]! as JsonArray)!.OfType<JsonObject>())
+            .Single(t => t["Name"]!.GetValue<string>() == "Laptop");
+        Assert.False(persisted.ContainsKey("PowerWatts")); // no key on disk when unset
+    }
+
+    [Fact]
+    public async Task PutTarget_PowerWatts_AppliedEchoed_OmittedNoChange_Negative400()
+    {
+        var options = SingleTargetOptions();
+        options.Targets[0]!.PowerWatts = 90; // pre-existing override on "Local"
+        await using var harness = await CreateTestAppAsync(options);
+
+        // 1) Omitted ⇒ NO change (STJ cannot distinguish explicit null from absent).
+        var omitted = (await PutJsonAsync(
+            harness.Client,
+            "/api/router/targets/Local",
+            "{\"enabled\":true}")) as JsonObject;
+        Assert.NotNull(omitted);
+        Assert.True(omitted!["success"]!.GetValue<bool>());
+        Assert.Equal(90, harness.Options.CurrentValue.Targets.Single(t => t.Name == "Local").PowerWatts);
+        Assert.Equal(90, omitted["target"]?["powerWatts"]?.GetValue<double>());
+
+        // 2) Provided ⇒ applied + echoed.
+        var updated = (await PutJsonAsync(
+            harness.Client,
+            "/api/router/targets/Local",
+            "{\"powerWatts\":250}")) as JsonObject;
+        Assert.NotNull(updated);
+        Assert.True(updated!["success"]!.GetValue<bool>());
+        Assert.Equal(250, harness.Options.CurrentValue.Targets.Single(t => t.Name == "Local").PowerWatts);
+        Assert.Equal(250, updated["target"]?["powerWatts"]?.GetValue<double>());
+
+        var file = ReadConfigFile(harness);
+        var persisted = ((file["OllamaRouter"]!["Targets"]! as JsonArray)!.OfType<JsonObject>())
+            .Single(t => t["Name"]!.GetValue<string>() == "Local");
+        Assert.Equal(250, persisted["PowerWatts"]!.GetValue<double>());
+
+        // 3) Negative ⇒ 400, nothing applied.
+        var bad = (await PutJsonAsync(
+            harness.Client,
+            "/api/router/targets/Local",
+            "{\"powerWatts\":-1}")) as JsonObject;
+        Assert.NotNull(bad);
+        Assert.False(bad!["success"]!.GetValue<bool>());
+        Assert.Contains("powerWatts", bad["message"]!.GetValue<string>(), StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(250, harness.Options.CurrentValue.Targets.Single(t => t.Name == "Local").PowerWatts);
+    }
+
     [Theory]
     [InlineData("""{"name":"local","url":"http://192.168.1.105:11435"}""")]
     public async Task PostTarget_DuplicateName_409(string body)
@@ -927,6 +1056,97 @@ public class RouterConfigEndpointsTests
         Assert.Equal(0.05, ((JsonObject)router["Pricing"]!)["CachedPromptPricePerMillion"]!.GetValue<double>());
     }
 
+    // ------------------------------------------------------------------
+    //  Task #84: pricing.electricityPricePerKwh / pricing.defaultNodePowerWatts
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task GetConfig_Pricing_ElectricityKnobs_SetEchoedValues_UnsetEchoJsonNull()
+    {
+        var options = SingleTargetOptions();
+        options.Pricing = new PricingOptions
+        {
+            PromptPricePerMillion = 0.2,
+            Currency = "$",
+            ElectricityPricePerKwh = 0.35,
+            DefaultNodePowerWatts = 400
+        };
+        await using var harness = await CreateTestAppAsync(options);
+
+        var response = await harness.Client.GetAsync("/api/router/config");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var pricing = ((JsonNode.Parse(await response.Content.ReadAsStringAsync()) as JsonObject)!["pricing"] as JsonObject)!;
+        response.Dispose();
+        Assert.Equal(0.35, pricing["electricityPricePerKwh"]!.GetValue<double>());
+        Assert.Equal(400, pricing["defaultNodePowerWatts"]!.GetValue<double>());
+
+        // Unset ⇒ JSON null (member present, unset).
+        options.Pricing = new PricingOptions { PromptPricePerMillion = 0.2, Currency = "$" };
+        var response2 = await harness.Client.GetAsync("/api/router/config");
+        var pricing2 = ((JsonNode.Parse(await response2.Content.ReadAsStringAsync()) as JsonObject)!["pricing"] as JsonObject)!;
+        response2.Dispose();
+        Assert.True(pricing2.ContainsKey("electricityPricePerKwh"));
+        Assert.Null(pricing2["electricityPricePerKwh"]);
+        Assert.True(pricing2.ContainsKey("defaultNodePowerWatts"));
+        Assert.Null(pricing2["defaultNodePowerWatts"]);
+    }
+
+    [Fact]
+    public async Task PutConfig_Pricing_ElectricityKnobs_PersistedAndApplied_OmittedMeansNull()
+    {
+        var options = SingleTargetOptions();
+        options.Pricing = new PricingOptions
+        {
+            PromptPricePerMillion = 0.1,
+            Currency = "$",
+            ElectricityPricePerKwh = 0.30,   // pre-existing values (full-section-replace target)
+            DefaultNodePowerWatts = 900
+        };
+        await using var harness = await CreateTestAppAsync(options);
+
+        // Set both knobs.
+        var json = (await PutJsonAsync(
+            harness.Client,
+            "/api/router/config",
+            "{\"pricing\": { \"promptPricePerMillion\": 0.2, \"electricityPricePerKwh\": 0.35, \"defaultNodePowerWatts\": 400, \"currency\": \"$\" }}")) as JsonObject;
+        Assert.NotNull(json);
+        Assert.True(json!["success"]!.GetValue<bool>());
+        var echoed = (json["config"]! as JsonObject)!["pricing"]! as JsonObject;
+        Assert.Equal(0.35, echoed!["electricityPricePerKwh"]!.GetValue<double>());
+        Assert.Equal(400, echoed["defaultNodePowerWatts"]!.GetValue<double>());
+
+        var live = harness.Options.CurrentValue.Pricing!;
+        Assert.Equal(0.35, live.ElectricityPricePerKwh);
+        Assert.Equal(400, live.DefaultNodePowerWatts);
+
+        var file = ReadConfigFile(harness);
+        var pricingNode = (JsonObject)((JsonObject)file["OllamaRouter"]!)["Pricing"]!;
+        Assert.Equal(0.35, pricingNode["ElectricityPricePerKwh"]!.GetValue<double>());
+        Assert.Equal(400, pricingNode["DefaultNodePowerWatts"]!.GetValue<double>());
+
+        // Omitted-in-PUT ⇒ JSON null on disk ⇒ null in memory ⇒ the effective defaults (0.20 /
+        // 150 W) apply at read time (full-section-replace semantics).
+        var cleared = (await PutJsonAsync(
+            harness.Client,
+            "/api/router/config",
+            "{\"pricing\": { \"promptPricePerMillion\": 0.4, \"currency\": \"$\" }}")) as JsonObject;
+        Assert.NotNull(cleared);
+        Assert.True(cleared!["success"]!.GetValue<bool>());
+        Assert.Null(cleared["config"]!["pricing"]?["electricityPricePerKwh"]);
+        Assert.Null(cleared["config"]!["pricing"]?["defaultNodePowerWatts"]);
+
+        var live2 = harness.Options.CurrentValue.Pricing!;
+        Assert.Null(live2.ElectricityPricePerKwh);
+        Assert.Null(live2.DefaultNodePowerWatts);
+        Assert.Equal(0.20, live2.GetEffectiveElectricityPricePerKwh());
+        Assert.Equal(150.0, live2.GetEffectiveDefaultNodePowerWatts());
+
+        var file2 = ReadConfigFile(harness);
+        var pricingNode2 = (JsonObject)((JsonObject)file2["OllamaRouter"]!)["Pricing"]!;
+        Assert.Null(pricingNode2["ElectricityPricePerKwh"]);
+        Assert.Null(pricingNode2["DefaultNodePowerWatts"]);
+    }
+
     [Fact]
     public async Task PutConfig_PartialUpdate_TouchesOnlyProvidedSections()
     {
@@ -1057,6 +1277,8 @@ public class RouterConfigEndpointsTests
     [InlineData("""{"resilience": { "maxConsecutiveFailures": -1, "consecutiveFailuresTokenTolerance": 4000 }}""")]
     [InlineData("""{"pricing": { "promptPricePerMillion": 0.1, "currency": "" }}""")]
     [InlineData("""{"pricing": { "cachedPromptPricePerMillion": -0.05, "currency": "$" }}""")]
+    [InlineData("""{"pricing": { "electricityPricePerKwh": -0.1, "currency": "$" }}""")]
+    [InlineData("""{"pricing": { "defaultNodePowerWatts": -5, "currency": "$" }}""")]
     public async Task PutConfig_NegativeValues_400(string body)
     {
         var options = SingleTargetOptions();

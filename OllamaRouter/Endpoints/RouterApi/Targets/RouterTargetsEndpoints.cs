@@ -148,6 +148,12 @@ public static class RouterTargetsEndpoints
             return AddTargetFailure("models must not contain blank names", StatusCodes.Status400BadRequest);
         }
 
+        // Task #84: a negative power draw is invalid (0 = zero-consumption node is valid).
+        if (addRequest.PowerWatts is { } requestPowerWatts && requestPowerWatts < 0)
+        {
+            return AddTargetFailure("powerWatts must be >= 0", StatusCodes.Status400BadRequest);
+        }
+
         if (effectiveTargets.Any(t => string.Equals(t.Name, name, StringComparison.OrdinalIgnoreCase)))
         {
             return AddTargetFailure(
@@ -174,7 +180,8 @@ public static class RouterTargetsEndpoints
             // it for config/config.json; the bind-time unwrap restores it on the next reload).
             ApiKey = string.IsNullOrWhiteSpace(apiKey) ? null : apiKey.Trim(),
             Provider = normalizedProvider,
-            Models = modelsList
+            Models = modelsList,
+            PowerWatts = addRequest.PowerWatts
         });
 
         // Immediate liveness probe (coalesced, bounded by the probe client timeout). Skipped
@@ -286,7 +293,8 @@ public static class RouterTargetsEndpoints
                 modelsList.Count > 0
                     ? modelsList.Select(m => new TargetModelDto(m.Name, m.ContextLength, m.Quantization)).ToList()
                     : null,
-                !string.IsNullOrWhiteSpace(apiKey)),
+                !string.IsNullOrWhiteSpace(apiKey),
+                addRequest.PowerWatts),
             latencyMs),
             OllamaRouterJsonSerializerContext.Default.AddTargetResponse,
             statusCode: StatusCodes.Status201Created);
@@ -327,9 +335,16 @@ public static class RouterTargetsEndpoints
             (updateRequest.Url is null && updateRequest.Enabled is null &&
              updateRequest.HardwareHint is null && updateRequest.MaxParallel is null &&
              updateRequest.Type is null && updateRequest.ApiKey is null &&
-             updateRequest.Provider is null && updateRequest.Models is null))
+             updateRequest.Provider is null && updateRequest.Models is null &&
+             updateRequest.PowerWatts is null))
         {
             return UpdateTargetFailure($"no target fields provided for '{name}'", StatusCodes.Status400BadRequest);
+        }
+
+        // Task #84: a negative power draw is invalid (0 = zero-consumption node is valid).
+        if (updateRequest.PowerWatts is { } updatePowerWatts && updatePowerWatts < 0)
+        {
+            return UpdateTargetFailure("powerWatts must be >= 0", StatusCodes.Status400BadRequest);
         }
 
         // Task #61: an explicitly provided type must be one of the known families (null/absent
@@ -425,6 +440,14 @@ public static class RouterTargetsEndpoints
             updated.Models = ToTargetModelConfigs(updateModels);
         }
 
+        // Task #84: node power-draw override (null/absent = no change; clearing a previously
+        // set override is done by editing config/config.json — STJ cannot distinguish an
+        // explicit JSON null from an absent key).
+        if (updateRequest.PowerWatts is { } powerWatts)
+        {
+            updated.PowerWatts = powerWatts;
+        }
+
         var newTargets = effectiveTargets.ToList();
         newTargets[index] = updated;
 
@@ -456,7 +479,8 @@ public static class RouterTargetsEndpoints
                 updated.Models is { Count: > 0 } updatedModels
                     ? updatedModels.Select(m => new TargetModelDto(m.Name, m.ContextLength, m.Quantization)).ToList()
                     : null,
-                !string.IsNullOrWhiteSpace(updated.ApiKey))),
+                !string.IsNullOrWhiteSpace(updated.ApiKey),
+                updated.PowerWatts)),
             OllamaRouterJsonSerializerContext.Default.UpdateTargetResponse);
     }
 
@@ -593,6 +617,7 @@ public static class RouterTargetsEndpoints
         Type = target.Type,
         ApiKey = target.ApiKey,
         Provider = target.Provider,
+        PowerWatts = target.PowerWatts,
         Models = target.Models is { Count: > 0 } existing
             ? existing.Select(m => new TargetModelConfig
                 {

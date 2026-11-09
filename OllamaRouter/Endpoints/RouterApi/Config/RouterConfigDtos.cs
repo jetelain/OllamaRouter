@@ -26,7 +26,9 @@ public sealed record RouterConfigResponse(
 /// adds the protocol family <c>type</c> (lowercase enum name), the informational
 /// <c>provider</c> label (null when unset), the declared <c>models</c> roster (null when empty)
 /// and <c>apiKeyConfigured</c> — a BOOL flag; the raw or wrapped key is NEVER returned by any
-/// endpoint, log or telemetry.
+/// endpoint, log or telemetry. Task #84 appends <c>powerWatts</c> (number|null — the node
+/// power-draw override for the electricity-cost leg; null = unset ⇒ the resolution chain
+/// <c>Pricing:DefaultNodePowerWatts</c> → 150 W applies).
 /// </summary>
 public sealed record RouterTargetConfigDto(
     [property: JsonPropertyName("name")] string Name,
@@ -37,7 +39,10 @@ public sealed record RouterTargetConfigDto(
     [property: JsonPropertyName("type")] string Type = "ollama",
     [property: JsonPropertyName("provider")] string? Provider = null,
     [property: JsonPropertyName("models")] IReadOnlyList<Endpoints.RouterApi.Targets.TargetModelDto>? Models = null,
-    [property: JsonPropertyName("apiKeyConfigured")] bool ApiKeyConfigured = false);
+    [property: JsonPropertyName("apiKeyConfigured")] bool ApiKeyConfigured = false,
+    // Task #84: node power-draw override (watts; null = unset). Appended at the END to avoid
+    // silently shifting the positional arguments at every construction site.
+    [property: JsonPropertyName("powerWatts")] double? PowerWatts = null);
 
 /// <summary>
 /// The cloud section of <c>GET /api/router/config</c> (task #19). Contains EXACTLY
@@ -86,7 +91,10 @@ public sealed record RouterResilienceConfigDto(
 
 /// <summary>
 /// The pricing section of <c>GET /api/router/config</c> (task #19): the per-million-token
-/// rates (null = rate not configured) and the display currency.
+/// rates (null = rate not configured) and the display currency. Task #84 appends
+/// <c>electricityPricePerKwh</c> (number|null; null = unset ⇒ the 0.20/kWh default applies) and
+/// <c>defaultNodePowerWatts</c> (number|null; null = unset ⇒ the 150 W default applies) for the
+/// actual-savings electricity-cost leg.
 /// </summary>
 public sealed record RouterPricingConfigDto(
     [property: JsonPropertyName("promptPricePerMillion")] double? PromptPricePerMillion,
@@ -96,7 +104,12 @@ public sealed record RouterPricingConfigDto(
     // Task #83: the cached prompt-token rate (null = not differentiated). Appended at the END
     // (NOT before the defaulted Currency) to avoid silently shifting the positional currency
     // argument at every construction site.
-    [property: JsonPropertyName("cachedPromptPricePerMillion")] double? CachedPromptPricePerMillion = null);
+    [property: JsonPropertyName("cachedPromptPricePerMillion")] double? CachedPromptPricePerMillion = null,
+    // Task #84: electricity price per kWh (null = unset ⇒ 0.20 effective) and the global
+    // default node power draw (null = unset ⇒ 150 W effective). Appended at the END for
+    // positional-compatibility.
+    [property: JsonPropertyName("electricityPricePerKwh")] double? ElectricityPricePerKwh = null,
+    [property: JsonPropertyName("defaultNodePowerWatts")] double? DefaultNodePowerWatts = null);
 
 /// <summary>
 /// Request body of <c>PUT /api/router/config</c> (task #19): a partial per-section update

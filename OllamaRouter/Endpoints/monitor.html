@@ -98,9 +98,10 @@
 
   <div class="cost-container" id="costContainer" style="display: none;">
     <div class="cost-card savings">
-      <div class="cost-title">💰 Estimated savings (last 7 days)</div>
+      <div class="cost-title">💰 Actual savings (last 7 days)</div>
       <div class="cost-value" id="estimatedSavingsValue">-</div>
-      <div class="cost-desc">Saved thanks to local &amp; remote routing</div>
+      <div class="cost-desc">Cloud value minus node electricity cost</div>
+      <div class="cost-desc" id="electricityCostLine">⚡ Electricity (last 7 days): -</div>
       <div class="per-target-savings" id="perTargetSavingsList"></div>
     </div>
     <div class="cost-card overflow" id="cloudCostCard">
@@ -358,6 +359,13 @@ function renderCost(cost, cloudEnabled) {
 
   savingsEl.textContent = formatCost(cost.estimatedSavings, cost.currency);
   cloudCostEl.textContent = formatCost(cost.cloudOverflowCost, cost.currency);
+
+  // Electricity cost readout (task #84): the savings above are already NET of this; absent-
+  // field-safe for older payloads without the key.
+  var electricityEl = document.getElementById('electricityCostLine');
+  if (electricityEl) {
+    electricityEl.textContent = '⚡ Electricity (last 7 days): ' + formatCost(cost.electricityCost != null ? cost.electricityCost : 0, cost.currency);
+  }
 
   clear(perTargetList);
   const perTarget = cost.perTargetSavings || {};

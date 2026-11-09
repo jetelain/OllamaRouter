@@ -163,7 +163,7 @@ public static partial class MonitorEndpointsExtensions
                 r.SessionId,
                 r.AgentId,
                 r.CachedInputTokens)).ToList(),
-            CalculateCostStatus(statistics.Last7Days, options.CurrentValue.Pricing),
+            CalculateCostStatus(statistics.Last7Days, options.CurrentValue.Pricing, effectiveTargets),
             includeOverhead
                 ? CalculateOverheadStatus(snapshot.RecentRequests, options.CurrentValue.TokenEstimationOverheadFactor, options.CurrentValue.TokenEstimator)
                 : null);
@@ -196,9 +196,37 @@ public static partial class MonitorEndpointsExtensions
         return v.ToString(System.Globalization.CultureInfo.InvariantCulture);
     }
 
+    /// <summary>
+    /// Calculates the monitor cost status (ACTUAL savings since task #84): per non-Cloud target,
+    /// the token cloud value (cached-token pricing included, <see cref="TokenCost"/>) MINUS the
+    /// target's electricity cost
+    /// <c>(elapsedMs / 3_600_000) × (watts / 1000) × ElectricityPricePerKwh</c>, with the
+    /// per-target wattage resolution chain (target <c>PowerWatts</c> override →
+    /// <c>Pricing:DefaultNodePowerWatts</c> → 150 W) and the effective electricity price
+    /// (explicit <c>ElectricityPricePerKwh</c> → 0.20). Rounding contract (4-decimal
+    /// everywhere, totals rounded LAST):
+    /// <c>electricity4 = round(raw, 4)</c>, <c>cloudValue4 = round(TokenCost, 4)</c>,
+    /// <c>savings4 = round(cloudValue4 − electricity4, 4)</c> (NEVER clamped — negative
+    /// savings are reported as-is); <c>EstimatedSavings = round(Σ savings4, 4)</c> and
+    /// <c>ElectricityCost = round(Σ electricity4, 4)</c> (Cloud excluded from both sums;
+    /// <c>CloudOverflowCost</c> is untouched).
+    /// Returns null (cost section hidden) unless at least one token price rate is configured
+    /// (<see cref="PricingOptions.IsConfigured"/> — the electricity price alone never surfaces
+    /// it).
+    /// </summary>
+    /// <param name="last7Days">Per-target token + GPU-time statistics of the last 7 days.</param>
+    /// <param name="pricing">The live pricing options (rates, currency, electricity price,
+    /// default node power).</param>
+    /// <param name="targets">
+    /// Optional effective fleet target list (name-matched case-insensitively for the
+    /// per-target <c>PowerWatts</c> override). Null (unit-test callers) ⇒ the electricity term
+    /// resolves against the pricing default / the 150 W fallback only (0 when there is no
+    /// elapsed time).
+    /// </param>
     public static MonitorCostStatus? CalculateCostStatus(
         IReadOnlyDictionary<RoutingTarget, ActivityStatisticsTotals> last7Days,
-        PricingOptions? pricing)
+        PricingOptions? pricing,
+        IReadOnlyList<OllamaTargetOptions>? targets = null)
     {
         if (pricing == null || !pricing.IsConfigured)
         {
@@ -210,13 +238,17 @@ public static partial class MonitorEndpointsExtensions
         // Unset cached rate falls back to the effective input price (cached tokens are then
         // valued at the regular input rate).
         var effectiveCachedPrice = pricing.CachedPromptPricePerMillion ?? pricing.PromptPricePerMillion ?? pricing.PricePerMillion ?? 0.0;
+        var electricityPrice = pricing.GetEffectiveElectricityPricePerKwh();
 
-        // Per-target savings: every NON-Cloud target's tokens valued at the effective cloud
-        // prices (the same 4-decimal rounding as the totals); the Cloud overflow is excluded
-        // (it is a cost, not a saving). Cached input tokens (a subset of the total input) are
-        // valued at the cached rate, so a prompt-cache hit saves LESS against the cloud baseline.
+        // Per-target ACTUAL savings: every NON-Cloud target's tokens valued at the effective
+        // cloud prices (4-decimal rounding) minus its electricity cost (4-decimal rounding);
+        // the Cloud overflow is excluded (it is a cost, not a saving). Cached input tokens (a
+        // subset of the total input) are valued at the cached rate, so a prompt-cache hit
+        // saves LESS against the cloud baseline.
         var perTargetSavings = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
-        var estimatedSavings = 0.0;
+        var perTargetElectricityCost = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        var actualSavings = 0.0;
+        var electricityCost = 0.0;
         foreach (var (target, stats) in last7Days)
         {
             if (target == RoutingTarget.Cloud)
@@ -224,10 +256,17 @@ public static partial class MonitorEndpointsExtensions
                 continue;
             }
 
-            var targetSavings = TokenCost(stats, effectiveInputPrice, effectiveCachedPrice, effectiveOutputPrice);
-            targetSavings = Math.Round(targetSavings, 4);
-            perTargetSavings[target.Value] = targetSavings;
-            estimatedSavings += targetSavings;
+            var cloudValue = Math.Round(TokenCost(stats, effectiveInputPrice, effectiveCachedPrice, effectiveOutputPrice), 4);
+            var electricity = Math.Round(
+                (stats.ElapsedMilliseconds / 3_600_000.0) * (ResolvePowerWatts(target, targets, pricing) / 1000.0) * electricityPrice,
+                4);
+            // Never clamped: negative savings (electricity exceeding the cloud value) are
+            // reported as-is.
+            var savings = Math.Round(cloudValue - electricity, 4);
+            perTargetSavings[target.Value] = savings;
+            perTargetElectricityCost[target.Value] = electricity;
+            actualSavings += savings;
+            electricityCost += electricity;
         }
 
         var cloudStats = last7Days.GetValueOrDefault(RoutingTarget.Cloud) ?? new ActivityStatisticsTotals(0, 0, 0);
@@ -235,9 +274,33 @@ public static partial class MonitorEndpointsExtensions
 
         return new MonitorCostStatus(
             pricing.Currency,
-            Math.Round(estimatedSavings, 4),
+            Math.Round(actualSavings, 4),
             Math.Round(cloudOverflowCost, 4),
-            perTargetSavings);
+            perTargetSavings,
+            Math.Round(electricityCost, 4),
+            perTargetElectricityCost);
+    }
+
+    /// <summary>
+    /// Wattage resolution chain of one NON-Cloud statistics target (task #84, decision 6):
+    /// the <see cref="OllamaTargetOptions.PowerWatts"/> of the name-matched (case-insensitive)
+    /// configured target via its full chain (override → pricing default → 150 W); a statistics
+    /// target ABSENT from the configured fleet (e.g. a removed target with 7-day history) —
+    /// or a null fleet list — uses the default wattage (<see cref="PricingOptions.DefaultPowerWatts"/>
+    /// / the pricing default when no fleet list is available).
+    /// </summary>
+    private static double ResolvePowerWatts(
+        RoutingTarget target,
+        IReadOnlyList<OllamaTargetOptions>? targets,
+        PricingOptions pricing)
+    {
+        if (targets is not null)
+        {
+            var match = targets.FirstOrDefault(t => string.Equals(t.Name, target.Value, StringComparison.OrdinalIgnoreCase));
+            return match is not null ? match.GetEffectivePowerWatts(pricing) : PricingOptions.DefaultPowerWatts;
+        }
+
+        return pricing.GetEffectiveDefaultNodePowerWatts();
     }
 
     /// <summary>

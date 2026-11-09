@@ -275,7 +275,20 @@ public class TerminalMonitorRendererTests
             "$",
             savings,
             cloudCost,
-            perTarget.ToDictionary(pair => pair.Name, pair => pair.Savings, StringComparer.OrdinalIgnoreCase));
+            perTarget.ToDictionary(pair => pair.Name, pair => pair.Savings, StringComparer.OrdinalIgnoreCase),
+            0.0,
+            perTarget.ToDictionary(pair => pair.Name, _ => 0.0, StringComparer.OrdinalIgnoreCase));
+    }
+
+    private static MonitorCostStatus CostWithElectricity(double savings, double cloudCost, double electricity, params (string Name, double Savings)[] perTarget)
+    {
+        return new MonitorCostStatus(
+            "$",
+            savings,
+            cloudCost,
+            perTarget.ToDictionary(pair => pair.Name, pair => pair.Savings, StringComparer.OrdinalIgnoreCase),
+            electricity,
+            perTarget.ToDictionary(pair => pair.Name, _ => electricity, StringComparer.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -476,6 +489,37 @@ public class TerminalMonitorRendererTests
         var output = TerminalMonitorRenderer.Render(state, "http://localhost:11434/monitor", enableAnsi: false);
 
         Assert.DoesNotContain("COST & SAVINGS", output);
+    }
+
+    [Fact]
+    public void Render_WithCost_RendersElectricityLineBelowCostLine()
+    {
+        // Task #84: the cost section gains the ⚡ electricity readout (the savings figure is
+        // already NET of it), rendered directly below the main cost line whenever a cost
+        // status exists.
+        var cost = CostWithElectricity(15.25, 0.45, 0.50, ("Local", 12.30), ("Remote", 3.45));
+        var state = CreateSampleState(cloudEnabled: true, cost: cost);
+
+        var output = TerminalMonitorRenderer.Render(state, "http://localhost:11434/monitor", enableAnsi: false);
+
+        Assert.Contains("Savings: ~$15.25", output);
+        Assert.Contains("⚡ Electricity: ~$0.50", output);
+
+        var lines = output.Split(["\r\n", "\n"], StringSplitOptions.None);
+        var costLineIndex = Array.IndexOf(lines, lines.Single(line => line.Contains("Savings: ~$15.25")));
+        var electricityLineIndex = Array.IndexOf(lines, lines.Single(line => line.Contains("Electricity: ~$0.50")));
+        Assert.Equal(costLineIndex + 1, electricityLineIndex); // part of the cost section, right below the cost line
+    }
+
+    [Fact]
+    public void Render_WithZeroElectricity_StillRendersElectricityLine()
+    {
+        var cost = Cost(15.75, 0.45, ("Local", 12.30), ("Remote", 3.45));
+        var state = CreateSampleState(cloudEnabled: false, cost: cost);
+
+        var output = TerminalMonitorRenderer.Render(state, "http://localhost:11434/monitor", enableAnsi: false);
+
+        Assert.Contains("⚡ Electricity: ~$0.00", output);
     }
 
     [Fact]

@@ -10,7 +10,8 @@ namespace OllamaRouter.Endpoints.RouterApi.Targets;
 /// <c>maxParallel</c> must be &gt;= 1. Task #61 adds <c>type</c> (case-insensitive
 /// <c>ollama|openai|osnative</c>), <c>apiKey</c> (null/absent = no change, <c>""</c> clears),
 /// <c>provider</c> (<c>""</c> clears) and <c>models</c> (null/absent = no change, a provided list
-/// — possibly empty — replaces the roster).
+/// — possibly empty — replaces the roster). Task #84 adds <c>powerWatts</c> (number|null;
+/// null/absent = no change, negative → 400).
 /// </summary>
 public sealed record UpdateTargetRequest(
     [property: JsonPropertyName("url")] string? Url = null,
@@ -20,7 +21,12 @@ public sealed record UpdateTargetRequest(
     [property: JsonPropertyName("type")] string? Type = null,
     [property: JsonPropertyName("apiKey")] string? ApiKey = null,
     [property: JsonPropertyName("provider")] string? Provider = null,
-    [property: JsonPropertyName("models")] IReadOnlyList<TargetModelDto>? Models = null);
+    [property: JsonPropertyName("models")] IReadOnlyList<TargetModelDto>? Models = null,
+    // Task #84: node power-draw override (watts); null/absent = NO CHANGE (STJ cannot
+    // distinguish an explicit JSON null from an absent key; clearing a previously set
+    // override is done by editing config/config.json, which removes the key when the
+    // in-memory value is null).
+    [property: JsonPropertyName("powerWatts")] double? PowerWatts = null);
 
 /// <summary>
 /// Response of <c>PUT /api/router/targets/{name}</c> (task #19): success flag + message,
@@ -52,7 +58,10 @@ public sealed record AddTargetRequest(
     [property: JsonPropertyName("type")] string? Type = null,
     [property: JsonPropertyName("apiKey")] string? ApiKey = null,
     [property: JsonPropertyName("provider")] string? Provider = null,
-    [property: JsonPropertyName("models")] IReadOnlyList<TargetModelDto>? Models = null);
+    [property: JsonPropertyName("models")] IReadOnlyList<TargetModelDto>? Models = null,
+    // Task #84: node power-draw override (watts; null = unset ⇒ the resolution chain
+    // Pricing:DefaultNodePowerWatts → 150 W applies).
+    [property: JsonPropertyName("powerWatts")] double? PowerWatts = null);
 
 /// <summary>
 /// One declared model of a target's synthetic catalog (task #61) in the Setup API wire

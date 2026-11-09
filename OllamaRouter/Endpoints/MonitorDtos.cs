@@ -56,9 +56,23 @@ public sealed record ReclaimVramResponse(
 
 public sealed record MonitorCostStatus(
     [property: JsonPropertyName("currency")] string Currency,
+    // ACTUAL savings (last 7 days, task #84): the token cloud value MINUS the accumulated
+    // per-target electricity cost; may be NEGATIVE (electricity exceeding the cloud value —
+    // never clamped). The wire name `estimatedSavings` is kept for compatibility.
     [property: JsonPropertyName("estimatedSavings")] double EstimatedSavings,
     [property: JsonPropertyName("cloudOverflowCost")] double CloudOverflowCost,
-    [property: JsonPropertyName("perTargetSavings")] IReadOnlyDictionary<string, double> PerTargetSavings);
+    // ACTUAL per-target savings (cloud value minus that target's electricity cost); the Cloud
+    // target is excluded (its overflow is a cost, not a saving).
+    [property: JsonPropertyName("perTargetSavings")] IReadOnlyDictionary<string, double> PerTargetSavings,
+    // Task #84: TOTAL electricity cost (last 7 days) = the rounded sum of the per-target
+    // values (Cloud excluded; 0 when there is no traffic / no GPU time). Appended at the END
+    // with a default to keep the positional construction sites source-compatible.
+    [property: JsonPropertyName("electricityCost")] double ElectricityCost = 0.0,
+    // Task #84: per-target electricity cost (last 7 days) for every non-Cloud target of the
+    // statistics window (Cloud excluded; 0.0 for targets without GPU time). Appended at the
+    // END; the `null!` default is for source-compatibility of positional construction sites —
+    // production construction (CalculateCostStatus) always passes the populated dictionary.
+    [property: JsonPropertyName("perTargetElectricityCost")] IReadOnlyDictionary<string, double> PerTargetElectricityCost = null!);
 
 /// <summary>
 /// One row of the ordered multi-target fleet view (configured targets first, Cloud last):

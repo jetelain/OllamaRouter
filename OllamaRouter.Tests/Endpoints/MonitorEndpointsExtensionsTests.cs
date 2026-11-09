@@ -1411,6 +1411,300 @@ public class MonitorEndpointsExtensionsTests
         Assert.Equal(0.0, result.EstimatedSavings);
     }
 
+    // ------------------------------------------------------------------
+    //  Task #84: electricity-cost / actual-savings math table.
+    //  Rounding contract: electricity4 = round(raw, 4); cloudValue4 = round(TokenCost, 4);
+    //  savings4 = round(cloudValue4 − electricity4, 4) (never clamped); totals = round(Σ, 4).
+    // ------------------------------------------------------------------
+
+    private static IReadOnlyList<OllamaTargetOptions> Fleet(params (string Name, double? Watts)[] targets) =>
+        targets.Select(t => new OllamaTargetOptions { Name = t.Name, Url = "http://127.0.0.1:11435", PowerWatts = t.Watts }).ToList();
+
+    private static Dictionary<RoutingTarget, ActivityStatisticsTotals> ElapsedOnly(RoutingTarget target, double elapsedMs)
+    {
+        var dict = new Dictionary<RoutingTarget, ActivityStatisticsTotals> { [target] = new(0, 0, 0, 0, elapsedMs) };
+        if (target != RoutingTarget.Cloud)
+        {
+            dict[RoutingTarget.Cloud] = new(0, 0, 0, 0, 0);
+        }
+        return dict;
+    }
+
+    [Fact]
+    public void CalculateCostStatus_Electricity_DefaultWatts_OneHour150WAt020()
+    {
+        // 150 W = 0.15 kW × 1 h × 0.20/kWh = 0.03 (electricity price unset ⇒ 0.20 default).
+        var pricing = new PricingOptions { PricePerMillion = 1.0 };
+
+        var result = MonitorEndpointsExtensions.CalculateCostStatus(
+            ElapsedOnly(RoutingTarget.Local, 3_600_000), pricing, Fleet(("Local", null)));
+
+        Assert.NotNull(result);
+        Assert.Equal(0.03, result.PerTargetElectricityCost["Local"]);
+        Assert.Equal(0.03, result.ElectricityCost);
+        // No tokens: actual savings = 0 − 0.03 (negative, reported as-is).
+        Assert.Equal(-0.03, result.PerTargetSavings["Local"]);
+        Assert.Equal(-0.03, result.EstimatedSavings);
+    }
+
+    [Fact]
+    public void CalculateCostStatus_Electricity_PerTargetOverrideWatts_OneHour130WAt020()
+    {
+        // 130 W = 0.13 kW × 1 h × 0.20/kWh = exactly 0.026 (the spec's reference value).
+        var pricing = new PricingOptions { PricePerMillion = 1.0 };
+
+        var result = MonitorEndpointsExtensions.CalculateCostStatus(
+            ElapsedOnly(RoutingTarget.Local, 3_600_000), pricing, Fleet(("Local", 130)));
+
+        Assert.NotNull(result);
+        Assert.Equal(0.026, result.PerTargetElectricityCost["Local"]);
+        Assert.Equal(0.026, result.ElectricityCost);
+    }
+
+    [Fact]
+    public void CalculateCostStatus_Electricity_ExplicitElectricityPrice_Applied()
+    {
+        // 150 W × 1 h × 0.30/kWh = 0.045.
+        var pricing = new PricingOptions { PricePerMillion = 1.0, ElectricityPricePerKwh = 0.30 };
+
+        var result = MonitorEndpointsExtensions.CalculateCostStatus(
+            ElapsedOnly(RoutingTarget.Local, 3_600_000), pricing, Fleet(("Local", null)));
+
+        Assert.NotNull(result);
+        Assert.Equal(0.045, result.PerTargetElectricityCost["Local"]);
+    }
+
+    [Fact]
+    public void CalculateCostStatus_Electricity_PricingDefaultNodePowerWatts_AppliesWithoutOverride()
+    {
+        // Pricing default 400 W (no per-target override): 0.4 kW × 1 h × 0.20 = 0.08.
+        var pricing = new PricingOptions { PricePerMillion = 1.0, DefaultNodePowerWatts = 400 };
+
+        var result = MonitorEndpointsExtensions.CalculateCostStatus(
+            ElapsedOnly(RoutingTarget.Local, 3_600_000), pricing, Fleet(("Local", null)));
+
+        Assert.NotNull(result);
+        Assert.Equal(0.08, result.PerTargetElectricityCost["Local"]);
+    }
+
+    [Fact]
+    public void CalculateCostStatus_Electricity_NoTargetsList_UsesPricingDefaultWatts()
+    {
+        // targets == null (unit-test default): the electricity term resolves against the
+        // pricing default chain (200 W here) instead of the fleet per-target overrides.
+        var pricing = new PricingOptions { PricePerMillion = 1.0, DefaultNodePowerWatts = 200 };
+
+        var result = MonitorEndpointsExtensions.CalculateCostStatus(
+            ElapsedOnly(RoutingTarget.Local, 3_600_000), pricing);
+
+        Assert.NotNull(result);
+        Assert.Equal(0.04, result.PerTargetElectricityCost["Local"]);
+    }
+
+    [Fact]
+    public void CalculateCostStatus_Electricity_TargetAbsentFromFleet_UsesDefaultWatts()
+    {
+        // "Remote" has 7-day history but is no longer in the fleet → the 150 W default
+        // (the 130 W Local override must NOT leak across).
+        var last7Days = new Dictionary<RoutingTarget, ActivityStatisticsTotals>
+        {
+            [RoutingTarget.Remote] = new(0, 0, 0, 0, 3_600_000)
+        };
+        var pricing = new PricingOptions { PricePerMillion = 1.0 };
+
+        var result = MonitorEndpointsExtensions.CalculateCostStatus(last7Days, pricing, Fleet(("Local", 130)));
+
+        Assert.NotNull(result);
+        Assert.Equal(0.03, result.PerTargetElectricityCost["Remote"]);
+    }
+
+    [Fact]
+    public void CalculateCostStatus_Electricity_CloudTargetExempt()
+    {
+        // Cloud's huge elapsed time is never counted; no "Cloud" key in perTargetElectricityCost.
+        var last7Days = new Dictionary<RoutingTarget, ActivityStatisticsTotals>
+        {
+            [RoutingTarget.Cloud] = new(1, 100_000, 0, 0, 3_600_000),
+            [RoutingTarget.Local] = new(0, 0, 0, 0, 0)
+        };
+        var pricing = new PricingOptions { PricePerMillion = 1.0 };
+
+        var result = MonitorEndpointsExtensions.CalculateCostStatus(last7Days, pricing, Fleet(("Local", 130)));
+
+        Assert.NotNull(result);
+        Assert.Equal(0.0, result.ElectricityCost);
+        Assert.Equal("Local", result.PerTargetElectricityCost.Keys.Single());
+        Assert.False(result.PerTargetElectricityCost.ContainsKey("Cloud")); // OrdinalIgnoreCase keys
+        Assert.Equal(0.0, result.EstimatedSavings);
+        // The Cloud OVERFLOW cost is untouched by the electricity term: 100k × 1.0 = 0.1.
+        Assert.Equal(0.1, result.CloudOverflowCost);
+    }
+
+    [Fact]
+    public void CalculateCostStatus_Electricity_ZeroElapsedOrZeroWatts_CostsZero()
+    {
+        var pricing = new PricingOptions { PricePerMillion = 1.0 };
+
+        var zeroElapsed = MonitorEndpointsExtensions.CalculateCostStatus(
+            ElapsedOnly(RoutingTarget.Local, 0), pricing, Fleet(("Local", 400)));
+        Assert.NotNull(zeroElapsed);
+        Assert.Equal(0.0, zeroElapsed!.ElectricityCost);
+        Assert.Equal(0.0, zeroElapsed.PerTargetSavings["Local"]);
+
+        var zeroWatts = MonitorEndpointsExtensions.CalculateCostStatus(
+            ElapsedOnly(RoutingTarget.Local, 3_600_000), pricing, Fleet(("Local", 0)));
+        Assert.NotNull(zeroWatts);
+        Assert.Equal(0.0, zeroWatts!.ElectricityCost); // 0 W = zero-consumption node
+        Assert.Equal(0.0, zeroWatts.PerTargetElectricityCost["Local"]);
+    }
+
+    [Fact]
+    public void CalculateCostStatus_ActualSavings_CloudValueMinusElectricity()
+    {
+        // Local: 1M input tokens @ 0.20/1M → cloudValue 0.20; electricity 150 W × 1 h × 0.20
+        // = 0.03; savings = round(0.20 − 0.03, 4) = 0.17.
+        var last7Days = new Dictionary<RoutingTarget, ActivityStatisticsTotals>
+        {
+            [RoutingTarget.Local] = new(1, 1_000_000, 0, 0, 3_600_000)
+        };
+        var pricing = new PricingOptions { PromptPricePerMillion = 0.20, CompletionPricePerMillion = 0.80 };
+
+        var result = MonitorEndpointsExtensions.CalculateCostStatus(last7Days, pricing, Fleet(("Local", 150)));
+
+        Assert.NotNull(result);
+        Assert.Equal(0.17, result.PerTargetSavings["Local"]);
+        Assert.Equal(0.17, result.EstimatedSavings);
+        Assert.Equal(0.03, result.PerTargetElectricityCost["Local"]);
+    }
+
+    [Fact]
+    public void CalculateCostStatus_ActualSavings_NegativeReportedAsIs_NeverClamped()
+    {
+        // Tiny cloud value: 100 output tokens @ 0.80/1M = 0.00008 → 0.0001; electricity
+        // 150 W × 1 h × 0.20 = 0.03 → savings = round(0.0001 − 0.03, 4) = −0.0299.
+        var last7Days = new Dictionary<RoutingTarget, ActivityStatisticsTotals>
+        {
+            [RoutingTarget.Local] = new(1, 0, 100, 0, 3_600_000)
+        };
+        var pricing = new PricingOptions { CompletionPricePerMillion = 0.80 };
+
+        var result = MonitorEndpointsExtensions.CalculateCostStatus(last7Days, pricing, Fleet(("Local", null)));
+
+        Assert.NotNull(result);
+        Assert.Equal(-0.0299, result.PerTargetSavings["Local"]);
+        Assert.Equal(-0.0299, result.EstimatedSavings);
+    }
+
+    [Fact]
+    public void CalculateCostStatus_Totals_AreRoundedSumsOfPerTargetValues()
+    {
+        // Local 150 W × 1 h → 0.03; Remote 130 W × 1 h → 0.026; each also carries tokens.
+        var last7Days = new Dictionary<RoutingTarget, ActivityStatisticsTotals>
+        {
+            [RoutingTarget.Local] = new(1, 1_000_000, 0, 0, 3_600_000),   // cloudValue 0.20
+            [RoutingTarget.Remote] = new(1, 500_000, 0, 0, 3_600_000)    // cloudValue 0.10
+        };
+        var pricing = new PricingOptions { PromptPricePerMillion = 0.20, CompletionPricePerMillion = 0.80 };
+
+        var result = MonitorEndpointsExtensions.CalculateCostStatus(
+            last7Days, pricing, Fleet(("Local", 150), ("Remote", 130)));
+
+        Assert.NotNull(result);
+        // Per-target: Local 0.20 − 0.03 = 0.17; Remote 0.10 − 0.026 = 0.074.
+        Assert.Equal(0.17, result.PerTargetSavings["Local"]);
+        Assert.Equal(0.074, result.PerTargetSavings["Remote"]);
+        // Totals = rounded sums of the per-target values.
+        Assert.Equal(0.17 + 0.074, result.EstimatedSavings);
+        Assert.Equal(Math.Round(0.03 + 0.026, 4), result.ElectricityCost);
+        Assert.Equal(result.PerTargetSavings.Values.Sum(), result.EstimatedSavings, 4);
+        Assert.Equal(result.PerTargetElectricityCost.Values.Sum(), result.ElectricityCost, 4);
+    }
+
+    [Fact]
+    public void CalculateCostStatus_Electricity_TargetNamesMatchedCaseInsensitively()
+    {
+        // The fleet name "local" (lowercase) still matches the Local statistics key.
+        var pricing = new PricingOptions { PricePerMillion = 1.0 };
+
+        var result = MonitorEndpointsExtensions.CalculateCostStatus(
+            ElapsedOnly(RoutingTarget.Local, 3_600_000), pricing, Fleet(("local", 130)));
+
+        Assert.NotNull(result);
+        Assert.Equal(0.026, result.PerTargetElectricityCost["Local"]);
+    }
+
+    [Fact]
+    public async Task GetMonitorApi_WithPricingAndPowerConfig_ActualSavingsAndElectricity()
+    {
+        // Integration (mirrors GetMonitorApi_WithPricing_*): known elapsed times flow through
+        // the full monitor pipeline — statistics carry elapsedMs per target and in total, and
+        // the cost status subtracts the observed-elapsed electricity term (Cloud exempt).
+        var stats = new ActivityStatisticsSnapshot(
+            Today: new Dictionary<RoutingTarget, ActivityStatisticsTotals>
+            {
+                [RoutingTarget.Local] = new(2, 1_000_000, 0, 0, 3_600_000),
+                [RoutingTarget.Remote] = new(1, 0, 0, 0, 0),
+                [RoutingTarget.Cloud] = new(0, 0, 0, 0, 7_200_000)
+            },
+            TodayTotal: new(3, 1_000_000, 0, 0, 10_800_000),
+            Last7Days: new Dictionary<RoutingTarget, ActivityStatisticsTotals>
+            {
+                [RoutingTarget.Local] = new(10, 1_000_000, 0, 0, 3_600_000),
+                [RoutingTarget.Remote] = new(5, 0, 0, 0, 0),
+                [RoutingTarget.Cloud] = new(2, 100_000, 0, 0, 7_200_000)
+            },
+            Last7DaysTotal: new(17, 1_100_000, 0, 0, 10_800_000));
+
+        var options = new OllamaRouterOptions
+        {
+            Targets =
+            [
+                new OllamaTargetOptions { Name = "Local", Url = "http://127.0.0.1:11435", PowerWatts = 130 },
+                new OllamaTargetOptions { Name = "Remote", Url = "http://192.168.1.2:11435" }
+            ],
+            Pricing = new PricingOptions
+            {
+                PromptPricePerMillion = 0.20,
+                CompletionPricePerMillion = 0.80,
+                DefaultNodePowerWatts = 150
+            }
+        };
+
+        var (app, client, _) = await CreateTestAppAsync(options: options, statisticsSnapshot: stats);
+        try
+        {
+            var response = await client.GetAsync("/monitor/api");
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var json = await response.Content.ReadFromJsonAsync<JsonObject>();
+            Assert.NotNull(json);
+
+            // elapsedMs is exposed per target AND in the reserved "total" keys.
+            var statistics = (JsonObject)json!["statistics"]!;
+            Assert.Equal(3_600_000, ((JsonObject)statistics["today"]!)!["Local"]!["elapsedMs"]?.GetValue<double>());
+            Assert.Equal(0, ((JsonObject)statistics["last7Days"]!)!["Remote"]!["elapsedMs"]?.GetValue<double>());
+            Assert.Equal(10_800_000, ((JsonObject)statistics["last7Days"]!)!["total"]!["elapsedMs"]?.GetValue<double>());
+
+            var cost = (JsonObject)json!["cost"]!;
+            // Local: cloudValue 1M × 0.20 = 0.2; electricity 130 W × 1 h × 0.20 = 0.026;
+            // actual savings = 0.2 − 0.026 = 0.174. Remote: zeros. Cloud: EXEMPT.
+            Assert.Equal(0.174, cost["estimatedSavings"]?.GetValue<double>());
+            Assert.Equal(0.026, cost["electricityCost"]?.GetValue<double>());
+            Assert.Equal(0.174, cost["perTargetSavings"]?["Local"]?.GetValue<double>());
+            Assert.Equal(0.0, cost["perTargetSavings"]?["Remote"]?.GetValue<double>());
+            var perTargetElectricity = (JsonObject)cost["perTargetElectricityCost"]!;
+            Assert.Equal(0.026, perTargetElectricity["Local"]?.GetValue<double>());
+            Assert.Equal(0.0, perTargetElectricity["Remote"]?.GetValue<double>());
+            Assert.False(perTargetElectricity.TryGetPropertyValue("Cloud", out _)); // OrdinalIgnoreCase keys
+            // The Cloud overflow cost is untouched by the electricity term: 100k × 0.20 = 0.02.
+            Assert.Equal(0.02, cost["cloudOverflowCost"]?.GetValue<double>());
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
     [Fact]
     public void CalculateOverheadStatus_NoValidSamples_ReturnsNullOverallFactor()
     {

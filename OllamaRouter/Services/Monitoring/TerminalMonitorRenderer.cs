@@ -467,6 +467,18 @@ public static class TerminalMonitorRenderer
 
         lines.Add(sb.ToString());
 
+        // Task #84: the electricity-cost readout — the savings figure above is already NET of
+        // it. Rendered on its own line directly below the cost line (the main line already
+        // carries the 79-column budget with the Savings + Cloud segments). Always present
+        // when a cost status exists.
+        var electricity = new StringBuilder();
+        electricity.Append("   ");
+        electricity.Append("⚡ Electricity: ~");
+        if (enableAnsi) electricity.Append(Bold).Append(BrightYellow);
+        electricity.Append(FormatCost(state.Cost.ElectricityCost, state.Cost.Currency));
+        if (enableAnsi) electricity.Append(Reset);
+        lines.Add(electricity.ToString());
+
         // Per-target savings breakdown (Cloud is excluded from PerTargetSavings).
         var perTarget = new List<string>();
         foreach (var (name, amount) in state.Cost.PerTargetSavings)

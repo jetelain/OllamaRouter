@@ -50,7 +50,8 @@ public static class RouterConfigEndpoints
             .WithDescription("Update any subset of cloud / dynamicContext / recording / resilience / pricing (all five null/absent "
                 + "→ 400). Persists ONLY the provided sections to config/config.json (merge, preserving all other user keys "
                 + "including Recording:TokenMetricsCsv) and applies them to the live in-memory options immediately (no restart). "
-                + "Validation (400): negative cooldown/timeout/maxFiles/resilience values, negative pricing rates, empty "
+                + "Validation (400): negative cooldown/timeout/maxFiles/resilience values, negative pricing rates (incl. "
+                + "electricityPricePerKwh / defaultNodePowerWatts), empty "
                 + "currency. 500 = persistence failure (NO in-memory change — the file write happens first). Env vars / CLI args "
                 + "sit above config/config.json: an environment-pinned value stays effective after a PUT. Echoes the resulting "
                 + "full configuration. Protected by the API-key middleware (default protected set).");
@@ -86,7 +87,8 @@ public static class RouterConfigEndpoints
                         .Select(m => new Targets.TargetModelDto(m!.Name, m.ContextLength, m.Quantization))
                         .ToList()
                     : null,
-                !string.IsNullOrWhiteSpace(t.ApiKey)))
+                !string.IsNullOrWhiteSpace(t.ApiKey),
+                t.PowerWatts))
             .ToList();
 
         var recording = options.Recording ?? new RecordingOptions();
@@ -115,7 +117,9 @@ public static class RouterConfigEndpoints
                 pricing.CompletionPricePerMillion,
                 pricing.PricePerMillion,
                 pricing.Currency,
-                pricing.CachedPromptPricePerMillion),
+                pricing.CachedPromptPricePerMillion,
+                pricing.ElectricityPricePerKwh,
+                pricing.DefaultNodePowerWatts),
             new ApiSecurityConfigDto(
                 options.ApiSecurity.RequireKeyForAllEndpoints,
                 options.ApiSecurity.DefaultKeyRotationHours));
@@ -218,9 +222,11 @@ public static class RouterConfigEndpoints
              (pricing.CompletionPricePerMillion is { } completion && completion < 0) ||
              (pricing.CachedPromptPricePerMillion is { } cached && cached < 0) ||
              (pricing.PricePerMillion is { } flat && flat < 0) ||
+             (pricing.ElectricityPricePerKwh is { } electricity && electricity < 0) ||
+             (pricing.DefaultNodePowerWatts is { } defaultWatts && defaultWatts < 0) ||
              string.IsNullOrWhiteSpace(pricing.Currency)))
         {
-            return "pricing rates must be >= 0 and currency must be non-empty";
+            return "pricing rates (incl. electricityPricePerKwh / defaultNodePowerWatts) must be >= 0 and currency must be non-empty";
         }
 
         return null;

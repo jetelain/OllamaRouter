@@ -34,7 +34,7 @@ public class ActivityStatisticsServiceTests : IDisposable
         return new ActivityStatisticsService(statsFilePath, targets ?? LegacyTargets(), lifetime, NullLogger<ActivityStatisticsService>.Instance);
     }
 
-    private static ActivityLogEntry Entry(RoutingTarget target, int? promptTokens, int? responseTokens, bool success = true)
+    private static ActivityLogEntry Entry(RoutingTarget target, int? promptTokens, int? responseTokens, bool success = true, double elapsedMs = 100)
     {
         return new ActivityLogEntry(
             DateTimeOffset.UtcNow,
@@ -43,7 +43,7 @@ public class ActivityStatisticsServiceTests : IDisposable
             promptTokens ?? 0,
             promptTokens,
             responseTokens,
-            100,
+            (long)elapsedMs,
             200,
             success);
     }
@@ -213,6 +213,122 @@ public class ActivityStatisticsServiceTests : IDisposable
         Assert.Equal(0, snapshot.TodayTotal.OutputTokens);
     }
 
+    // ------------------------------------------------------------------
+    //  Task #84: cumulative GPU time (elapsedMs) accounting
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public void Add_SuccessfulRequests_AccumulateElapsedMsPerTargetAndTotal()
+    {
+        var sut = CreateSut();
+
+        sut.Add(Entry(RoutingTarget.Local, 100, 20, elapsedMs: 1_000));
+        sut.Add(Entry(RoutingTarget.Local, 50, 10, elapsedMs: 500));
+        sut.Add(Entry(RoutingTarget.Remote, 200, 30, elapsedMs: 2_500));
+
+        var snapshot = sut.GetSnapshot();
+
+        Assert.Equal(1_500, snapshot.Today[RoutingTarget.Local].ElapsedMilliseconds);
+        Assert.Equal(2_500, snapshot.Today[RoutingTarget.Remote].ElapsedMilliseconds);
+        Assert.Equal(0, snapshot.Today[RoutingTarget.Cloud].ElapsedMilliseconds);
+        Assert.Equal(4_000, snapshot.TodayTotal.ElapsedMilliseconds);
+        Assert.Equal(1_500, snapshot.Last7Days[RoutingTarget.Local].ElapsedMilliseconds);
+        Assert.Equal(4_000, snapshot.Last7DaysTotal.ElapsedMilliseconds);
+    }
+
+    [Fact]
+    public void Add_FailedRequests_NeverCountElapsed()
+    {
+        var sut = CreateSut();
+
+        sut.Add(Entry(RoutingTarget.Local, 10, 10, success: false, elapsedMs: 900));
+
+        var snapshot = sut.GetSnapshot();
+
+        Assert.Equal(0, snapshot.Today[RoutingTarget.Local].ElapsedMilliseconds);
+        Assert.Equal(0, snapshot.TodayTotal.ElapsedMilliseconds);
+        Assert.Equal(0, snapshot.Last7DaysTotal.ElapsedMilliseconds);
+    }
+
+    [Fact]
+    public void Add_SuccessWithoutUsageReport_CountsElapsedButNoTokensOrRequests()
+    {
+        var sut = CreateSut();
+
+        sut.Add(Entry(RoutingTarget.Local, 10, null, elapsedMs: 750));
+
+        var snapshot = sut.GetSnapshot();
+
+        Assert.Equal(750, snapshot.Today[RoutingTarget.Local].ElapsedMilliseconds);
+        Assert.Equal(750, snapshot.TodayTotal.ElapsedMilliseconds);
+        Assert.Equal(0, snapshot.Today[RoutingTarget.Local].Requests);
+        Assert.Equal(0, snapshot.Today[RoutingTarget.Local].InputTokens);
+        Assert.Equal(0, snapshot.Today[RoutingTarget.Local].OutputTokens);
+    }
+
+    [Fact]
+    public void Add_NegativeElapsedMs_ClampsToZero()
+    {
+        var sut = CreateSut();
+
+        sut.Add(Entry(RoutingTarget.Local, 10, 5, elapsedMs: -50));
+
+        var snapshot = sut.GetSnapshot();
+
+        Assert.Equal(0, snapshot.Today[RoutingTarget.Local].ElapsedMilliseconds);
+        Assert.Equal(1, snapshot.Today[RoutingTarget.Local].Requests); // the usage path is unaffected
+    }
+
+    [Fact]
+    public void Save_WritesElapsedCounterToJsonFile()
+    {
+        var sut = CreateSut();
+
+        sut.Add(Entry(RoutingTarget.Local, 100, 20, elapsedMs: 1_234));
+        sut.Save();
+        WaitForPendingSaves();
+
+        var persisted = File.ReadAllText(statsFilePath);
+        Assert.Contains("\"TotalElapsedMilliseconds\": 1234", persisted);
+    }
+
+    [Fact]
+    public void Statistics_ElapsedMs_RoundTripsAcrossInstances()
+    {
+        var first = CreateSut();
+        first.Add(Entry(RoutingTarget.Remote, 100, 10, elapsedMs: 2_000));
+        first.Save();
+        WaitForPendingSaves();
+
+        var second = CreateSut();
+        second.Add(Entry(RoutingTarget.Remote, 10, 1, elapsedMs: 3_000));
+        WaitForPendingSaves();
+
+        var snapshot = second.GetSnapshot();
+
+        Assert.Equal(5_000, snapshot.Today[RoutingTarget.Remote].ElapsedMilliseconds);
+        Assert.Equal(5_000, snapshot.Last7DaysTotal.ElapsedMilliseconds);
+    }
+
+    [Fact]
+    public void Load_LegacyFileWithoutElapsedField_DefaultsToZero()
+    {
+        // Hand-written legacy JSON: the per-entry objects carry NO TotalElapsedMilliseconds
+        // (pre-task-#84 file shape).
+        var today = DateTime.Now.Date.ToString("o");
+        File.WriteAllText(statsFilePath,
+            "[{ \"Date\": \"" + today + "\", \"Statistics\": { \"Local\": { \"TotalRequests\": 2, \"TotalInputTokens\": 500, \"TotalOutputTokens\": 50 } } }]");
+
+        var sut = CreateSut();
+
+        var snapshot = sut.GetSnapshot();
+
+        Assert.Equal(2, snapshot.Today[RoutingTarget.Local].Requests);
+        Assert.Equal(500, snapshot.Today[RoutingTarget.Local].InputTokens);
+        Assert.Equal(0, snapshot.Today[RoutingTarget.Local].ElapsedMilliseconds);
+        Assert.Equal(0, snapshot.Last7DaysTotal.ElapsedMilliseconds);
+    }
+
     [Fact]
     public void GetSnapshot_Last7Days_AggregatesWithToday()
     {
@@ -246,7 +362,7 @@ public class ActivityStatisticsServiceTests : IDisposable
                 Date = today.AddDays(-2),
                 Statistics =
                 {
-                    [RoutingTarget.Local] = new ActivityStatisticsEntry { TotalRequests = 2, TotalInputTokens = 200, TotalOutputTokens = 20 }
+                    [RoutingTarget.Local] = new ActivityStatisticsEntry { TotalRequests = 2, TotalInputTokens = 200, TotalOutputTokens = 20, TotalElapsedMilliseconds = 900 }
                 }
             }
         };
@@ -260,6 +376,10 @@ public class ActivityStatisticsServiceTests : IDisposable
         Assert.Equal(0, snapshot.Today[RoutingTarget.Local].Requests);
         Assert.Equal(200, snapshot.Last7DaysTotal.InputTokens);
         Assert.Equal(20, snapshot.Last7DaysTotal.OutputTokens);
+        // Task #84: the 7-day aggregation carries the elapsed time of the included days only.
+        Assert.Equal(900, snapshot.Last7Days[RoutingTarget.Local].ElapsedMilliseconds);
+        Assert.Equal(900, snapshot.Last7DaysTotal.ElapsedMilliseconds);
+        Assert.Equal(0, snapshot.Today[RoutingTarget.Local].ElapsedMilliseconds);
     }
 
     [Fact]
@@ -349,6 +469,11 @@ public class ActivityStatisticsServiceTests : IDisposable
         Assert.Equal(0, snapshot.Last7Days[new RoutingTarget("laptop")].Requests);
         Assert.Equal(0, snapshot.Last7Days[RoutingTarget.Cloud].Requests);
         Assert.Equal(1, snapshot.Last7DaysTotal.Requests);
+        // Task #84: zero-fill entries carry 0 elapsed time as well.
+        Assert.Equal(100, snapshot.Today[new RoutingTarget("desktop")].ElapsedMilliseconds);
+        Assert.Equal(0, snapshot.Today[new RoutingTarget("laptop")].ElapsedMilliseconds);
+        Assert.Equal(0, snapshot.Last7Days[RoutingTarget.Cloud].ElapsedMilliseconds);
+        Assert.Equal(100, snapshot.Last7DaysTotal.ElapsedMilliseconds);
     }
 
     // Gives fire-and-forget saves (Task.Run) time to finish so the stats file is stable to read.

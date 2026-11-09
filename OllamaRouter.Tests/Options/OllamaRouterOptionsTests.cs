@@ -661,6 +661,99 @@ public class OllamaRouterOptionsTests
         Assert.False(new PricingOptions { PromptPricePerMillion = null }.IsConfigured);
     }
 
+    [Fact]
+    public void Pricing_IsConfigured_ElectricityKnobsAlone_DeliberatelyNotConfigured()
+    {
+        // Task #84 decision 2: the electricity price alone never surfaces the cost section.
+        Assert.False(new PricingOptions { ElectricityPricePerKwh = 0.20 }.IsConfigured);
+        Assert.False(new PricingOptions { DefaultNodePowerWatts = 150 }.IsConfigured);
+        Assert.True(new PricingOptions { PricePerMillion = 0.0, ElectricityPricePerKwh = 0.20 }.IsConfigured);
+    }
+
+    [Fact]
+    public void Normalize_PerNodePowerWatts_NegativeOrNonFiniteResetToNull_ZeroAndPositiveKept()
+    {
+        var options = new OllamaRouterOptions
+        {
+            Targets =
+            [
+                new OllamaTargetOptions { Name = "A", Url = "http://127.0.0.1:11435", PowerWatts = -10 },
+                new OllamaTargetOptions { Name = "B", Url = "http://127.0.0.1:11435", PowerWatts = double.NaN },
+                new OllamaTargetOptions { Name = "C", Url = "http://127.0.0.1:11435", PowerWatts = double.PositiveInfinity },
+                new OllamaTargetOptions { Name = "D", Url = "http://127.0.0.1:11435", PowerWatts = 0 },
+                new OllamaTargetOptions { Name = "E", Url = "http://127.0.0.1:11435", PowerWatts = 400 },
+                new OllamaTargetOptions { Name = "F", Url = "http://127.0.0.1:11435", PowerWatts = null }
+            ]
+        };
+
+        options.Normalize();
+
+        Assert.Null(options.Targets[0]!.PowerWatts);
+        Assert.Null(options.Targets[1]!.PowerWatts);
+        Assert.Null(options.Targets[2]!.PowerWatts);
+        Assert.Equal(0, options.Targets[3]!.PowerWatts); // 0 = zero-consumption node (valid)
+        Assert.Equal(400, options.Targets[4]!.PowerWatts);
+        Assert.Null(options.Targets[5]!.PowerWatts);
+    }
+
+    [Fact]
+    public void Normalize_PricingElectricityKnobs_NegativeOrNonFiniteResetToNull_ValidKept()
+    {
+        var options = new OllamaRouterOptions
+        {
+            Pricing = new PricingOptions { ElectricityPricePerKwh = -0.1, DefaultNodePowerWatts = double.NaN }
+        };
+
+        options.Normalize();
+
+        Assert.Null(options.Pricing!.ElectricityPricePerKwh);
+        Assert.Null(options.Pricing.DefaultNodePowerWatts);
+
+        var good = new OllamaRouterOptions
+        {
+            Pricing = new PricingOptions { ElectricityPricePerKwh = 0.30, DefaultNodePowerWatts = 0 }
+        };
+
+        good.Normalize();
+
+        Assert.Equal(0.30, good.Pricing!.ElectricityPricePerKwh);
+        Assert.Equal(0, good.Pricing.DefaultNodePowerWatts); // 0 W default is valid
+    }
+
+    [Fact]
+    public void GetEffectivePowerWatts_ResolutionChain_OverrideThenPricingDefaultThen150()
+    {
+        // The explicit override wins verbatim (including 0 = zero-consumption node).
+        Assert.Equal(130.0, new OllamaTargetOptions { PowerWatts = 130 }
+            .GetEffectivePowerWatts(new PricingOptions { DefaultNodePowerWatts = 999 }));
+        Assert.Equal(0.0, new OllamaTargetOptions { PowerWatts = 0 }.GetEffectivePowerWatts(null));
+
+        // Without a (valid) override the pricing default applies…
+        Assert.Equal(400.0, new OllamaTargetOptions().GetEffectivePowerWatts(new PricingOptions { DefaultNodePowerWatts = 400 }));
+        // …and with no pricing section (or an unset knob) the 150 W fallback.
+        Assert.Equal(150.0, new OllamaTargetOptions().GetEffectivePowerWatts(new PricingOptions()));
+        Assert.Equal(150.0, new OllamaTargetOptions().GetEffectivePowerWatts(null));
+
+        // Invalid overrides (non-finite / negative) fall through the chain.
+        Assert.Equal(400.0, new OllamaTargetOptions { PowerWatts = double.NaN }
+            .GetEffectivePowerWatts(new PricingOptions { DefaultNodePowerWatts = 400 }));
+        Assert.Equal(150.0, new OllamaTargetOptions { PowerWatts = -5 }.GetEffectivePowerWatts(new PricingOptions()));
+    }
+
+    [Fact]
+    public void Pricing_EffectiveElectricityPrice_UnsetOrInvalidFallsBackTo020()
+    {
+        Assert.Equal(0.20, new PricingOptions().GetEffectiveElectricityPricePerKwh());
+        Assert.Equal(0.20, new PricingOptions { ElectricityPricePerKwh = -1 }.GetEffectiveElectricityPricePerKwh());
+        Assert.Equal(0.20, new PricingOptions { ElectricityPricePerKwh = double.NaN }.GetEffectiveElectricityPricePerKwh());
+        Assert.Equal(0.25, new PricingOptions { ElectricityPricePerKwh = 0.25 }.GetEffectiveElectricityPricePerKwh());
+        Assert.Equal(0.0, new PricingOptions { ElectricityPricePerKwh = 0.0 }.GetEffectiveElectricityPricePerKwh());
+
+        Assert.Equal(150.0, new PricingOptions().GetEffectiveDefaultNodePowerWatts());
+        Assert.Equal(150.0, new PricingOptions { DefaultNodePowerWatts = -1 }.GetEffectiveDefaultNodePowerWatts());
+        Assert.Equal(300.0, new PricingOptions { DefaultNodePowerWatts = 300 }.GetEffectiveDefaultNodePowerWatts());
+    }
+
     private sealed class CapturingLogger : ILogger
     {
         private readonly List<string> warnings;

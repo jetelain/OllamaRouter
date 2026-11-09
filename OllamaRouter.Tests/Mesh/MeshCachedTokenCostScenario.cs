@@ -62,7 +62,8 @@ public class MeshCachedTokenCostScenario
 
         // Bounded poll (standard mesh settle pattern): re-fetch /monitor/api until the target's
         // last-7-days statistics carry the cached count (input 12 / cached 10 / output 7), the
-        // recent-request row carries it too, and the cost status values the cached usage.
+        // recent-request row carries it too, and the cost status values the cached usage
+        // (minus the observed-elapsed electricity term, task #84).
         var settled = await PollMonitorAsync(router, doc =>
         {
             var stat = PeriodStat(doc, "desktop", "last7Days");
@@ -74,20 +75,26 @@ public class MeshCachedTokenCostScenario
             return stat["inputTokens"]?.GetValue<int>() == 12
                 && stat["cachedInputTokens"]?.GetValue<int>() == 10
                 && stat["outputTokens"]?.GetValue<int>() == 7
+                && stat["elapsedMs"] is not null
                 && FirstRequestCached(doc) == 10
-                && CostMatchesCachedSplit(doc);
+                && CostMatchesCachedSplit(doc, stat);
         });
 
         Assert.True(settled, "the /monitor/api target statistics must carry cachedInputTokens=10 " +
-            "(a subset of inputTokens=12), the recent-request row must carry cachedInputTokens=10, " +
-            "and the cost status must value the cached usage");
+            "(a subset of inputTokens=12) and the cumulative elapsedMs, the recent-request row " +
+            "must carry cachedInputTokens=10, and the cost status must value the cached usage " +
+            "minus the electricity term");
     }
 
     // The cost object is present and values the "desktop" usage with the cached split
     // ((12 − 10)/1e6 × 0.20) + (10/1e6 × 0.05) + (7/1e6 × 0.80) = 0.0000065 → 0.0 at the
     // production 4-decimal rounding for this 12/10/7 scale (the exact-value formula rows are
     // asserted in the unit cost-math table; a larger-scale live check is the E2E scenario).
-    private static bool CostMatchesCachedSplit(JsonNode document)
+    // Task #84: the ACTUAL savings additionally subtract the observed-elapsed electricity term
+    // (150 W / 0.20 per-kWh effective defaults of this fixture — the fixture configures neither
+    // PowerWatts nor the electricity knobs), computed from the SAME document's elapsedMs so the
+    // assertion stays deterministic.
+    private static bool CostMatchesCachedSplit(JsonNode document, JsonNode desktopStat)
     {
         var cost = document["cost"];
         if (cost is null)
@@ -95,8 +102,17 @@ public class MeshCachedTokenCostScenario
             return false;
         }
 
-        return cost["estimatedSavings"]?.GetValue<double>() == 0.0
-            && cost["perTargetSavings"]?["desktop"]?.GetValue<double>() == 0.0;
+        var elapsedMs = desktopStat["elapsedMs"]?.GetValue<double>() ?? 0.0;
+        var electricity = Math.Round(
+            elapsedMs / 3_600_000.0 * PricingOptions.DefaultPowerWatts / 1000.0 * PricingOptions.DefaultElectricityPricePerKwh,
+            4);
+        // Token value rounds to 0.0 at this scale: savings = round(0.0 − electricity, 4).
+        var expectedSavings = Math.Round(-electricity, 4);
+
+        return cost["estimatedSavings"]?.GetValue<double>() == expectedSavings
+            && cost["perTargetSavings"]?["desktop"]?.GetValue<double>() == expectedSavings
+            && cost["electricityCost"]?.GetValue<double>() == electricity
+            && (cost["perTargetElectricityCost"]?["desktop"]?.GetValue<double>() ?? double.NaN) == electricity;
     }
 
     // The cached count on the FIRST (most recent) request row, or null when absent/unknown.

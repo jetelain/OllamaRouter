@@ -53,35 +53,62 @@ public class ActivityStatisticsService : IActivityStatisticsService
     }
 
     /// <summary>
-    /// Records the entry's token usage if the request succeeded and the router reported actual
-    /// response tokens; estimated outputs are never counted. The prompt count falls back to the
+    /// Records the entry's contribution toward the daily statistics: every COMPLETED SUCCESSFUL
+    /// request accumulates its wall-clock <see cref="ActivityLogEntry.ElapsedMilliseconds"/>
+    /// (defensively clamped to >= 0) because the node consumes electricity whether or not the
+    /// daemon reported usage tokens (task #84); the request/token counters are additionally
+    /// recorded only when the router reported actual response tokens (estimated outputs are
+    /// never counted; failed requests never count). The prompt count falls back to the
     /// estimate when the router did not report actual prompt tokens.
     /// </summary>
     public void Add(ActivityLogEntry activityLogEntry)
     {
+        if (!activityLogEntry.Success)
+        {
+            return;
+        }
+
+        var elapsedMs = Math.Max(0.0, (double)activityLogEntry.ElapsedMilliseconds);
         var actualOutput = activityLogEntry.ActualResponseTokens;
 
-        if (actualOutput != null && activityLogEntry.Success)
+        if (actualOutput is null)
         {
-            var actualInput = activityLogEntry.ActualPromptTokens ?? activityLogEntry.EstimatedPromptTokens;
-
-            // Cached is a subset of the total input tokens; a missing cached count counts as 0,
-            // and a corrupt cached > input value is clamped to the final input total.
-            var cachedInput = Math.Clamp(activityLogEntry.CachedInputTokens ?? 0, 0, actualInput);
-
-            Add(target: activityLogEntry.Target, inputTokens: actualInput, outputTokens: actualOutput.Value, cachedInputTokens: cachedInput);
+            // Electricity flows even when the daemon reports no usage (task #84); the
+            // request/token counters stay untouched (pre-existing semantics for
+            // usage-less entries).
+            AddElapsed(activityLogEntry.Target, elapsedMs);
+            return;
         }
+
+        var actualInput = activityLogEntry.ActualPromptTokens ?? activityLogEntry.EstimatedPromptTokens;
+
+        // Cached is a subset of the total input tokens; a missing cached count counts as 0,
+        // and a corrupt cached > input value is clamped to the final input total.
+        var cachedInput = Math.Clamp(activityLogEntry.CachedInputTokens ?? 0, 0, actualInput);
+
+        Add(target: activityLogEntry.Target, inputTokens: actualInput, outputTokens: actualOutput.Value, cachedInputTokens: cachedInput, elapsedMs: elapsedMs);
+    }
+
+    // Adds ONLY the elapsed time of a completed successful request without usage counters
+    // (task #84); thread-safe like <see cref="Add"/>.
+    private void AddElapsed(RoutingTarget target, double elapsedMs)
+    {
+        var current = GetToday()[target];
+        Interlocked.Add(ref current.TotalElapsedMilliseconds, (long)elapsedMs);
+
+        SaveThrottled();
     }
 
     // Increments today's counters; all counter reads/writes go through Interlocked, so this
     // is thread-safe even though multiple request-handling threads call it concurrently.
-    private void Add(RoutingTarget target, int inputTokens, int outputTokens, int cachedInputTokens)
+    private void Add(RoutingTarget target, int inputTokens, int outputTokens, int cachedInputTokens, double elapsedMs)
     {
         var current = GetToday()[target];
         Interlocked.Increment(ref current.TotalRequests);
         Interlocked.Add(ref current.TotalInputTokens, inputTokens);
         Interlocked.Add(ref current.TotalOutputTokens, outputTokens);
         Interlocked.Add(ref current.TotalCachedInputTokens, cachedInputTokens);
+        Interlocked.Add(ref current.TotalElapsedMilliseconds, (long)elapsedMs);
 
         SaveThrottled();
     }
@@ -130,7 +157,7 @@ public class ActivityStatisticsService : IActivityStatisticsService
     private Dictionary<RoutingTarget, ActivityStatisticsTotals> AggregateByTarget(IEnumerable<ActivityStatisticsDate> days)
     {
         var totals = targets
-            .ToDictionary(target => target, _ => (Requests: 0, InputTokens: 0, OutputTokens: 0, CachedInputTokens: 0));
+            .ToDictionary(target => target, _ => (Requests: 0, InputTokens: 0, OutputTokens: 0, CachedInputTokens: 0, ElapsedMilliseconds: 0.0));
 
         foreach (var day in days)
         {
@@ -145,13 +172,19 @@ public class ActivityStatisticsService : IActivityStatisticsService
                     current.Requests + entry.TotalRequests,
                     current.InputTokens + entry.TotalInputTokens,
                     current.OutputTokens + entry.TotalOutputTokens,
-                    current.CachedInputTokens + entry.TotalCachedInputTokens);
+                    current.CachedInputTokens + entry.TotalCachedInputTokens,
+                    current.ElapsedMilliseconds + entry.TotalElapsedMilliseconds);
             }
         }
 
         return totals.ToDictionary(
             pair => pair.Key,
-            pair => new ActivityStatisticsTotals(pair.Value.Requests, pair.Value.InputTokens, pair.Value.OutputTokens, pair.Value.CachedInputTokens));
+            pair => new ActivityStatisticsTotals(
+                pair.Value.Requests,
+                pair.Value.InputTokens,
+                pair.Value.OutputTokens,
+                pair.Value.CachedInputTokens,
+                pair.Value.ElapsedMilliseconds));
     }
 
     // Combines a per-target dictionary into a single overall total.
@@ -161,7 +194,8 @@ public class ActivityStatisticsService : IActivityStatisticsService
             byTarget.Values.Sum(t => t.Requests),
             byTarget.Values.Sum(t => t.InputTokens),
             byTarget.Values.Sum(t => t.OutputTokens),
-            byTarget.Values.Sum(t => t.CachedInputTokens));
+            byTarget.Values.Sum(t => t.CachedInputTokens),
+            byTarget.Values.Sum(t => t.ElapsedMilliseconds));
     }
 
     // Returns today's per-target counters, creating a new day bucket under gate when the
@@ -270,6 +304,11 @@ public class ActivityStatisticsEntry
     // TotalInputTokens; absent in legacy persisted files ⇒ defaults to 0 on load).
     [JsonInclude]
     public int TotalCachedInputTokens;
+    // Cumulative GPU time (milliseconds) of completed SUCCESSFUL requests for this target on
+    // this day (task #84; absent in legacy persisted files ⇒ defaults to 0 on load). Kept as
+    // long so the counter stays lock-free (Interlocked.Add) and exact for millisecond values.
+    [JsonInclude]
+    public long TotalElapsedMilliseconds;
 }
 
 /// <summary>

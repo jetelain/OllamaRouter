@@ -329,15 +329,32 @@ internal static class MonitorScenarios
         var pricingModified = false;
         try
         {
+            // Task #84: the savings are ACTUAL (cloud value − electricity). Read the electricity
+            // knobs from the config snapshot (null ⇒ 0.20 / 150 W) and ECHO them into the PUT
+            // body (full-section-replace would otherwise clear them) so the expected formula and
+            // the live options can never drift.
+            var snapshotPricing = snapshot?["pricing"] as JsonObject;
+            var snapshotElectricityPrice = snapshotPricing?["electricityPricePerKwh"];
+            var snapshotDefaultWatts = snapshotPricing?["defaultNodePowerWatts"];
+
+            var pricingSection = new JsonObject
+            {
+                ["promptPricePerMillion"] = 0.20,
+                ["completionPricePerMillion"] = 0.80,
+                ["cachedPromptPricePerMillion"] = 0.05,
+                ["currency"] = "$"
+            };
+            if (snapshotElectricityPrice is not null)
+            {
+                pricingSection["electricityPricePerKwh"] = snapshotElectricityPrice;
+            }
+            if (snapshotDefaultWatts is not null)
+            {
+                pricingSection["defaultNodePowerWatts"] = snapshotDefaultWatts;
+            }
             var putBody = new JsonObject
             {
-                ["pricing"] = new JsonObject
-                {
-                    ["promptPricePerMillion"] = 0.20,
-                    ["completionPricePerMillion"] = 0.80,
-                    ["cachedPromptPricePerMillion"] = 0.05,
-                    ["currency"] = "$"
-                }
+                ["pricing"] = pricingSection
             };
             var (putOk, putDoc, putStatus) = await ConfigRequestAsync(http, "PUT", "/api/router/config", putBody, config.ApiKey);
             if (!putOk)
@@ -355,12 +372,18 @@ internal static class MonitorScenarios
             }
 
             // Re-read the monitor: the cost object must now be present (pricing configured) and
-            // its per-target savings must match the cached split formula on the observed stats.
+            // its per-target ACTUAL savings (task #84) must match the cached-split token value
+            // MINUS the target's electricity cost (observed elapsedMs × resolved wattage ×
+            // electricity price, 4-decimal rounding contract) on the observed statistics.
             var monitor2 = await GetMonitorJsonAsync(http);
             if (monitor2?["cost"] is null)
             {
                 return "Expected a 'cost' object in /monitor/api after configuring pricing.";
             }
+
+            var electricityPrice = snapshotElectricityPrice?.GetValue<double>() ?? 0.20;
+            var defaultWatts = snapshotDefaultWatts?.GetValue<double>() ?? 150.0;
+            var snapshotTargets = (snapshot?["targets"] as JsonArray)?.OfType<JsonObject>().ToList() ?? [];
 
             foreach (var (name, stat) in PeriodEntries(monitor2, "last7Days"))
             {
@@ -373,13 +396,31 @@ internal static class MonitorScenarios
                 var input = stat?["inputTokens"]?.GetValue<int>() ?? 0;
                 var cached = stat?["cachedInputTokens"]?.GetValue<int>() ?? 0;
                 var output = stat?["outputTokens"]?.GetValue<int>() ?? 0;
-                var expected = Math.Round((input - cached) / 1_000_000.0 * 0.20 +
-                                          cached / 1_000_000.0 * 0.05 +
-                                          output / 1_000_000.0 * 0.80, 4);
+                var tokenValue = Math.Round((input - cached) / 1_000_000.0 * 0.20 +
+                                            cached / 1_000_000.0 * 0.05 +
+                                            output / 1_000_000.0 * 0.80, 4);
+
+                // Wattage resolution chain (target override → pricing default → 150 W) from the
+                // same config snapshot the live options resolve against.
+                var snapshotTarget = snapshotTargets.FirstOrDefault(t =>
+                    string.Equals(t?["name"]?.GetValue<string>(), name, StringComparison.OrdinalIgnoreCase));
+                var watts = snapshotTarget?["powerWatts"] is { } targetWatts && targetWatts.GetValue<double>() >= 0
+                    ? targetWatts.GetValue<double>()
+                    : defaultWatts;
+
+                var elapsedMs = stat?["elapsedMs"]?.GetValue<double>() ?? 0.0;
+                var electricity = Math.Round(elapsedMs / 3_600_000.0 * watts / 1000.0 * electricityPrice, 4);
+                var expected = Math.Round(tokenValue - electricity, 4);
                 var actual = monitor2["cost"]!["perTargetSavings"]![name]?.GetValue<double>();
                 if (actual is null || Math.Abs(actual.Value - expected) > 1e-9)
                 {
-                    return $"cost.perTargetSavings['{name}'] = {actual} does not match the cached-split formula ({expected}).";
+                    return $"cost.perTargetSavings['{name}'] = {actual} does not match the actual-savings formula tokenValue({tokenValue}) − electricity({electricity}) = {expected} (input {input}, cached {cached}, output {output}, elapsedMs {elapsedMs}, watts {watts}, electricityPrice {electricityPrice}).";
+                }
+
+                var actualElectricity = monitor2["cost"]!["perTargetElectricityCost"]?[name]?.GetValue<double>();
+                if (actualElectricity is null || Math.Abs(actualElectricity.Value - electricity) > 1e-9)
+                {
+                    return $"cost.perTargetElectricityCost['{name}'] = {actualElectricity} does not match the observed-elapsed electricity term ({electricity}).";
                 }
             }
 

@@ -265,6 +265,18 @@ public sealed class RouterConfigPersistence : IRouterConfigPersistence
         {
             node.Remove("ApiKey");
         }
+
+        // Task #84: node power-draw override (watts); the key is REMOVED when unset (a
+        // JSON null would mean "explicitly cleared" on the wire — the documented clear path
+        // is the absent key, matching the Provider/ApiKey pattern above).
+        if (target.PowerWatts is { } powerWatts)
+        {
+            node["PowerWatts"] = powerWatts;
+        }
+        else
+        {
+            node.Remove("PowerWatts");
+        }
     }
 
     /// <summary>
@@ -357,6 +369,11 @@ public sealed class RouterConfigPersistence : IRouterConfigPersistence
                 pricingNode["PricePerMillion"] = pricing.PricePerMillion;
                 pricingNode["Currency"] = pricing.Currency;
                 pricingNode["CachedPromptPricePerMillion"] = pricing.CachedPromptPricePerMillion;
+                // Task #84: electricity price / default node power (full-section-replace
+                // semantics: absent ⇒ JSON null ⇒ cleared ⇒ the effective defaults 0.20 / 150 W
+                // apply at read time).
+                pricingNode["ElectricityPricePerKwh"] = pricing.ElectricityPricePerKwh;
+                pricingNode["DefaultNodePowerWatts"] = pricing.DefaultNodePowerWatts;
             }
 
             var writeResult = await AtomicWriteAsync(root!, cancellationToken).ConfigureAwait(false);
@@ -555,7 +572,11 @@ public sealed class RouterConfigPersistence : IRouterConfigPersistence
                 CompletionPricePerMillion = pricing.CompletionPricePerMillion,
                 PricePerMillion = pricing.PricePerMillion,
                 Currency = pricing.Currency,
-                CachedPromptPricePerMillion = pricing.CachedPromptPricePerMillion
+                CachedPromptPricePerMillion = pricing.CachedPromptPricePerMillion,
+                // Task #84: copied verbatim (null = cleared = the effective defaults 0.20 /
+                // 150 W apply at read time) — same full-section-replace pattern as the rest.
+                ElectricityPricePerKwh = pricing.ElectricityPricePerKwh,
+                DefaultNodePowerWatts = pricing.DefaultNodePowerWatts
             };
         }
 

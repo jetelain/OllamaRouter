@@ -18,7 +18,7 @@ namespace OllamaRouter.Options;
 /// <c>Aggregation.PerTargetTimeoutMs</c>, <c>PreloadLoadTimeoutSeconds</c>, <c>DynamicContext.*</c>,
 /// <c>TerminalMonitoring.RefreshIntervalSeconds</c>, <c>ApiSecurity.*</c>, <c>Pricing.*</c> and per-EXISTING-target
 /// attributes (<c>Enabled</c>, <c>MaxParallel</c>, <c>MaxVramMB</c>, <c>SpeedFactor</c>,
-/// <c>Location</c>).
+/// <c>Location</c>, <c>PowerWatts</c>).
 /// </para>
 /// <para>
 /// The following remain STARTUP-SCOPED (a process restart is required for changes to take
@@ -436,6 +436,31 @@ public sealed class OllamaRouterOptions
             {
                 target.KeepAliveSeconds = null;
             }
+
+            // Task #84: a negative / non-finite power draw is invalid → null so the
+            // resolution chain (Pricing:DefaultNodePowerWatts → 150 W) takes over; 0
+            // (a zero-consumption node) stays 0.
+            if (target.PowerWatts is { } powerWatts && (!double.IsFinite(powerWatts) || powerWatts < 0))
+            {
+                target.PowerWatts = null;
+            }
+        }
+
+        // Task #84: the electricity price / default node power knobs are nullable (null =
+        // unset ⇒ the effective defaults 0.20 / 150 W apply at read time); negative or
+        // non-finite values are invalid → null (IsConfigured is deliberately UNCHANGED —
+        // the electricity price alone never surfaces the cost section).
+        if (Pricing is { } pricing)
+        {
+            if (pricing.ElectricityPricePerKwh is { } price && (!double.IsFinite(price) || price < 0))
+            {
+                pricing.ElectricityPricePerKwh = null;
+            }
+
+            if (pricing.DefaultNodePowerWatts is { } defaultWatts && (!double.IsFinite(defaultWatts) || defaultWatts < 0))
+            {
+                pricing.DefaultNodePowerWatts = null;
+            }
         }
 
         if (Recording?.TokenMetricsCsv is { } tokenMetricsCsv && tokenMetricsCsv.MaxFiles < 0)
@@ -597,12 +622,43 @@ public sealed class OllamaTargetOptions
     public double SpeedFactor { get; set; } = 1.0;
 
     /// <summary>
+    /// Explicit node power-draw override (in watts) for the electricity-cost leg of the
+    /// monitor's actual-savings math (task #84):
+    /// <c>electricityCost = (elapsedHours) × (watts / 1000) × ElectricityPricePerKwh</c>.
+    /// <c>0</c> (a zero-consumption node) is valid. Null (default) = resolved by
+    /// <see cref="GetEffectivePowerWatts(PricingOptions?)"/> (target override →
+    /// <c>Pricing:DefaultNodePowerWatts</c> → 150 W). Negative or non-finite values are
+    /// normalized to null by <see cref="OllamaRouterOptions.Normalize"/>. LIVE.
+    /// </summary>
+    public double? PowerWatts { get; set; }
+
+    /// <summary>
     /// The single read site for <see cref="SpeedFactor"/> clamping: non-finite values (NaN,
     /// +/-Infinity) or values <= 1.0 are treated as exactly 1.0 (no speed bonus); values > 1.0
     /// pass through unchanged. No Normalize() mutation - clamping is at read time only.
     /// </summary>
     public double GetEffectiveSpeedFactor() =>
         !double.IsFinite(SpeedFactor) || SpeedFactor <= 1.0 ? 1.0 : SpeedFactor;
+
+    /// <summary>
+    /// Resolves the effective node power draw (in watts) for this target's electricity-cost
+    /// leg (task #84): the explicit <see cref="PowerWatts"/> override (finite and &gt;= 0,
+    /// including 0) wins verbatim, otherwise the global
+    /// <see cref="PricingOptions.DefaultNodePowerWatts"/> of <paramref name="pricing"/>
+    /// (finite and &gt;= 0) and, finally, <see cref="PricingOptions.DefaultPowerWatts"/>
+    /// (150 W). Fail-safe: never throws.
+    /// </summary>
+    public double GetEffectivePowerWatts(PricingOptions? pricing = null)
+    {
+        if (PowerWatts is { } watts && double.IsFinite(watts) && watts >= 0)
+        {
+            return watts;
+        }
+
+        return pricing is not null
+            ? pricing.GetEffectiveDefaultNodePowerWatts()
+            : PricingOptions.DefaultPowerWatts;
+    }
 
     /// <summary>
     /// Maximum number of concurrent requests this target can serve. Defaults to 1.
@@ -1007,6 +1063,60 @@ public sealed class PricingOptions
     /// Currency symbol or code to display (e.g. "$", "€", "USD"). Defaults to "$".
     /// </summary>
     public string Currency { get; set; } = "$";
+
+    /// <summary>
+    /// Effective electricity price default (0.20 per kWh in the configured display currency;
+    /// e.g. 0.20 USD/kWh ⇒ one hour of a 130 W node costs 0.026). Task #84.
+    /// </summary>
+    public const double DefaultElectricityPricePerKwh = 0.20;
+
+    /// <summary>
+    /// Effective default node power draw (150 W) applied when neither a per-target
+    /// <see cref="OllamaTargetOptions.PowerWatts"/> override nor a
+    /// <see cref="DefaultNodePowerWatts"/> override applies. Task #84.
+    /// </summary>
+    public const double DefaultPowerWatts = 150.0;
+
+    /// <summary>
+    /// Electricity price per kilowatt-hour (e.g. 0.20 = $0.20/kWh in the display currency)
+    /// used by the monitor's actual-savings math (task #84):
+    /// <c>electricityCost = (elapsedSeconds / 3600) × (watts / 1000) × ElectricityPricePerKwh</c>.
+    /// Null (default) = the <see cref="DefaultElectricityPricePerKwh"/> (0.20) applies via
+    /// <see cref="GetEffectiveElectricityPricePerKwh"/>. Negative or non-finite values are
+    /// normalized to null by <see cref="OllamaRouterOptions.Normalize"/>. Setting this ALONE
+    /// does NOT surface the cost section — <see cref="IsConfigured"/> is deliberately
+    /// unchanged (a token price rate must still be configured). LIVE.
+    /// </summary>
+    public double? ElectricityPricePerKwh { get; set; }
+
+    /// <summary>
+    /// Global default node power draw (in watts) applied to every non-Cloud fleet target
+    /// WITHOUT its own <see cref="OllamaTargetOptions.PowerWatts"/> override (task #84).
+    /// Null (default) = the <see cref="DefaultPowerWatts"/> (150 W) applies via
+    /// <see cref="GetEffectiveDefaultNodePowerWatts"/>. Negative or non-finite values are
+    /// normalized to null by <see cref="OllamaRouterOptions.Normalize"/>. LIVE.
+    /// </summary>
+    public double? DefaultNodePowerWatts { get; set; }
+
+    /// <summary>
+    /// Resolves the effective electricity price (display currency per kWh): the explicit
+    /// <see cref="ElectricityPricePerKwh"/> (finite and &gt;= 0), otherwise the
+    /// <see cref="DefaultElectricityPricePerKwh"/> (0.20). Fail-safe: never throws.
+    /// </summary>
+    public double GetEffectiveElectricityPricePerKwh() =>
+        ElectricityPricePerKwh is { } price && double.IsFinite(price) && price >= 0
+            ? price
+            : DefaultElectricityPricePerKwh;
+
+    /// <summary>
+    /// Resolves the effective default node power draw (in watts): the explicit
+    /// <see cref="DefaultNodePowerWatts"/> (finite and &gt;= 0), otherwise the
+    /// <see cref="DefaultPowerWatts"/> (150 W). Fail-safe: never throws.
+    /// </summary>
+    public double GetEffectiveDefaultNodePowerWatts() =>
+        DefaultNodePowerWatts is { } watts && double.IsFinite(watts) && watts >= 0
+            ? watts
+            : DefaultPowerWatts;
 
     /// <summary>
     /// Returns true if at least one positive pricing rate is configured.
