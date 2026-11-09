@@ -22,6 +22,7 @@ Scenario[] scenarios =
     MonitorScenarios.ServiceUnavailableWhenNoTargets(),
     MonitorScenarios.CachedTokenPricing(),
     MonitorScenarios.SessionUsageEndpoints(),
+    SessionAffinityScenarios.ReleaseSessionAffinityLease(),
     OpenApiScenarios.GetRouterOpenApiDocument(),
     PreloadScenarios.PreloadModel()
 ];

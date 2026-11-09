@@ -515,11 +515,11 @@ public sealed class OllamaRoutingMiddleware(
             return null;
         }
 
-        if (sessionId!.Length > 256)
+        if (sessionId!.Length > OllamaReverseProxyConfig.PublicSessionIdMaxLength)
         {
             logger.LogWarning(
-                "Ignoring {Header} session ID longer than 256 characters (routing stateless).",
-                sourceHeader);
+                "Ignoring {Header} session ID longer than {MaxLength} characters (routing stateless).",
+                sourceHeader, OllamaReverseProxyConfig.PublicSessionIdMaxLength);
             return null;
         }
 

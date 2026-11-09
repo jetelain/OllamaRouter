@@ -584,7 +584,7 @@ The full router management API is documented as an OpenAPI 3.1 JSON document, ge
 GET {bind-address}/api/router/openapi.json
 ```
 
-e.g. `http://localhost:11434/api/router/openapi.json`. Point any OpenAPI tooling (Swagger Editor, Redoc, code generators) at that URL. The document covers the 27 `/api/router/*` operations in eight functional groups:
+e.g. `http://localhost:11434/api/router/openapi.json`. Point any OpenAPI tooling (Swagger Editor, Redoc, code generators) at that URL. The document covers the 28 `/api/router/*` operations in nine functional groups:
 
 - **Identity & Fleet** — `/info`, `/fleet`
 - **Hardware Profiling** — `/hardware`, `/fleet/hardware` (GET + PUT)
@@ -594,6 +594,7 @@ e.g. `http://localhost:11434/api/router/openapi.json`. Point any OpenAPI tooling
 - **Setup & Configuration** — `/config`, `/targets` (POST/PUT/DELETE)
 - **API Key Security** — `/api-keys` (GET/POST/DELETE `{name}`), `/api-keys/default/rotate`
 - **Session Usage & Savings** — `/monitor/sessions`, `/monitor/sessions/{*sessionId}`
+- **Session Affinity** — `/sessions/affinity/release` (POST)
 
 The `RouterApiKey` security scheme (http/bearer/base64url — `Authorization: Bearer <key>` or `X-Api-Key: <key>`) is applied to exactly the default protected route set above; with `ApiSecurity.RequireKeyForAllEndpoints: true` every route (including the document endpoint) requires a key. The document is regenerated per request from the same AOT source-generated DTO records the endpoints use — no drift, and it works in AOT-published builds.
 
@@ -756,6 +757,22 @@ Semantics (mirroring the monitor and the persisted daily statistics, so the figu
 - **Cost math:** the store holds raw counters only; cost figures are computed at READ time from the **currently configured** `Pricing` (cached-token pricing + electricity subtraction, the monitor's exact formulas, 4-decimal rounding, never clamped) — a pricing change re-prices every stored session immediately. `cloudValue` is the all-cloud **baseline** (values ALL tokens — local and cloud — at cloud rates); `actualCloudCost` is the Cloud pseudo-target's **own** token value — the actual money paid to cloud (`0.0` when the Cloud target was never used for the session, distinct from the all-cloud `cloudValue` baseline); `cost = actualCloudCost + electricityCost` is the session's **total actual spend** (cloud spend + local power; e.g. cloud-free ⇒ `cost == electricityCost`, cloud-only ⇒ `cost == actualCloudCost`) — NOT the savings-vs-baseline figure (`cost != savings` in general). The Cloud row carries `electricityCost: 0` and `savings: 0` (no node electricity; its token value is a cost against the all-cloud baseline, not a saving), so session `savings = Σ non-Cloud (cloudValue − electricity)`.
 - **Unconfigured pricing:** when no token price rate is configured, `currency`/`cloudValue`/`electricityCost`/`savings`/`actualCloudCost`/`cost` are omitted from the JSON (token totals are always present) — the same "hidden unless a token price is configured" rule as the monitor's cost card.
 - **Bounds & eviction:** in-memory-only bounded LRU keyed by the public session ID (nothing is persisted; `OllamaRouter:SessionUsageMaxSessions`, default `1000`, live). Requests **without** a session ID are never stored; IDs longer than 256 characters are never stored; GETs never refresh recency (eviction is driven by request traffic only).
+
+### Releasing a session's affinity lease (sticky routing)
+
+Clients that tag their requests with the public session header (`X-OllamaRouter-Session-Id`) get sticky routing: the router pins the session to the target that served it (the KV-cache affinity lease, 30-min sliding TTL) so consecutive turns reuse the target's prompt-prefix cache. When the session is **done, was compacted, or its KV cache is no longer needed**, release the lease explicitly instead of waiting for the TTL — the session's next request then routes fresh and re-pins as normal:
+
+```
+curl -X POST -H "X-OllamaRouter-Session-Id: sess-86" \
+ http://localhost:11434/api/router/sessions/affinity/release
+# → 200 { "sessionId": "sess-86", "released": true }
+```
+
+- **Idempotent:** ALWAYS `200` with `{ "sessionId": <echo of the trimmed header>, "released": <bool> }` — `released: true` iff a **live** lease was found and removed; `released: false` for unknown session IDs, TTL-expired or already-released sessions, and headers longer than 256 characters (the routing middleware never lets such an ID hold a lease). Clients can fire-and-forget on session end.
+- **400 rule:** a missing/empty/whitespace-only header → `400` `OllamaErrorResponse` ("`X-OllamaRouter-Session-Id header is required`") — the only non-200 response.
+- **Lookup** is case-insensitive (matching the lease store's keying).
+- **Scope:** the session affinity lease ONLY — the per-target/model dynamic-context auto-shrink lease (shared across sessions, with its cooldown/idle hysteresis), the failure-streak state and any per-target state are untouched; in-flight requests are unaffected.
+- **Auth:** no API key required in default mode (like the read-only router routes); covered when `ApiSecurity.RequireKeyForAllEndpoints: true`, like every route.
 
 ## Requirements
 

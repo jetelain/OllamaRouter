@@ -15,7 +15,7 @@ namespace OllamaRouter.E2ETests.Scenarios;
 /// </summary>
 internal static class OpenApiScenarios
 {
-    /// <summary>The 27 (method, path) operations the document must contain (23 path items).</summary>
+    /// <summary>The 28 (method, path) operations the document must contain (24 path items).</summary>
     private static readonly (string Method, string Path)[] ExpectedOperations =
     [
         ("GET", "/api/router/info"),
@@ -48,10 +48,11 @@ internal static class OpenApiScenarios
         // The generator emits the registered catch-all /api/router/monitor/sessions/{*sessionId}
         // with the leading '*' stripped (framework normalization, same as the models catch-alls).
         ("GET", "/api/router/monitor/sessions"),
-        ("GET", "/api/router/monitor/sessions/{sessionId}")
+        ("GET", "/api/router/monitor/sessions/{sessionId}"),
+        ("POST", "/api/router/sessions/affinity/release")
     ];
 
-    public static Scenario GetRouterOpenApiDocument() => new("Router OpenAPI document /api/router/openapi.json (27 operations, OpenAPI 3.x)", async config =>
+    public static Scenario GetRouterOpenApiDocument() => new("Router OpenAPI document /api/router/openapi.json (28 operations, OpenAPI 3.x)", async config =>
     {
         using var http = new HttpClient { BaseAddress = new Uri(config.RouterUrl) };
 

@@ -9,6 +9,7 @@ using OllamaRouter.Endpoints.RouterApi.Info;
 using OllamaRouter.Endpoints.RouterApi.Models;
 using OllamaRouter.Endpoints.RouterApi.Preload;
 using OllamaRouter.Endpoints.RouterApi.Sessions;
+using OllamaRouter.Endpoints.RouterApi.SessionAffinity;
 using OllamaRouter.Endpoints.RouterApi.Targets;
 using OllamaRouter.Endpoints.RouterApi.Vram;
 
@@ -23,7 +24,8 @@ namespace OllamaRouter.Endpoints;
 /// <see cref="RouterApi.Vram.RouterVramEndpoints"/>, <see cref="RouterApi.Context.RouterContextEndpoints"/>,
 /// <see cref="RouterApi.Preload.RouterPreloadEndpoints"/>, <see cref="RouterApi.Config.RouterConfigEndpoints"/>,
 /// <see cref="RouterApi.Targets.RouterTargetsEndpoints"/>, <see cref="RouterApi.ApiKeys.RouterApiKeysEndpoints"/>,
-/// <see cref="RouterApi.Sessions.RouterSessionUsageEndpoints"/>)
+/// <see cref="RouterApi.Sessions.RouterSessionUsageEndpoints"/>,
+/// <see cref="RouterApi.SessionAffinity.RouterSessionAffinityEndpoints"/>)
 /// in the exact original registration order, which global route matching depends on
 /// (in particular the catch-all <c>/api/router/models/{*modelName}</c> vs
 /// <c>POST /api/router/models/{*tail}</c> pair and the position of the
@@ -32,8 +34,8 @@ namespace OllamaRouter.Endpoints;
 public static class RouterApiEndpointsExtensions
 {
     /// <summary>
-    /// Maps the full OllamaRouter management API: the 27 endpoints of the 12 per-area
-    /// endpoint groups, registered in the original order (the session usage area is appended
+    /// Maps the full OllamaRouter management API: the 28 endpoints of the 13 per-area
+    /// endpoint groups, registered in the original order (the session-affinity area is appended
     /// last).
     /// </summary>
     public static WebApplication MapOllamaRouterApiEndpoints(this WebApplication app)
@@ -50,6 +52,7 @@ public static class RouterApiEndpointsExtensions
         app.MapRouterTargetsEndpoints();
         app.MapRouterApiKeysEndpoints();
         app.MapRouterSessionUsageEndpoints();
+        app.MapRouterSessionAffinityEndpoints();
         return app;
     }
 

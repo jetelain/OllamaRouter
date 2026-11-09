@@ -116,7 +116,7 @@ public class RouterOpenApiDocumentTests
     }
 
     /// <summary>
-    /// The approved 27 router operations: (method, document path) pairs — 23 path items.
+    /// The approved 28 router operations: (method, document path) pairs — 24 path items.
     /// NOTE: the generator emits the catch-all templates with the leading <c>*</c> stripped
     /// (the framework's documented template normalization: the registered
     /// <c>/api/router/models/{*modelName}</c> / <c>POST /api/router/models/{*tail}</c> /
@@ -151,10 +151,11 @@ public class RouterOpenApiDocumentTests
         ("DELETE", "/api/router/api-keys/{name}"),
         ("POST", "/api/router/api-keys/default/rotate"),
         ("GET", "/api/router/monitor/sessions"),
-        ("GET", "/api/router/monitor/sessions/{sessionId}")
+        ("GET", "/api/router/monitor/sessions/{sessionId}"),
+        ("POST", "/api/router/sessions/affinity/release")
     ];
 
-    /// <summary>The eight functional tag groups (the complete tag set of the document).</summary>
+    /// <summary>The nine functional tag groups (the complete tag set of the document).</summary>
     private static readonly string[] ApprovedTags =
     [
         "Identity & Fleet",
@@ -164,7 +165,8 @@ public class RouterOpenApiDocumentTests
         "Fleet Operations",
         "Setup & Configuration",
         "API Key Security",
-        "Session Usage & Savings"
+        "Session Usage & Savings",
+        "Session Affinity"
     ];
 
     /// <summary>
@@ -199,7 +201,8 @@ public class RouterOpenApiDocumentTests
             { ("DELETE", "/api/router/api-keys/{name}"), "DeleteRouterApiKey" },
             { ("POST", "/api/router/api-keys/default/rotate"), "PostRotateRouterDefaultApiKey" },
             { ("GET", "/api/router/monitor/sessions"), "GetRouterSessionUsageList" },
-            { ("GET", "/api/router/monitor/sessions/{sessionId}"), "GetRouterSessionUsageDetail" }
+            { ("GET", "/api/router/monitor/sessions/{sessionId}"), "GetRouterSessionUsageDetail" },
+            { ("POST", "/api/router/sessions/affinity/release"), "PostRouterSessionAffinityRelease" }
         };
 
     /// <summary>
@@ -253,7 +256,9 @@ public class RouterOpenApiDocumentTests
                 [("200", "ApiKeyRotatedResponse"), ("500", "OllamaErrorResponse")] },
             { ("GET", "/api/router/monitor/sessions"), [("200", "RouterSessionUsageListResponse")] },
             { ("GET", "/api/router/monitor/sessions/{sessionId}"),
-                [("200", "RouterSessionUsageDetailResponse"), ("404", "OllamaErrorResponse")] }
+                [("200", "RouterSessionUsageDetailResponse"), ("404", "OllamaErrorResponse")] },
+            { ("POST", "/api/router/sessions/affinity/release"),
+                [("200", "RouterSessionAffinityReleaseResponse"), ("400", "OllamaErrorResponse")] }
         };
 
     /// <summary>
@@ -356,14 +361,14 @@ public class RouterOpenApiDocumentTests
     }
 
     [Fact]
-    public async Task Document_ContainsExactlyThe27RouterOperations_AndExcludesEverythingElse()
+    public async Task Document_ContainsExactlyThe28RouterOperations_AndExcludesEverythingElse()
     {
         await using var harness = await DocHarness.StartAsync(requireKeyForAllEndpoints: false);
         var document = await FetchDocumentAsync(harness);
         var paths = (JsonObject)document["paths"]!;
 
-        // Exactly the 27 approved (method, path) pairs (23 path items).
-        Assert.Equal(23, paths.Count);
+        // Exactly the 28 approved (method, path) pairs (24 path items).
+        Assert.Equal(24, paths.Count);
         var pathKeys = JsonObjectKeys(paths);
         var actualOperations = pathKeys
             .Select(path => (Path: path, Item: (JsonObject)paths[path]!))
@@ -424,7 +429,7 @@ public class RouterOpenApiDocumentTests
             allTags.UnionWith(operation.Tags);
         }
 
-        // The tag set equals the eight functional groups.
+        // The tag set equals the nine functional groups.
         Assert.Equal(new HashSet<string>(ApprovedTags), allTags);
 
         // Every documented parameter carries the expected BASE schema type (route AND query
@@ -515,7 +520,7 @@ public class RouterOpenApiDocumentTests
         await using var harness = await DocHarness.StartAsync(requireKeyForAllEndpoints: false);
         var document = await FetchDocumentAsync(harness);
 
-        // The body-accepting endpoints carry the typed request body; the other 15 do not
+        // The body-accepting endpoints carry the typed request body; the other 16 do not
         // (the plan's "nine" body list plus POST /api/router/api-keys from task #50).
         foreach (var (method, path) in ApprovedOperations)
         {
@@ -556,7 +561,7 @@ public class RouterOpenApiDocumentTests
         Assert.False(string.IsNullOrWhiteSpace(scheme["description"]?.GetValue<string>()));
 
         // The requirement is applied to EXACTLY the operations the production policy protects
-        // (12 of the 27), each with a documented 401 OllamaErrorResponse.
+        // (12 of the 28), each with a documented 401 OllamaErrorResponse.
         var protectedCount = 0;
         foreach (var (method, path) in ApprovedOperations)
         {

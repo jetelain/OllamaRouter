@@ -10,8 +10,9 @@ namespace OllamaRouter.Tests.Services.Routing;
 /// Tests for the thread-safe sliding-TTL session-affinity store
 /// (<see cref="SessionAffinityService"/>): case-insensitive round-trip, sliding TTL with an
 /// injected clock, single-session removal, target-wide invalidation, the bounded lazy
-/// sweep on large tables, and the task #77 read-only active-session reservation-window
-/// queries (occupancy counts, other-session reservation, self-exemption, TTL non-refresh).
+/// sweep on large tables, the task #77 read-only active-session reservation-window
+/// queries (occupancy counts, other-session reservation, self-exemption, TTL non-refresh),
+/// and the task #86 atomic <c>TryRemoveAffinity</c> live-lease classification.
 /// </summary>
 public class SessionAffinityServiceTests
 {
@@ -378,5 +379,92 @@ public class SessionAffinityServiceTests
 
         clock.Advance(TimeSpan.FromMinutes(2));  // 31 min since the last real touch
         Assert.False(service.TryGetAffinity("agent-1", out _));
+    }
+
+    // ==================================================================
+    // Task #86 — TryRemoveAffinity (atomic remove + live-lease classification)
+    // ==================================================================
+
+    [Fact]
+    public void TryRemoveAffinity_LiveLease_ReturnsTrue_AndLeaseIsGone()
+    {
+        var (service, _) = Build();
+        var t1 = new RoutingTarget("aiserver1");
+        service.SetAffinity("agent-1", t1);
+
+        Assert.True(service.TryRemoveAffinity("agent-1"));
+        Assert.False(service.TryGetAffinity("agent-1", out _));
+    }
+
+    [Fact]
+    public void TryRemoveAffinity_UnknownOrBlank_ReturnsFalse_AndDoesNotThrow()
+    {
+        var (service, _) = Build();
+
+        Assert.False(service.TryRemoveAffinity("ghost"));
+        Assert.False(service.TryRemoveAffinity(null!));
+        Assert.False(service.TryRemoveAffinity(""));
+        Assert.False(service.TryRemoveAffinity("   "));
+    }
+
+    [Fact]
+    public void TryRemoveAffinity_KeyIsCaseInsensitive()
+    {
+        var (service, _) = Build();
+        service.SetAffinity("AGENT-1", new RoutingTarget("aiserver1"));
+
+        Assert.True(service.TryRemoveAffinity("agent-1"));
+        Assert.False(service.TryGetAffinity("Agent-1", out _));
+    }
+
+    [Fact]
+    public void TryRemoveAffinity_TtlExpiredNotYetSwept_ReturnsFalse_AndEvictsTheEntry()
+    {
+        var (service, clock) = Build(ttlMinutes: 30);
+        service.SetAffinity("agent-1", new RoutingTarget("aiserver1"));
+
+        clock.Advance(TimeSpan.FromMinutes(31)); // expired; single entry ⇒ no LazySweep can have run
+
+        Assert.False(service.TryRemoveAffinity("agent-1"));
+        Assert.False(service.TryGetAffinity("agent-1", out _), "the expired entry must be evicted");
+    }
+
+    [Fact]
+    public void TryRemoveAffinity_RemovesOnlyThatSession_OthersIntact()
+    {
+        var (service, _) = Build();
+        service.SetAffinity("agent-1", new RoutingTarget("aiserver1"));
+        service.SetAffinity("agent-2", new RoutingTarget("aiserver2"));
+
+        Assert.True(service.TryRemoveAffinity("agent-1"));
+
+        Assert.False(service.TryGetAffinity("agent-1", out _));
+        Assert.True(service.TryGetAffinity("agent-2", out _));
+    }
+
+    [Fact]
+    public void TryRemoveAffinity_AfterSlidingTtlRefresh_RemovedLeaseWasLive_True()
+    {
+        var (service, clock) = Build(ttlMinutes: 30);
+        service.SetAffinity("agent-1", new RoutingTarget("aiserver1"));
+
+        // 20 minutes idle, then a hit refreshes the sliding window...
+        clock.Advance(TimeSpan.FromMinutes(20));
+        Assert.True(service.TryGetAffinity("agent-1", out _));
+
+        // ...so 29 minutes after the TOUCH the lease is still live and its removal reports
+        // true (the refresh made it live again — the 20 min before the touch don't count).
+        clock.Advance(TimeSpan.FromMinutes(29));
+        Assert.True(service.TryRemoveAffinity("agent-1"));
+    }
+
+    [Fact]
+    public void TryRemoveAffinity_Idempotent_SecondCallReturnsFalse()
+    {
+        var (service, _) = Build();
+        service.SetAffinity("agent-1", new RoutingTarget("aiserver1"));
+
+        Assert.True(service.TryRemoveAffinity("agent-1"));
+        Assert.False(service.TryRemoveAffinity("agent-1"));
     }
 }

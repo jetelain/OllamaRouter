@@ -10,6 +10,7 @@ using OllamaRouter.Endpoints.RouterApi.Info;
 using OllamaRouter.Endpoints.RouterApi.Models;
 using OllamaRouter.Endpoints.RouterApi.Preload;
 using OllamaRouter.Endpoints.RouterApi.Sessions;
+using OllamaRouter.Endpoints.RouterApi.SessionAffinity;
 using OllamaRouter.Endpoints.RouterApi.Targets;
 using OllamaRouter.Endpoints.RouterApi.Vram;
 using OllamaRouter.Middleware;
@@ -26,7 +27,7 @@ namespace OllamaRouter.Endpoints;
 /// <c>HttpJsonOptions</c>) and is served at exactly <c>GET /api/router/openapi.json</c>
 /// (document name <see cref="DocumentName"/> + the <c>{documentName}</c> route parameter).
 /// <para>
-/// Scope: the 27 <c>/api/router/*</c> management operations ONLY (monitor, Ollama-compatible
+/// Scope: the 28 <c>/api/router/*</c> management operations ONLY (monitor, Ollama-compatible
 /// hybrid and YARP routes are excluded via <see cref="OpenApiOptions.ShouldInclude"/>, and the
 /// document endpoint's own template route is dropped). The security requirement is derived by
 /// calling the production <see cref="ApiSecurityPolicy.IsProtectedRoute"/> on each route
@@ -233,7 +234,7 @@ internal static class RouterOpenApiDocumentTransformer
         }
 
         // Security: derived from the PRODUCTION policy called with the route template (the
-        // single-segment logic matches template segments; exactly 12 of the 27 operations
+        // single-segment logic matches template segments; exactly 12 of the 28 operations
         // match). A 401 response is documented on exactly those operations.
         if (ApiSecurityPolicy.IsProtectedRoute(method, path))
         {
@@ -524,6 +525,13 @@ internal static class RouterOpenApiDocumentTransformer
                 [
                     ("200", typeof(RouterSessionUsageDetailResponse), "The session's totals (including the top-level actualCloudCost — the Cloud target's own token value / actual cloud spend — and cost = actualCloudCost + electricityCost, the total actual spend) plus the per-target breakdown (configured fleet order, Cloud last, historical targets appended after; cost figures computed at read time from the currently configured Pricing; the Cloud row carries electricityCost 0 and savings 0)."),
                     ("404", typeof(OllamaErrorResponse), "session not found: {sessionId}")
+                ]),
+
+            ["POST /api/router/sessions/affinity/release"] = new(typeof(RouterSessionAffinityReleaseResponse),
+                responses:
+                [
+                    ("200", typeof(RouterSessionAffinityReleaseResponse), "The release result: released is true iff a live lease was found and removed; false for unknown, TTL-expired or already-released sessions (idempotent)."),
+                    ("400", typeof(OllamaErrorResponse), "X-OllamaRouter-Session-Id header is required")
                 ])
         };
 

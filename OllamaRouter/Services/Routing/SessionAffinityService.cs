@@ -114,6 +114,27 @@ public sealed class SessionAffinityService : ISessionAffinityService
         }
     }
 
+    /// <summary>
+    /// Atomic remove-then-classify (task #86): <see cref="ConcurrentDictionary{TKey,TValue}.TryRemove"/>
+    /// makes the removal race-free, then the REMOVED lease's sliding timestamp classifies whether
+    /// a live lease was released. A TTL-expired (not-yet-swept) entry is evicted and reported
+    /// false — exactly the lazy-expiry path <see cref="TryGetAffinity"/> takes. A concurrent
+    /// re-pin between the check and the removal can neither be misreported nor evicted (the
+    /// TryRemove only succeeds against the lease instance it removes).
+    /// </summary>
+    public bool TryRemoveAffinity(string sessionId)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId) ||
+            !_leases.TryRemove(sessionId, out var removed))
+        {
+            return false;
+        }
+
+        // Liveness is judged on the REMOVED lease's sliding timestamp: a live lease was
+        // released iff its TTL had not expired (expired entries are evicted, reported false).
+        return _clock() - removed.LastAccessUtc <= GetTtl();
+    }
+
     public void InvalidateTarget(RoutingTarget target)
     {
         foreach (var (sessionId, lease) in _leases)

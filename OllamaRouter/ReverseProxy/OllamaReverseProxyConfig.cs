@@ -51,6 +51,15 @@ public static class OllamaReverseProxyConfig
     /// </summary>
     public const string PublicAgentIdHeader = "X-OllamaRouter-Agent-Id";
 
+    /// <summary>
+    /// The maximum length of a public session/agent ID in characters: the cap
+    /// <see cref="Middleware.OllamaRoutingMiddleware.TryExtractSessionId"/> enforces so a
+    /// hostile header can never bloat the in-memory lease store (IDs above the cap are
+    /// ignored for routing and can therefore never hold a session-affinity lease — the
+    /// task #86 release endpoint takes the idempotent <c>released: false</c> path for them).
+    /// </summary>
+    public const int PublicSessionIdMaxLength = 256;
+
     /// <summary>Telemetry response header: the model name dispatched to the target.</summary>
     public const string TelemetryModelHeader = "X-OllamaRouter-Model";
 

@@ -12,6 +12,7 @@ using OllamaRouter.Endpoints.RouterApi.Info;
 using OllamaRouter.Endpoints.RouterApi.Models;
 using OllamaRouter.Endpoints.RouterApi.Preload;
 using OllamaRouter.Endpoints.RouterApi.Sessions;
+using OllamaRouter.Endpoints.RouterApi.SessionAffinity;
 using OllamaRouter.Endpoints.RouterApi.Targets;
 using OllamaRouter.Endpoints.RouterApi.Vram;
 using OllamaRouter.Middleware;
@@ -158,6 +159,8 @@ namespace OllamaRouter.Serialization;
  [JsonSerializable(typeof(RouterSessionUsageItem))]
  [JsonSerializable(typeof(RouterSessionUsageDetailResponse))]
  [JsonSerializable(typeof(RouterSessionUsageTargetItem))]
+ // Session-affinity lease release router API DTO (task #86).
+ [JsonSerializable(typeof(RouterSessionAffinityReleaseResponse))]
 public partial class OllamaRouterJsonSerializerContext : JsonSerializerContext
 {
 }

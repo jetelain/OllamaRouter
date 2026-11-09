@@ -44,6 +44,15 @@ public interface ISessionAffinityService
     void RemoveAffinity(string sessionId);
 
     /// <summary>
+    /// Atomically removes the session's lease and reports whether a LIVE lease was released:
+    /// true only when the removed lease had not expired its sliding TTL at the moment of
+    /// removal. Unknown sessions, blank IDs, and TTL-expired (not-yet-swept) leases return
+    /// false (an expired entry is evicted lazily, mirroring TryGetAffinity's expiry path).
+    /// Case-insensitive ID matching, identical keying to every other operation.
+    /// </summary>
+    bool TryRemoveAffinity(string sessionId);
+
+    /// <summary>
     /// Removes every lease pinned to <paramref name="target"/> (case-insensitive name match),
     /// called when the target goes offline or fails uncommitted, so other sessions pinned to
     /// the dying target are released immediately rather than waiting for the TTL.
