@@ -26,7 +26,7 @@ public sealed class OllamaNdjsonResponseEncoder : IChatResponseEncoder
         var content = update.Text ?? string.Empty;
         return RentedFrameWriter.WriteToPipeAsync(writer, EstimateSize(modelName, content), (frame, json) =>
         {
-            RenderFrame(json, modelName, content, done: false, null, null, null, null);
+            RenderFrame(json, modelName, content, done: false, null, null, null, null, null);
             json.Flush();
             frame.AppendByte((byte)'\n');
         }, cancellationToken);
@@ -44,10 +44,11 @@ public sealed class OllamaNdjsonResponseEncoder : IChatResponseEncoder
         var totalDurationNs = ToNanoseconds(duration);
         long? promptEvalCount = usage?.InputTokenCount;
         long? evalCount = usage?.OutputTokenCount;
+        long? promptEvalCachedCount = usage?.CachedInputTokenCount;
 
         return RentedFrameWriter.WriteToPipeAsync(writer, EstimateSize(modelName, string.Empty), (frame, json) =>
         {
-            RenderFrame(json, modelName, string.Empty, done: true, doneReason, totalDurationNs, promptEvalCount, evalCount);
+            RenderFrame(json, modelName, string.Empty, done: true, doneReason, totalDurationNs, promptEvalCount, evalCount, promptEvalCachedCount);
             json.Flush();
             frame.AppendByte((byte)'\n');
         }, cancellationToken);
@@ -65,10 +66,11 @@ public sealed class OllamaNdjsonResponseEncoder : IChatResponseEncoder
         var totalDurationNs = ToNanoseconds(duration);
         long? promptEvalCount = completion.Usage?.InputTokenCount;
         long? evalCount = completion.Usage?.OutputTokenCount;
+        long? promptEvalCachedCount = completion.Usage?.CachedInputTokenCount;
 
         return RentedFrameWriter.WriteToStreamAsync(responseStream, EstimateSize(modelName, content), (frame, json) =>
         {
-            RenderFrame(json, modelName, content, done: true, doneReason, totalDurationNs, promptEvalCount, evalCount);
+            RenderFrame(json, modelName, content, done: true, doneReason, totalDurationNs, promptEvalCount, evalCount, promptEvalCachedCount);
             json.Flush();
             // Single NDJSON object; trailing newline written for consistency.
             frame.AppendByte((byte)'\n');
@@ -77,7 +79,7 @@ public sealed class OllamaNdjsonResponseEncoder : IChatResponseEncoder
 
     /// <summary>
     /// Exact field order: model, created_at, message, done[, done_reason, total_duration,
-    /// prompt_eval_count, eval_count]; null-valued count fields are omitted.
+    /// prompt_eval_count, eval_count, prompt_eval_cached_count]; null-valued count fields are omitted.
     /// </summary>
     private static void RenderFrame(
         Utf8JsonWriter json,
@@ -87,7 +89,8 @@ public sealed class OllamaNdjsonResponseEncoder : IChatResponseEncoder
         string? doneReason,
         long? totalDurationNs,
         long? promptEvalCount,
-        long? evalCount)
+        long? evalCount,
+        long? promptEvalCachedCount)
     {
         json.WriteStartObject();
         json.WriteString("model", modelName);
@@ -115,6 +118,13 @@ public sealed class OllamaNdjsonResponseEncoder : IChatResponseEncoder
             if (evalCount is long eval)
             {
                 json.WriteNumber("eval_count", eval);
+            }
+
+            // Emitted when the cached count is KNOWN (non-null — 0 included, matching real
+            // daemons that report prompt_eval_cached_count: 0).
+            if (promptEvalCachedCount is long cached)
+            {
+                json.WriteNumber("prompt_eval_cached_count", cached);
             }
         }
 

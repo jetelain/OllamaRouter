@@ -186,8 +186,10 @@ public sealed class OpenAiSseResponseEncoder : IChatResponseEncoder
     }
 
     /// <summary>
-    /// "usage":{"prompt_tokens"?,"completion_tokens"?,"total_tokens"?} — individual fields are
-    /// omitted when null; total_tokens is the sum of the present parts (omitted when none present).
+    /// "usage":{"prompt_tokens"?,"prompt_tokens_details":{"cached_tokens"?}?,"completion_tokens"?,"total_tokens"?} —
+    /// individual fields are omitted when null; prompt_tokens_details.cached_tokens (a subset of
+    /// prompt_tokens) is emitted only when known and > 0; total_tokens is the sum of the present
+    /// parts (omitted when none present).
     /// </summary>
     private static void RenderUsage(Utf8JsonWriter json, UsageDetails usage)
     {
@@ -198,6 +200,13 @@ public sealed class OpenAiSseResponseEncoder : IChatResponseEncoder
         {
             json.WriteNumber("prompt_tokens", input);
             total = input;
+        }
+
+        if (usage.CachedInputTokenCount is long cached and > 0)
+        {
+            json.WriteStartObject("prompt_tokens_details");
+            json.WriteNumber("cached_tokens", cached);
+            json.WriteEndObject();
         }
 
         if (usage.OutputTokenCount is long output)

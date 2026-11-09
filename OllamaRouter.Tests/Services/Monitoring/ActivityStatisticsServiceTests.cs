@@ -48,6 +48,21 @@ public class ActivityStatisticsServiceTests : IDisposable
             success);
     }
 
+    private static ActivityLogEntry EntryWithCached(RoutingTarget target, int prompt, int response, int? cached)
+    {
+        return new ActivityLogEntry(
+            DateTimeOffset.UtcNow,
+            target,
+            "llama3",
+            prompt,
+            prompt,
+            response,
+            100,
+            200,
+            true,
+            CachedInputTokens: cached);
+    }
+
     [Fact]
     public void GetSnapshot_NoData_ReturnsZeros()
     {
@@ -81,6 +96,93 @@ public class ActivityStatisticsServiceTests : IDisposable
         Assert.Equal(3, snapshot.TodayTotal.Requests);
         Assert.Equal(350, snapshot.TodayTotal.InputTokens);
         Assert.Equal(60, snapshot.TodayTotal.OutputTokens);
+    }
+
+    [Fact]
+    public void Add_WithCachedInputTokens_AggregatesCachedPerTargetAndTotal()
+    {
+        var sut = CreateSut();
+
+        sut.Add(EntryWithCached(RoutingTarget.Local, prompt: 1000, response: 100, cached: 800));
+        sut.Add(EntryWithCached(RoutingTarget.Local, prompt: 500, response: 50, cached: 100));
+        sut.Add(EntryWithCached(RoutingTarget.Remote, prompt: 200, response: 30, cached: null));
+
+        var snapshot = sut.GetSnapshot();
+
+        Assert.Equal(900, snapshot.Today[RoutingTarget.Local].CachedInputTokens);
+        Assert.Equal(0, snapshot.Today[RoutingTarget.Remote].CachedInputTokens);
+        Assert.Equal(900, snapshot.TodayTotal.CachedInputTokens);
+        Assert.Equal(900, snapshot.Last7Days[RoutingTarget.Local].CachedInputTokens);
+        Assert.Equal(900, snapshot.Last7DaysTotal.CachedInputTokens);
+    }
+
+    [Fact]
+    public void Add_CachedExceedingPrompt_ClampsToInputTotal()
+    {
+        var sut = CreateSut();
+
+        sut.Add(EntryWithCached(RoutingTarget.Local, prompt: 100, response: 10, cached: 150));
+
+        var snapshot = sut.GetSnapshot();
+
+        Assert.Equal(100, snapshot.Today[RoutingTarget.Local].CachedInputTokens);
+    }
+
+    [Fact]
+    public void Save_WritesCachedTokenCounterToJsonFile()
+    {
+        var sut = CreateSut();
+
+        sut.Add(EntryWithCached(RoutingTarget.Local, prompt: 1000, response: 100, cached: 800));
+        sut.Save();
+        WaitForPendingSaves();
+
+        var persisted = File.ReadAllText(statsFilePath);
+        Assert.Contains("\"TotalCachedInputTokens\": 800", persisted);
+    }
+
+    [Fact]
+    public void Statistics_CachedTokens_RoundTripAcrossInstances()
+    {
+        var first = CreateSut();
+        first.Add(EntryWithCached(RoutingTarget.Remote, prompt: 1000, response: 100, cached: 700));
+        first.Save();
+        WaitForPendingSaves();
+
+        var second = CreateSut();
+        second.Add(EntryWithCached(RoutingTarget.Remote, prompt: 100, response: 10, cached: 50));
+        WaitForPendingSaves();
+
+        var snapshot = second.GetSnapshot();
+
+        Assert.Equal(1100, snapshot.Today[RoutingTarget.Remote].InputTokens);
+        Assert.Equal(750, snapshot.Today[RoutingTarget.Remote].CachedInputTokens);
+    }
+
+    [Fact]
+    public void Load_LegacyFileWithoutCachedField_DefaultsToZero()
+    {
+        var today = DateTime.Now.Date;
+        var days = new List<ActivityStatisticsDate>
+        {
+            new()
+            {
+                Date = today,
+                Statistics =
+                {
+                    [RoutingTarget.Local] = new ActivityStatisticsEntry { TotalRequests = 1, TotalInputTokens = 1000, TotalOutputTokens = 100 }
+                }
+            }
+        };
+        // No TotalCachedInputTokens property in the persisted JSON (legacy file).
+        File.WriteAllText(statsFilePath, JsonSerializer.Serialize(days, new JsonSerializerOptions { IncludeFields = true }));
+
+        var sut = CreateSut();
+
+        var snapshot = sut.GetSnapshot();
+
+        Assert.Equal(1000, snapshot.Today[RoutingTarget.Local].InputTokens);
+        Assert.Equal(0, snapshot.Today[RoutingTarget.Local].CachedInputTokens);
     }
 
     [Fact]

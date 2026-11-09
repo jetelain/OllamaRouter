@@ -1293,6 +1293,124 @@ public class MonitorEndpointsExtensionsTests
         Assert.Equal(2.00, result.CloudOverflowCost);
     }
 
+    // Builds a single-Local-target (no Cloud) last7Days dictionary for the cost-math table.
+    private static Dictionary<RoutingTarget, ActivityStatisticsTotals> LocalOnly(int requests, int input, int output, int cached)
+    {
+        var dict = new Dictionary<RoutingTarget, ActivityStatisticsTotals>
+        {
+            [RoutingTarget.Local] = new(requests, input, output, cached)
+        };
+        if (RoutingTarget.Cloud != RoutingTarget.Local)
+        {
+            dict[RoutingTarget.Cloud] = new(0, 0, 0, 0);
+        }
+        return dict;
+    }
+
+    [Fact]
+    public void CalculateCostStatus_NoCachedTokens_SameAsPreChangeMath()
+    {
+        var pricing = new PricingOptions { PromptPricePerMillion = 0.20, CachedPromptPricePerMillion = 0.05, CompletionPricePerMillion = 0.80 };
+
+        var result = MonitorEndpointsExtensions.CalculateCostStatus(LocalOnly(1, 1_000, 100, 0), pricing);
+
+        Assert.NotNull(result);
+        // (1000 * 0.20 + 100 * 0.80) / 1e6 = 0.00028 -> 0.0003
+        Assert.Equal(0.0003, result.EstimatedSavings);
+    }
+
+    [Fact]
+    public void CalculateCostStatus_CachedPriceSet_SpecExampleRoundsTo0002()
+    {
+        var pricing = new PricingOptions { PromptPricePerMillion = 0.20, CachedPromptPricePerMillion = 0.05, CompletionPricePerMillion = 0.80 };
+
+        var result = MonitorEndpointsExtensions.CalculateCostStatus(LocalOnly(1, 1_000, 100, 800), pricing);
+
+        Assert.NotNull(result);
+        // (200*0.20 + 800*0.05 + 100*0.80)/1e6 = 0.00016 -> 0.0002 (4-dec rounding).
+        Assert.Equal(0.0002, result.EstimatedSavings);
+        Assert.Equal(0.0002, result.PerTargetSavings["Local"]);
+    }
+
+    [Fact]
+    public void CalculateCostStatus_CachedPriceSet_ScaledExact016()
+    {
+        var pricing = new PricingOptions { PromptPricePerMillion = 0.20, CachedPromptPricePerMillion = 0.05, CompletionPricePerMillion = 0.80 };
+
+        var result = MonitorEndpointsExtensions.CalculateCostStatus(LocalOnly(1, 1_000_000, 100_000, 800_000), pricing);
+
+        Assert.NotNull(result);
+        // (200000*0.20 + 800000*0.05 + 100000*0.80)/1e6 = exactly 0.16.
+        Assert.Equal(0.16, result.EstimatedSavings);
+    }
+
+    [Fact]
+    public void CalculateCostStatus_CachedPriceUnset_FallsBackToInputPrice()
+    {
+        var pricing = new PricingOptions { PromptPricePerMillion = 0.20, CompletionPricePerMillion = 0.80 };
+
+        var result = MonitorEndpointsExtensions.CalculateCostStatus(LocalOnly(1, 1_000, 100, 800), pricing);
+
+        Assert.NotNull(result);
+        // All 1000 input tokens valued at the input price: (1000*0.20 + 100*0.80)/1e6 = 0.00028 -> 0.0003.
+        Assert.Equal(0.0003, result.EstimatedSavings);
+    }
+
+    [Fact]
+    public void CalculateCostStatus_FlatPriceOnly_CachedFallsBackToFlat()
+    {
+        var pricing = new PricingOptions { PricePerMillion = 1.00 };
+
+        var result = MonitorEndpointsExtensions.CalculateCostStatus(LocalOnly(1, 1_000, 100, 800), pricing);
+
+        Assert.NotNull(result);
+        // (200 + 800 + 100) * 1.0 / 1e6 = 0.0011.
+        Assert.Equal(0.0011, result.EstimatedSavings);
+    }
+
+    [Fact]
+    public void CalculateCostStatus_AllZeroPricing_ReturnsZeroCostObject()
+    {
+        var pricing = new PricingOptions { PromptPricePerMillion = 0.0, CachedPromptPricePerMillion = 0.0, CompletionPricePerMillion = 0.0 };
+
+        var result = MonitorEndpointsExtensions.CalculateCostStatus(LocalOnly(1, 1_000, 100, 800), pricing);
+
+        // IsConfigured true (all rates present and >= 0) => cost object present with zeros.
+        Assert.NotNull(result);
+        Assert.Equal(0.0, result.EstimatedSavings);
+        Assert.Equal(0.0, result.CloudOverflowCost);
+    }
+
+    [Fact]
+    public void CalculateCostStatus_CachedExceedsInput_ClampsAndNeverNegative()
+    {
+        var pricing = new PricingOptions { PromptPricePerMillion = 0.20, CachedPromptPricePerMillion = 0.05, CompletionPricePerMillion = 0.80 };
+
+        // Corrupt stats: input 100, cached 150 -> clamped to 100; value = 100*0.05/1e6 = 0.000005 -> 0.0.
+        var result = MonitorEndpointsExtensions.CalculateCostStatus(LocalOnly(1, 100, 0, 150), pricing);
+
+        Assert.NotNull(result);
+        Assert.Equal(0.0, result.EstimatedSavings);
+    }
+
+    [Fact]
+    public void CalculateCostStatus_CachedPrice_AppliesToCloudOverflowCost()
+    {
+        var last7Days = new Dictionary<RoutingTarget, ActivityStatisticsTotals>
+        {
+            [RoutingTarget.Cloud] = new(1, 1_000_000, 100_000, 800_000)
+        };
+
+        var pricing = new PricingOptions { PromptPricePerMillion = 0.20, CachedPromptPricePerMillion = 0.05, CompletionPricePerMillion = 0.80 };
+
+        var result = MonitorEndpointsExtensions.CalculateCostStatus(last7Days, pricing);
+
+        Assert.NotNull(result);
+        // Cloud overflow cost also uses the cached split: exactly 0.16.
+        Assert.Equal(0.16, result.CloudOverflowCost);
+        Assert.Equal(0.0, result.EstimatedSavings);
+    }
+
     [Fact]
     public void CalculateOverheadStatus_NoValidSamples_ReturnsNullOverallFactor()
     {

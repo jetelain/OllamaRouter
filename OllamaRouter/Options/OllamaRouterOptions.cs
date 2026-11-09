@@ -981,6 +981,24 @@ public sealed class PricingOptions
     }
 
     /// <summary>
+    /// Price per 1,000,000 cached prompt / input tokens (the prompt-cache-hit subset of
+    /// <see cref="PromptPricePerMillion"/>). Cloud providers price cached input tokens cheaper
+    /// than fresh input tokens (e.g. 0.05 for $0.05 / 1M cached tokens). Null (default) means
+    /// the cached rate is NOT differentiated: cached tokens fall back to
+    /// <c>PromptPricePerMillion ?? PricePerMillion</c>. Alias: <see cref="CachedInputPricePerMillion"/>.
+    /// </summary>
+    public double? CachedPromptPricePerMillion { get; set; }
+
+    /// <summary>
+    /// Alias for CachedPromptPricePerMillion.
+    /// </summary>
+    public double? CachedInputPricePerMillion
+    {
+        get => CachedPromptPricePerMillion;
+        set => CachedPromptPricePerMillion = value;
+    }
+
+    /// <summary>
     /// Flat price per 1,000,000 tokens when input and output prices are not differentiated.
     /// </summary>
     public double? PricePerMillion { get; set; }
@@ -996,6 +1014,7 @@ public sealed class PricingOptions
     public bool IsConfigured =>
         (PromptPricePerMillion.HasValue && PromptPricePerMillion.Value >= 0) ||
         (CompletionPricePerMillion.HasValue && CompletionPricePerMillion.Value >= 0) ||
+        (CachedPromptPricePerMillion.HasValue && CachedPromptPricePerMillion.Value >= 0) ||
         (PricePerMillion.HasValue && PricePerMillion.Value >= 0);
 }
 

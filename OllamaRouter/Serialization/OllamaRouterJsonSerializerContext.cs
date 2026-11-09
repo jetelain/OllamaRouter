@@ -144,6 +144,7 @@ namespace OllamaRouter.Serialization;
  [JsonSerializable(typeof(OpenAiStreamChunkDeltaDto))]
  [JsonSerializable(typeof(OpenAiUsageDto))]
  [JsonSerializable(typeof(OpenAiCompletionTokensDetailsDto))]
+ [JsonSerializable(typeof(OpenAiPromptTokensDetailsDto))]
  [JsonSerializable(typeof(OpenAiErrorResponseDto))]
  [JsonSerializable(typeof(OpenAiErrorDetailDto))]
  // Outbound Ollama IChatClient wire DTOs (task #61: the router's own /api/chat client).

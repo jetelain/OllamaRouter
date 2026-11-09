@@ -114,7 +114,8 @@ public static class RouterConfigEndpoints
                 pricing.PromptPricePerMillion,
                 pricing.CompletionPricePerMillion,
                 pricing.PricePerMillion,
-                pricing.Currency),
+                pricing.Currency,
+                pricing.CachedPromptPricePerMillion),
             new ApiSecurityConfigDto(
                 options.ApiSecurity.RequireKeyForAllEndpoints,
                 options.ApiSecurity.DefaultKeyRotationHours));
@@ -215,6 +216,7 @@ public static class RouterConfigEndpoints
         if (request.Pricing is { } pricing &&
             ((pricing.PromptPricePerMillion is { } prompt && prompt < 0) ||
              (pricing.CompletionPricePerMillion is { } completion && completion < 0) ||
+             (pricing.CachedPromptPricePerMillion is { } cached && cached < 0) ||
              (pricing.PricePerMillion is { } flat && flat < 0) ||
              string.IsNullOrWhiteSpace(pricing.Currency)))
         {

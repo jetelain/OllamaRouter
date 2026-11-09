@@ -24,7 +24,10 @@ public interface IActivityStatisticsService
 public sealed record ActivityStatisticsTotals(
     [property: JsonPropertyName("requests")] int Requests,
     [property: JsonPropertyName("inputTokens")] int InputTokens,
-    [property: JsonPropertyName("outputTokens")] int OutputTokens);
+    [property: JsonPropertyName("outputTokens")] int OutputTokens,
+    // Total cached prompt tokens (a subset of InputTokens); appended at the END as an optional
+    // last parameter to keep the ~74 positional construction sites source-compatible.
+    [property: JsonPropertyName("cachedInputTokens")] int CachedInputTokens = 0);
 
 /// <summary>
 /// Read-only snapshot of the persisted activity statistics.

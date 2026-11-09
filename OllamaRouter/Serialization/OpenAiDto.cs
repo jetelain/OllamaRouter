@@ -329,6 +329,19 @@ public sealed class OpenAiUsageDto
 
     [JsonPropertyName("completion_tokens_details")]
     public OpenAiCompletionTokensDetailsDto? CompletionTokensDetails { get; set; }
+
+    [JsonPropertyName("prompt_tokens_details")]
+    public OpenAiPromptTokensDetailsDto? PromptTokensDetails { get; set; }
+}
+
+/// <summary>
+/// <c>{"cached_tokens": n}</c> (a subset of <c>prompt_tokens</c>; cached prompt tokens,
+/// DeepSeek / vLLM / OpenAI prompt-cache breakdown).
+/// </summary>
+public sealed class OpenAiPromptTokensDetailsDto
+{
+    [JsonPropertyName("cached_tokens")]
+    public long? CachedTokens { get; set; }
 }
 
 /// <summary><c>{"reasoning_tokens": n}</c> (DeepSeek / vLLM / OpenAI reasoning breakdown).</summary>

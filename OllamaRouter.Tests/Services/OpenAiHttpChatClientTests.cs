@@ -327,6 +327,47 @@ public class OpenAiHttpChatClientTests
     }
 
     [Fact]
+    public async Task GetResponseAsync_WithPromptTokensDetailsCached_MapsCachedInputTokenCount()
+    {
+        var handler = new FakeOpenAiHandler("""
+            {
+                "id": "chatcmpl-2",
+                "model": "vllm-llama",
+                "choices": [{ "index": 0, "message": { "role": "assistant", "content": "ok" }, "finish_reason": "stop" }],
+                "usage": { "prompt_tokens": 1000, "prompt_tokens_details": { "cached_tokens": 800 }, "completion_tokens": 100, "total_tokens": 1100 }
+            }
+            """);
+        var client = CreateClient(handler, apiKey: null);
+
+        var response = await client.GetResponseAsync([new ChatMessage(ChatRole.User, "hi")]);
+
+        Assert.NotNull(response.Usage);
+        Assert.Equal(1000, response.Usage!.InputTokenCount);
+        Assert.Equal(100, response.Usage.OutputTokenCount);
+        Assert.Equal(800, response.Usage.CachedInputTokenCount);
+    }
+
+    [Fact]
+    public async Task GetResponseAsync_WithoutPromptTokensDetails_LeavesCachedInputTokenCountNull()
+    {
+        var handler = new FakeOpenAiHandler("""
+            {
+                "id": "chatcmpl-3",
+                "model": "vllm-llama",
+                "choices": [{ "index": 0, "message": { "role": "assistant", "content": "ok" }, "finish_reason": "stop" }],
+                "usage": { "prompt_tokens": 1000, "completion_tokens": 100, "total_tokens": 1100 }
+            }
+            """);
+        var client = CreateClient(handler, apiKey: null);
+
+        var response = await client.GetResponseAsync([new ChatMessage(ChatRole.User, "hi")]);
+
+        Assert.NotNull(response.Usage);
+        Assert.Equal(1000, response.Usage!.InputTokenCount);
+        Assert.Null(response.Usage.CachedInputTokenCount);
+    }
+
+    [Fact]
     public async Task GetResponseAsync_ParsesToolCalls_Into_FunctionCallContent()
     {
         var handler = new FakeOpenAiHandler("""

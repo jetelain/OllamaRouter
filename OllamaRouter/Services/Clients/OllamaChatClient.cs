@@ -689,7 +689,7 @@ public sealed class OllamaChatClient : IChatClient
 
     private static UsageDetails? MapUsage(OllamaChatStreamChunkDto chunk)
     {
-        if (chunk.PromptEvalCount is null && chunk.EvalCount is null)
+        if (chunk.PromptEvalCount is null && chunk.EvalCount is null && chunk.PromptEvalCachedCount is null)
         {
             return null;
         }
@@ -698,6 +698,7 @@ public sealed class OllamaChatClient : IChatClient
         {
             InputTokenCount = chunk.PromptEvalCount,
             OutputTokenCount = chunk.EvalCount,
+            CachedInputTokenCount = chunk.PromptEvalCachedCount,
             TotalTokenCount = chunk.PromptEvalCount.HasValue || chunk.EvalCount.HasValue
                 ? (chunk.PromptEvalCount ?? 0) + (chunk.EvalCount ?? 0)
                 : null,

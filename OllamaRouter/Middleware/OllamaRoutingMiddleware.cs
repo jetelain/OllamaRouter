@@ -1320,7 +1320,7 @@ public sealed class OllamaRoutingMiddleware(
 
 
 
-            var (actualPromptTokens, actualResponseTokens) = TryExtractActualTokens(capturingStream.CapturedTail);
+            var (actualPromptTokens, actualCachedInputTokens, actualResponseTokens) = TryExtractActualTokens(capturingStream.CapturedTail);
             var isStreamCompleted = IsResponseComplete(context, capturingStream.CapturedTail, actualResponseTokens);
 
             var isInterrupted = !isStreamCompleted;
@@ -1369,7 +1369,8 @@ public sealed class OllamaRoutingMiddleware(
                 rawTokenCount,
                 reasoningEffort,
                 rawSessionId,
-                rawAgentId);
+                rawAgentId,
+                actualCachedInputTokens);
 
 
             activityMonitor.CompleteRequest(requestId, entry);
@@ -2170,16 +2171,19 @@ public sealed class OllamaRoutingMiddleware(
         return capturedTail.TrimEnd().EndsWith('}');
     }
 
-    private static (int? PromptTokens, int? ResponseTokens) TryExtractActualTokens(string capturedTail)
+    private static (int? PromptTokens, int? CachedInputTokens, int? ResponseTokens) TryExtractActualTokens(string capturedTail)
     {
         if (string.IsNullOrWhiteSpace(capturedTail))
         {
-            return (null, null);
+            return (null, null, null);
         }
 
         // The last NDJSON line of /api/chat and /api/generate responses carries "prompt_eval_count"
-        // and "eval_count". OpenAI-compatible (SSE) responses instead carry a "usage" object with
-        // "prompt_tokens" and "completion_tokens" in the final "data:" block before "data: [DONE]".
+        // (total prompt size, cached tokens INCLUSIVE per Ollama docs), "prompt_eval_cached_count"
+        // (absent ⇒ 0 cached) and "eval_count". OpenAI-compatible (SSE) responses instead carry a
+        // "usage" object with "prompt_tokens" (cached INCLUSIVE),
+        // "prompt_tokens_details.cached_tokens" (absent ⇒ 0 cached) and "completion_tokens" in the
+        // final "data:" block before "data: [DONE]".
         foreach (var line in capturedTail.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Reverse())
         {
             var json = line;
@@ -2200,11 +2204,17 @@ public sealed class OllamaRoutingMiddleware(
                 var root = document.RootElement;
 
                 int? promptTokens = null;
+                int? cachedInputTokens = null;
                 int? responseTokens = null;
 
                 if (root.TryGetProperty("prompt_eval_count", out var promptEvalCount) && promptEvalCount.TryGetInt32(out var promptCount))
                 {
                     promptTokens = promptCount;
+                }
+
+                if (root.TryGetProperty("prompt_eval_cached_count", out var promptEvalCachedCount) && promptEvalCachedCount.TryGetInt32(out var cachedCount))
+                {
+                    cachedInputTokens = cachedCount;
                 }
 
                 if (root.TryGetProperty("eval_count", out var evalCount) && evalCount.TryGetInt32(out var count))
@@ -2223,11 +2233,29 @@ public sealed class OllamaRoutingMiddleware(
                     {
                         responseTokens = completionCount;
                     }
+
+                    if (cachedInputTokens is null &&
+                        usage.TryGetProperty("prompt_tokens_details", out var promptTokensDetails) &&
+                        promptTokensDetails.ValueKind == JsonValueKind.Object &&
+                        promptTokensDetails.TryGetProperty("cached_tokens", out var cachedTokens) &&
+                        cachedTokens.TryGetInt32(out var cachedTokensValue))
+                    {
+                        cachedInputTokens = cachedTokensValue;
+                    }
                 }
 
                 if (promptTokens is not null || responseTokens is not null)
                 {
-                    return (promptTokens, responseTokens);
+                    // A line that yields prompt/response counts is the terminal usage frame:
+                    // an ABSENT cached count means the target saw 0 cached tokens.
+                    cachedInputTokens ??= 0;
+                    // Defensively clamp cached ≤ total (cached is a subset of the total input).
+                    if (promptTokens is not null && cachedInputTokens > promptTokens)
+                    {
+                        cachedInputTokens = promptTokens;
+                    }
+
+                    return (promptTokens, cachedInputTokens, responseTokens);
                 }
             }
             catch (JsonException)
@@ -2236,7 +2264,7 @@ public sealed class OllamaRoutingMiddleware(
             }
         }
 
-        return (null, null);
+        return (null, null, null);
     }
 
     private static async Task<string> ReadBodyAsync(HttpRequest request)

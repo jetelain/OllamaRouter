@@ -250,6 +250,207 @@ internal static class MonitorScenarios
         }
     });
 
+    /// <summary>
+    /// Task #83: cached prompt-token capture + pricing + cost math, best-effort end-to-end.
+    /// Repeats a long IDENTICAL prefix twice over native <c>/api/chat</c> (streaming) to attempt a
+    /// prompt-cache hit, then reads <c>GET /monitor/api</c>. When the live daemon actually reported
+    /// a cache hit (target stat <c>cachedInputTokens > 0</c>), the count is a subset of
+    /// <c>inputTokens</c>. When no hit was observed (non-flaky: KV-cache dependent) a notice is
+    /// printed and the read-only portion passes. When <c>OLLAMAROUTER_E2E_API_KEY</c> is set the
+    /// scenario additionally <c>PUT</c>s a cached prompt-token rate (snapshot/restore), and verifies
+    /// the <c>cost</c> status applies the cached split to the observed per-target statistics.
+    /// </summary>
+    public static Scenario CachedTokenPricing() => new("Monitor cost math applies cached prompt-token pricing (task #83)", async config =>
+    {
+        using var http = new HttpClient { BaseAddress = new Uri(config.RouterUrl) };
+
+        // 1. Attempt a prompt-cache hit: repeat the SAME long prefix twice over native /api/chat.
+        var prefix = new string('x', 400) + " Explain cached prompt tokens in Ollama. ";
+        for (var i = 0; i < 2; i++)
+        {
+            var warmPayload = JsonSerializer.Serialize(new
+            {
+                model = config.ModelName,
+                stream = true,
+                messages = new[] { new { role = "user", content = prefix } }
+            });
+            using var warmContent = new StringContent(warmPayload, Encoding.UTF8, "application/json");
+            var warm = await http.PostAsync("/api/chat", warmContent);
+            if (!warm.IsSuccessStatusCode)
+            {
+                return $"Expected 200 from POST /api/chat (warm-up {i + 1}), got {(int)warm.StatusCode} {warm.ReasonPhrase}.";
+            }
+
+            await warm.Content.ReadAsStringAsync();
+        }
+
+        // 2. GET /monitor/api: read the target statistics.
+        var monitor = await GetMonitorJsonAsync(http);
+        if (monitor is null)
+        {
+            return "Failed to read /monitor/api after warm-up chats.";
+        }
+
+        // 3. Consistency: whenever the daemon reported a cache hit, cachedInputTokens is a subset
+        //    of inputTokens (never exceeds it). Non-flaky: no hit observed ⇒ notice + pass.
+        var hitObserved = false;
+        foreach (var (name, stat) in PeriodEntries(monitor, "last7Days"))
+        {
+            var cached = stat?["cachedInputTokens"]?.GetValue<int>() ?? 0;
+            var input = stat?["inputTokens"]?.GetValue<int>() ?? 0;
+            if (cached > input)
+            {
+                return $"Target '{name}' reports cachedInputTokens ({cached}) > inputTokens ({input}).";
+            }
+
+            if (cached > 0)
+            {
+                hitObserved = true;
+            }
+        }
+
+        Console.WriteLine(hitObserved
+            ? "  [cache] live daemon reported a prompt-cache hit (cachedInputTokens > 0)."
+            : "  [cache] no prompt-cache hit observed this run (KV-cache dependent); skipping hit assertion.");
+
+        // 4. When an API key is supplied: PUT a cached prompt-token rate (snapshot/restore) and
+        //    verify the cost status applies the cached split to the observed statistics.
+        if (config.ApiKey.Length == 0)
+        {
+            return null; // read-only portion satisfied; config manipulation is opt-in.
+        }
+
+        var (snapshotOk, snapshot) = await GetConfigAsync(http, config.ApiKey);
+        if (!snapshotOk || snapshot is null)
+        {
+            return "Could not snapshot /api/router/config (API key) before the cached-pricing PUT.";
+        }
+
+        var pricingModified = false;
+        try
+        {
+            var putBody = new JsonObject
+            {
+                ["pricing"] = new JsonObject
+                {
+                    ["promptPricePerMillion"] = 0.20,
+                    ["completionPricePerMillion"] = 0.80,
+                    ["cachedPromptPricePerMillion"] = 0.05,
+                    ["currency"] = "$"
+                }
+            };
+            var (putOk, putDoc, putStatus) = await ConfigRequestAsync(http, "PUT", "/api/router/config", putBody, config.ApiKey);
+            if (!putOk)
+            {
+                return $"PUT /api/router/config (cached pricing) failed with HTTP {(int)putStatus}.";
+            }
+
+            // From here on the live config differs from the snapshot: restore it in the
+            // finally block even when a later assertion fails (snapshot/restore contract).
+            pricingModified = true;
+
+            if (putDoc?["config"]?["pricing"]?["cachedPromptPricePerMillion"]?.GetValue<double>() != 0.05)
+            {
+                return "PUT /api/router/config did not echo cachedPromptPricePerMillion = 0.05.";
+            }
+
+            // Re-read the monitor: the cost object must now be present (pricing configured) and
+            // its per-target savings must match the cached split formula on the observed stats.
+            var monitor2 = await GetMonitorJsonAsync(http);
+            if (monitor2?["cost"] is null)
+            {
+                return "Expected a 'cost' object in /monitor/api after configuring pricing.";
+            }
+
+            foreach (var (name, stat) in PeriodEntries(monitor2, "last7Days"))
+            {
+                if (string.Equals(name, "total", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(name, "Cloud", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var input = stat?["inputTokens"]?.GetValue<int>() ?? 0;
+                var cached = stat?["cachedInputTokens"]?.GetValue<int>() ?? 0;
+                var output = stat?["outputTokens"]?.GetValue<int>() ?? 0;
+                var expected = Math.Round((input - cached) / 1_000_000.0 * 0.20 +
+                                          cached / 1_000_000.0 * 0.05 +
+                                          output / 1_000_000.0 * 0.80, 4);
+                var actual = monitor2["cost"]!["perTargetSavings"]![name]?.GetValue<double>();
+                if (actual is null || Math.Abs(actual.Value - expected) > 1e-9)
+                {
+                    return $"cost.perTargetSavings['{name}'] = {actual} does not match the cached-split formula ({expected}).";
+                }
+            }
+
+            return null;
+        }
+        finally
+        {
+            if (pricingModified)
+            {
+                // Restore the original pricing section (or clear it when it was unset).
+                var originalPricing = snapshot?["pricing"];
+                var restoreBody = new JsonObject
+                {
+                    ["pricing"] = originalPricing ?? (JsonNode)new JsonObject()
+                };
+                _ = await ConfigRequestAsync(http, "PUT", "/api/router/config", restoreBody, config.ApiKey);
+            }
+        }
+    });
+
+    private static async Task<JsonNode?> GetMonitorJsonAsync(HttpClient http)
+    {
+        var response = await http.GetAsync("/monitor/api");
+        if (!response.IsSuccessStatusCode)
+        {
+            return null;
+        }
+
+        return JsonNode.Parse(await response.Content.ReadAsStringAsync());
+    }
+
+    private static IEnumerable<(string Name, JsonNode? Stat)> PeriodEntries(JsonNode monitor, string period)
+    {
+        var bucket = monitor["statistics"]![period] as JsonObject;
+        if (bucket is null)
+        {
+            yield break;
+        }
+
+        foreach (var pair in bucket)
+        {
+            yield return (pair.Key, pair.Value);
+        }
+    }
+
+    private static (bool Ok, JsonNode? Body) GetConfigResult(HttpStatusCode status, JsonNode? body) =>
+        (status == HttpStatusCode.OK, body);
+
+    private static async Task<(bool Ok, JsonNode? Body)> GetConfigAsync(HttpClient http, string apiKey)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, "/api/router/config");
+        request.Headers.Add("X-Api-Key", apiKey);
+        using var response = await http.SendAsync(request);
+        return GetConfigResult(response.StatusCode, JsonNode.Parse(await response.Content.ReadAsStringAsync()));
+    }
+
+    private static async Task<(bool Ok, JsonNode? Body, HttpStatusCode Status)> ConfigRequestAsync(
+        HttpClient http, string method, string path, JsonNode? body, string apiKey)
+    {
+        var request = new HttpRequestMessage(new HttpMethod(method), path);
+        request.Headers.Add("X-Api-Key", apiKey);
+        if (body is not null)
+        {
+            request.Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
+        }
+
+        using var response = await http.SendAsync(request);
+        var parsed = JsonNode.Parse(await response.Content.ReadAsStringAsync());
+        return (response.IsSuccessStatusCode, parsed, response.StatusCode);
+    }
+
     private static async Task<(bool Local, bool Remote, bool Cloud)> GetCurrentTargetsAsync(HttpClient http)
     {
         var response = await http.GetAsync("/monitor/api");

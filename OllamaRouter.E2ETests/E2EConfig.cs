@@ -35,6 +35,14 @@ internal sealed class E2EConfig
     /// </summary>
     public string[] ExpectedTargets { get; init; } = [];
 
+    /// <summary>
+    /// Optional router API key (OLLAMAROUTER_E2E_API_KEY). When set, the cached-token pricing
+    /// scenario additionally <c>PUT</c>s the cached rate (a config-affecting, key-protected
+    /// endpoint) and restores it afterward; when unset the scenario only exercises the public
+    /// read-only <c>GET /monitor/api</c> surface.
+    /// </summary>
+    public string ApiKey { get; init; } = "";
+
     public static E2EConfig FromEnvironment()
     {
         var expectedTargets = Environment.GetEnvironmentVariable("OLLAMAROUTER_E2E_MESH_TARGETS") is { Length: > 0 } targets
@@ -53,7 +61,10 @@ internal sealed class E2EConfig
             RouterUrlB = Environment.GetEnvironmentVariable("OLLAMAROUTER_E2E_MESH_URL_B") is { Length: > 0 } urlB
                 ? urlB
                 : "",
-            ExpectedTargets = expectedTargets
+            ExpectedTargets = expectedTargets,
+            ApiKey = Environment.GetEnvironmentVariable("OLLAMAROUTER_E2E_API_KEY") is { Length: > 0 } apiKey
+                ? apiKey
+                : ""
         };
     }
 }

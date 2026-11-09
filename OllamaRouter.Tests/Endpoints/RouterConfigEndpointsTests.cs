@@ -861,6 +861,73 @@ public class RouterConfigEndpointsTests
     }
 
     [Fact]
+    public async Task GetConfig_Pricing_CachedPromptPricePerMillion_Echoed()
+    {
+        var options = SingleTargetOptions();
+        options.Pricing = new PricingOptions
+        {
+            PromptPricePerMillion = 0.2,
+            CompletionPricePerMillion = 0.8,
+            CachedPromptPricePerMillion = 0.05,
+            Currency = "\u20ac"
+        };
+        await using var harness = await CreateTestAppAsync(options);
+
+        var response = await harness.Client.GetAsync("/api/router/config");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var raw = await response.Content.ReadAsStringAsync();
+        response.Dispose();
+
+        var pricingRoot = (JsonNode.Parse(raw) as JsonObject)!;
+        var pricing = (pricingRoot["pricing"] as JsonObject)!;
+        Assert.Equal(0.2, pricing["promptPricePerMillion"]!.GetValue<double>());
+        Assert.Equal(0.05, pricing["cachedPromptPricePerMillion"]!.GetValue<double>());
+    }
+
+    [Fact]
+    public async Task GetConfig_Pricing_CachedPromptPriceUnset_SerializesAsJsonNull()
+    {
+        var options = SingleTargetOptions();
+        options.Pricing = new PricingOptions { PromptPricePerMillion = 0.2, Currency = "$" };
+        await using var harness = await CreateTestAppAsync(options);
+
+        var response = await harness.Client.GetAsync("/api/router/config");
+        var raw = await response.Content.ReadAsStringAsync();
+        response.Dispose();
+
+        var pricingRoot = (JsonNode.Parse(raw) as JsonObject)!;
+        var pricing = (pricingRoot["pricing"] as JsonObject)!;
+        Assert.Null(pricing["cachedPromptPricePerMillion"]); // JSON null (member present, unset).
+    }
+
+    [Fact]
+    public async Task PutConfig_Pricing_CachedPromptPricePerMillion_PersistedAndApplied()
+    {
+        var options = SingleTargetOptions();
+        await using var harness = await CreateTestAppAsync(options);
+
+        var json = (await PutJsonAsync(
+            harness.Client,
+            "/api/router/config",
+            """{"pricing": { "promptPricePerMillion": 0.2, "completionPricePerMillion": 0.8, "cachedPromptPricePerMillion": 0.05, "currency": "$" }}""")) as JsonObject;
+        Assert.NotNull(json);
+        Assert.True(json!["success"]!.GetValue<bool>());
+
+        var echoed = (json["config"]! as JsonObject)!;
+        Assert.Equal(0.05, ((echoed["pricing"]! as JsonObject)!)["cachedPromptPricePerMillion"]!.GetValue<double>());
+
+        // Live in-memory application (no restart).
+        var pricing = harness.Options.CurrentValue.Pricing!;
+        Assert.Equal(0.05, pricing.CachedPromptPricePerMillion);
+        Assert.Equal(0.05, pricing.CachedInputPricePerMillion); // alias mirrors.
+
+        // Disk: the field was written in the documented PascalCase shape.
+        var file = ReadConfigFile(harness);
+        var router = (JsonObject)file["OllamaRouter"]!;
+        Assert.Equal(0.05, ((JsonObject)router["Pricing"]!)["CachedPromptPricePerMillion"]!.GetValue<double>());
+    }
+
+    [Fact]
     public async Task PutConfig_PartialUpdate_TouchesOnlyProvidedSections()
     {
         var options = SingleTargetOptions();
@@ -989,6 +1056,7 @@ public class RouterConfigEndpointsTests
     [InlineData("""{"recording": { "enabled": true, "maxFiles": -5 }}""")]
     [InlineData("""{"resilience": { "maxConsecutiveFailures": -1, "consecutiveFailuresTokenTolerance": 4000 }}""")]
     [InlineData("""{"pricing": { "promptPricePerMillion": 0.1, "currency": "" }}""")]
+    [InlineData("""{"pricing": { "cachedPromptPricePerMillion": -0.05, "currency": "$" }}""")]
     public async Task PutConfig_NegativeValues_400(string body)
     {
         var options = SingleTargetOptions();

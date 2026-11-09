@@ -235,6 +235,10 @@ public sealed class OllamaChatStreamChunkDto
     [JsonPropertyName("prompt_eval_count")]
     public int? PromptEvalCount { get; set; }
 
+    /// <summary>Cached prompt tokens (a subset of <see cref="PromptEvalCount"/>, absent ⇒ none cached).</summary>
+    [JsonPropertyName("prompt_eval_cached_count")]
+    public int? PromptEvalCachedCount { get; set; }
+
     [JsonPropertyName("eval_count")]
     public int? EvalCount { get; set; }
 

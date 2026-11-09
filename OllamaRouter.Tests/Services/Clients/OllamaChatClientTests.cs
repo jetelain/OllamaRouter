@@ -108,6 +108,52 @@ public class OllamaChatClientTests
     }
 
     [Fact]
+    public async Task GetStreamingResponse_WithPromptEvalCachedCount_MapsCachedInputTokenCount()
+    {
+        const string payload =
+            """
+            {"model":"llama3","message":{"role":"assistant","content":"ok"},"done":false}
+            {"model":"llama3","done":true,"done_reason":"stop","prompt_eval_count":1000,"prompt_eval_cached_count":800,"eval_count":100}
+            """;
+        var handler = new FakeOllamaHandler(
+            new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(payload, Encoding.UTF8, "application/x-ndjson")
+            });
+
+        using var client = CreateClient(handler);
+        var updates = await client.GetStreamingResponseAsync([new ChatMessage(ChatRole.User, "hi")],
+            new ChatOptions { ModelId = "llama3" }).ToListAsync();
+
+        var usage = updates.Last(u => u.Contents.OfType<UsageContent>().Any()).Contents.OfType<UsageContent>().Single().Details;
+        Assert.Equal(1000, usage.InputTokenCount);
+        Assert.Equal(100, usage.OutputTokenCount);
+        Assert.Equal(800, usage.CachedInputTokenCount);
+    }
+
+    [Fact]
+    public async Task GetStreamingResponse_WithoutPromptEvalCachedCount_LeavesCachedInputTokenCountNull()
+    {
+        const string payload =
+            """
+            {"model":"llama3","done":true,"done_reason":"stop","prompt_eval_count":1000,"eval_count":100}
+            """;
+        var handler = new FakeOllamaHandler(
+            new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(payload, Encoding.UTF8, "application/x-ndjson")
+            });
+
+        using var client = CreateClient(handler);
+        var updates = await client.GetStreamingResponseAsync([new ChatMessage(ChatRole.User, "hi")],
+            new ChatOptions { ModelId = "llama3" }).ToListAsync();
+
+        var usage = updates.Last(u => u.Contents.OfType<UsageContent>().Any()).Contents.OfType<UsageContent>().Single().Details;
+        Assert.Equal(1000, usage.InputTokenCount);
+        Assert.Null(usage.CachedInputTokenCount);
+    }
+
+    [Fact]
     public async Task GetStreamingResponse_KeepAlivePassthroughFlowsIntoOptionsDictionary()
     {
         const string payload = """

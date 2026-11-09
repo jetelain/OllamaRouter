@@ -356,6 +356,7 @@ public sealed class RouterConfigPersistence : IRouterConfigPersistence
                 pricingNode["CompletionPricePerMillion"] = pricing.CompletionPricePerMillion;
                 pricingNode["PricePerMillion"] = pricing.PricePerMillion;
                 pricingNode["Currency"] = pricing.Currency;
+                pricingNode["CachedPromptPricePerMillion"] = pricing.CachedPromptPricePerMillion;
             }
 
             var writeResult = await AtomicWriteAsync(root!, cancellationToken).ConfigureAwait(false);
@@ -553,7 +554,8 @@ public sealed class RouterConfigPersistence : IRouterConfigPersistence
                 PromptPricePerMillion = pricing.PromptPricePerMillion,
                 CompletionPricePerMillion = pricing.CompletionPricePerMillion,
                 PricePerMillion = pricing.PricePerMillion,
-                Currency = pricing.Currency
+                Currency = pricing.Currency,
+                CachedPromptPricePerMillion = pricing.CachedPromptPricePerMillion
             };
         }
 

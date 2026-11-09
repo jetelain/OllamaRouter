@@ -161,7 +161,8 @@ public static partial class MonitorEndpointsExtensions
                 r.RawPromptTokens,
                 r.ReasoningEffort,
                 r.SessionId,
-                r.AgentId)).ToList(),
+                r.AgentId,
+                r.CachedInputTokens)).ToList(),
             CalculateCostStatus(statistics.Last7Days, options.CurrentValue.Pricing),
             includeOverhead
                 ? CalculateOverheadStatus(snapshot.RecentRequests, options.CurrentValue.TokenEstimationOverheadFactor, options.CurrentValue.TokenEstimator)
@@ -206,10 +207,14 @@ public static partial class MonitorEndpointsExtensions
 
         var effectiveInputPrice = pricing.PromptPricePerMillion ?? pricing.PricePerMillion ?? 0.0;
         var effectiveOutputPrice = pricing.CompletionPricePerMillion ?? pricing.PricePerMillion ?? 0.0;
+        // Unset cached rate falls back to the effective input price (cached tokens are then
+        // valued at the regular input rate).
+        var effectiveCachedPrice = pricing.CachedPromptPricePerMillion ?? pricing.PromptPricePerMillion ?? pricing.PricePerMillion ?? 0.0;
 
         // Per-target savings: every NON-Cloud target's tokens valued at the effective cloud
         // prices (the same 4-decimal rounding as the totals); the Cloud overflow is excluded
-        // (it is a cost, not a saving).
+        // (it is a cost, not a saving). Cached input tokens (a subset of the total input) are
+        // valued at the cached rate, so a prompt-cache hit saves LESS against the cloud baseline.
         var perTargetSavings = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
         var estimatedSavings = 0.0;
         foreach (var (target, stats) in last7Days)
@@ -219,22 +224,38 @@ public static partial class MonitorEndpointsExtensions
                 continue;
             }
 
-            var targetSavings = (stats.InputTokens / 1_000_000.0 * effectiveInputPrice) +
-                                (stats.OutputTokens / 1_000_000.0 * effectiveOutputPrice);
+            var targetSavings = TokenCost(stats, effectiveInputPrice, effectiveCachedPrice, effectiveOutputPrice);
             targetSavings = Math.Round(targetSavings, 4);
             perTargetSavings[target.Value] = targetSavings;
             estimatedSavings += targetSavings;
         }
 
         var cloudStats = last7Days.GetValueOrDefault(RoutingTarget.Cloud) ?? new ActivityStatisticsTotals(0, 0, 0);
-        var cloudOverflowCost = (cloudStats.InputTokens / 1_000_000.0 * effectiveInputPrice) +
-                                (cloudStats.OutputTokens / 1_000_000.0 * effectiveOutputPrice);
+        var cloudOverflowCost = TokenCost(cloudStats, effectiveInputPrice, effectiveCachedPrice, effectiveOutputPrice);
 
         return new MonitorCostStatus(
             pricing.Currency,
             Math.Round(estimatedSavings, 4),
             Math.Round(cloudOverflowCost, 4),
             perTargetSavings);
+    }
+
+    /// <summary>
+    /// Values one target's token usage against the effective per-1M cloud rates:
+    /// <c>(input − cached) × inputPrice + cached × cachedPrice + output × outputPrice</c>, with
+    /// cached defensively clamped to the total input (never negative, never more than the input).
+    /// Rounding is left to the caller (per-target 4-dec, totals rounded last).
+    /// </summary>
+    internal static double TokenCost(
+        ActivityStatisticsTotals stats,
+        double effectiveInputPrice,
+        double effectiveCachedPrice,
+        double effectiveOutputPrice)
+    {
+        var cached = Math.Clamp(stats.CachedInputTokens, 0, stats.InputTokens);
+        return (stats.InputTokens - cached) / 1_000_000.0 * effectiveInputPrice
+            + cached / 1_000_000.0 * effectiveCachedPrice
+            + stats.OutputTokens / 1_000_000.0 * effectiveOutputPrice;
     }
 
     public static MonitorOverheadStatus CalculateOverheadStatus(

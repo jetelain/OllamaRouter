@@ -65,18 +65,23 @@ public class ActivityStatisticsService : IActivityStatisticsService
         {
             var actualInput = activityLogEntry.ActualPromptTokens ?? activityLogEntry.EstimatedPromptTokens;
 
-            Add(target: activityLogEntry.Target, inputTokens: actualInput, outputTokens: actualOutput.Value);
+            // Cached is a subset of the total input tokens; a missing cached count counts as 0,
+            // and a corrupt cached > input value is clamped to the final input total.
+            var cachedInput = Math.Clamp(activityLogEntry.CachedInputTokens ?? 0, 0, actualInput);
+
+            Add(target: activityLogEntry.Target, inputTokens: actualInput, outputTokens: actualOutput.Value, cachedInputTokens: cachedInput);
         }
     }
 
     // Increments today's counters; all counter reads/writes go through Interlocked, so this
     // is thread-safe even though multiple request-handling threads call it concurrently.
-    private void Add(RoutingTarget target, int inputTokens, int outputTokens)
+    private void Add(RoutingTarget target, int inputTokens, int outputTokens, int cachedInputTokens)
     {
         var current = GetToday()[target];
         Interlocked.Increment(ref current.TotalRequests);
         Interlocked.Add(ref current.TotalInputTokens, inputTokens);
         Interlocked.Add(ref current.TotalOutputTokens, outputTokens);
+        Interlocked.Add(ref current.TotalCachedInputTokens, cachedInputTokens);
 
         SaveThrottled();
     }
@@ -125,7 +130,7 @@ public class ActivityStatisticsService : IActivityStatisticsService
     private Dictionary<RoutingTarget, ActivityStatisticsTotals> AggregateByTarget(IEnumerable<ActivityStatisticsDate> days)
     {
         var totals = targets
-            .ToDictionary(target => target, _ => (Requests: 0, InputTokens: 0, OutputTokens: 0));
+            .ToDictionary(target => target, _ => (Requests: 0, InputTokens: 0, OutputTokens: 0, CachedInputTokens: 0));
 
         foreach (var day in days)
         {
@@ -139,13 +144,14 @@ public class ActivityStatisticsService : IActivityStatisticsService
                 totals[target] = (
                     current.Requests + entry.TotalRequests,
                     current.InputTokens + entry.TotalInputTokens,
-                    current.OutputTokens + entry.TotalOutputTokens);
+                    current.OutputTokens + entry.TotalOutputTokens,
+                    current.CachedInputTokens + entry.TotalCachedInputTokens);
             }
         }
 
         return totals.ToDictionary(
             pair => pair.Key,
-            pair => new ActivityStatisticsTotals(pair.Value.Requests, pair.Value.InputTokens, pair.Value.OutputTokens));
+            pair => new ActivityStatisticsTotals(pair.Value.Requests, pair.Value.InputTokens, pair.Value.OutputTokens, pair.Value.CachedInputTokens));
     }
 
     // Combines a per-target dictionary into a single overall total.
@@ -154,7 +160,8 @@ public class ActivityStatisticsService : IActivityStatisticsService
         return new ActivityStatisticsTotals(
             byTarget.Values.Sum(t => t.Requests),
             byTarget.Values.Sum(t => t.InputTokens),
-            byTarget.Values.Sum(t => t.OutputTokens));
+            byTarget.Values.Sum(t => t.OutputTokens),
+            byTarget.Values.Sum(t => t.CachedInputTokens));
     }
 
     // Returns today's per-target counters, creating a new day bucket under gate when the
@@ -259,6 +266,10 @@ public class ActivityStatisticsEntry
     public int TotalOutputTokens;
     [JsonInclude]
     public int TotalRequests;
+    // Total cached prompt tokens across all requests for this target on this day (a subset of
+    // TotalInputTokens; absent in legacy persisted files ⇒ defaults to 0 on load).
+    [JsonInclude]
+    public int TotalCachedInputTokens;
 }
 
 /// <summary>

@@ -579,6 +579,37 @@ public partial class ProtocolConverterTests
             Assert.Equal("stop", root.GetProperty("done_reason").GetString());
             Assert.False(root.TryGetProperty("prompt_eval_count", out _));
             Assert.False(root.TryGetProperty("eval_count", out _));
+            Assert.False(root.TryGetProperty("prompt_eval_cached_count", out _));
+        }
+
+        [Theory]
+        [InlineData(800)]
+        [InlineData(0)] // 0 included (matches real daemons that report prompt_eval_cached_count: 0).
+        public async Task StreamEnd_WithKnownCachedCount_EmitsPromptEvalCachedCount(int cached)
+        {
+            var usage = new UsageDetails { InputTokenCount = 1000, OutputTokenCount = 100, CachedInputTokenCount = cached };
+
+            var raw = await CapturePipeAsync(writer => _encoder.WriteStreamEndAsync(
+                writer, "m1", usage, TimeSpan.FromSeconds(1), ChatFinishReason.Stop, CancellationToken.None));
+
+            using var doc = JsonDocument.Parse(raw);
+            var root = doc.RootElement;
+            Assert.Equal(1000, root.GetProperty("prompt_eval_count").GetInt32());
+            Assert.Equal(cached, root.GetProperty("prompt_eval_cached_count").GetInt32());
+        }
+
+        [Fact]
+        public async Task StreamEnd_UnknownCachedCount_OmitsPromptEvalCachedCount()
+        {
+            var usage = new UsageDetails { InputTokenCount = 1000, OutputTokenCount = 100 };
+
+            var raw = await CapturePipeAsync(writer => _encoder.WriteStreamEndAsync(
+                writer, "m1", usage, TimeSpan.FromSeconds(1), ChatFinishReason.Stop, CancellationToken.None));
+
+            using var doc = JsonDocument.Parse(raw);
+            var root = doc.RootElement;
+            Assert.Equal(1000, root.GetProperty("prompt_eval_count").GetInt32());
+            Assert.False(root.TryGetProperty("prompt_eval_cached_count", out _));
         }
 
         [Fact]
@@ -804,6 +835,56 @@ public partial class ProtocolConverterTests
 
             using var doc = JsonDocument.Parse(raw);
             Assert.False(doc.RootElement.TryGetProperty("usage", out _));
+        }
+
+        [Fact]
+        public async Task StreamEnd_WithPositiveCachedCount_EmitsPromptTokensDetails()
+        {
+            var encoder = new OpenAiSseResponseEncoder();
+            var usage = new UsageDetails { InputTokenCount = 1000, OutputTokenCount = 100, CachedInputTokenCount = 800 };
+            var raw = await CapturePipeAsync(writer => encoder.WriteStreamEndAsync(
+                writer, "m", usage, TimeSpan.FromSeconds(1), ChatFinishReason.Stop, CancellationToken.None));
+
+            var frames = raw.Split("\n\n", StringSplitOptions.RemoveEmptyEntries).ToList();
+            var usageFrame = JsonDocument.Parse(frames[1]["data: ".Length..]).RootElement;
+            Assert.Equal(1000, usageFrame.GetProperty("usage").GetProperty("prompt_tokens").GetInt32());
+            Assert.Equal(800, usageFrame.GetProperty("usage").GetProperty("prompt_tokens_details").GetProperty("cached_tokens").GetInt32());
+        }
+
+        [Theory]
+        [InlineData(0)]
+        [InlineData(null)]
+        public async Task StreamEnd_ZeroOrUnknownCachedCount_OmitsPromptTokensDetails(int? cached)
+        {
+            var encoder = new OpenAiSseResponseEncoder();
+            var usage = new UsageDetails { InputTokenCount = 1000, OutputTokenCount = 100, CachedInputTokenCount = cached };
+            var raw = await CapturePipeAsync(writer => encoder.WriteStreamEndAsync(
+                writer, "m", usage, TimeSpan.FromSeconds(1), ChatFinishReason.Stop, CancellationToken.None));
+
+            var frames = raw.Split("\n\n", StringSplitOptions.RemoveEmptyEntries).ToList();
+            var usageFrame = JsonDocument.Parse(frames[1]["data: ".Length..]).RootElement;
+            Assert.Equal(1000, usageFrame.GetProperty("usage").GetProperty("prompt_tokens").GetInt32());
+            Assert.False(usageFrame.GetProperty("usage").TryGetProperty("prompt_tokens_details", out _));
+        }
+
+        [Fact]
+        public async Task NonStreaming_WithCachedCount_EmitsPromptTokensDetails()
+        {
+            var encoder = new OpenAiSseResponseEncoder();
+            var completion = new ChatResponse
+            {
+                Messages = [new ChatMessage(ChatRole.Assistant, "the full text")],
+                Usage = new UsageDetails { InputTokenCount = 1000, OutputTokenCount = 100, CachedInputTokenCount = 700 },
+                FinishReason = ChatFinishReason.Stop,
+            };
+
+            var raw = await CaptureStreamAsync(async (stream, ct) =>
+                await encoder.WriteNonStreamingResponseAsync(stream, completion, "gpt-x", TimeSpan.Zero, ct));
+
+            using var doc = JsonDocument.Parse(raw);
+            var usage = doc.RootElement.GetProperty("usage");
+            Assert.Equal(1000, usage.GetProperty("prompt_tokens").GetInt32());
+            Assert.Equal(700, usage.GetProperty("prompt_tokens_details").GetProperty("cached_tokens").GetInt32());
         }
 
         [Fact]

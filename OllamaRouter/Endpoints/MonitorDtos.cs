@@ -145,7 +145,10 @@ public sealed record MonitorRecentRequestItem(
     [property: JsonPropertyName("rawPromptTokens")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? RawPromptTokens = null,
     [property: JsonPropertyName("reasoningEffort")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? ReasoningEffort = null,
     [property: JsonPropertyName("sessionId")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? SessionId = null,
-    [property: JsonPropertyName("agentId")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? AgentId = null);
+    [property: JsonPropertyName("agentId")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? AgentId = null,
+    // Display-only cached prompt-token count of this request (a subset of actualPromptTokens);
+    // null = no usage was captured / the target did not report a cached count.
+    [property: JsonPropertyName("cachedInputTokens")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? CachedInputTokens = null);
 
 public sealed record MonitorOverheadRecommendation(
     [property: JsonPropertyName("model")] string Model,

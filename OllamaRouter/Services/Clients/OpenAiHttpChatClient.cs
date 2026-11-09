@@ -852,6 +852,7 @@ public sealed class OpenAiHttpChatClient : IChatClient
         {
             InputTokenCount = usage.PromptTokens,
             OutputTokenCount = usage.CompletionTokens,
+            CachedInputTokenCount = usage.PromptTokensDetails?.CachedTokens,
             TotalTokenCount = usage.TotalTokens ?? (usage.PromptTokens.HasValue || usage.CompletionTokens.HasValue
                 ? (usage.PromptTokens ?? 0) + (usage.CompletionTokens ?? 0)
                 : null),

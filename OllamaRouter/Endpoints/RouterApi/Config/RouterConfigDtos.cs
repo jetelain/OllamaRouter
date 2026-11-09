@@ -92,7 +92,11 @@ public sealed record RouterPricingConfigDto(
     [property: JsonPropertyName("promptPricePerMillion")] double? PromptPricePerMillion,
     [property: JsonPropertyName("completionPricePerMillion")] double? CompletionPricePerMillion,
     [property: JsonPropertyName("pricePerMillion")] double? PricePerMillion,
-    [property: JsonPropertyName("currency")] string Currency = "$");
+    [property: JsonPropertyName("currency")] string Currency = "$",
+    // Task #83: the cached prompt-token rate (null = not differentiated). Appended at the END
+    // (NOT before the defaulted Currency) to avoid silently shifting the positional currency
+    // argument at every construction site.
+    [property: JsonPropertyName("cachedPromptPricePerMillion")] double? CachedPromptPricePerMillion = null);
 
 /// <summary>
 /// Request body of <c>PUT /api/router/config</c> (task #19): a partial per-section update

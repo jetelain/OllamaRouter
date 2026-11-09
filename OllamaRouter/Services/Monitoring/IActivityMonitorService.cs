@@ -17,7 +17,12 @@ public sealed record ActivityLogEntry(
     int? RawPromptTokens = null,
     string? ReasoningEffort = null,
     string? SessionId = null,
-    string? AgentId = null);
+    string? AgentId = null,
+    // Cached prompt tokens reported by the target (a subset of the total prompt/input tokens;
+    // null when the target did not report a cached count, 0 when it explicitly reported none).
+    // Display + per-target statistics only (task #83); appending at the END keeps the ~22
+    // positional construction sites source-compatible.
+    int? CachedInputTokens = null);
 
 /// <summary>
 /// A chat/generate request that is currently being processed by an instance.

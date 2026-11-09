@@ -639,6 +639,28 @@ public class OllamaRouterOptionsTests
         Assert.Equal(-1, indefinite.PreloadDefaultKeepAliveSeconds);
     }
 
+    [Fact]
+    public void Pricing_CachedInputPricePerMillion_AliasMirrorsCachedPromptPricePerMillion()
+    {
+        var pricing = new PricingOptions();
+
+        pricing.CachedInputPricePerMillion = 0.05;
+        Assert.Equal(0.05, pricing.CachedPromptPricePerMillion);
+
+        pricing.CachedPromptPricePerMillion = 0.10;
+        Assert.Equal(0.10, pricing.CachedInputPricePerMillion);
+    }
+
+    [Fact]
+    public void Pricing_IsConfigured_WithCachedOnlyPrice_ReturnsTrue()
+    {
+        Assert.False(new PricingOptions().IsConfigured);
+        Assert.True(new PricingOptions { CachedPromptPricePerMillion = 0.05 }.IsConfigured);
+        Assert.True(new PricingOptions { CachedPromptPricePerMillion = 0.0 }.IsConfigured);
+        // Unset cached does not count on its own.
+        Assert.False(new PricingOptions { PromptPricePerMillion = null }.IsConfigured);
+    }
+
     private sealed class CapturingLogger : ILogger
     {
         private readonly List<string> warnings;

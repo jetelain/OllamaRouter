@@ -103,9 +103,23 @@ public sealed class FakeOllamaDaemon : IAsyncDisposable
     private volatile int _chatStreamDelayMs;
     private volatile int _generateDelayMs;
     private volatile int _abortCount;
+    // Set once at test setup (before the app starts serving) and read by the chat handler on
+    // request; a plain field suffices (happens-before the handler threads via app start).
+    private int? _promptEvalCachedCount;
 
     /// <summary>Diagnostic: number of times the chat handler took an abort path (AbortBeforeCommit / StreamNThenAbort).</summary>
     public int AbortCount => _abortCount;
+
+    /// <summary>
+    /// Opt-in terminal-NDJSON prompt-cache flag (task #83): when set (including 0), the daemon's
+    /// final <c>/api/chat</c> NDJSON frame emits <c>prompt_eval_cached_count</c>; when null (the
+    /// default) the field is omitted, so every existing fixture is byte-identical (zero impact).
+    /// </summary>
+    public int? PromptEvalCachedCount
+    {
+        get => _promptEvalCachedCount;
+        set => _promptEvalCachedCount = value;
+    }
 
     public FakeOllamaDaemon(string name, IReadOnlyList<DaemonModel> models, int capacity)
     {
@@ -664,7 +678,7 @@ public sealed class FakeOllamaDaemon : IAsyncDisposable
             return;
         }
 
-        await context.Response.WriteAsync(NdJsonChunk(model, "", done: true), ct);
+        await context.Response.WriteAsync(NdJsonChunk(model, "", done: true, promptEvalCachedCount: _promptEvalCachedCount), ct);
         await context.Response.Body.FlushAsync(ct);
     }
 
@@ -683,7 +697,7 @@ public sealed class FakeOllamaDaemon : IAsyncDisposable
         await context.Response.Body.FlushAsync(ct);
     }
 
-    private static string NdJsonChunk(string? model, string content, bool done)
+    private static string NdJsonChunk(string? model, string content, bool done, int? promptEvalCachedCount = null)
     {
         var obj = new JsonObject
         {
@@ -696,6 +710,11 @@ public sealed class FakeOllamaDaemon : IAsyncDisposable
         {
             obj["prompt_eval_count"] = 12;
             obj["eval_count"] = 7;
+            // Task #83: emit the cached count only when explicitly opted in (0 included).
+            if (promptEvalCachedCount is { } cached)
+            {
+                obj["prompt_eval_cached_count"] = cached;
+            }
         }
 
         return obj.ToJsonString() + "\n";
