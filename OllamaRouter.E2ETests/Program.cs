@@ -21,6 +21,7 @@ Scenario[] scenarios =
     MonitorScenarios.ReclaimVram(),
     MonitorScenarios.ServiceUnavailableWhenNoTargets(),
     MonitorScenarios.CachedTokenPricing(),
+    MonitorScenarios.SessionUsageEndpoints(),
     OpenApiScenarios.GetRouterOpenApiDocument(),
     PreloadScenarios.PreloadModel()
 ];

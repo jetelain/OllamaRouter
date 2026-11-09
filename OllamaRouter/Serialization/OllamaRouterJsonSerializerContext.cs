@@ -11,6 +11,7 @@ using OllamaRouter.Endpoints.RouterApi.Fleet;
 using OllamaRouter.Endpoints.RouterApi.Info;
 using OllamaRouter.Endpoints.RouterApi.Models;
 using OllamaRouter.Endpoints.RouterApi.Preload;
+using OllamaRouter.Endpoints.RouterApi.Sessions;
 using OllamaRouter.Endpoints.RouterApi.Targets;
 using OllamaRouter.Endpoints.RouterApi.Vram;
 using OllamaRouter.Middleware;
@@ -151,7 +152,12 @@ namespace OllamaRouter.Serialization;
  [JsonSerializable(typeof(OllamaChatRequestDto))]
  [JsonSerializable(typeof(OllamaChatStreamChunkDto))]
  // API key store file format (config/api-keys.json — hashes only; internal, same assembly).
-[JsonSerializable(typeof(OllamaRouter.Security.ApiKeyFile))]
+ [JsonSerializable(typeof(OllamaRouter.Security.ApiKeyFile))]
+ // Per-session usage & savings router API DTOs (task #85).
+ [JsonSerializable(typeof(RouterSessionUsageListResponse))]
+ [JsonSerializable(typeof(RouterSessionUsageItem))]
+ [JsonSerializable(typeof(RouterSessionUsageDetailResponse))]
+ [JsonSerializable(typeof(RouterSessionUsageTargetItem))]
 public partial class OllamaRouterJsonSerializerContext : JsonSerializerContext
 {
 }

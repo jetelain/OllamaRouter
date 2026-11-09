@@ -8,6 +8,7 @@ using OllamaRouter.Endpoints.RouterApi.Fleet;
 using OllamaRouter.Endpoints.RouterApi.Info;
 using OllamaRouter.Endpoints.RouterApi.Models;
 using OllamaRouter.Endpoints.RouterApi.Preload;
+using OllamaRouter.Endpoints.RouterApi.Sessions;
 using OllamaRouter.Endpoints.RouterApi.Targets;
 using OllamaRouter.Endpoints.RouterApi.Vram;
 
@@ -21,7 +22,8 @@ namespace OllamaRouter.Endpoints;
 /// <see cref="RouterApi.Models.RouterModelsEndpoints"/>, <see cref="RouterApi.Cartography.RouterCartographyEndpoints"/>,
 /// <see cref="RouterApi.Vram.RouterVramEndpoints"/>, <see cref="RouterApi.Context.RouterContextEndpoints"/>,
 /// <see cref="RouterApi.Preload.RouterPreloadEndpoints"/>, <see cref="RouterApi.Config.RouterConfigEndpoints"/>,
-/// <see cref="RouterApi.Targets.RouterTargetsEndpoints"/>, <see cref="RouterApi.ApiKeys.RouterApiKeysEndpoints"/>)
+/// <see cref="RouterApi.Targets.RouterTargetsEndpoints"/>, <see cref="RouterApi.ApiKeys.RouterApiKeysEndpoints"/>,
+/// <see cref="RouterApi.Sessions.RouterSessionUsageEndpoints"/>)
 /// in the exact original registration order, which global route matching depends on
 /// (in particular the catch-all <c>/api/router/models/{*modelName}</c> vs
 /// <c>POST /api/router/models/{*tail}</c> pair and the position of the
@@ -30,8 +32,9 @@ namespace OllamaRouter.Endpoints;
 public static class RouterApiEndpointsExtensions
 {
     /// <summary>
-    /// Maps the full OllamaRouter management API: the 25 endpoints of the 11 per-area
-    /// endpoint groups, registered in the original order.
+    /// Maps the full OllamaRouter management API: the 27 endpoints of the 12 per-area
+    /// endpoint groups, registered in the original order (the session usage area is appended
+    /// last).
     /// </summary>
     public static WebApplication MapOllamaRouterApiEndpoints(this WebApplication app)
     {
@@ -46,6 +49,7 @@ public static class RouterApiEndpointsExtensions
         app.MapRouterConfigEndpoints();
         app.MapRouterTargetsEndpoints();
         app.MapRouterApiKeysEndpoints();
+        app.MapRouterSessionUsageEndpoints();
         return app;
     }
 

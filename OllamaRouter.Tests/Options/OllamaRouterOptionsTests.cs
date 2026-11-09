@@ -206,6 +206,26 @@ public class OllamaRouterOptionsTests
     }
 
     [Fact]
+    public void Normalize_SessionUsageMaxSessions_InvalidResetsToDefault_CustomKept()
+    {
+        // Task #85: a non-positive session-usage cap is invalid → the 1000-session default;
+        // positive custom values survive normalization.
+        var options = new OllamaRouterOptions { SessionUsageMaxSessions = -5 };
+        options.Normalize();
+        Assert.Equal(1000, options.SessionUsageMaxSessions);
+
+        options = new OllamaRouterOptions { SessionUsageMaxSessions = 0 };
+        options.Normalize();
+        Assert.Equal(1000, options.SessionUsageMaxSessions);
+
+        options = new OllamaRouterOptions { SessionUsageMaxSessions = 7 };
+        options.Normalize();
+        Assert.Equal(7, options.SessionUsageMaxSessions);
+
+        Assert.Equal(1000, new OllamaRouterOptions().SessionUsageMaxSessions); // default
+    }
+
+    [Fact]
     public void Normalize_ZeroSessionReservationOptions_StayZero_Disabled()
     {
         // 0 is a meaningful opt-out (the reservation window / contention / cliff terms are

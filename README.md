@@ -397,6 +397,7 @@ appsettings.json  <  config/config.json  <  user secrets  <  environment variabl
 | `DynamicContext:DenseClampEnabled` | When `true` (default), a request on a **dense** model rewrites `options.num_ctx` only when the client's static value exceeds the node's pre-configured context, clamping it down (one-time KV reallocation; OOM protection). Set to `false` for pure dense pass-through. Dense values are never raised, bucketed, or leased. |
 | `MaxConsecutiveFailures` | Number of consecutive failures on a target for adjacent requests within `ConsecutiveFailuresTokenTolerance` before triggering fallback or cloud overflow. Defaults to `3`. Set to `0` to disable automatic target switching. |
 | `ConsecutiveFailuresTokenTolerance` | Maximum difference in estimated prompt tokens between adjacent requests to consider them part of the same retry streak. Defaults to `4000`. Set to `0` to require an exact match. |
+| `SessionUsageMaxSessions` | In-memory-only bound of the [per-session usage LRU](#per-session-usage--savings): the maximum number of distinct `X-OllamaRouter-Session-Id` values kept in memory. When a NEW session arrives beyond the cap, the least-recently-active stored session is evicted (nothing is persisted to disk). Defaults to `1000`. LIVE: a `config/config.json` change takes effect on the next recorded request (a shrunk cap evicts down to the new bound). Non-positive values normalize back to `1000`. |
 | `Recording:Enabled` | Enables the optional [inference request recording](#inference-request-recording-optional), saving each request's metadata and full request body for investigation of estimated vs actual token counts. Defaults to `false`. |
 | `Recording:OutputDirectory` | Directory where the records are stored: a `requests.jsonl` manifest plus one pretty-printed payload file per request. Defaults to the `inference-requests` folder in the local application data folder (`%LOCALAPPDATA%\OllamaRouter\inference-requests` on Windows). |
 | `Recording:MaxFiles` | Maximum number of payload files to keep in the output directory; the oldest records are deleted once this count is exceeded (and the manifest is trimmed to match). Defaults to `500`. Set to `0` to keep all files. |
@@ -583,7 +584,7 @@ The full router management API is documented as an OpenAPI 3.1 JSON document, ge
 GET {bind-address}/api/router/openapi.json
 ```
 
-e.g. `http://localhost:11434/api/router/openapi.json`. Point any OpenAPI tooling (Swagger Editor, Redoc, code generators) at that URL. The document covers the 25 `/api/router/*` operations in seven functional groups:
+e.g. `http://localhost:11434/api/router/openapi.json`. Point any OpenAPI tooling (Swagger Editor, Redoc, code generators) at that URL. The document covers the 27 `/api/router/*` operations in eight functional groups:
 
 - **Identity & Fleet** — `/info`, `/fleet`
 - **Hardware Profiling** — `/hardware`, `/fleet/hardware` (GET + PUT)
@@ -592,6 +593,7 @@ e.g. `http://localhost:11434/api/router/openapi.json`. Point any OpenAPI tooling
 - **Fleet Operations** — `/vram/reclaim`, `/fleet/unload`, `/context/evaluate`, `/models/{*tail}/preload` (POST catch-all), `/preload/preview`
 - **Setup & Configuration** — `/config`, `/targets` (POST/PUT/DELETE)
 - **API Key Security** — `/api-keys` (GET/POST/DELETE `{name}`), `/api-keys/default/rotate`
+- **Session Usage & Savings** — `/monitor/sessions`, `/monitor/sessions/{*sessionId}`
 
 The `RouterApiKey` security scheme (http/bearer/base64url — `Authorization: Bearer <key>` or `X-Api-Key: <key>`) is applied to exactly the default protected route set above; with `ApiSecurity.RequireKeyForAllEndpoints: true` every route (including the document endpoint) requires a key. The document is regenerated per request from the same AOT source-generated DTO records the endpoints use — no drift, and it works in AOT-published builds.
 
@@ -729,6 +731,30 @@ It starts automatically when running interactively. If standard output is redire
 ```powershell
 OllamaRouter.exe --no-tui
 ```
+
+### Per-session usage & savings
+
+Client applications that send the public session header (`X-OllamaRouter-Session-Id`) can read the actual price and savings **per session** from two read-only router API endpoints (no API key required in default mode):
+
+- `GET /api/router/monitor/sessions` — the stored sessions, **most-recently-active first**:
+
+  ```json
+  {
+    "currency": "$", "count": 1,
+    "sessions": [{ "sessionId": "sess-85", "requests": 3, "inputTokens": 32, "cachedInputTokens": 20,
+                   "outputTokens": 19, "elapsedMs": 1842.0, "lastSeenAt": "2026-11-09T13:20:11.412Z",
+                   "cloudValue": 0.000011, "electricityCost": 0.000002, "savings": 0.000009 }]
+  }
+  ```
+
+- `GET /api/router/monitor/sessions/{sessionId}` — one session's totals (same fields, `sessionId` lookup is case-insensitive) plus a `perTarget` breakdown (per-row tokens, `elapsedMs`, `cloudValue`, `electricityCost`, `savings`; configured fleet order, Cloud last, historical since-renamed/removed targets appended after). Unknown session → `404` with `OllamaErrorResponse` (`"session not found: …"`).
+
+Semantics (mirroring the monitor and the persisted daily statistics, so the figures stay consistent by construction):
+
+- **Counting:** only COMPLETED requests are recorded — failed requests contribute nothing; successful completions with daemon-reported usage add `requests` + `inputTokens` (cached INCLUSIVE, `cachedInputTokens` reported separately as a subset) + `outputTokens` + `elapsedMs`; successful completions WITHOUT usage add `elapsedMs` only (electricity still flows).
+- **Cost math:** the store holds raw counters only; cost figures are computed at READ time from the **currently configured** `Pricing` (cached-token pricing + electricity subtraction, the monitor's exact formulas, 4-decimal rounding, never clamped) — a pricing change re-prices every stored session immediately. `cloudValue` values ALL tokens including Cloud; the Cloud row carries `electricityCost: 0` and `savings: 0` (no node electricity; its token value is a cost against the all-cloud baseline, not a saving), so session `savings = Σ non-Cloud (cloudValue − electricity)`.
+- **Unconfigured pricing:** when no token price rate is configured, `currency`/`cloudValue`/`electricityCost`/`savings` are omitted from the JSON (token totals are always present) — the same "hidden unless a token price is configured" rule as the monitor's cost card.
+- **Bounds & eviction:** in-memory-only bounded LRU keyed by the public session ID (nothing is persisted; `OllamaRouter:SessionUsageMaxSessions`, default `1000`, live). Requests **without** a session ID are never stored; IDs longer than 256 characters are never stored; GETs never refresh recency (eviction is driven by request traffic only).
 
 ## Requirements
 

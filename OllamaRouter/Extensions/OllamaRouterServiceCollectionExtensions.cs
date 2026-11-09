@@ -417,6 +417,9 @@ public static class OllamaRouterServiceCollectionExtensions
         services.AddSingleton<IActivityMonitorService, ActivityMonitorService>();
         services.AddSingleton<IInferenceRequestRecorder, InferenceRequestRecorder>();
         services.AddSingleton<ITokenMetricsRecorder, TokenMetricsRecorder>();
+        // Bounded in-memory per-session usage aggregates (task #85); the live cap is read from
+        // IOptionsMonitor inside the store on every Record (OllamaRouter:SessionUsageMaxSessions).
+        services.AddSingleton<ISessionUsageStore, SessionUsageStore>();
 
         // OpenAI-compatible dispatch client factory (task #60): pooled per (base address, API key)
         // with the codebase-standard 10 s PooledConnectionLifetime handlers and infinite client

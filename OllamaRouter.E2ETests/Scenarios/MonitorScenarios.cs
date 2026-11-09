@@ -441,6 +441,52 @@ internal static class MonitorScenarios
         }
     });
 
+    public static Scenario SessionUsageEndpoints() => new("Per-session usage API /api/router/monitor/sessions list shape + 404 detail (task #85)", async config =>
+    {
+        using var http = new HttpClient { BaseAddress = new Uri(config.RouterUrl) };
+
+        // 1. The list endpoint is read-only (no key required) and always 200 with the
+        //    { currency?, count, sessions: [] } shape (currency omitted without pricing).
+        var response = await http.GetAsync("/api/router/monitor/sessions");
+        if (response.StatusCode != HttpStatusCode.OK)
+        {
+            return $"Expected 200 OK from /api/router/monitor/sessions, got {(int)response.StatusCode} {response.ReasonPhrase}.";
+        }
+
+        var contentType = response.Content.Headers.ContentType?.MediaType;
+        if (contentType != "application/json")
+        {
+            return $"Expected Content-Type 'application/json' from /api/router/monitor/sessions, got '{contentType}'.";
+        }
+
+        var node = JsonNode.Parse(await response.Content.ReadAsStringAsync());
+        if (node?["count"] is null)
+        {
+            return "Missing 'count' property in /api/router/monitor/sessions response.";
+        }
+
+        if (node["sessions"] is not JsonArray)
+        {
+            return "Expected a 'sessions' array in /api/router/monitor/sessions response.";
+        }
+
+        // 2. The detail endpoint 404s for an unknown session with the OllamaErrorResponse shape.
+        using var detail = await http.GetAsync("/api/router/monitor/sessions/unknown-e2e-session");
+        if (detail.StatusCode != HttpStatusCode.NotFound)
+        {
+            return $"Expected 404 from GET /api/router/monitor/sessions/unknown-e2e-session, got {(int)detail.StatusCode} {detail.ReasonPhrase}.";
+        }
+
+        var errorNode = JsonNode.Parse(await detail.Content.ReadAsStringAsync());
+        var error = errorNode?["error"]?.GetValue<string>();
+        if (string.IsNullOrWhiteSpace(error) || !error.StartsWith("session not found: ", StringComparison.Ordinal))
+        {
+            return $"Expected a 'session not found: …' error body, got '{error}'.";
+        }
+
+        return null;
+    });
+
     private static async Task<JsonNode?> GetMonitorJsonAsync(HttpClient http)
     {
         var response = await http.GetAsync("/monitor/api");

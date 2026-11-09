@@ -116,11 +116,12 @@ public class RouterOpenApiDocumentTests
     }
 
     /// <summary>
-    /// The approved 25 router operations: (method, document path) pairs — 21 path items.
-    /// NOTE: the generator emits the two catch-all templates with the leading <c>*</c> stripped
+    /// The approved 27 router operations: (method, document path) pairs — 23 path items.
+    /// NOTE: the generator emits the catch-all templates with the leading <c>*</c> stripped
     /// (the framework's documented template normalization: the registered
-    /// <c>/api/router/models/{*modelName}</c> / <c>POST /api/router/models/{*tail}</c> are
-    /// documented as <c>{modelName}</c> / <c>{tail}</c>) — the assertions use the EMITTED form.
+    /// <c>/api/router/models/{*modelName}</c> / <c>POST /api/router/models/{*tail}</c> /
+    /// <c>GET /api/router/monitor/sessions/{*sessionId}</c> are documented as <c>{modelName}</c> /
+    /// <c>{tail}</c> / <c>{sessionId}</c>) — the assertions use the EMITTED form.
     /// </summary>
     private static readonly (string Method, string Path)[] ApprovedOperations =
     [
@@ -148,10 +149,12 @@ public class RouterOpenApiDocumentTests
         ("GET", "/api/router/api-keys"),
         ("POST", "/api/router/api-keys"),
         ("DELETE", "/api/router/api-keys/{name}"),
-        ("POST", "/api/router/api-keys/default/rotate")
+        ("POST", "/api/router/api-keys/default/rotate"),
+        ("GET", "/api/router/monitor/sessions"),
+        ("GET", "/api/router/monitor/sessions/{sessionId}")
     ];
 
-    /// <summary>The seven functional tag groups (the complete tag set of the document).</summary>
+    /// <summary>The eight functional tag groups (the complete tag set of the document).</summary>
     private static readonly string[] ApprovedTags =
     [
         "Identity & Fleet",
@@ -160,7 +163,8 @@ public class RouterOpenApiDocumentTests
         "Model Catalog & Cartography",
         "Fleet Operations",
         "Setup & Configuration",
-        "API Key Security"
+        "API Key Security",
+        "Session Usage & Savings"
     ];
 
     /// <summary>
@@ -193,7 +197,9 @@ public class RouterOpenApiDocumentTests
             { ("GET", "/api/router/api-keys"), "GetRouterApiKeys" },
             { ("POST", "/api/router/api-keys"), "PostRouterApiKey" },
             { ("DELETE", "/api/router/api-keys/{name}"), "DeleteRouterApiKey" },
-            { ("POST", "/api/router/api-keys/default/rotate"), "PostRotateRouterDefaultApiKey" }
+            { ("POST", "/api/router/api-keys/default/rotate"), "PostRotateRouterDefaultApiKey" },
+            { ("GET", "/api/router/monitor/sessions"), "GetRouterSessionUsageList" },
+            { ("GET", "/api/router/monitor/sessions/{sessionId}"), "GetRouterSessionUsageDetail" }
         };
 
     /// <summary>
@@ -244,7 +250,10 @@ public class RouterOpenApiDocumentTests
             { ("DELETE", "/api/router/api-keys/{name}"),
                 [("200", "ApiKeyDeletedResponse"), ("404", "ApiKeyDeletedResponse"), ("500", "OllamaErrorResponse")] },
             { ("POST", "/api/router/api-keys/default/rotate"),
-                [("200", "ApiKeyRotatedResponse"), ("500", "OllamaErrorResponse")] }
+                [("200", "ApiKeyRotatedResponse"), ("500", "OllamaErrorResponse")] },
+            { ("GET", "/api/router/monitor/sessions"), [("200", "RouterSessionUsageListResponse")] },
+            { ("GET", "/api/router/monitor/sessions/{sessionId}"),
+                [("200", "RouterSessionUsageDetailResponse"), ("404", "OllamaErrorResponse")] }
         };
 
     /// <summary>
@@ -268,7 +277,8 @@ public class RouterOpenApiDocumentTests
                 [("model", "string"), ("keepAliveSeconds", "integer"), ("contextIntentTokens", "integer"), ("target", "string")] },
             { ("PUT", "/api/router/targets/{name}"), [("name", "string")] },
             { ("DELETE", "/api/router/targets/{name}"), [("name", "string")] },
-            { ("DELETE", "/api/router/api-keys/{name}"), [("name", "string")] }
+            { ("DELETE", "/api/router/api-keys/{name}"), [("name", "string")] },
+            { ("GET", "/api/router/monitor/sessions/{sessionId}"), [("sessionId", "string")] }
         };
 
     private static string[] JsonObjectKeys(JsonObject obj) =>
@@ -346,14 +356,14 @@ public class RouterOpenApiDocumentTests
     }
 
     [Fact]
-    public async Task Document_ContainsExactlyThe25RouterOperations_AndExcludesEverythingElse()
+    public async Task Document_ContainsExactlyThe27RouterOperations_AndExcludesEverythingElse()
     {
         await using var harness = await DocHarness.StartAsync(requireKeyForAllEndpoints: false);
         var document = await FetchDocumentAsync(harness);
         var paths = (JsonObject)document["paths"]!;
 
-        // Exactly the 25 approved (method, path) pairs (21 path items).
-        Assert.Equal(21, paths.Count);
+        // Exactly the 27 approved (method, path) pairs (23 path items).
+        Assert.Equal(23, paths.Count);
         var pathKeys = JsonObjectKeys(paths);
         var actualOperations = pathKeys
             .Select(path => (Path: path, Item: (JsonObject)paths[path]!))
@@ -414,7 +424,7 @@ public class RouterOpenApiDocumentTests
             allTags.UnionWith(operation.Tags);
         }
 
-        // The tag set equals the seven functional groups.
+        // The tag set equals the eight functional groups.
         Assert.Equal(new HashSet<string>(ApprovedTags), allTags);
 
         // Every documented parameter carries the expected BASE schema type (route AND query
@@ -546,7 +556,7 @@ public class RouterOpenApiDocumentTests
         Assert.False(string.IsNullOrWhiteSpace(scheme["description"]?.GetValue<string>()));
 
         // The requirement is applied to EXACTLY the operations the production policy protects
-        // (12 of the 25), each with a documented 401 OllamaErrorResponse.
+        // (12 of the 27), each with a documented 401 OllamaErrorResponse.
         var protectedCount = 0;
         foreach (var (method, path) in ApprovedOperations)
         {

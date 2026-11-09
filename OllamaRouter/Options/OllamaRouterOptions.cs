@@ -11,6 +11,7 @@ namespace OllamaRouter.Options;
 /// through <c>IOptionsMonitor&lt;OllamaRouterOptions&gt;</c>, so behavioral options are LIVE at
 /// runtime (an on-disk <c>config/config.json</c> change rebinds on the next dispatch / loop
 /// iteration, no restart required): <c>MaxConsecutiveFailures</c>, <c>SessionAffinityTtlMinutes</c>,
+/// <c>SessionUsageMaxSessions</c>,
 /// <c>SessionReservationWindowSeconds</c>, <c>OtherSessionReservationPenalty</c>,
 /// <c>MaxParallelCliffPenalty</c>, <c>ContextFitMarginTokens</c>, <c>DispatchToLargestCapacityOnOverflow</c>,
 /// <c>FilterNamespacedModels</c>, <c>TokenEstimationOverheadFactor</c>, <c>Models:{model}.*</c>
@@ -219,6 +220,18 @@ public sealed class OllamaRouterOptions
     public int SessionAffinityTtlMinutes { get; set; } = 30;
 
     /// <summary>
+    /// In-memory-only bound of the per-session usage LRU
+    /// (<see cref="Services.Monitoring.ISessionUsageStore"/>): the maximum number of distinct
+    /// public session IDs kept in memory at once. When a NEW session arrives beyond the cap,
+    /// the LEAST-recently-active stored session is evicted (requests are never persisted to
+    /// disk). Defaults to 1000. Non-positive values normalize back to 1000 by
+    /// <see cref="Normalize"/> (re-applied on every config reload). LIVE: the cap is read from
+    /// <c>IOptionsMonitor</c> on every recorded request, so a config change takes effect on the
+    /// next recorded completion (a shrunk cap evicts down to the new bound).
+    /// </summary>
+    public int SessionUsageMaxSessions { get; set; } = 1000;
+
+    /// <summary>
     /// Active-session reservation window (in seconds, task #77): a fleet target that served a
     /// session within this window is treated as RESERVED/contended when a DIFFERENT session
     /// evaluates it in Stage 2 (that candidate takes the
@@ -412,6 +425,13 @@ public sealed class OllamaRouterOptions
         if (MaxParallelCliffPenalty < 0)
         {
             MaxParallelCliffPenalty = 220;
+        }
+
+        // Per-session usage store bound (task #85): a non-positive cap is invalid → the
+        // 1000-session default (the store is in-memory-only, so the bound must stay positive).
+        if (SessionUsageMaxSessions <= 0)
+        {
+            SessionUsageMaxSessions = 1000;
         }
 
         // Preload keep-alive normalization: the router-level last-resort default keeps -1

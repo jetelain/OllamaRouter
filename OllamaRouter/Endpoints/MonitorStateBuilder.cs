@@ -233,12 +233,7 @@ public static partial class MonitorEndpointsExtensions
             return null;
         }
 
-        var effectiveInputPrice = pricing.PromptPricePerMillion ?? pricing.PricePerMillion ?? 0.0;
-        var effectiveOutputPrice = pricing.CompletionPricePerMillion ?? pricing.PricePerMillion ?? 0.0;
-        // Unset cached rate falls back to the effective input price (cached tokens are then
-        // valued at the regular input rate).
-        var effectiveCachedPrice = pricing.CachedPromptPricePerMillion ?? pricing.PromptPricePerMillion ?? pricing.PricePerMillion ?? 0.0;
-        var electricityPrice = pricing.GetEffectiveElectricityPricePerKwh();
+        var effectiveRates = EffectiveRates(pricing);
 
         // Per-target ACTUAL savings: every NON-Cloud target's tokens valued at the effective
         // cloud prices (4-decimal rounding) minus its electricity cost (4-decimal rounding);
@@ -256,10 +251,8 @@ public static partial class MonitorEndpointsExtensions
                 continue;
             }
 
-            var cloudValue = Math.Round(TokenCost(stats, effectiveInputPrice, effectiveCachedPrice, effectiveOutputPrice), 4);
-            var electricity = Math.Round(
-                (stats.ElapsedMilliseconds / 3_600_000.0) * (ResolvePowerWatts(target, targets, pricing) / 1000.0) * electricityPrice,
-                4);
+            var cloudValue = Math.Round(TokenCost(stats, effectiveRates.Input, effectiveRates.Cached, effectiveRates.Output), 4);
+            var electricity = ElectricityCost(stats.ElapsedMilliseconds, ResolvePowerWatts(target, targets, pricing), effectiveRates.ElectricityKwh);
             // Never clamped: negative savings (electricity exceeding the cloud value) are
             // reported as-is.
             var savings = Math.Round(cloudValue - electricity, 4);
@@ -270,7 +263,7 @@ public static partial class MonitorEndpointsExtensions
         }
 
         var cloudStats = last7Days.GetValueOrDefault(RoutingTarget.Cloud) ?? new ActivityStatisticsTotals(0, 0, 0);
-        var cloudOverflowCost = TokenCost(cloudStats, effectiveInputPrice, effectiveCachedPrice, effectiveOutputPrice);
+        var cloudOverflowCost = TokenCost(cloudStats, effectiveRates.Input, effectiveRates.Cached, effectiveRates.Output);
 
         return new MonitorCostStatus(
             pricing.Currency,
@@ -282,6 +275,29 @@ public static partial class MonitorEndpointsExtensions
     }
 
     /// <summary>
+    /// Resolves the four effective rate values from the live pricing options (extracted from
+    /// <see cref="CalculateCostStatus"/> so the per-session endpoints reuse the EXACT same
+    /// resolution chain): <c>input = PromptPricePerMillion ?? PricePerMillion ?? 0</c>,
+    /// <c>output = CompletionPricePerMillion ?? PricePerMillion ?? 0</c>, <c>cached =
+    /// CachedPromptPricePerMillion ?? input</c> (an unset cached rate values cached tokens at
+    /// the regular input rate) and <c>electricityKwh = GetEffectiveElectricityPricePerKwh()</c>.
+    /// </summary>
+    internal static (double Input, double Cached, double Output, double ElectricityKwh) EffectiveRates(PricingOptions pricing)
+    {
+        var input = pricing.PromptPricePerMillion ?? pricing.PricePerMillion ?? 0.0;
+        var output = pricing.CompletionPricePerMillion ?? pricing.PricePerMillion ?? 0.0;
+        var cached = pricing.CachedPromptPricePerMillion ?? input;
+        return (input, cached, output, pricing.GetEffectiveElectricityPricePerKwh());
+    }
+
+    /// <summary>
+    /// Electricity cost of one target's cumulative GPU time (task #84 formula, 4-decimal
+    /// rounding): <c>round((elapsedMs / 3_600_000) × (watts / 1000) × electricityPrice, 4)</c>.
+    /// </summary>
+    internal static double ElectricityCost(double elapsedMs, double watts, double electricityKwh) =>
+        Math.Round(elapsedMs / 3_600_000.0 * watts / 1000.0 * electricityKwh, 4);
+
+    /// <summary>
     /// Wattage resolution chain of one NON-Cloud statistics target (task #84, decision 6):
     /// the <see cref="OllamaTargetOptions.PowerWatts"/> of the name-matched (case-insensitive)
     /// configured target via its full chain (override → pricing default → 150 W); a statistics
@@ -289,7 +305,7 @@ public static partial class MonitorEndpointsExtensions
     /// or a null fleet list — uses the default wattage (<see cref="PricingOptions.DefaultPowerWatts"/>
     /// / the pricing default when no fleet list is available).
     /// </summary>
-    private static double ResolvePowerWatts(
+    internal static double ResolvePowerWatts(
         RoutingTarget target,
         IReadOnlyList<OllamaTargetOptions>? targets,
         PricingOptions pricing)

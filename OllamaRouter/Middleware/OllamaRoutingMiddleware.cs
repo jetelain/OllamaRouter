@@ -52,7 +52,8 @@ public sealed class OllamaRoutingMiddleware(
     ITokenMetricsRecorder? tokenMetricsRecorder = null,
     OllamaChatRequestParser? ollamaRequestParser = null,
     OpenAIChatRequestParser? openAiRequestParser = null,
-    ITargetChatClientProvider? targetChatClientProvider = null)
+    ITargetChatClientProvider? targetChatClientProvider = null,
+    ISessionUsageStore? sessionUsage = null)
     {
     // During the first 10 s after the liveness prober started, an unresolved (Unknown)
     // target is treated as routable rather than offline, so a request arriving before the
@@ -1375,6 +1376,7 @@ public sealed class OllamaRoutingMiddleware(
 
             activityMonitor.CompleteRequest(requestId, entry);
             activityStatistics.Add(entry);
+            sessionUsage?.Record(entry);
             inferenceRequestRecorder.Record(entry, endpoint, body);
 
             // Token metrics CSV export (dispatch-path only — pre-dispatch 503 short-circuits

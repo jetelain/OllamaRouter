@@ -85,8 +85,10 @@ public static class MeshTestHelpers
 
     /// <summary>
     /// Sends a streaming <c>POST /api/chat</c> for <paramref name="model"/> with a prompt of
-    /// <paramref name="tokenCount"/> tokens, an optional client <c>options.num_ctx</c> and an
-    /// optional <c>X-OllamaRouter-Target</c> pin. Returns the (not yet consumed) response.
+    /// <paramref name="tokenCount"/> tokens, an optional client <c>options.num_ctx</c>, an
+    /// optional <c>X-OllamaRouter-Target</c> pin and an optional public
+    /// <c>X-OllamaRouter-Session-Id</c> header (per-session usage accounting, task #85).
+    /// Returns the (not yet consumed) response.
     /// </summary>
     public static Task<HttpResponseMessage> SendChatAsync(
         MeshRouter router,
@@ -94,6 +96,7 @@ public static class MeshTestHelpers
         int tokenCount,
         int? numCtx = null,
         string? pin = null,
+        string? sessionId = null,
         bool returnOnHeaders = false)
     {
         var options = new JsonObject();
@@ -123,6 +126,11 @@ public static class MeshTestHelpers
         if (pin is not null)
         {
             request.Headers.Add(OllamaRouter.ReverseProxy.OllamaReverseProxyConfig.PublicTargetHeader, pin);
+        }
+
+        if (sessionId is not null)
+        {
+            request.Headers.Add(OllamaRouter.ReverseProxy.OllamaReverseProxyConfig.PublicSessionIdHeader, sessionId);
         }
 
         return router.Client.SendAsync(
