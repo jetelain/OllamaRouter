@@ -160,9 +160,9 @@ if ($Uninstall) {
 
 # 2. Project check & version reading
 $repoRoot = $PSScriptRoot
-$webProjectPath = Join-Path $repoRoot "OllamaRouter\OllamaRouter.csproj"
+$webProjectPath = Join-Path $repoRoot "src\OllamaRouter\OllamaRouter.csproj"
 if (-not (Test-Path $webProjectPath)) {
-    $webProjectPath = Join-Path $repoRoot "src\OllamaRouter\OllamaRouter.csproj"
+    $webProjectPath = Join-Path $repoRoot "OllamaRouter\OllamaRouter.csproj"
 }
 
 if (-not (Test-Path $webProjectPath)) {

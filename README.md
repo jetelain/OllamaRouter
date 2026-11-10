@@ -681,7 +681,7 @@ Download the latest [`OllamaRouter-win-x64.zip`](../../releases) from the [relea
 ### From source
 
 ```powershell
-dotnet run --project OllamaRouter\OllamaRouter.csproj
+dotnet run --project src\OllamaRouter\OllamaRouter.csproj
 ```
 
 ## Running
@@ -689,7 +689,7 @@ dotnet run --project OllamaRouter\OllamaRouter.csproj
 After installation, start the router by launching `OllamaRouter.exe`, or from source:
 
 ```powershell
-dotnet run --project OllamaRouter\OllamaRouter.csproj
+dotnet run --project src\OllamaRouter\OllamaRouter.csproj
 ```
 
 By default, the router listens on `http://localhost:11434`, the standard Ollama port, so it can be used as a drop-in replacement for a direct Ollama endpoint in your existing tools and clients. On startup, a link to the [monitoring UI](#monitoring) is printed to the console.
@@ -833,7 +833,7 @@ It checks that:
 Before running it, make sure OllamaRouter is running (see [Running](#running)) and that both the local and remote Ollama instances are up and have the expected model pulled and aliased (see [Setup Ollama instances](#setup-ollama-instances)).
 
 ```powershell
-dotnet run --project OllamaRouter.E2ETests\OllamaRouter.E2ETests.csproj
+dotnet run --project tests\OllamaRouter.E2ETests\OllamaRouter.E2ETests.csproj
 ```
 
 The executable prints a `PASS`/`FAIL` line per scenario and exits with a non-zero code if any scenario fails, so it can be wired into a CI pipeline or a post-deployment check. It can be configured through the following environment variables:

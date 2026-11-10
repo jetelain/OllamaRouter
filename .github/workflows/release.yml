@@ -20,10 +20,10 @@ jobs:
           dotnet-version: '10.0.x'
 
       - name: Run unit tests
-        run: dotnet test OllamaRouter.Tests/OllamaRouter.Tests.csproj -c Release
+        run: dotnet test tests/OllamaRouter.Tests/OllamaRouter.Tests.csproj -c Release
 
       - name: Publish single file (win-x64)
-        run: dotnet publish OllamaRouter/OllamaRouter.csproj -c Release -r win-x64 -o OllamaRouter-win-x64
+        run: dotnet publish src/OllamaRouter/OllamaRouter.csproj -c Release -r win-x64 -o OllamaRouter-win-x64
 
       - name: Bundle release artifact
         shell: pwsh

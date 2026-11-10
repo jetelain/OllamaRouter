@@ -4,7 +4,11 @@
     <File Path="LICENSE" />
     <File Path="README.md" />
   </Folder>
-  <Project Path="OllamaRouter.E2ETests/OllamaRouter.E2ETests.csproj" />
-  <Project Path="OllamaRouter.Tests/OllamaRouter.Tests.csproj" />
-  <Project Path="OllamaRouter/OllamaRouter.csproj" />
+  <Folder Name="/src/">
+    <Project Path="src/OllamaRouter/OllamaRouter.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/OllamaRouter.E2ETests/OllamaRouter.E2ETests.csproj" />
+    <Project Path="tests/OllamaRouter.Tests/OllamaRouter.Tests.csproj" />
+  </Folder>
 </Solution>

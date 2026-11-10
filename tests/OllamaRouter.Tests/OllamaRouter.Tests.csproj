@@ -26,7 +26,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\OllamaRouter\OllamaRouter.csproj" />
+    <ProjectReference Include="..\..\src\OllamaRouter\OllamaRouter.csproj" />
   </ItemGroup>
 
 </Project>
