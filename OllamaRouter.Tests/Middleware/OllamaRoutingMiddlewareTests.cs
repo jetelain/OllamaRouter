@@ -1,5 +1,6 @@
 using OllamaRouter.Tests.TestHelpers;
 using System.Net.Http;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -2404,6 +2405,17 @@ public class OllamaRoutingMiddlewareTests
         return feature.Object;
     }
 
+    // Task #96: the error feature WITH its exception — the same shape the real YARP forwarder
+    // populates (ReportProxyError carries the thrown exception in IForwarderErrorFeature.Exception),
+    // which the post-dispatch ResponseBodyDestination classification now consults.
+    private static IForwarderErrorFeature ErrorFeature(ForwarderError error, Exception? exception)
+    {
+        var feature = new Mock<IForwarderErrorFeature>();
+        feature.SetupGet(f => f.Error).Returns(error);
+        feature.SetupGet(f => f.Exception).Returns(exception);
+        return feature.Object;
+    }
+
     // Wires the forwarder so SendAsync consumes a positional script: entry i handles attempt i
     // (the last entry is reused for any attempts beyond the list). Each entry writes the response
     // side effects and returns the ForwarderError the loop should observe. A non-None error is
@@ -2431,6 +2443,35 @@ public class OllamaRoutingMiddlewareTests
                         ctx.Features.Set<IForwarderErrorFeature>(ErrorFeature(result));
                     }
                     return new ValueTask<ForwarderError>(result);
+                });
+    }
+
+    // Task #96: a WireForwarder variant whose script entries may publish a non-None error
+    // TOGETHER with its exception (the same IForwarderErrorFeature shape the real YARP forwarder
+    // populates) so the post-dispatch ResponseBodyDestination client-drop classification can be
+    // exercised deterministically.
+    private static void WireForwarder(
+        Mock<IHttpForwarder> forwarder,
+        List<Func<HttpContext, string, (ForwarderError Error, Exception? Exception)>> script,
+        List<string> sentUrls)
+    {
+        var idx = 0;
+        forwarder
+            .Setup(f => f.SendAsync(
+                It.IsAny<HttpContext>(), It.IsAny<string>(), It.IsAny<HttpMessageInvoker>(),
+                It.IsAny<ForwarderRequestConfig>(), It.IsAny<HttpTransformer>(), It.IsAny<CancellationToken>()))
+            .Returns<HttpContext, string, HttpMessageInvoker, ForwarderRequestConfig, HttpTransformer, CancellationToken>(
+                (ctx, url, _, _, _, _) =>
+                {
+                    sentUrls.Add(url);
+                    var i = idx < script.Count ? idx : script.Count - 1;
+                    var (error, exception) = script[i](ctx, url);
+                    idx++;
+                    if (error != ForwarderError.None)
+                    {
+                        ctx.Features.Set<IForwarderErrorFeature>(ErrorFeature(error, exception));
+                    }
+                    return new ValueTask<ForwarderError>(error);
                 });
     }
 
@@ -2527,6 +2568,143 @@ public class OllamaRoutingMiddlewareTests
         Assert.Single(sentUrls);
         Assert.Equal(1, streak.GetStreak(RoutingTarget.Remote));
         liveness.Verify(t => t.MarkHardFailureAsync(It.IsAny<RoutingTarget>()), Times.Never);
+    }
+
+    // Task #96: a committed mid-stream error that YARP 2.3.0 classifies as
+    // ForwarderError.ResponseBodyDestination (its activity-token timeout races a client
+    // disconnect) must be classified client-vs-destination by the exception chain: cancellation
+    // evidence (TaskCanceledException / OperationCanceledException /
+    // SocketException(995 WSA_OPERATION_ABORTED)) with a canceled request token suppresses the
+    // streak (499/success-false semantics preserved); genuine reset evidence (a bare IOException,
+    // ECONNRESET 10054, …) records it — including when the reset ALSO propagates into the
+    // request token (D2 precedence).
+    [Fact]
+    public async Task MidStreamFailure_CommittedResponse_ClientAborted_ResponseBodyDestination_TaskCanceledException_StreakSuppressed()
+    {
+        var (sentUrls, streak, liveness, activity, requestId, _) = await RunMidStreamResponseBodyDestinationAsync(
+            _ => new TaskCanceledException("stream canceled by client"), cancelToken: true);
+
+        // Committed ⇒ no failover; client abort ⇒ streak suppressed, no liveness strike, and the
+        // activity entry keeps the existing 499/success-false semantics.
+        Assert.Single(sentUrls);
+        Assert.Equal(0, streak.GetStreak(RoutingTarget.Remote));
+        liveness.Verify(t => t.MarkHardFailureAsync(It.IsAny<RoutingTarget>()), Times.Never);
+        activity.Verify(
+            m => m.CompleteRequest(requestId, It.Is<ActivityLogEntry>(e => e.StatusCode == 499 && e.Success == false)),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task MidStreamFailure_CommittedResponse_ClientAborted_ResponseBodyDestination_OperationCanceledException_StreakSuppressed()
+    {
+        var (sentUrls, streak, liveness, activity, requestId, _) = await RunMidStreamResponseBodyDestinationAsync(
+            cts => new OperationCanceledException("stream canceled", cts.Token), cancelToken: true);
+
+        Assert.Single(sentUrls);
+        Assert.Equal(0, streak.GetStreak(RoutingTarget.Remote));
+        liveness.Verify(t => t.MarkHardFailureAsync(It.IsAny<RoutingTarget>()), Times.Never);
+        activity.Verify(
+            m => m.CompleteRequest(requestId, It.Is<ActivityLogEntry>(e => e.StatusCode == 499 && e.Success == false)),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task MidStreamFailure_CommittedResponse_ClientAborted_ResponseBodyDestination_SocketException995Aborted_StreakSuppressed()
+    {
+        // The transport converted our canceled in-flight socket read into an aborted-I/O error
+        // (WSA_OPERATION_ABORTED) wrapped in an IOException: still a client-initiated break.
+        var (sentUrls, streak, liveness, activity, requestId, _) = await RunMidStreamResponseBodyDestinationAsync(
+            _ => new IOException("aborted", new SocketException(995)), cancelToken: true);
+
+        Assert.Single(sentUrls);
+        Assert.Equal(0, streak.GetStreak(RoutingTarget.Remote));
+        liveness.Verify(t => t.MarkHardFailureAsync(It.IsAny<RoutingTarget>()), Times.Never);
+        activity.Verify(
+            m => m.CompleteRequest(requestId, It.Is<ActivityLogEntry>(e => e.StatusCode == 499 && e.Success == false)),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task MidStreamFailure_CommittedResponse_ClientAborted_ResponseBodyDestination_TokenCancelledButGenuineReset_StreakRecorded()
+    {
+        // D2 precedence: the request token is canceled (the daemon reset propagated into it) AND
+        // the chain carries a genuine ECONNRESET ⇒ the failure IS recorded — one spurious streak
+        // count is recoverable, a masked daemon crash is not.
+        var (sentUrls, streak, liveness, activity, requestId, _) = await RunMidStreamResponseBodyDestinationAsync(
+            _ => new IOException("reset", new SocketException(10054)), cancelToken: true);
+
+        Assert.Single(sentUrls);
+        Assert.Equal(1, streak.GetStreak(RoutingTarget.Remote));
+        liveness.Verify(t => t.MarkHardFailureAsync(It.IsAny<RoutingTarget>()), Times.Never);
+        // The token WAS aborted, so the existing 499/502 rule records 499.
+        activity.Verify(
+            m => m.CompleteRequest(requestId, It.Is<ActivityLogEntry>(e => e.StatusCode == 499 && e.Success == false)),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task MidStreamFailure_CommittedResponse_TokenNotCancelled_DestinationResetIOException_StreakRecorded()
+    {
+        // Control: client still connected, daemon dropped the TCP connection mid-stream ⇒ the
+        // existing recording behavior is unchanged (502, streak, no liveness strike).
+        var (sentUrls, streak, liveness, activity, requestId, _) = await RunMidStreamResponseBodyDestinationAsync(
+            _ => new IOException("connection reset"), cancelToken: false);
+
+        Assert.Single(sentUrls);
+        Assert.Equal(1, streak.GetStreak(RoutingTarget.Remote));
+        liveness.Verify(t => t.MarkHardFailureAsync(It.IsAny<RoutingTarget>()), Times.Never);
+        activity.Verify(
+            m => m.CompleteRequest(requestId, It.Is<ActivityLogEntry>(e => e.StatusCode == 502 && e.Success == false)),
+            Times.Once);
+    }
+
+    // Task #96 shared scenario: exactly one committed mid-stream attempt ending in
+    // ForwarderError.ResponseBodyDestination with the exception built from the request's CTS;
+    // the request token is canceled MID-STREAM (inside the forwarder callback) when
+    // <paramref name="cancelToken"/> — mirroring a real client disconnect.
+    private async Task<(List<string> SentUrls, TargetFailureStreakService Streak,
+        Mock<ITargetLivenessService> Liveness, Mock<IActivityMonitorService> Activity,
+        Guid RequestId, CancellationTokenSource Cts)>
+        RunMidStreamResponseBodyDestinationAsync(Func<CancellationTokenSource, Exception> buildException, bool cancelToken)
+    {
+        var (availability, liveness) = OnlineMocks();
+        var context = BuildContext("/api/chat", FailoverBody);
+        context.Response.Body = new MemoryStream();
+        var cts = new CancellationTokenSource();
+        context.RequestAborted = cts.Token;
+
+        var streak = new TargetFailureStreakService();
+        var sentUrls = new List<string>();
+        var activity = new Mock<IActivityMonitorService>();
+        var requestId = Guid.NewGuid();
+        activity.Setup(m => m.StartRequest(
+                It.IsAny<RoutingTarget>(), It.IsAny<string>(), It.IsAny<int>(),
+                It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<string?>()))
+            .Returns(requestId);
+
+        var forwarder = new Mock<IHttpForwarder>();
+        WireForwarder(forwarder, new List<Func<HttpContext, string, (ForwarderError Error, Exception? Exception)>>
+        {
+            (ctx, url) =>
+            {
+                // Commit a partial NDJSON frame (done:false, no terminal frame), then break the
+                // stream — canceling the client token first when cancelToken is set.
+                ctx.Response.StatusCode = 200;
+                ctx.Response.ContentType = "application/x-ndjson";
+                ctx.Response.WriteAsync("{ \"model\": \"llama3\", \"done\": false }\n").GetAwaiter().GetResult();
+                if (cancelToken)
+                {
+                    cts.Cancel();
+                }
+                return (ForwarderError.ResponseBodyDestination, buildException(cts));
+            }
+        }, sentUrls);
+
+        var sut = BuildFailoverSut(Estimator(), DecisionFor(RoutingTarget.Remote), availability, liveness,
+            TwoTargetOptions(), forwarder, streak, activity);
+        await sut.InvokeAsync(context);
+
+        return (sentUrls, streak, liveness, activity, requestId, cts);
     }
 
     // 3. Streak skip on next request: a target whose streak exceeds the threshold is excluded from

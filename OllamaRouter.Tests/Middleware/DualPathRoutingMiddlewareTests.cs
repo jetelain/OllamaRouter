@@ -704,6 +704,151 @@ public class DualPathRoutingMiddlewareTests
         streak.Verify(s => s.RecordFailure(new RoutingTarget(OpenRouter)), Times.Once);
     }
 
+    // ------------------------------------------------------------------
+    //  Task #96: client-aborted ResponseBodyDestination vs. genuine destination reset
+    // ------------------------------------------------------------------
+
+    // Task #96 (T6): YARP path — a client disconnect mid-stream that YARP classifies as
+    // ResponseBodyDestination (activity-timeout race) with a TaskCanceledException must NOT
+    // strike the streak: the exception chain evidences our cancellation as the initiator.
+    [Fact]
+    public async Task YarpPath_ClientAbortedMidStream_ResponseBodyDestination_TokenCanceledException_NoStreak()
+    {
+        var context = BuildContext("/api/chat", """
+            { "model": "llama3", "stream": true, "messages": [ { "role": "user", "content": "hi" } ] }
+            """);
+        var cts = new CancellationTokenSource();
+        context.RequestAborted = cts.Token;
+
+        var forwarder = new Mock<IHttpForwarder>();
+        var attempts = new int[1];
+        SetupForwarderMidStreamError(forwarder, ForwarderError.ResponseBodyDestination,
+            () => { cts.Cancel(); return new TaskCanceledException("stream canceled by client"); }, attempts);
+
+        var streak = new Mock<ITargetFailureStreakService>();
+        var sut = BuildSut(_ => Task.CompletedTask, HeterogeneousFleetOptions(), new RoutingTarget(Local),
+            null, forwarder, streak, out _);
+
+        await sut.InvokeAsync(context);
+
+        // Client abort ⇒ no streak in either direction, and committed ⇒ terminal (no failover).
+        streak.Verify(s => s.RecordFailure(It.IsAny<RoutingTarget>()), Times.Never);
+        streak.Verify(s => s.RecordSuccess(It.IsAny<RoutingTarget>()), Times.Never);
+        Assert.Equal(1, attempts[0]);
+        var feature = context.Features.Get<IForwarderErrorFeature>();
+        Assert.NotNull(feature);
+        Assert.Equal(ForwarderError.ResponseBodyDestination, feature!.Error);
+    }
+
+    // Task #96 (T7): YARP path — the daemon genuinely reset the TCP connection mid-stream
+    // (IOException, client still connected) ⇒ the failure IS recorded, exactly once.
+    [Fact]
+    public async Task YarpPath_DestinationResetMidStream_IOException_TokenNotCanceled_StreakRecorded()
+    {
+        var context = BuildContext("/api/chat", """
+            { "model": "llama3", "stream": true, "messages": [ { "role": "user", "content": "hi" } ] }
+            """);
+
+        var forwarder = new Mock<IHttpForwarder>();
+        var attempts = new int[1];
+        SetupForwarderMidStreamError(forwarder, ForwarderError.ResponseBodyDestination,
+            () => new IOException("connection reset"), attempts);
+
+        var streak = new Mock<ITargetFailureStreakService>();
+        var sut = BuildSut(_ => Task.CompletedTask, HeterogeneousFleetOptions(), new RoutingTarget(Local),
+            null, forwarder, streak, out _);
+
+        await sut.InvokeAsync(context);
+
+        streak.Verify(s => s.RecordFailure(new RoutingTarget(Local)), Times.Once);
+        Assert.Equal(1, attempts[0]); // committed ⇒ terminal, no failover
+    }
+
+    // Task #96 (T8, parity lock): converter path — a client abort mid-stream (TaskCanceledException
+    // after the first chunk) is caught by the converter's OperationCanceledException guard and
+    // published as ForwarderError.RequestCanceled: terminal, no streak, single attempt.
+    [Fact]
+    public async Task ConverterPath_ClientAbortedMidStream_TokenCancelled_TerminatedNoStreak()
+    {
+        var context = BuildContext("/api/chat", """
+            { "model": "openai/gpt-4o", "stream": true, "messages": [ { "role": "user", "content": "hi" } ] }
+            """);
+        var cts = new CancellationTokenSource();
+        context.RequestAborted = cts.Token;
+
+        var forwarder = new Mock<IHttpForwarder>();
+        var streak = new Mock<ITargetFailureStreakService>();
+        streak.Setup(s => s.ShouldSkip(It.IsAny<RoutingTarget>(), It.IsAny<int>())).Returns(false);
+        var sut = BuildSut(_ => Task.CompletedTask, HeterogeneousFleetOptions(), new RoutingTarget(OpenRouter),
+            new FakeTargetChatClientProvider(new Dictionary<string, IChatClient> { [OpenRouter] = new TaskCanceledAfterFirstChunkClient(cts) }),
+            forwarder, streak, out _);
+
+        await sut.InvokeAsync(context);
+
+        // The clean client abort publishes RequestCanceled (already suppressed by IsClientAbort)
+        // and never strikes the streak; single attempt (no failover).
+        streak.Verify(s => s.RecordFailure(It.IsAny<RoutingTarget>()), Times.Never);
+        var feature = context.Features.Get<IForwarderErrorFeature>();
+        Assert.NotNull(feature);
+        Assert.Equal(ForwarderError.RequestCanceled, feature!.Error);
+        forwarder.Verify(f => f.SendAsync(
+            It.IsAny<HttpContext>(), It.IsAny<string>(), It.IsAny<HttpMessageInvoker>(),
+            It.IsAny<ForwarderRequestConfig>(), It.IsAny<HttpTransformer>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    // Task #96 YARP stand-in: commits a partial NDJSON frame, publishes IForwarderErrorFeature
+    // (error + exception) exactly like the real YARP forwarder does via ReportProxyError, and
+    // returns the error. Counts attempts for single-attempt (no failover) assertions.
+    private static void SetupForwarderMidStreamError(
+        Mock<IHttpForwarder> forwarder,
+        ForwarderError error,
+        Func<Exception> buildException,
+        int[] attempts)
+    {
+        forwarder
+            .Setup(f => f.SendAsync(
+                It.IsAny<HttpContext>(), It.IsAny<string>(), It.IsAny<HttpMessageInvoker>(),
+                It.IsAny<ForwarderRequestConfig>(), It.IsAny<HttpTransformer>(), It.IsAny<CancellationToken>()))
+            .Callback<HttpContext, string, HttpMessageInvoker, ForwarderRequestConfig, HttpTransformer, CancellationToken>(async (c, _, _, _, _, _) =>
+            {
+                attempts[0]++;
+                c.Response.ContentType = "application/x-ndjson";
+                await c.Response.WriteAsync("{\"model\":\"llama3\",\"message\":{\"role\":\"assistant\",\"content\":\"part\"},\"done\":false}\n");
+                c.Features.Set<IForwarderErrorFeature>(new ErrorFeature(error, buildException()));
+            })
+            .ReturnsAsync(error);
+    }
+
+    // Task #96: the public IForwarderErrorFeature shape YARP populates (error + exception).
+    private sealed class ErrorFeature(ForwarderError error, Exception? exception) : IForwarderErrorFeature
+    {
+        public ForwarderError Error { get; } = error;
+        public Exception? Exception { get; } = exception;
+    }
+
+    // Task #96: one healthy chunk, then a TaskCanceledException AFTER the client token fires
+    // (a real client disconnect mid-stream).
+    private sealed class TaskCanceledAfterFirstChunkClient(CancellationTokenSource cts) : IChatClient
+    {
+        public Task<ChatResponse> GetResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
+            => throw new NotImplementedException();
+
+        public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+            IEnumerable<ChatMessage> messages,
+            ChatOptions? options = null,
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            yield return new ChatResponseUpdate(ChatRole.Assistant, [new TextContent("part")]);
+            cts.Cancel();
+            throw new TaskCanceledException("stream canceled by client");
+        }
+
+        public object? GetService(Type serviceType, object? serviceKey = null) => null;
+
+        public void Dispose() { }
+    }
+
     private sealed class ThrowingAfterFirstChunkClient : IChatClient
     {
         public Task<ChatResponse> GetResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)

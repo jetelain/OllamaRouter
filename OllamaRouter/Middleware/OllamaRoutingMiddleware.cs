@@ -5,6 +5,7 @@ using System.IO.Pipelines;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -488,6 +489,74 @@ public sealed class OllamaRoutingMiddleware(
             or ForwarderError.ResponseBodyClient
             or ForwarderError.RequestBodyCanceled
             or ForwarderError.RequestBodyClient;
+
+    /// <summary>
+    /// Client-abort detection for destination-classified MID-STREAM errors (task #96).
+    /// Returns true ONLY for ForwarderError.ResponseBodyDestination where the client's
+    /// request-aborted token is the evident initiator of the stream break.
+    /// </summary>
+    private static bool IsClientAbortedDestinationDrop(IForwarderErrorFeature forwarderError, HttpContext context)
+    {
+        // Deliberately scoped to ResponseBodyDestination: a request-body destination failure is
+        // a genuine destination fault (the request body here is a seekable in-memory stream whose
+        // reads cannot fail), and every other ForwarderError value keeps its prior semantics.
+        if (forwarderError.Error != ForwarderError.ResponseBodyDestination)
+        {
+            return false;
+        }
+
+        // Client still connected ⇒ the destination dropped first; record the failure.
+        if (!context.RequestAborted.IsCancellationRequested)
+        {
+            return false;
+        }
+
+        // Walk the exception chain: cancellation evidence (an OperationCanceledException in the
+        // chain — the request token or YARP's linked activity token — or a 995/
+        // WSA_OPERATION_ABORTED socket code) marks the client as the initiator; any genuine
+        // transport-reset evidence wins over the canceled token (D2), preserving the anti-masking
+        // invariant that a daemon reset propagating into the request token must still count as a
+        // failure. Socket codes are matched via the SocketError enum (D1), so Windows WSA codes
+        // and Linux errnos normalize into the same classification.
+        var cancellationEvidence = false;
+        var resetEvidence = false;
+        for (Exception? ex = forwarderError.Exception; ex is not null; ex = ex.InnerException)
+        {
+            if (ex is OperationCanceledException)
+            {
+                // Covers TaskCanceledException. The request token is already confirmed canceled
+                // above; this is the cancellation that ran on our side of the socket.
+                cancellationEvidence = true;
+            }
+            else if (ex is SocketException se)
+            {
+                // Peer-side reset (ECONNRESET/ECONNABORTED/network reset/not connected).
+                resetEvidence |= se.SocketErrorCode is SocketError.ConnectionReset
+                    or SocketError.ConnectionAborted
+                    or SocketError.NetworkReset
+                    or SocketError.NotConnected;
+                // Aborted BY US (995/WSA_OPERATION_ABORTED): our cancellation landed on
+                // in-flight I/O — the transport's way of surfacing the cancel.
+                cancellationEvidence |= se.SocketErrorCode == SocketError.OperationAborted;
+            }
+            else if (ex is HttpRequestException)
+            {
+                resetEvidence = true;
+            }
+            else if (ex is IOException)
+            {
+                // An IOException wrapping a SocketException is the transport re-wrapping the
+                // socket result — the inner socket code above classifies it (OperationAborted ⇒
+                // cancellation evidence, reset family ⇒ reset evidence). A BARE IOException
+                // (unexpected EOF, "connection reset by peer") is a genuine destination reset.
+                resetEvidence |= ex.InnerException is not SocketException;
+            }
+        }
+
+        // Null/unknown-shape Exception with a canceled token is conservative (record): YARP always
+        // populates the exception for copy failures (D3).
+        return cancellationEvidence && !resetEvidence;
+    }
 
     // Session/agent sticky-routing extraction: X-OllamaRouter-Session-Id first, then the
     // X-OllamaRouter-Agent-Id fallback (whitespace trimmed; empty ⇒ absent). The ID is opaque
@@ -1341,14 +1410,35 @@ public sealed class OllamaRoutingMiddleware(
             // mid-stream, and that same reset can propagate to cancel the router's request
             // token, which would otherwise misclassify the daemon drop as a client abort and
             // suppress the streak. Only a genuinely client-initiated cancellation suppresses it.
-            var midStreamClientAbort = isClientAborted && (forwarderError is null || IsClientAbort(forwarderError.Error));
+            //
+            // Task #96 addendum: ResponseBodyDestination is ADDITIONALLY treated as client-
+            // initiated when the request token is canceled AND the exception chain evidences a
+            // cancellation-side break (OperationCanceledException/TaskCanceledException, or
+            // SocketException(995/WSA_OPERATION_ABORTED) — a client disconnect / client timeout
+            // racing YARP's activity timeout); genuine reset evidence in the chain always wins
+            // (record the failure).
+            var midStreamClientAbort = isClientAborted
+                && (forwarderError is null
+                    || IsClientAbort(forwarderError.Error)
+                    || IsClientAbortedDestinationDrop(forwarderError, context));
             if (servedTarget is { } midStreamTarget
-                && !midStreamClientAbort
                 && forwarderError is not null
                 && forwarderError.Error != ForwarderError.None
                 && IsResponseCommitted(context))
             {
-                streakTracker.RecordFailure(midStreamTarget);
+                if (midStreamClientAbort)
+                {
+                    logger.LogWarning(
+                        "Target {Target} response stream canceled by client disconnect; suppressing failure streak.",
+                        midStreamTarget);
+                }
+                else
+                {
+                    logger.LogWarning(forwarderError.Exception,
+                        "Target {Target} dropped the response stream mid-stream ({Error}); recording failure streak.",
+                        midStreamTarget, forwarderError.Error);
+                    streakTracker.RecordFailure(midStreamTarget);
+                }
             }
 
             var recordedStatusCode = context.Response.StatusCode;
@@ -2082,8 +2172,10 @@ public sealed class OllamaRoutingMiddleware(
 
     // YARP 2.3.0's ForwarderErrorFeature class is INTERNAL (only IForwarderErrorFeature is
     // public), so the converter dispatch path publishes its classification through this tiny
-    // public implementation — the post-dispatch block only reads IForwarderErrorFeature.Error
-    // (mid-stream streaks fire for any Error != None that is not a client-abort value).
+    // public implementation — the post-dispatch block reads IForwarderErrorFeature.Error
+    // (mid-stream streaks fire for any Error != None that is not a client-abort value) and
+    // consults its Exception for the task #96 ResponseBodyDestination client-drop
+    // classification (IsClientAbortedDestinationDrop).
     private sealed class ConverterForwarderErrorFeature(ForwarderError error, Exception? exception) : IForwarderErrorFeature
     {
         public ForwarderError Error { get; } = error;
