@@ -10,7 +10,8 @@ namespace OllamaRouter.Options;
 /// <b>Live vs startup rebinding boundary.</b> All production consumers read this options type
 /// through <c>IOptionsMonitor&lt;OllamaRouterOptions&gt;</c>, so behavioral options are LIVE at
 /// runtime (an on-disk <c>config/config.json</c> change rebinds on the next dispatch / loop
-/// iteration, no restart required): <c>MaxConsecutiveFailures</c>, <c>SessionAffinityTtlMinutes</c>,
+/// iteration, no restart required): <c>MaxConsecutiveFailures</c>, <c>FailureStreakCooldownSeconds</c>,
+/// <c>ResetStreakOnLivenessRecovery</c>, <c>SessionAffinityTtlMinutes</c>,
 /// <c>SessionUsageMaxSessions</c>,
 /// <c>SessionReservationWindowSeconds</c>, <c>OtherSessionReservationPenalty</c>,
 /// <c>MaxParallelCliffPenalty</c>, <c>ContextFitMarginTokens</c>, <c>DispatchToLargestCapacityOnOverflow</c>,
@@ -58,6 +59,13 @@ public sealed class OllamaRouterOptions
     /// (tool calls, compiles, I/O waits) during which a session's target stays "reserved".
     /// </summary>
     public const int DefaultSessionReservationWindowSeconds = 30;
+
+    /// <summary>
+    /// The <see cref="FailureStreakCooldownSeconds"/> default (60 s): the circuit-breaker
+    /// window a tripped target stays skipped (circuit Open) before it becomes eligible for
+    /// a single half-open trial request.
+    /// </summary>
+    public const int DefaultFailureStreakCooldownSeconds = 60;
 
     /// <summary>
     /// Per-model routing thresholds, keyed by model name (e.g. "llama3", "qwen3:8b").
@@ -209,6 +217,28 @@ public sealed class OllamaRouterOptions
     /// streak. Defaults to 3. Set to 0 (or negative) to disable streak-based skipping.
     /// </summary>
     public int MaxConsecutiveFailures { get; set; } = 3;
+
+    /// <summary>
+    /// Failure-streak circuit-breaker cooldown (in seconds, task #94): once a target's streak
+    /// exceeds <see cref="MaxConsecutiveFailures"/> (circuit Open), the target is skipped for
+    /// this bounded window; after it elapses the circuit is HalfOpen and exactly ONE trial
+    /// request may reach the target (a success closes the circuit, a failure re-arms the
+    /// cooldown). Default 60. A NEGATIVE value normalizes to 60 by <see cref="Normalize"/>;
+    /// 0 DISABLES the cooldown window (a tripped target is immediately half-open — the
+    /// single-trial lease still bounds concurrency). LIVE: the effective window is read from
+    /// <c>IOptionsMonitor&lt;OllamaRouterOptions&gt;</c> per routing decision.
+    /// </summary>
+    public int FailureStreakCooldownSeconds { get; set; } = DefaultFailureStreakCooldownSeconds;
+
+    /// <summary>
+    /// When true (default, task #94), an Offline/Unknown → Online liveness transition resets
+    /// the target's failure streak (<c>ResetStreak</c>), clearing a stale streak the moment a
+    /// re-probed node rejoins the fleet. Transition-ONLY by design: probes on an already-Online
+    /// target never reset (the breaker exists for probe-healthy daemons whose model streams
+    /// drop). LIVE: read from <c>IOptionsMonitor&lt;OllamaRouterOptions&gt;</c> per liveness
+    /// transition.
+    /// </summary>
+    public bool ResetStreakOnLivenessRecovery { get; set; } = true;
 
     /// <summary>
     /// Sliding TTL (in minutes) of the in-memory session-affinity store
@@ -432,6 +462,14 @@ public sealed class OllamaRouterOptions
         if (SessionUsageMaxSessions <= 0)
         {
             SessionUsageMaxSessions = 1000;
+        }
+
+        // Failure-streak circuit-breaker cooldown (task #94): a negative window is invalid →
+        // the 60 s default; 0 is meaningful (the cooldown window is disabled — tripped targets
+        // are immediately half-open, single trial still bounded).
+        if (FailureStreakCooldownSeconds < 0)
+        {
+            FailureStreakCooldownSeconds = DefaultFailureStreakCooldownSeconds;
         }
 
         // Preload keep-alive normalization: the router-level last-resort default keeps -1

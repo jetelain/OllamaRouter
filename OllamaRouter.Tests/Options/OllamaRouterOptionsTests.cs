@@ -258,6 +258,37 @@ public class OllamaRouterOptionsTests
     }
 
     [Fact]
+    public void FailureStreakCircuitBreaker_Options_HaveDocumentedDefaults()
+    {
+        // Task #94: the circuit-breaker knobs default to a 60 s cooldown and an enabled
+        // liveness-recovery streak reset.
+        var options = new OllamaRouterOptions();
+
+        Assert.Equal(60, OllamaRouterOptions.DefaultFailureStreakCooldownSeconds);
+        Assert.Equal(60, options.FailureStreakCooldownSeconds);
+        Assert.True(options.ResetStreakOnLivenessRecovery);
+    }
+
+    [Fact]
+    public void Normalize_FailureStreakCooldownSeconds_NegativeResetsToDefault_ZeroStaysDisabled_PositiveKept()
+    {
+        // Task #94 (maintainer-confirmed contract): a NEGATIVE window is invalid → the 60 s
+        // default; 0 is meaningful (the cooldown window is DISABLED — tripped targets are
+        // immediately half-open) and stays 0; positive custom values are kept.
+        var options = new OllamaRouterOptions { FailureStreakCooldownSeconds = -30 };
+        options.Normalize();
+        Assert.Equal(60, options.FailureStreakCooldownSeconds);
+
+        options = new OllamaRouterOptions { FailureStreakCooldownSeconds = 0 };
+        options.Normalize();
+        Assert.Equal(0, options.FailureStreakCooldownSeconds);
+
+        options = new OllamaRouterOptions { FailureStreakCooldownSeconds = 120 };
+        options.Normalize();
+        Assert.Equal(120, options.FailureStreakCooldownSeconds);
+    }
+
+    [Fact]
     public void ContextFitMarginTokens_BindsFromConfiguration()
     {
         var configuration = new Microsoft.Extensions.Configuration.ConfigurationBuilder()

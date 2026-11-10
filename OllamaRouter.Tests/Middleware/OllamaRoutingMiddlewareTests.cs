@@ -1,4 +1,5 @@
 using OllamaRouter.Tests.TestHelpers;
+using System.Diagnostics;
 using System.Net.Http;
 using System.Net.Sockets;
 using System.Text;
@@ -2746,6 +2747,144 @@ public class OllamaRoutingMiddlewareTests
         await sut2.InvokeAsync(context2);
 
         Assert.Contains(FailoverRemoteUrl, sentUrls2);
+    }
+
+    // ------------------------------------------------------------------
+    // Task #94: dispatch-loop half-open trial reservation
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task HalfOpenCandidate_TrialReserved_ServedSuccess_ResetsStreak()
+    {
+        // Remote tripped (4 > 3) and past the cooldown ⇒ HalfOpen: it passes the 3-arg
+        // failover gate, the dispatch reserves the single trial slot, and the completed 2xx
+        // closes the circuit (streak 0, timestamp cleared).
+        var (availability, liveness) = OnlineMocks();
+        var clock = new ManualTimeProvider();
+        var streak = new TargetFailureStreakService(clock);
+        for (var i = 0; i < 4; i++)
+        {
+            streak.RecordFailure(RoutingTarget.Remote);
+        }
+        clock.Advance(TimeSpan.FromSeconds(61)); // past the default 60 s window
+
+        var forwarder = new Mock<IHttpForwarder>();
+        var sentUrls = new List<string>();
+        WireForwarder(forwarder, new List<Func<HttpContext, string, ForwarderError>>
+        {
+            (ctx, url) => Uncommitted(ctx, url), // attempt 1: Local (primary) fails uncommitted
+            (ctx, url) =>
+            {
+                // The real YARP forwarder resets the error feature per attempt; the fake
+                // only sets it on non-None, so mirror the reset to avoid a stale error.
+                ctx.Features.Set<IForwarderErrorFeature>(ErrorFeature(ForwarderError.None));
+                return Ok(ctx, url); // attempt 2: Remote half-open trial → 200
+            }
+        }, sentUrls);
+
+        // DecideAsync → Local, so Remote is reached through the FAILOVER list (the 3-arg gate
+        // must let the half-open candidate through).
+        var sut = BuildFailoverSut(Estimator(), DecisionFor(RoutingTarget.Local), availability, liveness,
+            TwoTargetOptions(), forwarder, streak);
+        var context = BuildContext("/api/chat", FailoverBody);
+        context.Response.Body = new MemoryStream();
+        await sut.InvokeAsync(context);
+
+        Assert.Equal(new[] { FailoverLocalUrl, FailoverRemoteUrl }, sentUrls);
+        Assert.Equal(200, context.Response.StatusCode);
+        Assert.Equal(0, streak.GetStreak(RoutingTarget.Remote));
+        Assert.Null(streak.GetLastFailureUtc(RoutingTarget.Remote));
+        Assert.Equal(FailureStreakCircuitState.Closed, streak.GetCircuitState(RoutingTarget.Remote, 3, TimeSpan.FromSeconds(60)));
+        liveness.Verify(t => t.MarkHardFailureAsync(RoutingTarget.Remote), Times.Never);
+    }
+
+    [Fact]
+    public async Task HalfOpenCandidate_TrialReserved_UncommittedFailure_ReArmsCooldown()
+    {
+        // The half-open trial fails uncommitted: the streak increments, the timestamp refreshes,
+        // the circuit re-arms (Open), and — once the re-armed window elapses — the target is
+        // trial-eligible again (the breaker loop, never a permanent quarantine).
+        var (availability, liveness) = OnlineMocks();
+        var clock = new ManualTimeProvider();
+        var streak = new TargetFailureStreakService(clock);
+        for (var i = 0; i < 4; i++)
+        {
+            streak.RecordFailure(RoutingTarget.Remote);
+        }
+        clock.Advance(TimeSpan.FromSeconds(61)); // HalfOpen
+
+        var forwarder = new Mock<IHttpForwarder>();
+        var sentUrls = new List<string>();
+        WireForwarder(forwarder, new List<Func<HttpContext, string, ForwarderError>>
+        {
+            (ctx, url) => Uncommitted(ctx, url), // attempt 1: Local (primary) fails uncommitted
+            (ctx, url) => Uncommitted(ctx, url) // attempt 2: Remote half-open trial fails uncommitted
+        }, sentUrls);
+
+        var sut = BuildFailoverSut(Estimator(), DecisionFor(RoutingTarget.Local), availability, liveness,
+            TwoTargetOptions(), forwarder, streak);
+        var context = BuildContext("/api/chat", FailoverBody);
+        context.Response.Body = new MemoryStream();
+        await sut.InvokeAsync(context);
+
+        Assert.Equal(new[] { FailoverLocalUrl, FailoverRemoteUrl }, sentUrls);
+        Assert.Equal(StatusCodes.Status503ServiceUnavailable, context.Response.StatusCode); // both attempts failed
+        // Local's own failure + the failed trial.
+        Assert.Equal(1, streak.GetStreak(RoutingTarget.Local));
+        // The failed trial is struck by the loop's uncommitted path; the terminal 503 that
+        // follows commits the diagnostics body (capturing stream ⇒ "committed") while the
+        // last attempt's error feature is still set, so the post-dispatch mid-stream
+        // classification strikes the last-attempted target once more (pre-existing 503-path
+        // semantics). Either way the cooldown is re-armed by the fresh timestamp.
+        Assert.Equal(6, streak.GetStreak(RoutingTarget.Remote));
+        Assert.Equal(clock.UtcNow, streak.GetLastFailureUtc(RoutingTarget.Remote));
+        Assert.Equal(FailureStreakCircuitState.Open, streak.GetCircuitState(RoutingTarget.Remote, 3, TimeSpan.FromSeconds(60)));
+
+        // After the RE-ARMED window elapses the target is half-open again (single trial bounded).
+        clock.Advance(TimeSpan.FromSeconds(61));
+        Assert.Equal(FailureStreakCircuitState.HalfOpen, streak.GetCircuitState(RoutingTarget.Remote, 3, TimeSpan.FromSeconds(60)));
+        Assert.True(streak.TryReserveTrial(RoutingTarget.Remote, 3, TimeSpan.FromSeconds(60)));
+        streak.ReleaseTrial(RoutingTarget.Remote);
+    }
+
+    [Fact]
+    public async Task HalfOpenCandidate_TrialSlotBusy_CandidateSkippedWithoutSideEffects()
+    {
+        // A pre-leased trial slot (another request is the in-flight half-open trial) makes the
+        // dispatch skip the candidate with NO streak/liveness side effects and continue to the
+        // next candidate — mirroring the protocol-ineligibility skip.
+        var (availability, liveness) = OnlineMocks();
+        var clock = new ManualTimeProvider();
+        var streak = new TargetFailureStreakService(clock);
+        for (var i = 0; i < 4; i++)
+        {
+            streak.RecordFailure(RoutingTarget.Remote);
+        }
+        clock.Advance(TimeSpan.FromSeconds(61)); // HalfOpen
+        Assert.True(streak.TryReserveTrial(RoutingTarget.Remote, 3, TimeSpan.FromSeconds(60))); // held by another request
+
+        var forwarder = new Mock<IHttpForwarder>();
+        var sentUrls = new List<string>();
+        WireForwarder(forwarder, new List<Func<HttpContext, string, ForwarderError>>
+        {
+            // Remote (the decided primary) must never be attempted: the only dispatch goes to Local.
+            (ctx, url) => Ok(ctx, url)
+        }, sentUrls);
+
+        var sut = BuildFailoverSut(Estimator(), DecisionFor(RoutingTarget.Remote), availability, liveness,
+            TwoTargetOptions(), forwarder, streak);
+        var context = BuildContext("/api/chat", FailoverBody);
+        context.Response.Body = new MemoryStream();
+        await sut.InvokeAsync(context);
+
+        // The busy-trial Remote is skipped without side effects; Local serves instead.
+        Assert.Equal(new[] { FailoverLocalUrl }, sentUrls);
+        Assert.Equal(200, context.Response.StatusCode);
+        Assert.Equal(4, streak.GetStreak(RoutingTarget.Remote)); // no streak side effect
+        Assert.NotNull(streak.GetLastFailureUtc(RoutingTarget.Remote)); // stamp untouched
+        // The pre-leased slot is still held (this request neither reserved nor released it).
+        Assert.False(streak.TryReserveTrial(RoutingTarget.Remote, 3, TimeSpan.FromSeconds(60)));
+        liveness.Verify(t => t.MarkHardFailureAsync(It.IsAny<RoutingTarget>()), Times.Never);
     }
 
     // 4. All-fleet-fail → Cloud relay: every fleet candidate fails uncommitted; the terminal

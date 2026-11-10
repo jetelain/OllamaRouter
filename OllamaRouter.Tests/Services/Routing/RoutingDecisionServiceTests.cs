@@ -1,4 +1,5 @@
 using OllamaRouter.Tests.TestHelpers;
+using System.Diagnostics;
 using System.Text.Json.Nodes;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.DependencyInjection;
@@ -51,6 +52,11 @@ public class RoutingDecisionServiceTests
         /// this between turns; the tracker mock reads it live on every GetState call).
         /// </summary>
         public required Dictionary<RoutingTarget, TargetExecutionState> States { get; init; }
+        /// <summary>
+        /// The real per-harness failure-streak service (task #94) so tests can seed/observe
+        /// streaks, last-failure stamps and the half-open trial lease.
+        /// </summary>
+        public required TargetFailureStreakService StreakTracker { get; init; }
 
         public Task<RoutingTarget> Decide(int tokens, string model, int? numCtx = null)
             => SUT.DecideWithEvaluationsAsync(tokens, model, numCtx, e => Evaluations.Add(e));
@@ -108,7 +114,8 @@ public class RoutingDecisionServiceTests
         Mock<ITargetLivenessService>? livenessOverride = null,
         Func<RoutingTarget, int>? failureStreaks = null,
         ISessionAffinityService? sessionAffinity = null,
-        ILogger<RoutingDecisionService>? logger = null)
+        ILogger<RoutingDecisionService>? logger = null,
+        TimeProvider? streakTimeProvider = null)
     {
         meta ??= new MetaMap();
         var metaMap = meta;
@@ -146,9 +153,10 @@ public class RoutingDecisionServiceTests
             .Returns((RoutingTarget t) => statesStore.TryGetValue(t, out var s) ? s : null);
         tracker.Setup(t => t.GetAllStates()).Returns(() => statesStore.Values.ToList());
 
-        // The decision service consumes the per-target failure streak (task #8): a real
-        // streak service is minted per harness and fed from the per-target streak function.
-        var streakTracker = new TargetFailureStreakService();
+        // The decision service consumes the per-target failure streak (task #8; task #94
+        // circuit breaker): a real streak service is minted per harness (optionally on a fake
+        // clock) and fed from the per-target streak function.
+        var streakTracker = new TargetFailureStreakService(streakTimeProvider);
         if (failureStreaks is not null)
         {
             var tracked = new HashSet<RoutingTarget>();
@@ -200,7 +208,7 @@ public class RoutingDecisionServiceTests
             streakTracker,
             sessionAffinity);
 
-        return (new Harness { SUT = sut, States = statesStore }, meta);
+        return (new Harness { SUT = sut, States = statesStore, StreakTracker = streakTracker }, meta);
     }
 
     // ---- option / metadata builders ----
@@ -1654,6 +1662,213 @@ public class RoutingDecisionServiceTests
         var winner = await h.Decide(30_000, "qwen3.8-27B");
 
         Assert.Equal(RoutingTarget.Cloud, winner);
+    }
+
+    // ------------------------------------------------------------------
+    // Task #94: failure-streak circuit breaker (cooldown + half-open trial)
+    // ------------------------------------------------------------------
+
+    private sealed class InfoCapturingLogger : ILogger<RoutingDecisionService>
+    {
+        public List<string> Information { get; } = [];
+        public List<string> Warnings { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            if (logLevel == LogLevel.Information)
+            {
+                Information.Add(formatter(state, exception));
+            }
+            else if (logLevel == LogLevel.Warning)
+            {
+                Warnings.Add(formatter(state, exception));
+            }
+        }
+    }
+
+    [Fact]
+    public async Task StreakSwitchOver_TrippedWinner_SkippedDuringCooldown_FailoverToNext()
+    {
+        // Fresh streaks (recorded at the fake clock's start) are INSIDE the 60 s cooldown
+        // window ⇒ the tripped winner is Open and skipped through the 3-arg gate; the
+        // switch-over lands on the next-ranked candidate (existing behavior, pinned through
+        // the cooldown-aware gate).
+        var meta = AddDense(new MetaMap(), "small1", 4_000_000_000); // 4B ⇒ SmallDense
+        var clock = new ManualTimeProvider();
+        var logger = new InfoCapturingLogger();
+        var (h, _) = Build(
+            FleetOptions("small1"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|small1", $"{LaptopUrl}|small1", $"{ServerUrl}|small1" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, 0, ("small1", 4 * Gb)), // top-ranked: 100 affinity
+                [TLaptop] = State(TLaptop, 0),
+                [TServer] = State(TServer, 0)
+            },
+            failureStreaks: t => t == TDesktop ? 5 : 0,
+            meta: meta,
+            logger: logger,
+            streakTimeProvider: clock);
+
+        var winner = await h.Decide(30_000, "small1");
+
+        // Circuit Open inside the window: the tripped winner is skipped.
+        Assert.Equal(FailureStreakCircuitState.Open, h.StreakTracker.GetCircuitState(TDesktop, 3, TimeSpan.FromSeconds(60)));
+        Assert.Equal(TLaptop, winner);
+        Assert.DoesNotContain(logger.Information, m => m.Contains("half-open trial"));
+    }
+
+    [Fact]
+    public async Task StreakSwitchOver_CooldownElapsed_WinnerSelectedAsHalfOpenTrial_AndLogsTrialMessage()
+    {
+        // After the cooldown elapses the tripped winner is HalfOpen and selectable: the
+        // switch-over gate lets it through as the single-trial candidate, and the exact
+        // Information message is emitted on the half-open final winner.
+        var meta = AddDense(new MetaMap(), "small1", 4_000_000_000); // 4B ⇒ SmallDense
+        var clock = new ManualTimeProvider();
+        var logger = new InfoCapturingLogger();
+        var (h, _) = Build(
+            FleetOptions("small1"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|small1", $"{LaptopUrl}|small1", $"{ServerUrl}|small1" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, 0, ("small1", 4 * Gb)), // top-ranked: 100 affinity
+                [TLaptop] = State(TLaptop, 0),
+                [TServer] = State(TServer, 0)
+            },
+            failureStreaks: t => t == TDesktop ? 5 : 0,
+            meta: meta,
+            logger: logger,
+            streakTimeProvider: clock);
+
+        clock.Advance(TimeSpan.FromSeconds(61)); // past the default 60 s window
+
+        var winner = await h.Decide(30_000, "small1");
+
+        Assert.Equal(FailureStreakCircuitState.HalfOpen, h.StreakTracker.GetCircuitState(TDesktop, 3, TimeSpan.FromSeconds(60)));
+        Assert.Equal(TDesktop, winner);
+        Assert.Contains(logger.Information, m =>
+            m == $"Target {TDesktop} cooldown elapsed. Entering half-open trial.");
+    }
+
+    [Fact]
+    public async Task StreakSwitchOver_TrialSucceeds_TargetHealed()
+    {
+        // A completed trial success resets the streak (circuit Closed): the next decision
+        // selects the healed target normally, with no trial log.
+        var meta = AddDense(new MetaMap(), "small1", 4_000_000_000); // 4B ⇒ SmallDense
+        var clock = new ManualTimeProvider();
+        var logger = new InfoCapturingLogger();
+        var (h, _) = Build(
+            FleetOptions("small1"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|small1", $"{LaptopUrl}|small1", $"{ServerUrl}|small1" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, 0, ("small1", 4 * Gb)),
+                [TLaptop] = State(TLaptop, 0),
+                [TServer] = State(TServer, 0)
+            },
+            failureStreaks: t => t == TDesktop ? 5 : 0,
+            meta: meta,
+            logger: logger,
+            streakTimeProvider: clock);
+
+        clock.Advance(TimeSpan.FromSeconds(61));
+        var first = await h.Decide(30_000, "small1");
+        Assert.Equal(TDesktop, first); // the half-open trial
+        Assert.Equal(1, logger.Information.Count(m => m.Contains("half-open trial")));
+
+        h.StreakTracker.RecordSuccess(TDesktop); // trial completed with 2xx
+
+        var second = await h.Decide(30_000, "small1");
+
+        Assert.Equal(0, h.StreakTracker.GetStreak(TDesktop));
+        Assert.Null(h.StreakTracker.GetLastFailureUtc(TDesktop));
+        Assert.Equal(FailureStreakCircuitState.Closed, h.StreakTracker.GetCircuitState(TDesktop, 3, TimeSpan.FromSeconds(60)));
+        Assert.Equal(TDesktop, second);
+        // No trial log on the post-heal decision.
+        Assert.Equal(1, logger.Information.Count(m => m.Contains("half-open trial")));
+    }
+
+    [Fact]
+    public async Task StreakSwitchOver_TrialFails_CooldownReArms()
+    {
+        // A trial failure increments the streak and refreshes the timestamp: the next
+        // decision (still inside the re-armed window) skips the target again.
+        var meta = AddDense(new MetaMap(), "small1", 4_000_000_000); // 4B ⇒ SmallDense
+        var clock = new ManualTimeProvider();
+        var logger = new InfoCapturingLogger();
+        var (h, _) = Build(
+            FleetOptions("small1"),
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|small1", $"{LaptopUrl}|small1", $"{ServerUrl}|small1" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, 0, ("small1", 4 * Gb)),
+                [TLaptop] = State(TLaptop, 0),
+                [TServer] = State(TServer, 0)
+            },
+            failureStreaks: t => t == TDesktop ? 5 : 0,
+            meta: meta,
+            logger: logger,
+            streakTimeProvider: clock);
+
+        clock.Advance(TimeSpan.FromSeconds(61));
+        var first = await h.Decide(30_000, "small1");
+        Assert.Equal(TDesktop, first); // the half-open trial
+
+        h.StreakTracker.RecordFailure(TDesktop); // trial failed (uncommitted / mid-stream)
+
+        var second = await h.Decide(30_000, "small1"); // still inside the re-armed window
+
+        Assert.Equal(6, h.StreakTracker.GetStreak(TDesktop));
+        Assert.Equal(clock.UtcNow, h.StreakTracker.GetLastFailureUtc(TDesktop));
+        Assert.Equal(FailureStreakCircuitState.Open, h.StreakTracker.GetCircuitState(TDesktop, 3, TimeSpan.FromSeconds(60)));
+        Assert.Equal(TLaptop, second);
+    }
+
+    [Fact]
+    public async Task FailureStreakCooldownSeconds_Zero_TrippedTargetImmediatelyTrialEligible()
+    {
+        // Options cooldown = 0 disables the Open window: a freshly-tripped target is
+        // immediately HalfOpen and selected as the trial candidate (no clock advance).
+        var meta = AddDense(new MetaMap(), "small1", 4_000_000_000); // 4B ⇒ SmallDense
+        var clock = new ManualTimeProvider();
+        var logger = new InfoCapturingLogger();
+        var options = FleetOptions("small1");
+        options.FailureStreakCooldownSeconds = 0;
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|small1", $"{LaptopUrl}|small1", $"{ServerUrl}|small1" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            states: new()
+            {
+                [TDesktop] = State(TDesktop, 0, ("small1", 4 * Gb)),
+                [TLaptop] = State(TLaptop, 0),
+                [TServer] = State(TServer, 0)
+            },
+            failureStreaks: t => t == TDesktop ? 5 : 0,
+            meta: meta,
+            logger: logger,
+            streakTimeProvider: clock);
+
+        var winner = await h.Decide(30_000, "small1");
+
+        Assert.Equal(FailureStreakCircuitState.HalfOpen, h.StreakTracker.GetCircuitState(TDesktop, 3, TimeSpan.Zero));
+        Assert.Equal(TDesktop, winner);
+        Assert.Contains(logger.Information, m =>
+            m == $"Target {TDesktop} cooldown elapsed. Entering half-open trial.");
     }
 
     [Fact]

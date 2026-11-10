@@ -94,17 +94,20 @@ public class TargetLivenessServiceTests : IDisposable
         Func<HttpRequestMessage, HttpResponseMessage> respond,
         TimeSpan? reprobeInterval = null,
         TimeSpan? probeTimeout = null,
-        TimeSpan? onlineCacheTtl = null)
+        TimeSpan? onlineCacheTtl = null,
+        ITargetFailureStreakService? streakService = null,
+        bool resetStreakOnLivenessRecovery = true)
     {
         var handler = new CountingFakeHttpMessageHandler(respond);
         var client = new HttpClient(handler) { Timeout = probeTimeout ?? TimeSpan.FromSeconds(2) };
         var options = new TestOptionsMonitor<OllamaRouterOptions>(new OllamaRouterOptions
         {
             LocalUrl = LocalUrl,
-            RemoteUrl = RemoteUrl
+            RemoteUrl = RemoteUrl,
+            ResetStreakOnLivenessRecovery = resetStreakOnLivenessRecovery
         });
         var catalog = new CountingCatalogCache();
-        var sut = new TargetLivenessService(options, catalog, client, NullLogger<TargetLivenessService>.Instance, reprobeInterval, onlineCacheTtl);
+        var sut = new TargetLivenessService(options, catalog, client, NullLogger<TargetLivenessService>.Instance, reprobeInterval, onlineCacheTtl, streakService);
         return (sut, handler, catalog);
     }
 
@@ -669,6 +672,109 @@ public class TargetLivenessServiceTests : IDisposable
         // Strike 2: trips to Offline
         var state2 = await sut.EnsureKnownAsync(RoutingTarget.Local);
         Assert.Equal(TargetLivenessState.Offline, state2);
+    }
+
+    // ------------------------------------------------------------------
+    // Task #94: liveness-recovery streak reconciliation (transition-only reset)
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task Rejoin_OfflineToOnline_WithActiveStreak_ClearsStreak()
+    {
+        // A node that went Offline (connection refused) carries a stale failure streak; when
+        // it REJOINS as Online through a successful probe, the streak is reset (default
+        // ResetStreakOnLivenessRecovery = true).
+        var streaks = new TargetFailureStreakService();
+        streaks.RecordFailure(RoutingTarget.Local);
+        var online = false;
+        var (sut, _, _) = CreateSut(
+            _ => { var ok = online; online = true; return ok ? Ok() : throw Refused(); },
+            onlineCacheTtl: TimeSpan.Zero,
+            streakService: streaks);
+
+        // Offline probe: the HardError transition never resets the streak.
+        var state1 = await sut.EnsureKnownAsync(RoutingTarget.Local);
+        Assert.Equal(TargetLivenessState.Offline, state1);
+        Assert.Equal(1, streaks.GetStreak(RoutingTarget.Local));
+
+        // Rejoin: Offline → Online clears the stale streak.
+        online = true;
+        var state2 = await sut.EnsureKnownAsync(RoutingTarget.Local);
+
+        Assert.Equal(TargetLivenessState.Online, state2);
+        Assert.Equal(0, streaks.GetStreak(RoutingTarget.Local));
+        Assert.Null(streaks.GetLastFailureUtc(RoutingTarget.Local));
+    }
+
+    [Fact]
+    public async Task Rejoin_WithResetStreakOnLivenessRecoveryFalse_KeepsStreak()
+    {
+        // The reconciliation is opt-out-able: with ResetStreakOnLivenessRecovery = false the
+        // Offline → Online transition leaves the streak untouched (it still heals through a
+        // completed success / the half-open trial only).
+        var streaks = new TargetFailureStreakService();
+        streaks.RecordFailure(RoutingTarget.Local);
+        var online = false;
+        var (sut, _, _) = CreateSut(
+            _ => { var ok = online; online = true; return ok ? Ok() : throw Refused(); },
+            onlineCacheTtl: TimeSpan.Zero,
+            streakService: streaks,
+            resetStreakOnLivenessRecovery: false);
+
+        await sut.EnsureKnownAsync(RoutingTarget.Local); // Offline
+        online = true;
+        var state = await sut.EnsureKnownAsync(RoutingTarget.Local); // rejoin
+
+        Assert.Equal(TargetLivenessState.Online, state);
+        Assert.Equal(1, streaks.GetStreak(RoutingTarget.Local));
+    }
+
+    [Fact]
+    public async Task SuccessfulProbe_AlreadyOnline_DoesNotClearStreak()
+    {
+        // Transition-ONLY by design: an already-Online target taking another successful probe
+        // (Online → Online) NEVER resets the streak — the breaker exists precisely for
+        // probe-healthy daemons whose model streams drop, and clearing on every re-probe tick
+        // would neutralize it.
+        var streaks = new TargetFailureStreakService();
+        var (sut, _, _) = CreateSut(
+            _ => Ok(),
+            onlineCacheTtl: TimeSpan.Zero, // force a real re-probe on every call
+            streakService: streaks);
+
+        await sut.EnsureKnownAsync(RoutingTarget.Local); // Unknown → Online (no streak yet)
+        streaks.RecordFailure(RoutingTarget.Local);
+        streaks.RecordFailure(RoutingTarget.Local);
+
+        var state = await sut.EnsureKnownAsync(RoutingTarget.Local); // Online → Online
+
+        Assert.Equal(TargetLivenessState.Online, state);
+        Assert.Equal(2, streaks.GetStreak(RoutingTarget.Local));
+        Assert.NotNull(streaks.GetLastFailureUtc(RoutingTarget.Local));
+    }
+
+    [Fact]
+    public async Task HardError_WhileOnline_MarksOffline_AndDoesNotResetStreak()
+    {
+        // MarkHardFailureAsync (HardError ⇒ Offline) is never a rejoin: it must mark the
+        // target Offline without touching the streak.
+        var streaks = new TargetFailureStreakService();
+        var flips = 0;
+        var (sut, handler, _) = CreateSut(
+            _ => { flips++; return flips == 1 ? Ok() : throw Refused(); },
+            onlineCacheTtl: TimeSpan.Zero,
+            streakService: streaks);
+
+        await sut.EnsureKnownAsync(RoutingTarget.Local); // establish Online
+        streaks.RecordFailure(RoutingTarget.Local);      // a stream drop while Online
+        Assert.Equal(1, streaks.GetStreak(RoutingTarget.Local));
+
+        await sut.MarkHardFailureAsync(RoutingTarget.Local);
+
+        Assert.Equal(TargetLivenessState.Offline, sut.GetEntries()[RoutingTarget.Local].State);
+        Assert.Equal(1, streaks.GetStreak(RoutingTarget.Local));
+        Assert.NotNull(streaks.GetLastFailureUtc(RoutingTarget.Local));
+        Assert.Equal(1, handler.RequestCount); // the hard-failure strike performs no probe
     }
 
     private static async Task AssertEventuallyAsync(Func<bool> condition, int timeoutMs = 3000, int pollMs = 20)

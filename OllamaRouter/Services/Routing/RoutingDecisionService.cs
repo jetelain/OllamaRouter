@@ -244,6 +244,12 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         // (Normalize resets negatives to 30), which disables the contention term entirely. ----
         var reservationWindow = TimeSpan.FromSeconds(Math.Max(0, settings.SessionReservationWindowSeconds));
 
+        // ---- Failure-streak circuit-breaker cooldown (task #94): resolved ONCE per decision
+        // and shared by every streak gate in this decision. A non-positive configured window
+        // normalizes to 0 (Normalize resets negatives to 60), which disables the Open phase
+        // (a tripped target is immediately half-open — the single trial still bounded). ----
+        var streakCooldown = TimeSpan.FromSeconds(Math.Max(0, settings.FailureStreakCooldownSeconds));
+
         var context = new RoutingContext(
             tokenCount,
             modelName,
@@ -402,18 +408,21 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             "{Model}: Routing decision {Winner} (score {Score}; {Detail})",
             normalizedName, winner.Target, winner.Score, winner.Detail);
 
-        // ---- Failure-streak switch over the ranked list (task #8 streak semantics). ----
-        // If the winner's uncommitted/mid-stream failure streak is ABOVE the threshold, take
-        // the next-ranked candidate (including the Cloud pseudo-target) whose streak is below
-        // the threshold; otherwise keep the winner (a forced switch to another failing target
-        // would be worse).
+        // ---- Failure-streak switch over the ranked list (task #8 streak semantics, task #94
+        // circuit breaker). ----
+        // If the winner's uncommitted/mid-stream failure streak is ABOVE the threshold and the
+        // circuit is skipping it (Open, or HalfOpen with the trial slot already held), take the
+        // next-ranked candidate (including the Cloud pseudo-target) that passes the cooldown-
+        // aware gate; otherwise keep the winner (a forced switch to another failing target
+        // would be worse). A HalfOpen winner (cooldown elapsed, no trial in flight) stays
+        // selectable as the single-trial candidate.
         var finalWinner = winner.Target;
         var maxFailures = settings.MaxConsecutiveFailures;
-        if (maxFailures > 0 && _streakTracker.ShouldSkip(winner.Target, maxFailures))
+        if (maxFailures > 0 && _streakTracker.ShouldSkip(winner.Target, maxFailures, streakCooldown))
         {
             var nextCandidate = ranked
                 .Skip(1)
-                .FirstOrDefault(e => !_streakTracker.ShouldSkip(e.Target, maxFailures));
+                .FirstOrDefault(e => !_streakTracker.ShouldSkip(e.Target, maxFailures, streakCooldown));
 
             if (nextCandidate is not null)
             {
@@ -428,6 +437,19 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
                     "{Model}: Target {FailedTarget} has a failure streak of {Streak} above threshold {MaxFailures}, but no subsequent target is enabled or can process the request. Keeping {FailedTarget}.",
                     normalizedName, winner.Target, _streakTracker.GetStreak(winner.Target), maxFailures, winner.Target);
             }
+        }
+
+        // ---- Half-open trial signal (task #94): the final winner is a tripped target whose
+        // cooldown has elapsed and whose trial slot is free — exactly one request may now
+        // reach it; a completed success closes the circuit, a failure re-arms the cooldown. ----
+        if (finalWinner != RoutingTarget.Cloud &&
+            maxFailures > 0 &&
+            _streakTracker.GetStreak(finalWinner) > maxFailures &&
+            !_streakTracker.ShouldSkip(finalWinner, maxFailures, streakCooldown))
+        {
+            _logger.LogInformation(
+                "Target {Target} cooldown elapsed. Entering half-open trial.",
+                finalWinner);
         }
 
         // ---- Session lease write (on the FINAL winner, including the streak switch-over). ----
@@ -505,12 +527,15 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         // the pre-configured CMax for dense (task #26, Option A).
         var maxAvailableCapacity = ContextCapacityForFit(maxAvailableCandidate.Capability, thresholds);
 
+        // ---- Failure-streak circuit-breaker cooldown (task #94): resolved ONCE per decision
+        // (the fallback hatch is part of the same decision). ----
+        var streakCooldown = TimeSpan.FromSeconds(Math.Max(0, settings.FailureStreakCooldownSeconds));
         var maxFailuresFallback = settings.MaxConsecutiveFailures;
-        if (maxFailuresFallback > 0 && _streakTracker.ShouldSkip(winnerCandidate.Target, maxFailuresFallback))
+        if (maxFailuresFallback > 0 && _streakTracker.ShouldSkip(winnerCandidate.Target, maxFailuresFallback, streakCooldown))
         {
             var nextCandidate = fallbackRanked
                 .Skip(1)
-                .FirstOrDefault(c => !_streakTracker.ShouldSkip(c.Target, maxFailuresFallback));
+                .FirstOrDefault(c => !_streakTracker.ShouldSkip(c.Target, maxFailuresFallback, streakCooldown));
 
             if (nextCandidate.Options is not null)
             {

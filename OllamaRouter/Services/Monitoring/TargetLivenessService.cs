@@ -35,8 +35,12 @@ public sealed class TargetLivenessService(
     HttpClient probeHttpClient,
     ILogger<TargetLivenessService> logger,
     TimeSpan? reprobeInterval = null,
-    TimeSpan? onlineCacheTtl = null) : ITargetLivenessService, IHostedService
+    TimeSpan? onlineCacheTtl = null,
+    ITargetFailureStreakService? streakService = null) : ITargetLivenessService, IHostedService
 {
+    // Task #94: optional failure-streak reconciliation hook (DI-wired in production via
+    // sp.GetService; null in existing direct constructions and test harnesses that opt out).
+    private readonly ITargetFailureStreakService? _streakService = streakService;
     /// <summary>Default: how long a successful probe's "Online" verdict is trusted before the next on-demand re-probe (15 s, matching <see cref="ITargetLivenessService.DefaultTolerantCacheTtl"/>).</summary>
     private static readonly TimeSpan DefaultOnlineCacheTtl = TimeSpan.FromSeconds(15);
 
@@ -398,6 +402,25 @@ public sealed class TargetLivenessService(
         }
 
         LogTransition(target, source, previous, next, outcome);
+
+        // ---- Liveness-recovery streak reconciliation (task #94), transition-ONLY by design:
+        // an Offline/Unknown target that REJOINS as Online has its stale failure streak
+        // cleared (the breaker exists for probe-healthy daemons whose model streams drop —
+        // an already-Online target taking another successful probe (Online → Online) MUST
+        // NOT reset the streak, or every 10 s re-prober tick would neutralize it). Gated on
+        // the live ResetStreakOnLivenessRecovery flag; MarkHardFailureAsync (HardError ⇒
+        // Offline) never reaches this branch. ----
+        if (previous != TargetLivenessState.Online &&
+            next == TargetLivenessState.Online &&
+            _streakService is { } streaks &&
+            options.CurrentValue.ResetStreakOnLivenessRecovery)
+        {
+            streaks.ResetStreak(target);
+            logger.LogInformation(
+                "Liveness probe ({Source}) for {Target}: rejoined Online; failure streak reset.",
+                source, target);
+        }
+
         return previous;
     }
 

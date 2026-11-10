@@ -1523,6 +1523,14 @@ public sealed class OllamaRoutingMiddleware(
             // exhausting the in-scope candidates produces the existing terminal 503 instead.
             && (allowedLocations is null || allowedLocations.Contains(TargetLocation.Cloud));
 
+        // ---- Failure-streak circuit breaker (task #94): resolved ONCE per dispatch loop. ----
+        // A tripped (streak above threshold) candidate is a failover candidate while its
+        // circuit is HalfOpen (cooldown elapsed); the per-attempt trial reservation below then
+        // bounds the in-flight trial requests to one. A non-positive window normalizes to 0
+        // (Normalize resets negatives to 60) and disables the Open phase.
+        var maxFailures = options.CurrentValue.MaxConsecutiveFailures;
+        var streakCooldown = TimeSpan.FromSeconds(Math.Max(0, options.CurrentValue.FailureStreakCooldownSeconds));
+
         // Ranked candidate list: (routing target, live target options — carrying Type,
         // ApiKey and Url; the Cloud relay entries carry the relay NODE's options).
         var candidates = new List<(RoutingTarget Target, OllamaTargetOptions Options)>();
@@ -1562,7 +1570,7 @@ public sealed class OllamaRoutingMiddleware(
                     continue;
                 }
                 if (!IsRoutableNow(candidate)
-                    || streakTracker.ShouldSkip(candidate, options.CurrentValue.MaxConsecutiveFailures))
+                    || streakTracker.ShouldSkip(candidate, maxFailures, streakCooldown))
                 {
                     continue;
                 }
@@ -1627,6 +1635,26 @@ public sealed class OllamaRoutingMiddleware(
                 continue;
             }
 
+            // ---- Half-open trial reservation (task #94): the single in-flight trial slot is
+            // owned by the DISPATCH attempt (not the decision — a decision may name a
+            // half-open target the loop never reaches). A tripped candidate that passed the
+            // cooldown-aware gate is HalfOpen (or flipped there between list build and
+            // attempt): exactly one in-flight trial may reach it. A busy slot skips this
+            // candidate with NO streak/liveness side effects (mirrors the protocol-ineligible
+            // skip). The lease is released after the outcome on every path below. ----
+            var trialLeased = false;
+            if (maxFailures > 0 && streakTracker.GetStreak(candidate) > maxFailures)
+            {
+                if (!streakTracker.TryReserveTrial(candidate, maxFailures, streakCooldown))
+                {
+                    logger.LogInformation(
+                        "Target {Target} half-open trial already in flight; skipping.",
+                        candidate.ToString());
+                    continue;
+                }
+                trialLeased = true;
+            }
+
             lastAttempted = candidate;
             // Publish the candidate AND the dispatch path being attempted so a successful
             // fallback's committed response (headers flushed mid-attempt → OnStarting) reports
@@ -1668,6 +1696,16 @@ public sealed class OllamaRoutingMiddleware(
                     context.Response.Headers[OllamaReverseProxyConfig.DispatchModeHeader] = "yarp";
                 }
                 outcome = await TryYarpDispatchAsync(context, targetOptions);
+            }
+
+            // The dispatch outcome for this attempt is determined (terminal return or the
+            // uncommitted fail-over below): release the single-trial slot so the circuit can
+            // be re-reserved. Idempotent — the RecordFailure/RecordSuccess safety nets
+            // double-release harmlessly (task #94).
+            if (trialLeased)
+            {
+                streakTracker.ReleaseTrial(candidate);
+                trialLeased = false;
             }
 
             switch (outcome)

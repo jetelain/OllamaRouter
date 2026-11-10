@@ -469,7 +469,11 @@ public static class OllamaRouterServiceCollectionExtensions
             sp.GetRequiredService<IHttpClientFactory>().CreateClient("LivenessProbe"),
             sp.GetRequiredService<ILogger<TargetLivenessService>>(),
             reprobeInterval,
-            onlineCacheTtl));
+            onlineCacheTtl,
+            // Task #94: liveness-recovery streak reconciliation (defensive GetService, consistent
+            // with the graph's minimal-host tolerance; the streak singleton is registered earlier
+            // in this core, so it always resolves in production).
+            sp.GetService<ITargetFailureStreakService>()));
         services.AddSingleton<IHostedService>(sp => (IHostedService)sp.GetRequiredService<ITargetLivenessService>());
 
         // Multi-target execution state tracker (singleton + hosted refresh timer). The SP factory injects
