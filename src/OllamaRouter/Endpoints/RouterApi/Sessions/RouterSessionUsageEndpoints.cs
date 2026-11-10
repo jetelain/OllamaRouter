@@ -58,7 +58,10 @@ public static class RouterSessionUsageEndpoints
             + "the currency/cloudValue/electricityCost/savings/actualCloudCost/cost fields are omitted (token "
             + "totals are always "
             + "present). The store is a bounded LRU (OllamaRouter:SessionUsageMaxSessions, default 1000, "
-            + "live) and in-memory-only; requests without a session ID are never stored; failed requests "
+            + "live) that is best-effort persisted to session-usage.json in the state directory (throttled ~30 s "
+            + "background write plus a flush on graceful shutdown); raw counters only — the cost figures "
+            + "stay computed at read time, so pricing changes re-price persisted sessions immediately. "
+            + "Requests without a session ID are never stored; failed requests "
             + "contribute nothing; successful completions without daemon-reported usage contribute elapsed "
             + "time only. Read-only — no key required in default mode.");
         app.MapGet("/api/router/monitor/sessions/{*sessionId}", (ISessionUsageStore store, IOptionsMonitor<OllamaRouterOptions> options, string sessionId) =>

@@ -42,14 +42,14 @@ public class RouterSessionUsageEndpointsTests
         }
     }
 
-    private static async Task<Harness> CreateAppAsync(OllamaRouterOptions options)
+    private static async Task<Harness> CreateAppAsync(OllamaRouterOptions options, string? stateFile = null)
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseUrls("http://127.0.0.1:0");
         builder.Logging.ClearProviders();
 
         var optionsMonitor = new TestOptionsMonitor<OllamaRouterOptions>(options);
-        var store = new SessionUsageStore(optionsMonitor, NullLogger<SessionUsageStore>.Instance);
+        var store = new SessionUsageStore(optionsMonitor, NullLogger<SessionUsageStore>.Instance, stateFile);
 
         builder.Services.AddSingleton<IOptionsMonitor<OllamaRouterOptions>>(optionsMonitor);
         builder.Services.AddSingleton<ISessionUsageStore>(store);
@@ -469,5 +469,101 @@ public class RouterSessionUsageEndpointsTests
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         var node = JsonNode.Parse(await response.Content.ReadAsStringAsync())!;
         Assert.Equal("a/b", node["sessionId"]!.ToString());
+    }
+
+    // ------------------------------------------------------------------
+    //  Persistence across restarts (task #105)
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task Restart_RoundTrip_ListAndDetail_FiguresIdentical()
+    {
+        var temp = Directory.CreateTempSubdirectory("session-usage-restart-")!;
+        var stateFile = Path.Combine(temp.FullName, "session-usage.json");
+        try
+        {
+            var options = OptionsWithPricing();
+            await using var first = await CreateAppAsync(options, stateFile);
+            // Multiple sessions across targets (incl. Cloud), interleaved for LRU order.
+            first.Store.Record(Entry("s1", (RoutingTarget)"Desktop", actualPrompt: 10, actualResponse: 5, cached: 2, elapsedMs: 100, timestamp: T0));
+            first.Store.Record(Entry("s2", (RoutingTarget)"Server", actualPrompt: 20, actualResponse: 7, elapsedMs: 200, timestamp: T0.AddSeconds(1)));
+            first.Store.Record(Entry("s2", RoutingTarget.Cloud, actualPrompt: 10, actualResponse: 2, elapsedMs: 50, timestamp: T0.AddSeconds(2)));
+            first.Store.Record(Entry("s1", (RoutingTarget)"Server", actualPrompt: 30, actualResponse: 11, cached: 5, elapsedMs: 300, timestamp: T0.AddSeconds(3)));
+
+            using var list1 = await first.Client.GetAsync("/api/router/monitor/sessions");
+            var listBody1 = await list1.Content.ReadAsStringAsync();
+            using var detail1 = await first.Client.GetAsync("/api/router/monitor/sessions/s2");
+            var detailBody1 = await detail1.Content.ReadAsStringAsync();
+
+            // Explicit flush (the harness registers no application lifetime on the store).
+            first.Store.Save();
+            await first.DisposeAsync();
+
+            // Harness #2: a FRESH SessionUsageStore on the SAME file (simulates a server restart).
+            await using var second = await CreateAppAsync(OptionsWithPricing(), stateFile);
+
+            using var list2 = await second.Client.GetAsync("/api/router/monitor/sessions");
+            var listBody2 = await list2.Content.ReadAsStringAsync();
+            using var detail2 = await second.Client.GetAsync("/api/router/monitor/sessions/s2");
+            var detailBody2 = await detail2.Content.ReadAsStringAsync();
+
+            // Identical figures before and after the restart for the same pricing: the raw bodies
+            // (sessionId order, counters, lastSeenAt and every cost field) are byte-equal.
+            Assert.Equal(listBody1, listBody2);
+            Assert.Equal(detailBody1, detailBody2);
+
+            var node = JsonNode.Parse(listBody2)!;
+            var sessions = node["sessions"]!.AsArray();
+            Assert.Equal(["s1", "s2"], sessions.Select(s => s!["sessionId"]!.ToString()).ToArray());
+            Assert.NotNull(sessions[1]!["cost"]);
+        }
+        finally
+        {
+            Directory.Delete(temp.FullName, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Restart_ThenPricingChange_RepricesPersistedSessions_AtReadTime()
+    {
+        var temp = Directory.CreateTempSubdirectory("session-usage-reprice-")!;
+        var stateFile = Path.Combine(temp.FullName, "session-usage.json");
+        try
+        {
+            await using var first = await CreateAppAsync(OptionsWithPricing(), stateFile);
+            first.Store.Record(Entry("s1", (RoutingTarget)"Desktop", actualPrompt: 10_000, actualResponse: 5_000, cached: 2_000, elapsedMs: 60_000, timestamp: T0));
+
+            using var preRestart = await first.Client.GetAsync("/api/router/monitor/sessions/s1");
+            var firstValue = JsonNode.Parse(await preRestart.Content.ReadAsStringAsync())!["cloudValue"]!.GetValue<double>();
+
+            first.Store.Save();
+            await first.DisposeAsync();
+
+            // Restart: a fresh store loads the RAW counters from disk; the same pricing yields the
+            // SAME figures (read-time math on persisted raw counters survives the restart).
+            await using var second = await CreateAppAsync(OptionsWithPricing(), stateFile);
+            using var afterRestart = await second.Client.GetAsync("/api/router/monitor/sessions/s1");
+            var reloadedNode = JsonNode.Parse(await afterRestart.Content.ReadAsStringAsync())!;
+            Assert.Equal(firstValue, reloadedNode["cloudValue"]!.GetValue<double>(), 4);
+
+            // Flip the pricing live after the restart: the persisted RAW counters re-price on the
+            // next read (proves no cost figures were frozen at save time).
+            second.Options.SetValue(new OllamaRouterOptions
+            {
+                Targets = OptionsWithPricing().Targets,
+                Pricing = new PricingOptions { PricePerMillion = 10.0, Currency = "€" }
+            });
+
+            using var repriced = await second.Client.GetAsync("/api/router/monitor/sessions/s1");
+            var repricedNode = JsonNode.Parse(await repriced.Content.ReadAsStringAsync())!;
+            Assert.Equal("€", repricedNode["currency"]!.ToString());
+            var expected = Math.Round(10_000 / 1_000_000.0 * 10.0 + 5_000 / 1_000_000.0 * 10.0, 4);
+            Assert.Equal(expected, repricedNode["cloudValue"]!.GetValue<double>(), 4);
+            Assert.NotEqual(firstValue, repricedNode["cloudValue"]!.GetValue<double>());
+        }
+        finally
+        {
+            Directory.Delete(temp.FullName, recursive: true);
+        }
     }
 }

@@ -159,6 +159,7 @@ namespace OllamaRouter.Serialization;
  [JsonSerializable(typeof(RouterSessionUsageItem))]
  [JsonSerializable(typeof(RouterSessionUsageDetailResponse))]
  [JsonSerializable(typeof(RouterSessionUsageTargetItem))]
+ [JsonSerializable(typeof(List<SessionUsageStateEntry>))] // task #105: session-usage.json root
  // Session-affinity lease release router API DTO (task #86).
  [JsonSerializable(typeof(RouterSessionAffinityReleaseResponse))]
 public partial class OllamaRouterJsonSerializerContext : JsonSerializerContext
