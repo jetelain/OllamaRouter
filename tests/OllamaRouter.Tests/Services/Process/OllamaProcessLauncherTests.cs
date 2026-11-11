@@ -8,9 +8,10 @@ using OllamaRouter.Services.Process;
 namespace OllamaRouter.Tests.Services.Process;
 
 /// <summary>
-/// Unit tests for <see cref="OllamaProcessLauncher"/> port-availability detection (plan §2.5):
-/// the bind probe is platform-neutral and fully covered; the launch path itself is Windows-only
-/// and is explicitly skipped (via a runtime OS check) on non-Windows CI.
+/// Unit tests for <see cref="OllamaProcessLauncher"/>: the bind-probe port-availability detection
+/// (plan §2.5, fully covered and platform-neutral), the OLLAMA_HOST host:port resolution used by
+/// the macOS launch path, and the OS guard. The actual process launch is Windows/macOS-only and
+/// is explicitly skipped (via a runtime OS check) on other CI platforms.
 /// </summary>
 public class OllamaProcessLauncherTests
 {
@@ -126,7 +127,63 @@ public class OllamaProcessLauncherTests
 
         var ex = Record.Exception(() => launcher.EnsureRunning());
         Assert.Null(ex);
-        // The launch path is Windows-only; the probe/short-circuit keeps it side-effect-free.
-        _ = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+        // The launch path is Windows/macOS-only; the probe/short-circuit keeps it side-effect-free.
+        _ = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) || RuntimeInformation.IsOSPlatform(OSPlatform.OSX);
+    }
+
+    [Theory]
+    [InlineData("http://127.0.0.1:11435", "127.0.0.1:11435")]
+    [InlineData("http://127.0.0.1:11435/", "127.0.0.1:11435")]
+    [InlineData("http://localhost", "localhost:80")]
+    public void GetOllamaHost_ValidUrl_ReturnsHostAndPort(string url, string expected)
+    {
+        Assert.Equal(expected, OllamaProcessLauncher.GetOllamaHost(url));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("not a url")]
+    [InlineData(null)]
+    public void GetOllamaHost_InvalidUrl_ReturnsNull(string? url)
+    {
+        Assert.Null(OllamaProcessLauncher.GetOllamaHost(url));
+    }
+
+    [Fact]
+    public void ResolveExpectedDaemonHost_FirstLoopbackTarget_ReturnsItsHostAndPort()
+    {
+        var options = new OllamaRouterOptions
+        {
+            Targets =
+            [
+                new OllamaTargetOptions { Name = "desktop", Url = "http://127.0.0.1:11435" },
+                new OllamaTargetOptions { Name = "laptop", Url = "http://192.168.1.20:11435" }
+            ]
+        };
+
+        Assert.Equal("127.0.0.1:11435", OllamaProcessLauncher.ResolveExpectedDaemonHost(options));
+    }
+
+    [Fact]
+    public void ResolveExpectedDaemonHost_NoLoopbackTarget_FallsBackToLocalUrl()
+    {
+        var options = new OllamaRouterOptions
+        {
+#pragma warning disable CS0618
+            LocalUrl = "http://127.0.0.1:11436",
+#pragma warning restore CS0618
+            Targets =
+            [
+                new OllamaTargetOptions { Name = "laptop", Url = "http://192.168.1.20:11435" }
+            ]
+        };
+
+        Assert.Equal("127.0.0.1:11436", OllamaProcessLauncher.ResolveExpectedDaemonHost(options));
+    }
+
+    [Fact]
+    public void ResolveExpectedDaemonHost_NoOptions_ReturnsNull()
+    {
+        Assert.Null(OllamaProcessLauncher.ResolveExpectedDaemonHost(null));
     }
 }

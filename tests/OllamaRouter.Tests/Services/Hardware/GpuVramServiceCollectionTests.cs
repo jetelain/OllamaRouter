@@ -82,4 +82,31 @@ public class GpuVramServiceCollectionTests
         Assert.Equal(1, fakeRunner.InvocationCount("nvidia-smi", nvidiaArgs));
         _ = nvidia;
     }
+
+    [Fact]
+    public void AddGpuVramProviders_MacOS_AppleProviderRegisteredAndInComposite()
+    {
+        if (!OperatingSystem.IsMacOS())
+        {
+            return;
+        }
+
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddGpuVramProviders();
+
+        using var providerFactory = services.BuildServiceProvider();
+        var apple1 = providerFactory.GetRequiredService<AppleUnifiedMemoryVramProvider>();
+        var apple2 = providerFactory.GetRequiredService<AppleUnifiedMemoryVramProvider>();
+
+        Assert.Same(apple1, apple2);
+
+        // The composite must contain the exact same shared instance (no production API change:
+        // MultiVendorVramProvider has no provider accessor, so read the field via reflection).
+        var composite = providerFactory.GetRequiredService<IGpuVramProvider>();
+        var providersField = typeof(MultiVendorVramProvider).GetField("_providers",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        var providers = (IReadOnlyList<IGpuVramProvider>)providersField!.GetValue(composite)!;
+        Assert.Contains(providers, p => ReferenceEquals(p, apple1));
+    }
 }

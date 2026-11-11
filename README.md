@@ -2,7 +2,7 @@
 
 OllamaRouter is a lightweight reverse proxy that sits in front of two [Ollama](https://ollama.com) instances and transparently routes each request to the most appropriate one:
 
-- A **local** Ollama instance, running on a machine with a powerful GPU but **limited VRAM** (NVIDIA, AMD, or Intel GPU).
+- A **local** Ollama instance, running on a machine with a powerful GPU but **limited VRAM** (NVIDIA, AMD, or Intel GPU, or Apple Silicon Mac with unified memory).
 - A **remote** Ollama instance (e.g. a server), with a lot of **unified RAM or VRAM** but a **less powerful GPU**.
 
 The goal is to get the best of both worlds: use the fast local GPU whenever the request can fit in its available VRAM, and fall back to the remote server for everything else (larger contexts, models that don't fit locally, etc.).
@@ -313,6 +313,8 @@ Set the following environment variables:
 - `OLLAMA_FLASH_ATTENTION` to `1`
 
 Then install (or restart) Ollama for the changes to take effect.
+
+> **macOS.** On macOS the daemon is launched by the `Ollama.app` menu bar app, so the environment must be set in the user's launchd session: run `launchctl setenv OLLAMA_HOST 127.0.0.1:11435` and then restart Ollama. These values are lost on reboot — either re-set them from a LaunchAgent, or let OllamaRouter start Ollama itself (see [Running](#running)), which passes `OLLAMA_HOST` at launch. Beware the default-port pitfall: an Ollama left on its default `127.0.0.1:11434` keeps listening alongside the router on `11434`, letting local clients bypass the router.
 
 Pull the model you want to use locally, e.g.:
 ```powershell
@@ -709,6 +711,14 @@ The simulated fleet (two in-process routers + N daemon stubs), the full §4 acce
 
 Download the latest [`OllamaRouter-win-x64.zip`](../../releases) from the [releases page](../../releases), extract it into a folder of your choice and run `OllamaRouter.exe`. The executable is self-contained: no .NET installation is required.
 
+### macOS
+
+No macOS release zip is published yet. Build a self-contained native executable (requires the Xcode Command Line Tools, `xcode-select --install`):
+
+```bash
+dotnet publish src/OllamaRouter/OllamaRouter.csproj -c Release -r osx-arm64 -o OllamaRouter-osx-arm64
+```
+
 ### From source
 
 ```powershell
@@ -724,6 +734,8 @@ dotnet run --project src\OllamaRouter\OllamaRouter.csproj
 ```
 
 By default, the router listens on `http://localhost:11434`, the standard Ollama port, so it can be used as a drop-in replacement for a direct Ollama endpoint in your existing tools and clients. On startup, a link to the [monitoring UI](#monitoring) is printed to the console.
+
+On startup the router ensures the local Ollama is running (Windows and macOS only): on **Windows** it launches `%LOCALAPPDATA%\Programs\Ollama\ollama app.exe`, and on **macOS** it starts `/Applications/Ollama.app` (or `~/Applications/Ollama.app`) in the background with `OLLAMA_HOST` set to the host:port of the first loopback `Targets` entry (falling back to `LocalUrl`). An already-running Ollama is left exactly as is (it must already listen on the expected port — the router probes it and never starts a competing daemon). On other platforms Ollama is expected to be managed by the OS or started manually.
 
 ## Monitoring
 
@@ -809,7 +821,7 @@ curl -X POST -H "X-OllamaRouter-Session-Id: sess-86" \
 
 - .NET 9 / .NET 10 SDK
 - Two reachable Ollama instances (local and remote)
-- A GPU VRAM probe tool on the local machine (see “GPU/VRAM detection”); if none is present the probe returns 0, which effectively disables VRAM-gated local routing
+- A GPU VRAM probe tool on the local machine (see “GPU/VRAM detection”); if none is present the probe returns 0, which effectively disables VRAM-gated local routing. To report the free VRAM of the local machine: Windows / Linux: `nvidia-smi` (returns 0 if unavailable); macOS (Apple Silicon): nothing to install — `sysctl` and `vm_stat`
 
 ## GPU/VRAM detection
 
@@ -819,12 +831,17 @@ OllamaRouter probes the local GPU's free VRAM through a composite provider that 
 2. **AMD** — `rocm-smi` (Linux only, ROCm required); reports exact free VRAM (summed across all AMD GPUs).
 3. **Intel** — `xpu-smi` (Linux, Intel GPU Tools) or, as a fallback, `intel_gpu_top` (Linux); reports exact free VRAM.
 4. **Windows non-NVIDIA fallback** — WMI `Win32_VideoController.AdapterRAM` (Windows only). **Degraded: this reports TOTAL VRAM, not free VRAM**, and is only reached when `nvidia-smi` reports 0 (i.e. no usable NVIDIA device).
+5. **macOS Apple Silicon** — `AppleUnifiedMemoryVramProvider` estimates the free VRAM from the machine's unified memory via `sysctl` (`hw.memsize`, `iogpu.wired_limit_mb`) and `vm_stat` — nothing to install. See [GPU memory on macOS](#gpu-memory-on-macos).
 
 Notes:
 
-- AMD and Intel probes are only attempted on Linux; the WMI fallback is only attempted on Windows. On macOS (or a machine with no probe tool installed at all) the probe returns 0.
+- AMD and Intel probes are only attempted on Linux; the WMI fallback is only attempted on Windows; the Apple unified-memory estimator is only attempted on macOS. On a machine with no probe tool available at all (e.g. Linux without any of the CLI tools) the probe returns 0.
 - If **all** probes report 0, the composite returns 0, which effectively disables VRAM-gated local routing (requests fall through to the remote target).
 - Each probe result is logged at `Trace` level for diagnostics (e.g. “VRAM probe RocmSmiVramProvider: 1234MB”).
+
+### GPU memory on macOS
+
+Apple Silicon Macs have no dedicated VRAM: the GPU shares the machine's **unified memory**. macOS lets the GPU wire at most `iogpu.wired_limit_mb` megabytes when that sysctl is set (`sudo sysctl iogpu.wired_limit_mb=<MB>`), and otherwise defaults to roughly **2/3 of the total RAM up to 36 GB, 3/4 above that size** — which is exactly the budget `AppleUnifiedMemoryVramProvider` applies when the sysctl is unset. The reported value is `min(remaining GPU wired budget, free + inactive + speculative pages)` from `vm_stat`, so it varies as other applications (and loaded models) use memory: size `MinRequiredVramMB` per Mac (a 24 GB Mac typically reports ≈ 12–14 GB free).
 
 ## Project structure
 
@@ -838,6 +855,7 @@ Notes:
 - `Endpoints/OllamaEndpointsExtensions.cs` – hybrid endpoints (`/api/tags`, `/api/ps`, `/v1/models`) that short-circuit YARP to return merged results including configured cloud models.
 - `Endpoints/MonitorEndpointsExtensions.cs` – lightweight monitoring UI (`/monitor`, `/monitor/api`), target toggles (`POST /targets`), and non-destructive VRAM reclaim (`POST /api/models/unload`, `POST /monitor/reclaim-vram`).
 - `Services/ActivityMonitorService.cs` – in-memory bookkeeping of busy state, in-progress requests and recent request history used by the monitoring UI.
+- `Services/OllamaProcessLauncher.cs` – ensures the local Ollama is running on startup (Windows and macOS only), probing the expected daemon port first so a manually managed daemon is never duplicated.
 - `Services/ActivityStatisticsService.cs` – per-target counters (requests, actual input/output tokens) with current-day and last-7-days aggregation, persisted on a best-effort basis to a dedicated JSON file in the application data folder (`%LOCALAPPDATA%\OllamaRouter\activity-statistics.json` on Windows) and exposed via `/monitor/api`.
 - `Services/TargetAvailabilityService.cs` – in-memory state of the Local/Remote/Cloud enable/disable flags, loaded at startup from and persisted on a best-effort basis to a dedicated JSON state file in the application data folder (`%LOCALAPPDATA%\OllamaRouter\targets.json` on Windows), toggled via `POST /targets`.
 - `Services/InferenceRequestRecorder.cs` – optional, best-effort recorder of inference requests (a `requests.jsonl` metadata manifest plus one pretty-printed payload file per request with the full request body) used to investigate estimated vs actual token counts; disabled by default, records are stored in the application data folder (`%LOCALAPPDATA%\OllamaRouter\inference-requests\` on Windows).

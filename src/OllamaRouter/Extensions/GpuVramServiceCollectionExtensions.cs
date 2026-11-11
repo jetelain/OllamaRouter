@@ -11,10 +11,11 @@ public static class GpuVramServiceCollectionExtensions
 {
     /// <summary>
     /// Registers <see cref="IProcessRunner"/> (internal, via the concrete <c>ProcessRunner</c>), the vendor
-    /// providers (NVIDIA always; AMD/Intel on Linux; the degraded Windows WMI provider on Windows), the
+    /// providers (NVIDIA always; AMD/Intel on Linux; the degraded Windows WMI provider on Windows; the
+    /// Apple Silicon unified-memory estimator on macOS), the
     /// composite <see cref="MultiVendorVramProvider"/> as the <see cref="IGpuVramProvider"/> singleton, and the
     /// local workstation hardware profiler (<see cref="LocalHardwareProfileProvider"/>).
-    /// Probe order is fixed here: NVIDIA, AMD, Intel, Windows WMI (first non-zero value wins).
+    /// Probe order is fixed here: NVIDIA, AMD, Intel, Windows WMI, macOS unified memory (first non-zero value wins).
     /// </summary>
     public static IServiceCollection AddGpuVramProviders(this IServiceCollection services)
     {
@@ -29,6 +30,10 @@ public static class GpuVramServiceCollectionExtensions
         {
             services.AddSingleton<WindowsVramProvider>();
         }
+        if (OperatingSystem.IsMacOS())
+        {
+            services.AddSingleton(sp => new AppleUnifiedMemoryVramProvider(sp.GetRequiredService<IProcessRunner>()));
+        }
         services.AddSingleton<IGpuVramProvider>(sp =>
         {
             var list = new List<IGpuVramProvider> { sp.GetRequiredService<NvidiaSmiVramProvider>() };
@@ -40,6 +45,10 @@ public static class GpuVramServiceCollectionExtensions
             if (OperatingSystem.IsWindows())
             {
                 list.Add(sp.GetRequiredService<WindowsVramProvider>());
+            }
+            if (OperatingSystem.IsMacOS())
+            {
+                list.Add(sp.GetRequiredService<AppleUnifiedMemoryVramProvider>());
             }
             return new MultiVendorVramProvider(list, sp.GetRequiredService<ILogger<MultiVendorVramProvider>>());
         });

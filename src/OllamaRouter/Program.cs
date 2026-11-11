@@ -92,7 +92,7 @@ var fleetTargets = OllamaRouterServiceCollectionExtensions.BuildFleetTargets(oll
     }
 }
 
-// Ensure local Ollama is running (Windows only).
+// Ensure local Ollama is running (Windows and macOS only).
 app.Services.GetRequiredService<IOllamaProcessLauncher>().EnsureRunning(ollamaOptions);
 
 app.UseOllamaRouterPipeline();
