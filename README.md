@@ -529,8 +529,11 @@ nThe router's Setup API can edit persistent configuration (fleet targets, hardwa
 | `GET`, `POST` | `/api/router/api-keys` (key management) |
 | `DELETE` | `/api/router/api-keys/{name}` (key management) |
 | `POST` | `/api/router/api-keys/default/rotate` (key management) |
+| `POST` | `/api/router/admin/shutdown` (daemon lifecycle — graceful host stop) |
 
 The monitor availability toggle (`POST /targets`) is **not** protected in default mode (runtime state, not persistent config — the browser flow needs no key).
+
+**Graceful daemon shutdown** — `POST /api/router/admin/shutdown` (key-protected) returns `202 Accepted` with `{"stopping":true,"processId":...}` and triggers a graceful host stop via `IHostApplicationLifetime.StopApplication()` *after* the response starts flowing: Kestrel stops the listener and drains the in-flight request, so the complete `202` body is always delivered, and the hosted statistics persistence (activity statistics + per-session usage) flushes its in-memory state on `ApplicationStopped`. The daemon also reports its own process telemetry on `GET /api/router/info` (`processId`, `startedAtUtc`, `uptimeSeconds`).
 
 **`ApiSecurity.RequireKeyForAllEndpoints`** (default `false`) extends key enforcement to **every** endpoint (reads, `/monitor*`, proxy paths, runtime actions). Both `ApiSecurity` values are **live**: an edit of `config/config.json` rebinds without a restart.
 
@@ -584,7 +587,7 @@ The full router management API is documented as an OpenAPI 3.1 JSON document, ge
 GET {bind-address}/api/router/openapi.json
 ```
 
-e.g. `http://localhost:11434/api/router/openapi.json`. Point any OpenAPI tooling (Swagger Editor, Redoc, code generators) at that URL. The document covers the 28 `/api/router/*` operations in nine functional groups:
+e.g. `http://localhost:11434/api/router/openapi.json`. Point any OpenAPI tooling (Swagger Editor, Redoc, code generators) at that URL. The document covers the 29 `/api/router/*` operations in ten functional groups:
 
 - **Identity & Fleet** — `/info`, `/fleet`
 - **Hardware Profiling** — `/hardware`, `/fleet/hardware` (GET + PUT)
@@ -595,6 +598,7 @@ e.g. `http://localhost:11434/api/router/openapi.json`. Point any OpenAPI tooling
 - **API Key Security** — `/api-keys` (GET/POST/DELETE `{name}`), `/api-keys/default/rotate`
 - **Session Usage & Savings** — `/monitor/sessions`, `/monitor/sessions/{*sessionId}`
 - **Session Affinity** — `/sessions/affinity/release` (POST)
+- **Admin & Lifecycle** — `/admin/shutdown` (POST, key-protected graceful host stop)
 
 The `RouterApiKey` security scheme (http/bearer/base64url — `Authorization: Bearer <key>` or `X-Api-Key: <key>`) is applied to exactly the default protected route set above; with `ApiSecurity.RequireKeyForAllEndpoints: true` every route (including the document endpoint) requires a key. The document is regenerated per request from the same AOT source-generated DTO records the endpoints use — no drift, and it works in AOT-published builds.
 

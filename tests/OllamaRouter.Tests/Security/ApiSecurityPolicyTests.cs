@@ -27,6 +27,7 @@ public class ApiSecurityPolicyTests
     [InlineData("POST", "/api/router/api-keys")]
     [InlineData("DELETE", "/api/router/api-keys/{name}")]
     [InlineData("POST", "/api/router/api-keys/default/rotate")]
+    [InlineData("POST", "/api/router/admin/shutdown")]
     public void IsProtectedRoute_DefaultSet_IncludesConfigAffectingRoutes(string method, string path)
     {
         Assert.True(ApiSecurityPolicy.IsProtectedRoute(method, path), $"{method} {path} must be protected");
@@ -119,6 +120,8 @@ public class ApiSecurityPolicyTests
     [InlineData("POST", "/api/router/api-keys/name")]
     [InlineData("DELETE", "/api/router/api-keys/name/sub")] // two segments: no single-segment match
     [InlineData("GET", "/api/router/unknown")]
+    [InlineData("GET", "/api/router/admin/shutdown")] // wrong method on the admin route
+    [InlineData("POST", "/api/router/admin/other")] // unknown path under the admin prefix
     [InlineData("POST", "/")]
     [InlineData("GET", "/")]
     public void IsProtectedRoute_WrongMethodOrUnknownPath_IsOpen(string method, string path)

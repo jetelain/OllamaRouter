@@ -38,6 +38,13 @@ public interface IOllamaRouterApiClient
     /// <summary><c>GET /api/router/info</c>: router version, fleet summary and feature flags.</summary>
     Task<RouterInfoResponse> GetInfoAsync(CancellationToken ct = default);
 
+    /// <summary>
+    /// <c>POST /api/router/admin/shutdown</c> (202): triggers the router's graceful host shutdown
+    /// (task #99). Key-protected: unauthenticated requests get a 401 (surfaced as
+    /// <see cref="OllamaRouterApiException"/> after the single automatic 401 re-read retry).
+    /// </summary>
+    Task<RouterShutdownResponse> ShutdownAsync(CancellationToken ct = default);
+
     /// <summary><c>GET /monitor/api</c>: the full monitor state (fleet, statistics, requests, cost, overhead).</summary>
     Task<MonitorStateResponse> GetMonitorStateAsync(CancellationToken ct = default);
 
@@ -248,6 +255,11 @@ public sealed class OllamaRouterApiClient : IOllamaRouterApiClient, IDisposable
     public Task<RouterInfoResponse> GetInfoAsync(CancellationToken ct = default) =>
         SendAsync(HttpMethod.Get, "api/router/info",
             OllamaRouterClientJsonContext.Default.RouterInfoResponse, ct);
+
+    /// <inheritdoc />
+    public Task<RouterShutdownResponse> ShutdownAsync(CancellationToken ct = default) =>
+        SendAsync(HttpMethod.Post, "api/router/admin/shutdown",
+            OllamaRouterClientJsonContext.Default.RouterShutdownResponse, ct);
 
     /// <inheritdoc />
     public async Task<MonitorStateResponse> GetMonitorStateAsync(CancellationToken ct = default)

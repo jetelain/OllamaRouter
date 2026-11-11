@@ -31,16 +31,22 @@ public static class RouterInfoEndpoints
             CancellationToken cancellationToken) =>
         {
             var (fleet, features) = await BuildInfoBlocksAsync(options, serviceProvider, cancellationToken);
-            return Results.Json(new RouterInfoResponse(RouterApiEndpointsExtensions.GetRouterVersion(), true, fleet, features),
+            return Results.Json(new RouterInfoResponse(
+                    RouterApiEndpointsExtensions.GetRouterVersion(), true, fleet, features,
+                    ProcessId: RouterProcessTelemetry.ProcessId,
+                    StartedAtUtc: RouterProcessTelemetry.StartedAtUtc,
+                    UptimeSeconds: RouterProcessTelemetry.UptimeSeconds),
                 OllamaRouterJsonSerializerContext.Default.RouterInfoResponse);
         })
         .WithName("GetRouterInfo")
         .WithTags("Identity & Fleet")
-        .WithSummary("Report the router identity, version, fleet summary and active feature flags.")
+        .WithSummary("Report the router identity, version, fleet summary, active feature flags and process telemetry.")
         .WithDescription("Instantly differentiates OllamaRouter from a standard Ollama daemon (which 404s this route). "
             + "Pure in-memory snapshot read: no statistics, no history aggregation and no blocking per-target HTTP (only the awaited "
             + "local GPU CLI snapshot when a local workstation target is present). 'version' is the assembly informational version. "
-            + "The fleet summary counts the Cloud pseudo-target in totalTargets/onlineTargets when cloud overflow is enabled.");
+            + "The fleet summary counts the Cloud pseudo-target in totalTargets/onlineTargets when cloud overflow is enabled. "
+            + "The process telemetry reports the daemon process id ('processId'), the process start instant UTC ('startedAtUtc') "
+            + "and the non-negative process uptime in seconds ('uptimeSeconds').");
         return app;
     }
 

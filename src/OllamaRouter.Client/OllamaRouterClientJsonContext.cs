@@ -43,10 +43,11 @@ namespace OllamaRouter.Client;
 [JsonSerializable(typeof(MonitorRecentRequestItem))]
 [JsonSerializable(typeof(MonitorOverheadStatus))]
 [JsonSerializable(typeof(MonitorOverheadRecommendation))]
-// Info.
+// Info + admin lifecycle.
 [JsonSerializable(typeof(RouterInfoResponse))]
 [JsonSerializable(typeof(RouterFleetSummary))]
 [JsonSerializable(typeof(RouterFeatures))]
+[JsonSerializable(typeof(RouterShutdownResponse))]
 // Fleet + execution.
 [JsonSerializable(typeof(RouterFleetResponse))]
 [JsonSerializable(typeof(RouterTargetItem))]

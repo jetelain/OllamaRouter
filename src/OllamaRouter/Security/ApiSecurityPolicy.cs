@@ -10,7 +10,9 @@ namespace OllamaRouter.Security;
 /// <c>PUT /api/router/fleet/hardware/{targetName}</c>, <c>POST /api/router/benchmark</c>,
 /// <c>DELETE /api/router/benchmark/results</c> and the key-management endpoints
 /// (<c>GET/POST /api/router/api-keys</c>, <c>DELETE /api/router/api-keys/{name}</c>,
-/// <c>POST /api/router/api-keys/default/rotate</c> — key-protected by definition).
+/// <c>POST /api/router/api-keys/default/rotate</c> — key-protected by definition) and the
+/// daemon lifecycle endpoint <c>POST /api/router/admin/shutdown</c> (task #99: stopping the
+/// host is config-lifetime-affecting and must never be reachable keyless).
 /// </para>
 /// <para>
 /// Explicitly NOT in the default set: <c>POST /targets</c> (monitor availability toggle —
@@ -64,6 +66,12 @@ public static class ApiSecurityPolicy
         if (string.Equals(path, "/api/router/benchmark/results", StringComparison.OrdinalIgnoreCase))
         {
             return method == "DELETE";
+        }
+
+        if (string.Equals(path, "/api/router/admin/shutdown", StringComparison.OrdinalIgnoreCase))
+        {
+            // POST only (task #99): the graceful daemon shutdown is lifecycle-affecting.
+            return method == "POST";
         }
 
         // ---- Key management (key-protected by definition) -----------------

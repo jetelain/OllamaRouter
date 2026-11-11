@@ -276,6 +276,12 @@ public class RouterApiEndpointsTests
         Assert.NotNull(node);
         Assert.Equal("true", node!["isRouter"]!.ToString());
         Assert.False(string.IsNullOrEmpty(node["version"]!.ToString()));
+        // Process telemetry (task #99): valid pid, parseable start instant, non-negative uptime.
+        Assert.Equal(Environment.ProcessId.ToString(), node["processId"]!.ToString());
+        var startedAtRaw = node["startedAtUtc"]!.ToString();
+        Assert.True(DateTimeOffset.TryParse(startedAtRaw, out _), $"startedAtUtc must parse: '{startedAtRaw}'");
+        Assert.True(double.Parse(node["uptimeSeconds"]!.ToString(), System.Globalization.CultureInfo.InvariantCulture) >= 0.0,
+            "uptimeSeconds must be non-negative");
         Assert.Equal("4", node["fleet"]!["totalTargets"]!.ToString()); // 3 configured + Cloud
         Assert.Equal("3", node["fleet"]!["onlineTargets"]!.ToString()); // Local + Server + Cloud (Laptop offline)
         Assert.Equal("true", node["fleet"]!["cloudEnabled"]!.ToString());

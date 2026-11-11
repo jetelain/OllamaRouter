@@ -1,4 +1,5 @@
 using System.Reflection;
+using OllamaRouter.Endpoints.RouterApi.Admin;
 using OllamaRouter.Endpoints.RouterApi.ApiKeys;
 using OllamaRouter.Endpoints.RouterApi.Benchmark;
 using OllamaRouter.Endpoints.RouterApi.Cartography;
@@ -25,7 +26,8 @@ namespace OllamaRouter.Endpoints;
 /// <see cref="RouterApi.Preload.RouterPreloadEndpoints"/>, <see cref="RouterApi.Config.RouterConfigEndpoints"/>,
 /// <see cref="RouterApi.Targets.RouterTargetsEndpoints"/>, <see cref="RouterApi.ApiKeys.RouterApiKeysEndpoints"/>,
 /// <see cref="RouterApi.Sessions.RouterSessionUsageEndpoints"/>,
-/// <see cref="RouterApi.SessionAffinity.RouterSessionAffinityEndpoints"/>)
+/// <see cref="RouterApi.SessionAffinity.RouterSessionAffinityEndpoints"/>,
+/// <see cref="RouterApi.Admin.RouterAdminEndpoints"/>)
 /// in the exact original registration order, which global route matching depends on
 /// (in particular the catch-all <c>/api/router/models/{*modelName}</c> vs
 /// <c>POST /api/router/models/{*tail}</c> pair and the position of the
@@ -34,9 +36,10 @@ namespace OllamaRouter.Endpoints;
 public static class RouterApiEndpointsExtensions
 {
     /// <summary>
-    /// Maps the full OllamaRouter management API: the 28 endpoints of the 13 per-area
+    /// Maps the full OllamaRouter management API: the 29 endpoints of the 14 per-area
     /// endpoint groups, registered in the original order (the session-affinity area is appended
-    /// last).
+    /// before the admin & lifecycle area, which is last — its fixed path cannot conflict with
+    /// any catch-all route).
     /// </summary>
     public static WebApplication MapOllamaRouterApiEndpoints(this WebApplication app)
     {
@@ -53,6 +56,7 @@ public static class RouterApiEndpointsExtensions
         app.MapRouterApiKeysEndpoints();
         app.MapRouterSessionUsageEndpoints();
         app.MapRouterSessionAffinityEndpoints();
+        app.MapRouterAdminEndpoints();
         return app;
     }
 

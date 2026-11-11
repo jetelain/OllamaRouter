@@ -31,7 +31,7 @@ namespace OllamaRouter.Tests.Client;
 /// <c>POST /targets</c> dictionary, the always-<c>residentModels</c>-array monitor contract,
 /// non-2xx error mapping (<see cref="OllamaRouterApiException"/> <c>Status</c> + <c>Error</c>
 /// with a 512-char raw-body fallback), the single automatic 401 default-key re-read-and-retry,
-/// and a table-driven round-trip of ALL 27 route-table methods against the source-generated
+/// and a table-driven round-trip of ALL 28 route-table methods against the source-generated
 /// <see cref="OllamaRouterClientJsonContext"/>.
 /// Self-contained: a fake <see cref="HttpMessageHandler"/> captures method/path/body/headers and
 /// serves canned responses; a temp-dir <see cref="DefaultKeyReader"/> with
@@ -91,6 +91,11 @@ public sealed class OllamaRouterApiClientTests : IDisposable
         Assert.True(info.Features.Failover);
         Assert.True(info.Features.AntiThrashingAffinity);
         Assert.False(info.Features.AutoShrink);
+
+        // Process telemetry (task #99).
+        Assert.Equal(1234, info.ProcessId);
+        Assert.Equal(new DateTimeOffset(2026, 11, 10, 12, 0, 0, TimeSpan.Zero), info.StartedAtUtc);
+        Assert.Equal(3600.5, info.UptimeSeconds);
     }
 
     [Fact]
@@ -333,7 +338,7 @@ public sealed class OllamaRouterApiClientTests : IDisposable
         Assert.True(handler.Requests.Count <= 1, $"expected no retry, got {handler.Requests.Count} requests");
     }
 
-    // ------------------------------------------------- 27-method route-table round-trip
+    // ------------------------------------------------- 28-method route-table round-trip
 
     [Theory]
     [InlineData("GetInfoAsync")]
@@ -363,6 +368,7 @@ public sealed class OllamaRouterApiClientTests : IDisposable
     [InlineData("CreateApiKeyAsync")]
     [InlineData("DeleteApiKeyAsync")]
     [InlineData("RotateDefaultKeyAsync")]
+    [InlineData("ShutdownAsync")]
     public async Task RouteTable_EveryMethod_RoundTripsRequestSerializationAndResponseParsing(string method)
     {
         var route = RouteCases[method];
@@ -720,6 +726,16 @@ public sealed class OllamaRouterApiClientTests : IDisposable
                 Assert.Equal("bmV3LWRlZmF1bHQta2V5", r.Key);
                 Assert.Equal(GeneratedAt, r.GeneratedAt);
             }),
+
+        ["ShutdownAsync"] = new(
+            "POST", "/api/router/admin/shutdown", null, null, (HttpStatusCode)202, RouterShutdownResponseJson,
+            async client => await client.ShutdownAsync(),
+            result =>
+            {
+                var r = (RouterShutdownResponse)result!;
+                Assert.True(r.Stopping);
+                Assert.Equal(4242, r.ProcessId);
+            }),
     };
 
     // ------------------------------------------------------------------ canned JSON
@@ -727,8 +743,12 @@ public sealed class OllamaRouterApiClientTests : IDisposable
     private const string RouterInfoJson = """
         {"version":"2026.11.0","isRouter":true,
          "fleet":{"totalTargets":3,"onlineTargets":2,"cloudEnabled":true},
-         "features":{"dynamicContext":true,"autoShrink":false,"failover":true,"antiThrashingAffinity":true}}
+         "features":{"dynamicContext":true,"autoShrink":false,"failover":true,"antiThrashingAffinity":true},
+         "processId":1234,"startedAtUtc":"2026-11-10T12:00:00.000Z","uptimeSeconds":3600.5}
         """;
+
+    private const string RouterShutdownResponseJson =
+        """{"stopping":true,"processId":4242}""";
 
     private const string MonitorStateJson = """
         {
