@@ -1,0 +1,48 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:views="using:OllamaRouter.App.Views"
+        xmlns:vm="using:OllamaRouter.App.ViewModels"
+        x:Class="OllamaRouter.App.Views.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Title="OllamaRouter"
+        Width="1280" Height="800"
+        MinWidth="960" MinHeight="600">
+  <DockPanel>
+    <!-- Connection bar -->
+    <Border DockPanel.Dock="Top" Padding="8" BorderBrush="#333" BorderThickness="0,0,0,1">
+      <StackPanel Spacing="6">
+        <StackPanel Orientation="Horizontal" Spacing="8">
+          <TextBlock Text="{Binding StatusText}" FontWeight="Bold" VerticalAlignment="Center" Width="130"/>
+          <TextBlock Text="{Binding StatusDetail}" TextWrapping="Wrap" VerticalAlignment="Center"/>
+          <Button Content="Refresh" Command="{Binding RefreshStatusCommand}" Margin="12,0,0,0"/>
+          <Button Content="Start" Command="{Binding StartDaemonCommand}"/>
+          <Button Content="Stop" Command="{Binding StopDaemonCommand}"/>
+          <Button Content="Restart" Command="{Binding RestartDaemonCommand}"/>
+          <Button Content="Connect Local" Command="{Binding ConnectLocalCommand}"/>
+        </StackPanel>
+        <StackPanel Orientation="Horizontal" Spacing="8">
+          <TextBlock Text="Remote router:" VerticalAlignment="Center"/>
+          <TextBox Text="{Binding RemoteUrl}" Watermark="http://host:11434" Width="280"/>
+          <TextBox Text="{Binding RemoteApiKey}" PasswordChar="•" Watermark="API key (session only)" Width="220"/>
+          <Button Content="Connect Remote" Command="{Binding ConnectRemoteCommand}"/>
+        </StackPanel>
+      </StackPanel>
+    </Border>
+
+    <!-- Tabs -->
+    <TabControl SelectedIndex="{Binding SelectedTabIndex}">
+      <TabItem Header="Monitor &amp; Savings" DataContext="{Binding MonitorTab}">
+        <views:MonitorView/>
+      </TabItem>
+      <TabItem Header="Fleet &amp; Cloud Targets" DataContext="{Binding FleetTab}">
+        <views:FleetTargetsView/>
+      </TabItem>
+      <TabItem Header="Model Cartography" DataContext="{Binding CartographyTab}">
+        <views:CartographyView/>
+      </TabItem>
+      <TabItem Header="Settings &amp; API Keys" DataContext="{Binding SettingsTab}">
+        <views:SettingsView/>
+      </TabItem>
+    </TabControl>
+  </DockPanel>
+</Window>

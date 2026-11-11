@@ -1,0 +1,15 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="OllamaRouter.App.Views.Dialogs.ConfirmDialog"
+        Title="Confirm"
+        Width="460" SizeToContent="Height"
+        WindowStartupLocation="CenterOwner">
+  <DockPanel Margin="12">
+    <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal"
+                HorizontalAlignment="Right" Spacing="8" Margin="0,12,0,0">
+      <Button Content="Cancel" Click="OnCancelClick" MinWidth="90"/>
+      <Button Content="OK" Click="OnOkClick" MinWidth="90"/>
+    </StackPanel>
+    <TextBlock x:Name="PART_Message" TextWrapping="Wrap"/>
+  </DockPanel>
+</Window>

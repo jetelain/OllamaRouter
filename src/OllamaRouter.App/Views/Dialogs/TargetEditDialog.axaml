@@ -1,0 +1,74 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:OllamaRouter.App.ViewModels"
+        x:Class="OllamaRouter.App.Views.Dialogs.TargetEditDialog"
+        x:DataType="vm:TargetEditFormViewModel"
+        Title="Target"
+        Width="640" Height="640"
+        WindowStartupLocation="CenterOwner">
+  <DockPanel Margin="8">
+    <TextBlock DockPanel.Dock="Top" Text="{Binding ValidationErrorMessage}" Foreground="#FF7B7B"
+               TextWrapping="Wrap" IsVisible="{Binding HasValidationError}" Margin="0,0,0,6"/>
+    <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
+      <Button Content="Cancel" Click="OnCancelClick" MinWidth="90"/>
+      <Button Content="Save" Click="OnSaveClick" MinWidth="90"/>
+    </StackPanel>
+
+    <ScrollViewer>
+      <StackPanel Spacing="8">
+        <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto,Auto,Auto" RowSpacing="6" ColumnSpacing="8">
+          <TextBlock Grid.Row="0" Grid.Column="0" Text="Name:" VerticalAlignment="Center"/>
+          <TextBox Grid.Row="0" Grid.Column="1" Text="{Binding Name}"/>
+
+          <TextBlock Grid.Row="1" Grid.Column="0" Text="URL:" VerticalAlignment="Center"/>
+          <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding Url}"/>
+
+          <TextBlock Grid.Row="2" Grid.Column="0" Text="Type:" VerticalAlignment="Center"/>
+          <ComboBox Grid.Row="2" Grid.Column="1" ItemsSource="{Binding TypeChoices}" SelectedItem="{Binding Type}"/>
+
+          <TextBlock Grid.Row="3" Grid.Column="0" Text="Provider:" VerticalAlignment="Center"/>
+          <TextBox Grid.Row="3" Grid.Column="1" Text="{Binding Provider}" Watermark="OpenRouter / Groq / ..."/>
+
+          <TextBlock Grid.Row="4" Grid.Column="0" Text="Max Parallel:" VerticalAlignment="Center"/>
+          <TextBox Grid.Row="4" Grid.Column="1" Text="{Binding MaxParallel}"/>
+
+          <TextBlock Grid.Row="5" Grid.Column="0" Text="Hardware Hint:" VerticalAlignment="Center"/>
+          <TextBox Grid.Row="5" Grid.Column="1" Text="{Binding HardwareHint}"/>
+
+          <TextBlock Grid.Row="6" Grid.Column="0" Text="API Key:" VerticalAlignment="Center"
+                     ToolTip.Tip="Upstream (masked) key — required for OpenAI-compatible providers. Edit mode: untouched = no change, emptied = clear."/>
+          <StackPanel Grid.Row="6" Grid.Column="1" Orientation="Horizontal" Spacing="6">
+            <TextBox Text="{Binding ApiKey}" PasswordChar="•" Width="320" Watermark="{Binding ApiKeyWatermark}"/>
+            <TextBlock Text="{Binding ExistingApiKeyConfigured, StringFormat='configured: {0}'}"
+                       VerticalAlignment="Center" Opacity="0.7"/>
+          </StackPanel>
+
+          <TextBlock Grid.Row="7" Grid.Column="0" Text="Power (W):" VerticalAlignment="Center"
+                     ToolTip.Tip="Node power-draw override; blank = no change (clearing a set override requires editing config/config.json)."/>
+          <TextBox Grid.Row="7" Grid.Column="1" Text="{Binding PowerWatts}" Watermark="blank = no change"/>
+        </Grid>
+
+        <StackPanel Spacing="4">
+          <StackPanel Orientation="Horizontal" Spacing="8">
+            <TextBlock Text="Declared Models" FontWeight="Bold"/>
+            <Button Content="Add Model Row" Click="OnAddModelRowClick"/>
+          </StackPanel>
+          <ItemsControl ItemsSource="{Binding Models}">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate>
+                <Grid ColumnDefinitions="*,120,140,auto" Margin="0,2" ColumnSpacing="6">
+                  <TextBox Grid.Column="0" Text="{Binding Name}" Watermark="model name"/>
+                  <TextBox Grid.Column="1" Text="{Binding ContextLength}" Watermark="contextLength"/>
+                  <TextBox Grid.Column="2" Text="{Binding Quantization}" Watermark="quantization"/>
+                  <Button Grid.Column="3" Content="Remove" Click="OnRemoveModelRowClick" Tag="{Binding}"/>
+                </Grid>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+        </StackPanel>
+
+        <CheckBox IsChecked="{Binding TestConnectionFirst}" Content="Test the connection first (an immediate liveness probe runs before persisting)"/>
+      </StackPanel>
+    </ScrollViewer>
+  </DockPanel>
+</Window>

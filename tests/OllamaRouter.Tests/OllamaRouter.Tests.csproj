@@ -29,6 +29,8 @@
     <ProjectReference Include="..\..\src\OllamaRouter\OllamaRouter.csproj" />
     <!-- Task #100: CLI project under test (InternalsVisibleTo exposes the runner/command seams). -->
     <ProjectReference Include="..\..\src\OllamaRouter.Cli\OllamaRouter.Cli.csproj" />
+    <!-- Task #102: the Avalonia desktop app under test (built as a dependency, never executed). -->
+    <ProjectReference Include="..\..\src\OllamaRouter.App\OllamaRouter.App.csproj" />
   </ItemGroup>
 
 </Project>
