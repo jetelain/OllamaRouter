@@ -190,6 +190,21 @@ public sealed class MainWindowViewModelTests : IAsyncLifetime
         Assert.Equal("Remote", viewModel.StatusText);
     }
 
+    [Fact]
+    public async Task Startup_FromBackgroundThread_DoesNotThrowThreadAccessException()
+    {
+        var viewModel = CreateViewModel();
+        _launcher.Status = FakeDaemonLauncher.RunningStatus();
+
+        // Run from ThreadPool thread to guarantee background thread execution
+        await Task.Run(async () =>
+        {
+            await viewModel.StartAsync();
+        });
+
+        Assert.Equal("Running", viewModel.StatusText);
+    }
+
     private MainWindowViewModel CreateViewModel()
     {
         // The harness factories install THIS fake client / launcher as the service's active

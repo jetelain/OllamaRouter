@@ -474,12 +474,24 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
 
     private void RaiseCommandAvailability()
     {
-        RefreshStatusCommand.NotifyCanExecuteChanged();
-        StartDaemonCommand.NotifyCanExecuteChanged();
-        StopDaemonCommand.NotifyCanExecuteChanged();
-        RestartDaemonCommand.NotifyCanExecuteChanged();
-        ConnectLocalCommand.NotifyCanExecuteChanged();
-        ConnectRemoteCommand.NotifyCanExecuteChanged();
+        void Notify()
+        {
+            RefreshStatusCommand.NotifyCanExecuteChanged();
+            StartDaemonCommand.NotifyCanExecuteChanged();
+            StopDaemonCommand.NotifyCanExecuteChanged();
+            RestartDaemonCommand.NotifyCanExecuteChanged();
+            ConnectLocalCommand.NotifyCanExecuteChanged();
+            ConnectRemoteCommand.NotifyCanExecuteChanged();
+        }
+
+        if (Avalonia.Threading.Dispatcher.UIThread.CheckAccess())
+        {
+            Notify();
+        }
+        else
+        {
+            Avalonia.Threading.Dispatcher.UIThread.Post(Notify);
+        }
     }
 
     /// <summary>
