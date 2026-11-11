@@ -11,6 +11,7 @@ using OllamaRouter.Endpoints.RouterApi.Fleet;
 using OllamaRouter.Endpoints.RouterApi.Info;
 using OllamaRouter.Endpoints.RouterApi.Models;
 using OllamaRouter.Endpoints.RouterApi.Preload;
+using OllamaRouter.Endpoints.RouterApi.Recommendations;
 using OllamaRouter.Endpoints.RouterApi.Sessions;
 using OllamaRouter.Endpoints.RouterApi.SessionAffinity;
 using OllamaRouter.Endpoints.RouterApi.Targets;
@@ -20,6 +21,7 @@ using OllamaRouter.Options;
 using OllamaRouter.Services.Monitoring;
 using OllamaRouter.Services.Benchmarking;
 using OllamaRouter.Services.Hardware;
+using OllamaRouter.Services.Recommendations;
 
 namespace OllamaRouter.Serialization;
 
@@ -87,6 +89,15 @@ namespace OllamaRouter.Serialization;
 [JsonSerializable(typeof(RouterBenchmarkRunResponse))]
 [JsonSerializable(typeof(RouterBenchmarkResultsResponse))]
 [JsonSerializable(typeof(RouterBenchmarkClearedResponse))]
+// Native role recommendations + node context ceilings DTOs (task #66): the
+// <state>/recommended.json round-trip shape + the generate/apply response records.
+[JsonSerializable(typeof(NodeRoleProfile))]
+[JsonSerializable(typeof(RoleRecommendation))]
+[JsonSerializable(typeof(ModelNodeProfile))]
+[JsonSerializable(typeof(FleetRecommendations))]
+[JsonSerializable(typeof(RouterRecommendationsGeneratedResponse))]
+[JsonSerializable(typeof(RouterRecommendationsAppliedTarget))]
+[JsonSerializable(typeof(RouterRecommendationsAppliedResponse))]
 // Dynamic fleet configuration / Setup API DTOs (task #19).
 [JsonSerializable(typeof(RouterConfigResponse))]
 [JsonSerializable(typeof(RouterTargetConfigDto))]

@@ -9,6 +9,7 @@ using OllamaRouter.Endpoints.RouterApi.Fleet;
 using OllamaRouter.Endpoints.RouterApi.Info;
 using OllamaRouter.Endpoints.RouterApi.Models;
 using OllamaRouter.Endpoints.RouterApi.Preload;
+using OllamaRouter.Endpoints.RouterApi.Recommendations;
 using OllamaRouter.Endpoints.RouterApi.Sessions;
 using OllamaRouter.Endpoints.RouterApi.SessionAffinity;
 using OllamaRouter.Endpoints.RouterApi.Targets;
@@ -16,6 +17,7 @@ using OllamaRouter.Endpoints.RouterApi.Vram;
 using OllamaRouter.Middleware;
 using OllamaRouter.Security;
 using OllamaRouter.Services.Hardware;
+using OllamaRouter.Services.Recommendations;
 
 namespace OllamaRouter.Endpoints;
 
@@ -27,11 +29,11 @@ namespace OllamaRouter.Endpoints;
 /// <c>HttpJsonOptions</c>) and is served at exactly <c>GET /api/router/openapi.json</c>
 /// (document name <see cref="DocumentName"/> + the <c>{documentName}</c> route parameter).
 /// <para>
-/// Scope: the 29 <c>/api/router/*</c> management operations ONLY (monitor, Ollama-compatible
+/// Scope: the 32 <c>/api/router/*</c> management operations ONLY (monitor, Ollama-compatible
 /// hybrid and YARP routes are excluded via <see cref="OpenApiOptions.ShouldInclude"/>, and the
 /// document endpoint's own template route is dropped). The security requirement is derived by
 /// calling the production <see cref="ApiSecurityPolicy.IsProtectedRoute"/> on each route
-/// template, so the document can never drift from the enforced set (13 protected operations
+/// template, so the document can never drift from the enforced set (15 protected operations
 /// in default mode; <c>ApiSecurity.RequireKeyForAllEndpoints: true</c> protects every route).
 /// </para>
 /// <para>
@@ -234,7 +236,7 @@ internal static class RouterOpenApiDocumentTransformer
         }
 
         // Security: derived from the PRODUCTION policy called with the route template (the
-        // single-segment logic matches template segments; exactly 13 of the 29 operations
+        // single-segment logic matches template segments; exactly 15 of the 32 operations
         // match). A 401 response is documented on exactly those operations.
         if (ApiSecurityPolicy.IsProtectedRoute(method, path))
         {
@@ -532,6 +534,23 @@ internal static class RouterOpenApiDocumentTransformer
                 [
                     ("200", typeof(RouterSessionAffinityReleaseResponse), "The release result: released is true iff a live lease was found and removed; false for unknown, TTL-expired or already-released sessions (idempotent)."),
                     ("400", typeof(OllamaErrorResponse), "X-OllamaRouter-Session-Id header is required")
+                ]),
+
+            ["GET /api/router/recommendations"] = new(typeof(FleetRecommendations),
+                [("200", typeof(FleetRecommendations), "The live role recommendation matrix (role → NATIVE model + per-node context ceilings + MoE baselines); stable empty shape (generatedAt null, empty roles/models) when nothing is active — read-only, no key required in default mode.")]),
+
+            ["POST /api/router/recommendations/generate"] = new RouterOperationSpec(null,
+                responses:
+                [
+                    ("200", typeof(RouterRecommendationsGeneratedResponse), "Recomputed from the benchmark results + fleet hardware profiles, persisted to <stateDir>/recommended.json (atomic write) and activated in the live store — the Stage-1 ceilings + dense clamp/inject + MoE baseline take effect immediately."),
+                    ("409", typeof(OllamaErrorResponse), "no benchmark results available; run POST /api/router/benchmark first")
+                ]),
+
+            ["POST /api/router/recommendations/apply"] = new RouterOperationSpec(null,
+                responses:
+                [
+                    ("200", typeof(RouterRecommendationsAppliedResponse), "Idempotent re-activation of <stateDir>/recommended.json into the live store (after a manual edit, a fleet/target change, or a router restart); reports the per-target ceilings now enforced."),
+                    ("409", typeof(OllamaErrorResponse), "no recommendations file; run POST /api/router/recommendations/generate first")
                 ]),
 
             ["POST /api/router/admin/shutdown"] = new(typeof(RouterShutdownResponse),

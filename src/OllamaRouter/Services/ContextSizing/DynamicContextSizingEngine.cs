@@ -4,19 +4,27 @@ using OllamaRouter.Services.Catalog;
 namespace OllamaRouter.Services.ContextSizing;
 
 /// <summary>
-/// Sizing mode of one (target, model, request) triple (task #26, two-bucket MoE ladder):
+/// Sizing mode of one (target, model, request) triple (task #26, two-bucket MoE ladder;
+/// task #66 ceiling vocabulary):
 /// <list type="bullet">
 /// <item><see cref="Baseline"/> - MoE: the request fits the node's pre-configured context
-/// (the "optimal" baseline bucket); the injected value is the baseline (clamped to the
+/// (the "optimal" baseline bucket; with an active recommendation the effective baseline is
+/// lowered to the recommended one, task #66); the injected value is the baseline (clamped to the
 /// extensible limit when the operator cap is below it).</item>
 /// <item><see cref="Expanded"/> - MoE: the request exceeds the baseline; the single
 /// extensible bucket (the model's native context limit, optionally capped by
-/// <see cref="ModelThresholds.MaxContextTokens"/>) is injected.</item>
+/// <see cref="ModelThresholds.MaxContextTokens"/> and the active recommendation ceiling,
+/// task #66) is injected.</item>
 /// <item><see cref="Clamped"/> - dense: the client's static <c>num_ctx</c> exceeded the
-/// node's pre-configured context and was clamped DOWN to it (one-time KV reallocation;
-/// never raised, never bucketed, never leased).</item>
+/// node's pre-configured context (or the active recommendation ceiling, task #66) and was
+/// clamped DOWN to it (one-time KV reallocation; never raised, never bucketed, never
+/// leased).</item>
+/// <item><see cref="RecommendedCeiling"/> - dense (task #66): the client sent NO
+/// <c>num_ctx</c> and an active recommendation lowered the effective default below the
+/// node's CMax — the ceiling is injected (no separate Modelfile needed on the daemon).</item>
 /// <item><see cref="PassThrough"/> - dense: the payload is untouched (no client
-/// <c>num_ctx</c>, client value ≤ pre-configured, or clamping disabled by
+/// <c>num_ctx</c> and no lowering recommendation, client value ≤ effective ceiling, or
+/// clamping disabled by
 /// <see cref="DynamicContextOptions.DenseClampEnabled"/>) — <see cref="ContextSizingDecision.InjectedNumCtx"/>
 /// carries the 0 sentinel meaning "no rewrite".</item>
 /// </list>
@@ -26,7 +34,8 @@ public enum ContextSizingMode
     Baseline,
     Expanded,
     Clamped,
-    PassThrough
+    PassThrough,
+    RecommendedCeiling
 }
 
 /// <summary>
@@ -141,10 +150,22 @@ public static class DynamicContextSizingEngine
         long estimatedTokens,
         int? clientNumCtx,
         int contextFitMarginTokens,
-        int? maxContextTokensOverride)
+        int? maxContextTokensOverride,
+        int? recommendedBaselineTokens = null,
+        int? activeCeiling = null)
     {
+        // Task #66: the active recommendation can only LOWER the baseline (the MoE
+        // "optimal" bucket the Auto-Shrink lease also shrinks back to) and the extensible
+        // limit — never raise either.
         var baseline = BaselineBucket(capability);
-        var extensibleMax = ModelCapabilityEngine.GetMoeExtensibleCapacity(capability, maxContextTokensOverride);
+        if (recommendedBaselineTokens is { } recommended && recommended > 0 && recommended < baseline)
+        {
+            baseline = recommended;
+        }
+
+        var extensibleMax = Math.Min(
+            ModelCapabilityEngine.GetMoeExtensibleCapacity(capability, maxContextTokensOverride),
+            activeCeiling ?? int.MaxValue);
 
         var requirement = (long)estimatedTokens + Math.Max(0, contextFitMarginTokens);
         if (clientNumCtx is { } client && client > 0)
@@ -187,6 +208,12 @@ public static class DynamicContextSizingEngine
     /// The retired profile table is NOT consulted (profiles remain bindable but are
     /// ignored). <paramref name="maxContextTokensOverride"/> is the model's
     /// <see cref="ModelThresholds.MaxContextTokens"/> (applied to MoE only).
+    /// <paramref name="activeCeiling"/> (task #66) is the active per-node recommendation
+    /// ceiling: it can only LOWER capacities — the MoE extensible limit and the dense
+    /// clamp/inject target — and a null ceiling keeps every existing decision byte-identical.
+    /// <paramref name="recommendedBaselineTokens"/> (task #66, MoE only) lowers the two-
+    /// bucket baseline to the benchmark-derived optimal baseline (the Auto-Shrink lease
+    /// shrink target inherits it).
     /// </summary>
     public static ContextSizingDecision Decide(
         DynamicContextOptions dynamicOptions,
@@ -194,7 +221,9 @@ public static class DynamicContextSizingEngine
         long estimatedTokens,
         int? clientNumCtx,
         int contextFitMarginTokens,
-        int? maxContextTokensOverride)
+        int? maxContextTokensOverride,
+        int? activeCeiling = null,
+        int? recommendedBaselineTokens = null)
     {
         if (capability.Architecture == ModelArchitectureKind.Moe)
         {
@@ -203,7 +232,9 @@ public static class DynamicContextSizingEngine
                 estimatedTokens,
                 clientNumCtx,
                 contextFitMarginTokens,
-                maxContextTokensOverride);
+                maxContextTokensOverride,
+                recommendedBaselineTokens,
+                activeCeiling);
 
             var clamped = clientNumCtx is { } requestedValue && requestedValue > injected;
             return new ContextSizingDecision(
@@ -215,19 +246,39 @@ public static class DynamicContextSizingEngine
                 baseline);
         }
 
-        // Dense: clamp-only pass-through (no profile consulted, no lease ever).
+        // Dense: clamp-only pass-through (no profile consulted, no lease ever), with the
+        // active per-node recommendation ceiling applied (task #66): the effective ceiling
+        // is min(CMax, activeCeiling) (BaselineBucket == CMax by construction).
         var denseBaseline = BaselineBucket(capability);
+        var denseCeiling = Math.Min(denseBaseline, activeCeiling ?? int.MaxValue);
 
         if (dynamicOptions.DenseClampEnabled &&
             clientNumCtx is { } denseClientValue &&
-            denseClientValue > denseBaseline)
+            denseClientValue > denseCeiling)
         {
+            // Client value ABOVE the effective ceiling → clamp DOWN (one-time KV
+            // reallocation; tighter target than the legacy clamp when a ceiling is active).
             return new ContextSizingDecision(
                 DynamicContextOptions.MoeProfileName,
-                denseBaseline,
+                denseCeiling,
                 capability.CMax,
                 true,
                 ContextSizingMode.Clamped,
+                denseBaseline);
+        }
+
+        // Task #66 injection: no client <c>num_ctx</c> AND the active recommendation ceiling
+        // is strictly below the node's CMax → inject the ceiling (the "injected per target
+        // without separate Modelfiles" case: the daemon's Modelfile default would otherwise
+        // allocate a KV window the benchmark proved is not viable on this node).
+        if (clientNumCtx is null && activeCeiling is { } loweredCeiling && loweredCeiling > 0 && loweredCeiling < denseBaseline)
+        {
+            return new ContextSizingDecision(
+                DynamicContextOptions.MoeProfileName,
+                loweredCeiling,
+                capability.CMax,
+                false,
+                ContextSizingMode.RecommendedCeiling,
                 denseBaseline);
         }
 

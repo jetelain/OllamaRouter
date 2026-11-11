@@ -20,6 +20,7 @@ using OllamaRouter.Services.Catalog;
 using OllamaRouter.Services.Clients;
 using OllamaRouter.Services.ContextSizing;
 using OllamaRouter.Services.Monitoring;
+using OllamaRouter.Services.Recommendations;
 using OllamaRouter.Services.Routing;
 using OllamaRouter.Transforms;
 using Yarp.ReverseProxy.Forwarder;
@@ -54,7 +55,8 @@ public sealed class OllamaRoutingMiddleware(
     OpenAIChatRequestParser? openAiRequestParser = null,
     ITargetChatClientProvider? targetChatClientProvider = null,
     ISessionUsageStore? sessionUsage = null,
-    ILocalClientIdentityResolver? localClientIdentity = null)
+    ILocalClientIdentityResolver? localClientIdentity = null,
+    IRecommendationStore? recommendations = null)
     {
     // During the first 10 s after the liveness prober started, an unresolved (Unknown)
     // target is treated as routable rather than offline, so a request arriving before the
@@ -169,6 +171,16 @@ public sealed class OllamaRoutingMiddleware(
     /// explicit-headers-only semantics.
     /// </summary>
     private readonly ILocalClientIdentityResolver? _localClientIdentity = localClientIdentity;
+
+    /// <summary>
+    /// The live role recommendation matrix store (task #66): supplies the virtual role
+    /// alias → native model translation and the per-node context ceilings (Stage-1 +
+    /// dynamic sizing). NULLABLE FOR UNIT-TEST COMPATIBILITY (fail-open null = no
+    /// ceilings, no translation — every existing behavior stays byte-identical). Registered
+    /// as a singleton in production (see <c>AddOllamaRouter</c>); the <c>UseMiddleware</c> DI
+    /// activation resolves it, and manual test constructions that omit it get null.
+    /// </summary>
+    private readonly IRecommendationStore? _recommendations = recommendations;
 
     // One-shot guard for the converter-degradation warning (the middleware is a singleton;
     // test hosts create fresh instances so each warns exactly once).
@@ -979,6 +991,43 @@ public sealed class OllamaRoutingMiddleware(
             var requestInfo = OllamaRequestParser.ParseCompletionRequest(body);
             modelName = string.IsNullOrEmpty(requestInfo.ModelName) ? "unknown" : requestInfo.ModelName;
             reasoningEffort = requestInfo.ReasoningEffort;
+
+            // Virtual role translation (task #66): a request addressed by one of the FIVE
+            // canonical virtual role aliases (case-insensitive) is transparently rewritten to
+            // its recommended NATIVE model name BEFORE token estimation, the routing decision,
+            // the pin capability gate, context sizing and telemetry — Ollama only ever sees
+            // the native name, so roles sharing a model (e.g. AgenticChat / SoftwareArchitect
+            // / SeniorDeveloper → qwen3.8:27b) reuse the exact same resident model with ZERO
+            // evictions. Permissive: no active matrix / role absent / store null → the name
+            // is a literal model name forwarded untouched (a model genuinely named "basic"
+            // keeps working when no recommendations are active). All five completion shapes
+            // flow through this one method and reuse the translated <c>body</c> string, so the
+            // converter path translates for free.
+            if (_recommendations is not null &&
+                _recommendations.GetRole(modelName) is { Model: { Length: > 0 } roleModel })
+            {
+                var requestedRole = modelName;
+                var translatedBody = OllamaRequestParser.ReplaceModelName(body, roleModel);
+                if (!string.Equals(translatedBody, body, StringComparison.Ordinal))
+                {
+                    // Re-buffer the swapped request body (bytes + ContentLength + Position 0),
+                    // mirroring the buffer-swap pattern above.
+                    body = translatedBody;
+                    var translatedBytes = Encoding.UTF8.GetBytes(translatedBody);
+                    context.Request.Body = new MemoryStream(translatedBytes);
+                    context.Request.ContentLength = translatedBytes.Length;
+                    context.Request.Body.Position = 0;
+
+                    modelName = roleModel;
+                    // Echoes the requested virtual role ONLY when a translation happened; the
+                    // native name is echoed by X-OllamaRouter-Model (the rewritten modelName).
+                    context.Response.Headers[OllamaReverseProxyConfig.TelemetryRoleHeader] = requestedRole;
+                    logger.LogInformation(
+                        "Virtual role {Role} translated to native model {Model} (role recommendation matrix active).",
+                        requestedRole, roleModel);
+                }
+            }
+
             rawTokenCount = tokenEstimator.EstimateTokens(requestInfo.ContextParts, modelName)
                 + requestInfo.PriorContextTokenCount;
             tokenCount = (int)Math.Ceiling(rawTokenCount * options.CurrentValue.TokenEstimationOverheadFactor);
@@ -2502,21 +2551,50 @@ public sealed class OllamaRoutingMiddleware(
 
             var clientNumCtx = DynamicContextPayloadTransformer.ExtractClientNumCtx(body);
             var margin = Math.Max(0, options.CurrentValue.ContextFitMarginTokens);
+
+            // Active per-node recommendation (task #66): the ceiling can only LOWER the
+            // effective capacities; the MoE recommended baseline lowers the two-bucket
+            // "optimal" bucket (the Auto-Shrink shrink target inherits it). No store /
+            // no active pair → both null → every existing decision is byte-identical.
+            int? activeCeiling = null;
+            if (_recommendations is not null &&
+                _recommendations.TryGetNodeContextCeiling(target.Value, modelName, out var recommendationCeiling))
+            {
+                activeCeiling = recommendationCeiling;
+            }
+
+            int? recommendedBaselineTokens = null;
+            if (_recommendations is not null &&
+                _recommendations.TryGetModelProfile(normalizedName, out var recommendationProfile))
+            {
+                foreach (var node in recommendationProfile.Nodes)
+                {
+                    if (string.Equals(node.Target, target.Value, StringComparison.OrdinalIgnoreCase))
+                    {
+                        recommendedBaselineTokens = node.BaselineContext;
+                        break;
+                    }
+                }
+            }
+
             var decision = DynamicContextSizingEngine.Decide(
                 dynamicOptions,
                 capability,
                 tokenCount,
                 clientNumCtx,
                 margin,
-                thresholds?.MaxContextTokens);
+                thresholds?.MaxContextTokens,
+                activeCeiling,
+                recommendedBaselineTokens);
 
-            // Dense clamp-only pass-through (task #26): the Auto-Shrink Manager is skipped
-            // entirely (dense is never bucketed or leased — a dense KV refill costs 300 s+).
-            // Clamped → rewrite options.num_ctx down to the pre-configured baseline exactly
-            // once; PassThrough → the payload is byte-identical, no mode header.
-            if (decision.Mode is ContextSizingMode.Clamped or ContextSizingMode.PassThrough)
+            // Dense clamp-only / ceiling-inject pass-through (task #26 + task #66): the
+            // Auto-Shrink Manager is skipped entirely (dense is never bucketed or leased —
+            // a dense KV refill costs 300 s+). Clamped / RecommendedCeiling → rewrite
+            // options.num_ctx down to the effective ceiling exactly once; PassThrough →
+            // the payload is byte-identical, no mode header.
+            if (decision.Mode is ContextSizingMode.Clamped or ContextSizingMode.PassThrough or ContextSizingMode.RecommendedCeiling)
             {
-                if (decision.Mode == ContextSizingMode.Clamped)
+                if (decision.Mode is ContextSizingMode.Clamped or ContextSizingMode.RecommendedCeiling)
                 {
                     var (clampedBody, clampedInjected) = DynamicContextPayloadTransformer.ApplyExplicitNumCtx(body, decision.InjectedNumCtx);
                     if (clampedInjected is null)
@@ -2532,7 +2610,8 @@ public sealed class OllamaRoutingMiddleware(
 
                     context.Response.Headers[OllamaReverseProxyConfig.TelemetryContextModeHeader] = decision.Mode.ToString();
                     logger.LogInformation(
-                        "Dynamic context sizing (dense clamp-only): {Model} on {Target} - client num_ctx {ClientNumCtx} clamped down to the pre-configured context {Injected}.",
+                        "Dynamic context sizing (dense {Mode}): {Model} on {Target} - client num_ctx {ClientNumCtx}, effective ceiling {Injected}.",
+                        decision.Mode,
                         modelName,
                         target.Value,
                         clientNumCtx?.ToString() ?? "none",

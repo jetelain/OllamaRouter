@@ -7,6 +7,7 @@ using OllamaRouter.Serialization;
 using OllamaRouter.Services.Catalog;
 using OllamaRouter.Services.ContextSizing;
 using OllamaRouter.Services.Monitoring;
+using OllamaRouter.Services.Recommendations;
 using OllamaRouter.Services.Routing;
 
 namespace OllamaRouter.Endpoints.RouterApi.Context;
@@ -205,7 +206,6 @@ public static class RouterContextEndpoints
         var capability = metadata is not null
             ? capabilityEngine.DeriveCapability(metadata, selected.Value, targetOptions, pinnedArchitecture)
             : null;
-
         if (capability is null)
         {
             // Undiscoverable capability for the selected fleet target: pass-through preview
@@ -219,21 +219,52 @@ public static class RouterContextEndpoints
                 AffinityScore: affinityScore);
         }
 
+        // Active per-node recommendation (task #66): pass the SAME ceiling lookups the
+        // middleware passes into Decide, so the preview matches the production decision
+        // (the ceilings can only LOWER capacities; no store / no active pair → byte-identical
+        // legacy preview).
+        var recommendations = serviceProvider.GetService<IRecommendationStore>();
+        int? activeCeiling = null;
+        if (recommendations is not null &&
+            recommendations.TryGetNodeContextCeiling(selected.Value, request.Model, out var recommendationCeiling))
+        {
+            activeCeiling = recommendationCeiling;
+        }
+
+        int? recommendedBaselineTokens = null;
+        if (recommendations is not null &&
+            recommendations.TryGetModelProfile(normalizedName, out var recommendationProfile))
+        {
+            foreach (var node in recommendationProfile.Nodes)
+            {
+                if (string.Equals(node.Target, selected.Value, StringComparison.OrdinalIgnoreCase))
+                {
+                    recommendedBaselineTokens = node.BaselineContext;
+                    break;
+                }
+            }
+        }
+
         var sizing = DynamicContextSizingEngine.Decide(
             opt.DynamicContext,
             capability,
             request.EstimatedTokens,
             request.ClientRequestedNumCtx,
             Math.Max(0, opt.ContextFitMarginTokens),
-            thresholds?.MaxContextTokens);
+            thresholds?.MaxContextTokens,
+            activeCeiling,
+            recommendedBaselineTokens);
 
         // contextMode vocabulary (task #26, lowercase engine modes): passthrough (dense,
         // untouched — injectedNumCtx reports what would flow through, matching the existing
-        // degraded-preview convention), clamped (dense, down-clamped), baseline/expanded
+        // degraded-preview convention), clamped (dense, down-clamped), recommended_ceiling
+        // (dense, task #66 ceiling injected — the explicit arm because the multi-word enum
+        // name does not snake_case-ize through ToLowerInvariant), baseline/expanded
         // (MoE two-bucket ladder).
         var (injectedNumCtx, contextMode) = sizing.Mode switch
         {
             ContextSizingMode.PassThrough => (request.ClientRequestedNumCtx ?? estimatedTokensWithMargin, "passthrough"),
+            ContextSizingMode.RecommendedCeiling => (sizing.InjectedNumCtx, "recommended_ceiling"),
             _ => (sizing.InjectedNumCtx, sizing.Mode.ToString().ToLowerInvariant())
         };
 

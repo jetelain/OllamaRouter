@@ -24,6 +24,7 @@ using OllamaRouter.Services.Routing;
 using OllamaRouter.Services.Benchmarking;
 using OllamaRouter.Services.Clients;
 using OllamaRouter.Services.Hardware;
+using OllamaRouter.Services.Recommendations;
 using Yarp.ReverseProxy;
 using MsOptions = Microsoft.Extensions.Options.Options;
 
@@ -345,7 +346,8 @@ public static class OllamaRouterServiceCollectionExtensions
             sp.GetRequiredService<ILogger<RoutingDecisionService>>(),
             sp.GetRequiredService<ITargetFailureStreakService>(),
             sp.GetRequiredService<ISessionAffinityService>(),
-            sp.GetRequiredService<IFleetHardwareService>()));
+            sp.GetRequiredService<IFleetHardwareService>(),
+            sp.GetRequiredService<IRecommendationStore>()));
         // Multi-agent session/agent sticky-routing lease store: thread-safe singleton with a
         // sliding TTL (OllamaRouterOptions.SessionAffinityTtlMinutes, default 30 min) and a
         // bounded lazy sweep — shared by the decision service (Stage-2 bonus + rebinding) and
@@ -466,6 +468,16 @@ public static class OllamaRouterServiceCollectionExtensions
                 Path.Combine(effectiveStateDirectory, "targets.json"),
                 fleetTargets,
                 sp.GetRequiredService<ILogger<TargetAvailabilityService>>()));
+
+        // Native role recommendations + node context ceilings (task #66): the stateless
+        // engine (pure algorithm) and the live matrix store over
+        // <state>/recommended.json (machine-generated state, never config/ — same
+        // convention as benchmarks.json / targets-hardware.json). The store auto-loads the
+        // file fail-soft at startup so the ceilings survive router restarts.
+        services.AddSingleton<IRecommendationEngine, RecommendationEngine>();
+        services.AddSingleton<IRecommendationStore>(sp => new RecommendationStore(
+            Path.Combine(effectiveStateDirectory, "recommended.json"),
+            sp.GetService<ILoggerFactory>()?.CreateLogger<RecommendationStore>()));
 
         // In-terminal activity monitor (registered always; disabled via the option's
         // TerminalMonitoring.Enabled, enforced by the caller overload at registration time).

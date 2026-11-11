@@ -9,6 +9,7 @@ using OllamaRouter.Endpoints.RouterApi.Fleet;
 using OllamaRouter.Endpoints.RouterApi.Info;
 using OllamaRouter.Endpoints.RouterApi.Models;
 using OllamaRouter.Endpoints.RouterApi.Preload;
+using OllamaRouter.Endpoints.RouterApi.Recommendations;
 using OllamaRouter.Endpoints.RouterApi.Sessions;
 using OllamaRouter.Endpoints.RouterApi.SessionAffinity;
 using OllamaRouter.Endpoints.RouterApi.Targets;
@@ -27,7 +28,8 @@ namespace OllamaRouter.Endpoints;
 /// <see cref="RouterApi.Targets.RouterTargetsEndpoints"/>, <see cref="RouterApi.ApiKeys.RouterApiKeysEndpoints"/>,
 /// <see cref="RouterApi.Sessions.RouterSessionUsageEndpoints"/>,
 /// <see cref="RouterApi.SessionAffinity.RouterSessionAffinityEndpoints"/>,
-/// <see cref="RouterApi.Admin.RouterAdminEndpoints"/>)
+/// <see cref="RouterApi.Admin.RouterAdminEndpoints"/>,
+/// <see cref="RouterApi.Recommendations.RouterRecommendationEndpoints"/>)
 /// in the exact original registration order, which global route matching depends on
 /// (in particular the catch-all <c>/api/router/models/{*modelName}</c> vs
 /// <c>POST /api/router/models/{*tail}</c> pair and the position of the
@@ -36,10 +38,10 @@ namespace OllamaRouter.Endpoints;
 public static class RouterApiEndpointsExtensions
 {
     /// <summary>
-    /// Maps the full OllamaRouter management API: the 29 endpoints of the 14 per-area
-    /// endpoint groups, registered in the original order (the session-affinity area is appended
-    /// before the admin & lifecycle area, which is last — its fixed path cannot conflict with
-    /// any catch-all route).
+    /// Maps the full OllamaRouter management API: the 32 endpoints of the 15 per-area
+    /// endpoint groups, registered in the original order (the admin & lifecycle and the
+    /// role-recommendation areas are appended last — append-last preserves the global
+    /// route-matching order documented in the class summary).
     /// </summary>
     public static WebApplication MapOllamaRouterApiEndpoints(this WebApplication app)
     {
@@ -57,6 +59,7 @@ public static class RouterApiEndpointsExtensions
         app.MapRouterSessionUsageEndpoints();
         app.MapRouterSessionAffinityEndpoints();
         app.MapRouterAdminEndpoints();
+        app.MapRouterRecommendationEndpoints();
         return app;
     }
 

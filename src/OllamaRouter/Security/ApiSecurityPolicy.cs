@@ -8,7 +8,9 @@ namespace OllamaRouter.Security;
 /// DEFAULT mode (config-affecting routes only): <c>GET/PUT /api/router/config</c>,
 /// <c>POST /api/router/targets</c>, <c>PUT/DELETE /api/router/targets/{name}</c>,
 /// <c>PUT /api/router/fleet/hardware/{targetName}</c>, <c>POST /api/router/benchmark</c>,
-/// <c>DELETE /api/router/benchmark/results</c> and the key-management endpoints
+/// <c>DELETE /api/router/benchmark/results</c>, the recommendation writes
+/// (<c>POST /api/router/recommendations/generate</c>,
+/// <c>POST /api/router/recommendations/apply</c>) and the key-management endpoints
 /// (<c>GET/POST /api/router/api-keys</c>, <c>DELETE /api/router/api-keys/{name}</c>,
 /// <c>POST /api/router/api-keys/default/rotate</c> — key-protected by definition) and the
 /// daemon lifecycle endpoint <c>POST /api/router/admin/shutdown</c> (task #99: stopping the
@@ -17,7 +19,7 @@ namespace OllamaRouter.Security;
 /// <para>
 /// Explicitly NOT in the default set: <c>POST /targets</c> (monitor availability toggle —
 /// runtime state, not persistent config; the browser flow must keep working), all reads
-/// (<c>/api/router/info|fleet|models|cartography|benchmark/results|preload/preview</c>,
+/// (<c>/api/router/info|fleet|models|cartography|benchmark/results|recommendations|preload/preview</c>,
 /// <c>/api/tags|ps|show</c>, <c>/v1/models</c>, <c>/monitor*</c>), the runtime actions
 /// (<c>/api/router/vram/reclaim</c>, <c>/api/router/fleet/unload</c>,
 /// <c>/api/router/context/evaluate</c>, preload, <c>/monitor/reclaim-vram</c>,
@@ -66,6 +68,19 @@ public static class ApiSecurityPolicy
         if (string.Equals(path, "/api/router/benchmark/results", StringComparison.OrdinalIgnoreCase))
         {
             return method == "DELETE";
+        }
+
+        // Role recommendations (task #66): the matrix read is open (like the benchmark
+        // results read); both writes are config-affecting (they persist recommended.json /
+        // activate live ceilings) and key-protected.
+        if (string.Equals(path, "/api/router/recommendations/generate", StringComparison.OrdinalIgnoreCase))
+        {
+            return method == "POST";
+        }
+
+        if (string.Equals(path, "/api/router/recommendations/apply", StringComparison.OrdinalIgnoreCase))
+        {
+            return method == "POST";
         }
 
         if (string.Equals(path, "/api/router/admin/shutdown", StringComparison.OrdinalIgnoreCase))

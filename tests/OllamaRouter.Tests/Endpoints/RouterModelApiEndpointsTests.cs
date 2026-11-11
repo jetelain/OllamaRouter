@@ -15,6 +15,7 @@ using OllamaRouter.Services.Catalog;
 using OllamaRouter.Services.Monitoring;
 using OllamaRouter.Services.Routing;
 using OllamaRouter.Services.ContextSizing;
+using OllamaRouter.Services.Recommendations;
 
 namespace OllamaRouter.Tests.Endpoints;
 
@@ -191,7 +192,8 @@ public class RouterModelApiEndpointsTests
         IReadOnlyDictionary<RoutingTarget, TargetExecutionState>? executionStates = null,
         IReadOnlyDictionary<RoutingTarget, bool>? availabilityFlags = null,
         bool registerCapabilityStack = true,
-        bool registerDecisionPipeline = true)
+        bool registerDecisionPipeline = true,
+        Action<IServiceCollection>? extraServices = null)
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseUrls("http://127.0.0.1:0");
@@ -268,6 +270,8 @@ public class RouterModelApiEndpointsTests
                 sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<RoutingDecisionService>>(),
                 sp.GetRequiredService<ITargetFailureStreakService>()));
         }
+
+        extraServices?.Invoke(builder.Services);
 
         var app = builder.Build();
         app.MapOllamaRouterApiEndpoints();
@@ -742,6 +746,37 @@ public class RouterModelApiEndpointsTests
         Assert.Equal(131_072, (int)root["targetMaxContext"]!.GetValue<int>());
         Assert.Equal("passthrough", root["contextMode"]!.ToString());
         Assert.Equal(9_192, (int)root["estimatedTokensWithMargin"]!.GetValue<int>()); // 1,000 + 8,192
+    }
+
+    [Fact]
+    public async Task Evaluate_DenseActiveCeiling_NoClientNumCtx_ReportsRecommendedCeilingMode()
+    {
+        // Task #66 preview: an active per-node recommendation ceiling (49,152) is strictly
+        // below the dense CMax (131,072) and the client sent no num_ctx → the preview
+        // surfaces the NEW lowercase mode "recommended_ceiling" with the injected ceiling
+        // (matching the production middleware decision).
+        var options = ThreeTargetOptions(cloudEnabled: false);
+        var catalog = DefaultFleetCatalog(moeOnAllTargets: true);
+        var store = new RecommendationStore(Path.Combine(Path.GetTempPath(), $"unused-{Guid.NewGuid():N}.json"));
+        store.Activate(new FleetRecommendations(
+            DateTimeOffset.UtcNow,
+            new Dictionary<string, RoleRecommendation>(StringComparer.OrdinalIgnoreCase),
+            new Dictionary<string, ModelNodeProfile>(StringComparer.OrdinalIgnoreCase)
+            {
+                [SmallModel] = new ModelNodeProfile(SmallModel, "Dense", 131_072, "q4",
+                    [new NodeRoleProfile("Local", 49_152, null, 30.0, null)])
+            }));
+        await using var harness = await CreateTestAppAsync(options, catalog,
+            extraServices: s => s.AddSingleton<IRecommendationStore>(store));
+
+        var (status, root) = await PostEvaluateAsync(harness.Client,
+            new { model = SmallModel, estimatedTokens = 40000, clientRequestedNumCtx = (object?)null });
+        Assert.Equal(200, status);
+        Assert.NotNull(root);
+        Assert.Equal("Local", root!["selectedTarget"]!.ToString());
+        Assert.Equal("recommended_ceiling", root["contextMode"]!.ToString());
+        Assert.Equal(49_152, (int)root["injectedNumCtx"]!.GetValue<int>());
+        Assert.Equal(131_072, (int)root["targetMaxContext"]!.GetValue<int>());
     }
 
     [Fact]

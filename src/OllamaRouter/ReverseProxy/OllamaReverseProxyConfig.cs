@@ -63,6 +63,14 @@ public static class OllamaReverseProxyConfig
     /// <summary>Telemetry response header: the model name dispatched to the target.</summary>
     public const string TelemetryModelHeader = "X-OllamaRouter-Model";
 
+    /// <summary>
+    /// Telemetry response header (task #66): the virtual ROLE alias the request was
+    /// addressed with (<c>basic</c> / <c>agentic_chat</c> / <c>software_architect</c> /
+    /// <c>senior_developer</c> / <c>junior_developer</c>) when a translation to the native
+    /// model happened. Absent when the request used a literal model name (no translation).
+    /// </summary>
+    public const string TelemetryRoleHeader = "X-OllamaRouter-Role";
+
     /// <summary>Telemetry response header: the estimated prompt token count for the request.</summary>
     public const string TelemetryEstimatedTokensHeader = "X-OllamaRouter-Estimated-Tokens";
 

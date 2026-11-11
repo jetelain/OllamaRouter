@@ -12,6 +12,7 @@ using OllamaRouter.Services.Monitoring;
 using OllamaRouter.Services.Routing;
 using OllamaRouter.Services.Catalog;
 using OllamaRouter.Services.ContextSizing;
+using OllamaRouter.Services.Recommendations;
 
 namespace OllamaRouter.Tests.Services.Routing;
 
@@ -115,7 +116,8 @@ public class RoutingDecisionServiceTests
         Func<RoutingTarget, int>? failureStreaks = null,
         ISessionAffinityService? sessionAffinity = null,
         ILogger<RoutingDecisionService>? logger = null,
-        TimeProvider? streakTimeProvider = null)
+        TimeProvider? streakTimeProvider = null,
+        IRecommendationStore? recommendations = null)
     {
         meta ??= new MetaMap();
         var metaMap = meta;
@@ -206,7 +208,8 @@ public class RoutingDecisionServiceTests
             cloudHandler,
             logger ?? NullLogger<RoutingDecisionService>.Instance,
             streakTracker,
-            sessionAffinity);
+            sessionAffinity,
+            recommendations: recommendations);
 
         return (new Harness { SUT = sut, States = statesStore, StreakTracker = streakTracker }, meta);
     }
@@ -3808,5 +3811,183 @@ public class RoutingDecisionServiceTests
 
         var remoteScope = (IReadOnlySet<TargetLocation>)new HashSet<TargetLocation> { TargetLocation.Remote };
         await Assert.ThrowsAsync<NoAvailableTargetException>(() => h.DecideScoped(30_000, "qwen3.8-27B", remoteScope));
+    }
+
+    // ------------------------------------------------------------------
+    //  Task #66: active per-node recommendation ceilings (Stage-1 lowering)
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// The spec example: dense qwen3.8-27B with benchmark-derived ceilings — Desktop 49,152,
+    /// Server 262,144 (the nodes are pre-configured at CMax 131,072; the ceilings LOWER them).
+    /// </summary>
+    private static (MetaMap meta, OllamaRouterOptions options, IRecommendationStore store) BuildCeilingFleet()
+    {
+        var meta = new MetaMap();
+        // No Modelfile pin, native context 131,072 → dense CMax = 131,072 on every node.
+        meta.Add(DesktopUrl, "qwen3.8:27b", new JsonObject
+        {
+            ["model_info"] = new JsonObject
+            {
+                ["general.parameter_count"] = (JsonNode)27_800_000_000L,
+                ["qwen35.context_length"] = (JsonNode)131_072L
+            },
+            ["details"] = new JsonObject { ["family"] = "qwen" },
+            ["parameters"] = ""
+        }, 16 * Gb);
+        meta.Add(LaptopUrl, "qwen3.8:27b", PinnedDenseShow(27_800_000_000, modelfileNumCtx: 32_768), 8 * Gb);
+        // Server: Modelfile pin 262,144 (CMax 262,144) with the benchmark evidence capping the
+        // viable context at 184,320 (the 262,144 row was non-viable on this node).
+        meta.Add(ServerUrl, "qwen3.8:27b", new JsonObject
+        {
+            ["model_info"] = new JsonObject
+            {
+                ["general.parameter_count"] = (JsonNode)27_800_000_000L,
+                ["qwen35.context_length"] = (JsonNode)131_072L
+            },
+            ["details"] = new JsonObject { ["family"] = "qwen" },
+            ["parameters"] = "num_ctx 262144"
+        }, 96 * Gb);
+
+        var options = FleetOptions("qwen3.8:27b", dispatchToLargestCapacityOnOverflow: false);
+        var store = new RecommendationStore(Path.Combine(Path.GetTempPath(), $"unused-{Guid.NewGuid():N}.json"));
+        store.Activate(new FleetRecommendations(
+            DateTimeOffset.UtcNow,
+            new Dictionary<string, RoleRecommendation>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["senior_developer"] = new RoleRecommendation("senior_developer", "qwen3.8:27b", 262_144, "desc", [])
+            },
+            new Dictionary<string, ModelNodeProfile>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["qwen3.8:27b"] = new ModelNodeProfile("qwen3.8:27b", "Dense", 131_072, "q4",
+                [
+                    new NodeRoleProfile("Desktop", 49_152, null, 33.0, 16_384),
+                    new NodeRoleProfile("Server", 184_320, null, 22.5, 98_304)
+                ])
+            }));
+        return (meta, options, store);
+    }
+
+    [Fact]
+    public async Task Stage1_RecommendationCeiling_LowersDenseCapacity_SpecExample()
+    {
+        // Spec example (margin 8,192): a 40,000-token prompt (48,192 required) qualifies BOTH
+        // Desktop (ceiling 49,152) and Server (ceiling 262,144); a 100,000-token prompt
+        // (108,192 required) disqualifies the Desktop (49,152 < 108,192 — the reason string
+        // carries the LOWERED CMax) and qualifies only the Server.
+        var (meta, options, store) = BuildCeilingFleet();
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8:27b", $"{LaptopUrl}|qwen3.8:27b", $"{ServerUrl}|qwen3.8:27b" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            meta: meta,
+            recommendations: store);
+
+        // 40k → Desktop + Server both qualify (Laptop's 32,768 CMax overflows either way).
+        await h.Decide(40_000, "qwen3.8:27b");
+        Assert.True(h.Eval(TDesktop)!.Qualified);
+        Assert.True(h.Eval(TServer)!.Qualified);
+        Assert.False(h.Eval(TLaptop)!.Qualified);
+
+        // 100k → Desktop disqualified at the LOWERED ceiling; Server still qualifies.
+        await h.Decide(100_000, "qwen3.8:27b");
+        var desktop = h.Eval(TDesktop)!;
+        Assert.False(desktop.Qualified);
+        Assert.StartsWith("context overflow", desktop.DisqualifiedReason);
+        Assert.Contains("CMax: 49152", desktop.DisqualifiedReason);
+        Assert.True(h.Eval(TServer)!.Qualified);
+    }
+
+    [Fact]
+    public async Task Stage1_NoStore_LegacyCMaxBehaviorUnchanged()
+    {
+        // The SAME fixtures WITHOUT the store (null): the legacy CMax 131,072 applies — a
+        // 100k prompt qualifies the Desktop (108,192 ≤ 131,072). Byte-identical legacy path.
+        var (meta, options, _) = BuildCeilingFleet();
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8:27b", $"{LaptopUrl}|qwen3.8:27b", $"{ServerUrl}|qwen3.8:27b" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            meta: meta);
+
+        await h.Decide(100_000, "qwen3.8:27b");
+        Assert.True(h.Eval(TDesktop)!.Qualified);   // legacy: 108,192 ≤ 131,072
+        Assert.True(h.Eval(TServer)!.Qualified);
+    }
+
+    [Fact]
+    public async Task Stage1_RecommendationCeiling_LowersMoeExtensibleCapacity()
+    {
+        // MoE: an active ceiling (65,536) LOWERS the extensible capacity used for Stage-1
+        // qualification (native 131,072 → 65,536): a 70k prompt (78,192) overflows it while
+        // a 30k prompt (38,192) still fits.
+        var meta = new MetaMap();
+        foreach (var url in new[] { DesktopUrl, LaptopUrl, ServerUrl })
+        {
+            meta.Add(url, "moe", PinnedMoeShow(35_000_000_000, modelfileNumCtx: 131_072, nativeContextLength: 131_072), 16 * Gb);
+        }
+        var options = FleetOptions("moe", dispatchToLargestCapacityOnOverflow: false);
+        var store = new RecommendationStore(Path.Combine(Path.GetTempPath(), $"unused-{Guid.NewGuid():N}.json"));
+        store.Activate(new FleetRecommendations(
+            DateTimeOffset.UtcNow,
+            new Dictionary<string, RoleRecommendation>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["junior_developer"] = new RoleRecommendation("junior_developer", "moe", 131_072, "desc", [])
+            },
+            new Dictionary<string, ModelNodeProfile>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["moe"] = new ModelNodeProfile("moe", "MoE", 131_072, "q4",
+                [
+                    new NodeRoleProfile("Desktop", 65_536, 65_536, 40.0, null),
+                    new NodeRoleProfile("Laptop", 65_536, 65_536, 35.0, null),
+                    new NodeRoleProfile("Server", 65_536, 65_536, 45.0, null)
+                ])
+            }));
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|moe", $"{LaptopUrl}|moe", $"{ServerUrl}|moe" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            meta: meta,
+            recommendations: store);
+
+        // 30k fits the lowered 65,536 extensible capacity.
+        await h.Decide(30_000, "moe");
+        Assert.True(h.Eval(TDesktop)!.Qualified);
+
+        // 70k overflows the lowered capacity (the legacy 131,072 would have qualified it).
+        await Assert.ThrowsAsync<NoAvailableTargetException>(() => h.Decide(70_000, "moe"));
+        var desktop = h.Eval(TDesktop)!;
+        Assert.False(desktop.Qualified);
+        Assert.StartsWith("context overflow", desktop.DisqualifiedReason);
+        Assert.Contains("CMax: 65536", desktop.DisqualifiedReason);
+    }
+
+    [Fact]
+    public async Task Fallback_LargestCapacityClamp_RespectsLoweredCeiling()
+    {
+        // The DispatchToLargestCapacityOnOverflow clamp value (TargetCMax) uses the SAME
+        // lowered capacity as Stage 1: with ceilings Desktop 49,152 / Server 184,320 (the
+        // Server is pre-configured at 262,144, which the benchmark evidence lowers), a
+        // 300k prompt (308,192 required) overflows BOTH and clamps to the Server's
+        // 184,320 ceiling — the legacy clamp would have injected the Server's full 262,144
+        // (the ranking + clamp must never inject above the active ceiling).
+        var (meta, options, store) = BuildCeilingFleet();
+        options.DispatchToLargestCapacityOnOverflow = true;
+        var (h, _) = Build(
+            options,
+            withEngine: true,
+            catalogModels: new() { $"{DesktopUrl}|qwen3.8:27b", $"{LaptopUrl}|qwen3.8:27b", $"{ServerUrl}|qwen3.8:27b" },
+            onlineTargets: new() { "Desktop", "Laptop", "Server" },
+            meta: meta,
+            recommendations: store);
+
+        var result = await h.DecideDetailed(300_000, "qwen3.8:27b");
+        Assert.Equal(TServer, result.Target);
+        Assert.True(result.IsFallback);
+        Assert.Equal("LargestCapacityOverflow", result.FallbackStrategy);
+        Assert.Equal(184_320, result.TargetCMax);
     }
 }

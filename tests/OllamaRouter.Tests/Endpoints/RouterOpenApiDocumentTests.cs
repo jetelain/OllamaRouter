@@ -116,7 +116,7 @@ public class RouterOpenApiDocumentTests
     }
 
     /// <summary>
-    /// The approved 29 router operations: (method, document path) pairs — 25 path items.
+    /// The approved 32 router operations: (method, document path) pairs — 28 path items.
     /// NOTE: the generator emits the catch-all templates with the leading <c>*</c> stripped
     /// (the framework's documented template normalization: the registered
     /// <c>/api/router/models/{*modelName}</c> / <c>POST /api/router/models/{*tail}</c> /
@@ -153,10 +153,13 @@ public class RouterOpenApiDocumentTests
         ("GET", "/api/router/monitor/sessions"),
         ("GET", "/api/router/monitor/sessions/{sessionId}"),
         ("POST", "/api/router/sessions/affinity/release"),
+        ("GET", "/api/router/recommendations"),
+        ("POST", "/api/router/recommendations/generate"),
+        ("POST", "/api/router/recommendations/apply"),
         ("POST", "/api/router/admin/shutdown")
     ];
 
-    /// <summary>The ten functional tag groups (the complete tag set of the document).</summary>
+    /// <summary>The eleven functional tag groups (the complete tag set of the document).</summary>
     private static readonly string[] ApprovedTags =
     [
         "Identity & Fleet",
@@ -168,7 +171,8 @@ public class RouterOpenApiDocumentTests
         "API Key Security",
         "Session Usage & Savings",
         "Session Affinity",
-        "Admin & Lifecycle"
+        "Admin & Lifecycle",
+        "Recommendations"
     ];
 
     /// <summary>
@@ -205,6 +209,9 @@ public class RouterOpenApiDocumentTests
             { ("GET", "/api/router/monitor/sessions"), "GetRouterSessionUsageList" },
             { ("GET", "/api/router/monitor/sessions/{sessionId}"), "GetRouterSessionUsageDetail" },
             { ("POST", "/api/router/sessions/affinity/release"), "PostRouterSessionAffinityRelease" },
+            { ("GET", "/api/router/recommendations"), "GetRouterRecommendations" },
+            { ("POST", "/api/router/recommendations/generate"), "PostRouterRecommendationsGenerate" },
+            { ("POST", "/api/router/recommendations/apply"), "PostRouterRecommendationsApply" },
             { ("POST", "/api/router/admin/shutdown"), "PostRouterAdminShutdown" }
         };
 
@@ -262,6 +269,11 @@ public class RouterOpenApiDocumentTests
                 [("200", "RouterSessionUsageDetailResponse"), ("404", "OllamaErrorResponse")] },
             { ("POST", "/api/router/sessions/affinity/release"),
                 [("200", "RouterSessionAffinityReleaseResponse"), ("400", "OllamaErrorResponse")] },
+            { ("GET", "/api/router/recommendations"), [("200", "FleetRecommendations")] },
+            { ("POST", "/api/router/recommendations/generate"),
+                [("200", "RouterRecommendationsGeneratedResponse"), ("409", "OllamaErrorResponse")] },
+            { ("POST", "/api/router/recommendations/apply"),
+                [("200", "RouterRecommendationsAppliedResponse"), ("409", "OllamaErrorResponse")] },
             { ("POST", "/api/router/admin/shutdown"), [("202", "RouterShutdownResponse")] }
         };
 
@@ -365,14 +377,14 @@ public class RouterOpenApiDocumentTests
     }
 
     [Fact]
-    public async Task Document_ContainsExactlyThe29RouterOperations_AndExcludesEverythingElse()
+    public async Task Document_ContainsExactlyThe32RouterOperations_AndExcludesEverythingElse()
     {
         await using var harness = await DocHarness.StartAsync(requireKeyForAllEndpoints: false);
         var document = await FetchDocumentAsync(harness);
         var paths = (JsonObject)document["paths"]!;
 
-        // Exactly the 29 approved (method, path) pairs (25 path items).
-        Assert.Equal(25, paths.Count);
+        // Exactly the 32 approved (method, path) pairs (28 path items).
+        Assert.Equal(28, paths.Count);
         var pathKeys = JsonObjectKeys(paths);
         var actualOperations = pathKeys
             .Select(path => (Path: path, Item: (JsonObject)paths[path]!))
@@ -565,7 +577,7 @@ public class RouterOpenApiDocumentTests
         Assert.False(string.IsNullOrWhiteSpace(scheme["description"]?.GetValue<string>()));
 
         // The requirement is applied to EXACTLY the operations the production policy protects
-        // (13 of the 29), each with a documented 401 OllamaErrorResponse.
+        // (15 of the 32), each with a documented 401 OllamaErrorResponse.
         var protectedCount = 0;
         foreach (var (method, path) in ApprovedOperations)
         {
@@ -594,8 +606,9 @@ public class RouterOpenApiDocumentTests
             }
         }
 
-        // The #50 default protected set (incl. the #99 admin shutdown route) is exactly 13 operations.
-        Assert.Equal(13, protectedCount);
+        // The #50 default protected set (incl. the #99 admin shutdown route and the #66
+        // recommendation writes) is exactly 15 operations.
+        Assert.Equal(15, protectedCount);
     }
 
     [Fact]

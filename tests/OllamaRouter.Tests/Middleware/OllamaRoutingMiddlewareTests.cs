@@ -17,6 +17,7 @@ using Yarp.ReverseProxy.Forwarder;
 using OllamaRouter.Services.Catalog;
 using OllamaRouter.Services.ContextSizing;
 using OllamaRouter.Services.Monitoring;
+using OllamaRouter.Services.Recommendations;
 using OllamaRouter.Services.Routing;
 
 namespace OllamaRouter.Tests.Middleware;
@@ -48,8 +49,9 @@ public class OllamaRoutingMiddlewareTests
         ISessionAffinityService? sessionAffinity = null,
         ITokenMetricsRecorder? tokenMetricsRecorder = null,
         ILocalClientIdentityResolver? localClientIdentity = null,
-        ISessionUsageStore? sessionUsage = null) =>
-        CreateSut(next, tokenEstimator.Object, routingDecisionService, modelCatalogCache, activityMonitor, activityStatistics, inferenceRequestRecorder, targetAvailability, targetLiveness, capabilityEngine, forwarder, streakTracker, sessionAffinity, tokenMetricsRecorder, localClientIdentity, sessionUsage);
+        ISessionUsageStore? sessionUsage = null,
+        IRecommendationStore? recommendations = null) =>
+        CreateSut(next, tokenEstimator.Object, routingDecisionService, modelCatalogCache, activityMonitor, activityStatistics, inferenceRequestRecorder, targetAvailability, targetLiveness, capabilityEngine, forwarder, streakTracker, sessionAffinity, tokenMetricsRecorder, localClientIdentity, sessionUsage, recommendations);
 
     private static OllamaRoutingMiddleware CreateSut(
         RequestDelegate next,
@@ -67,7 +69,8 @@ public class OllamaRoutingMiddlewareTests
         ISessionAffinityService? sessionAffinity = null,
         ITokenMetricsRecorder? tokenMetricsRecorder = null,
         ILocalClientIdentityResolver? localClientIdentity = null,
-        ISessionUsageStore? sessionUsage = null)
+        ISessionUsageStore? sessionUsage = null,
+        IRecommendationStore? recommendations = null)
         {
         var effectiveTargetAvailability = targetAvailability ?? new Mock<ITargetAvailabilityService>();
         if (targetAvailability is null)
@@ -128,7 +131,8 @@ public class OllamaRoutingMiddlewareTests
             sessionAffinity,
             tokenMetricsRecorder,
             localClientIdentity: localClientIdentity,
-            sessionUsage: sessionUsage);
+            sessionUsage: sessionUsage,
+            recommendations: recommendations);
     }
 
             // Builds the forwarder used by the middleware. When the caller does not supply an explicit
@@ -1649,7 +1653,8 @@ public class OllamaRoutingMiddlewareTests
         ModelCapabilityEngine capabilityEngine,
         Mock<IModelCatalogCacheService> modelCatalogCache,
         Mock<IActivityMonitorService>? activityMonitor = null,
-        bool enableDynamicContext = true)
+        bool enableDynamicContext = true,
+        IRecommendationStore? recommendations = null)
     {
         if (enableDynamicContext && !options.DynamicContext.Enabled)
         {
@@ -1681,7 +1686,8 @@ public class OllamaRoutingMiddlewareTests
             NullLogger<OllamaRoutingMiddleware>.Instance,
             CreateForwarder(next).Object,
             new TargetFailureStreakService(),
-            new Mock<ITargetExecutionTracker>().Object);
+            new Mock<ITargetExecutionTracker>().Object,
+            recommendations: recommendations);
             }
 
     private static Mock<IModelCatalogCacheService> DigestCache(string digest)
@@ -4519,5 +4525,376 @@ public class OllamaRoutingMiddlewareTests
         Assert.Null(loggedEntry!.SessionId);
         Assert.Null(loggedEntry.AgentId);
         Assert.Equal(RoutingTarget.Remote, loggedEntry.Target);
+    }
+
+    // ------------------------------------------------------------------
+    //  Task #66: virtual role translation + recommendation ceiling sizing
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// A fail-soft store (no file) pre-activated with the given matrix (null → no store
+    /// registration at all: the null fail-open path).
+    /// </summary>
+    private static RecommendationStore StoreWith(FleetRecommendations? matrix)
+    {
+        var store = new RecommendationStore(Path.Combine(Path.GetTempPath(), $"unused-{Guid.NewGuid():N}.json"));
+        if (matrix is not null)
+        {
+            store.Activate(matrix);
+        }
+        return store;
+    }
+
+    private static FleetRecommendations RoleMatrix(
+        params (string Alias, string Model, string Target, int Ceiling, int? Baseline)[] roles)
+    {
+        var roleDictionary = new Dictionary<string, RoleRecommendation>(StringComparer.OrdinalIgnoreCase);
+        var models = new Dictionary<string, ModelNodeProfile>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (alias, model, target, ceiling, baseline) in roles)
+        {
+            var node = new NodeRoleProfile(target, ceiling, baseline, 30.0, null);
+            var nodes = models.TryGetValue(model, out var existing)
+                ? existing.Nodes.Append(node).ToList()
+                : [node];
+            roleDictionary[alias] = new RoleRecommendation(alias, model, ceiling, "desc", nodes);
+            if (!models.ContainsKey(model))
+            {
+                var isMoe = baseline is not null;
+                models[model] = new ModelNodeProfile(model, isMoe ? "MoE" : "Dense", 131_072, "q4", nodes);
+            }
+        }
+
+        return new FleetRecommendations(DateTimeOffset.UtcNow, roleDictionary, models);
+    }
+
+    [Fact]
+    public async Task Translate_RoleAlias_ForwardsNativeModelName_AndEmitsRoleHeader()
+    {
+        // model: "senior_developer" + active matrix → the forwarded body carries the NATIVE
+        // name; Ollama never sees the alias (no model evictions / reloads).
+        var context = BuildContext("/api/chat", """{ "model": "senior_developer", "messages": [ { "role": "user", "content": "hi" } ] }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(2_000);
+
+        // The routing decision runs on the TRANSLATED native name.
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(2_000, "qwen3.8:27b", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var captured = new string[1];
+        var sut = CreateSut(
+            CaptureBodyDelegate(captured),
+            tokenEstimator,
+            routingDecisionService,
+            recommendations: StoreWith(RoleMatrix(("senior_developer", "qwen3.8:27b", "Local", 49_152, null))));
+
+        await sut.InvokeAsync(context);
+
+        Assert.NotNull(captured[0]);
+        using var doc = JsonDocument.Parse(captured[0]!);
+        Assert.Equal("qwen3.8:27b", doc.RootElement.GetProperty("model").GetString());
+        // Telemetry: the requested virtual role is echoed; the native name rides the model header.
+        Assert.Equal("senior_developer", context.Response.Headers["X-OllamaRouter-Role"]);
+        Assert.Equal("qwen3.8:27b", context.Response.Headers["X-OllamaRouter-Model"]);
+    }
+
+    [Fact]
+    public async Task Translate_OpenAiShape_CaseInsensitiveAlias_TranslatesToo()
+    {
+        // The OpenAI shape (/v1/chat/completions) flows through the same method and reuses the
+        // translated body; alias matching is case-insensitive.
+        var context = BuildContext("/v1/chat/completions", """{ "model": "Software_Architect", "messages": [ { "role": "user", "content": "hi" } ] }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(2_000);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(2_000, "qwen3.8:27b", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var captured = new string[1];
+        var sut = CreateSut(
+            CaptureBodyDelegate(captured),
+            tokenEstimator,
+            routingDecisionService,
+            recommendations: StoreWith(RoleMatrix(("software_architect", "qwen3.8:27b", "Local", 49_152, null))));
+
+        await sut.InvokeAsync(context);
+
+        Assert.NotNull(captured[0]);
+        using var doc = JsonDocument.Parse(captured[0]!);
+        Assert.Equal("qwen3.8:27b", doc.RootElement.GetProperty("model").GetString());
+        Assert.Equal("Software_Architect", context.Response.Headers["X-OllamaRouter-Role"]);
+        Assert.Equal("qwen3.8:27b", context.Response.Headers["X-OllamaRouter-Model"]);
+    }
+
+    [Fact]
+    public async Task Translate_NoActiveRole_BodyByteIdentical_NoRoleHeader_ForwardedLiterally()
+    {
+        // Permissive: the role is ABSENT from the active matrix → the name is a literal model
+        // name forwarded untouched (no X-OllamaRouter-Role header).
+        const string body = """{ "model": "senior_developer", "messages": [ { "role": "user", "content": "hi" } ] }""";
+
+        foreach (var (label, store) in new[]
+        {
+            ("role absent from matrix", StoreWith(RoleMatrix(("basic", "gemma4:e4b", "Local", 49_152, null)))),
+            ("store null", null)
+        })
+        {
+            var context = BuildContext("/api/chat", body);
+
+            var tokenEstimator = new Mock<ITokenEstimator>();
+            tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(2_000);
+
+            // The literal (untranslated) name is what the decision service sees.
+            var routingDecisionService = new Mock<IRoutingDecisionService>();
+            routingDecisionService
+                .Setup(r => r.DecideAsync(2_000, "senior_developer", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(RoutingTarget.Local);
+
+            var captured = new string[1];
+            var sut = CreateSut(
+                CaptureBodyDelegate(captured),
+                tokenEstimator,
+                routingDecisionService,
+                recommendations: store);
+
+            await sut.InvokeAsync(context);
+
+            Assert.Equal(body, captured[0]);          // byte-identical
+            Assert.False(context.Response.Headers.ContainsKey("X-OllamaRouter-Role"), label);
+            Assert.True(context.Response.Headers.ContainsKey("X-OllamaRouter-Model"), label);
+            Assert.Equal("senior_developer", context.Response.Headers["X-OllamaRouter-Model"].ToString());
+        }
+    }
+
+    [Fact]
+    public async Task Translate_NonCompletionPath_ApiShow_AliasShapeNameUntouched()
+    {
+        // Non-completion paths are NEVER translated.
+        const string body = """{ "name": "senior_developer", "model": "senior_developer" }""";
+        var context = BuildContext("/api/show", body);
+        context.Request.Method = HttpMethods.Post;
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+
+        var captured = new string[1];
+        var sut = CreateSut(
+            CaptureBodyDelegate(captured),
+            tokenEstimator,
+            routingDecisionService,
+            recommendations: StoreWith(RoleMatrix(("senior_developer", "qwen3.8:27b", "Local", 49_152, null))));
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal(body, captured[0]);
+        Assert.False(context.Response.Headers.ContainsKey("X-OllamaRouter-Role"));
+    }
+
+    private static (ModelCapabilityEngine Engine, Mock<IOllamaModelCatalogClient> Catalog) Dense131kEngine()
+    {
+        var engine = CreateCapabilityEngine(out var catalogClient);
+        // 27B dense (no Modelfile num_ctx): CMax = native 131,072 (the daemon Modelfile would
+        // otherwise allocate a 131k KV window the benchmark proved is not viable here).
+        catalogClient
+            .Setup(c => c.GetShowAsync("http://localhost:11435", "dense-ceiling", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new JsonObject
+            {
+                ["parameters"] = "num_predict 4096",
+                ["model_info"] = new JsonObject
+                {
+                    ["general.parameter_count"] = 27_800_000_000L,
+                    ["general.context_length"] = 131_072
+                }
+            });
+        return (engine, catalogClient);
+    }
+
+    private static OllamaRouterOptions DenseSizingOptions()
+    {
+        var options = new OllamaRouterOptions { Targets = [new() { Name = "Local", Url = "http://localhost:11435", MaxVramMB = 16384 }] };
+        options.DynamicContext.Enabled = true;
+        return options;
+    }
+
+    [Fact]
+    public async Task Sizing_DenseActiveCeiling_ClientAboveCeiling_ClampedDownToCeiling()
+    {
+        // CMax 131,072 with an active ceiling of 49,152: the client's 131,072 is clamped DOWN
+        // to the TIGHTER ceiling (not the legacy 131,072 pass-through).
+        var context = BuildContext("/api/chat", """{ "model": "dense-ceiling", "messages": [ { "role": "user", "content": "hi" } ], "options": { "num_ctx": 131072 } }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(2_000);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(2_000, "dense-ceiling", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var (engine, _) = Dense131kEngine();
+        var captured = new string[1];
+        var sut = CreateSizingSut(
+            CaptureBodyDelegate(captured),
+            tokenEstimator,
+            routingDecisionService,
+            DenseSizingOptions(),
+            engine,
+            DigestCache("digest-1"),
+            recommendations: StoreWith(RoleMatrix(("senior_developer", "dense-ceiling", "Local", 49_152, null))));
+
+        await sut.InvokeAsync(context);
+
+        Assert.NotNull(captured[0]);
+        using var doc = JsonDocument.Parse(captured[0]!);
+        Assert.Equal(49_152, doc.RootElement.GetProperty("options").GetProperty("num_ctx").GetInt32());
+        Assert.Equal("Clamped", context.Response.Headers["X-OllamaRouter-Context-Mode"]);
+        Assert.Equal("49152", context.Response.Headers["X-OllamaRouter-Context-Size"]);
+    }
+
+    [Fact]
+    public async Task Sizing_DenseActiveCeiling_NoClientNumCtx_InjectsRecommendedCeiling()
+    {
+        // The "injected per target without separate Modelfiles" case: no client num_ctx and
+        // the active ceiling (49,152) is strictly below CMax (131,072) → inject the ceiling
+        // with the new RecommendedCeiling mode.
+        var context = BuildContext("/api/chat", """{ "model": "dense-ceiling", "messages": [ { "role": "user", "content": "hi" } ] }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(2_000);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(2_000, "dense-ceiling", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var (engine, _) = Dense131kEngine();
+        var captured = new string[1];
+        var sut = CreateSizingSut(
+            CaptureBodyDelegate(captured),
+            tokenEstimator,
+            routingDecisionService,
+            DenseSizingOptions(),
+            engine,
+            DigestCache("digest-1"),
+            recommendations: StoreWith(RoleMatrix(("senior_developer", "dense-ceiling", "Local", 49_152, null))));
+
+        await sut.InvokeAsync(context);
+
+        Assert.NotNull(captured[0]);
+        using var doc = JsonDocument.Parse(captured[0]!);
+        Assert.Equal(49_152, doc.RootElement.GetProperty("options").GetProperty("num_ctx").GetInt32());
+        Assert.Equal("RecommendedCeiling", context.Response.Headers["X-OllamaRouter-Context-Mode"]);
+        Assert.Equal("49152", context.Response.Headers["X-OllamaRouter-Context-Size"]);
+    }
+
+    [Fact]
+    public async Task Sizing_DenseActiveCeiling_ClientAtOrBelowCeiling_PassThroughUntouched()
+    {
+        // The client's explicit 32,768 is ≤ the active ceiling (49,152) → never raised, never
+        // rewritten: byte-identical pass-through, no mode header.
+        const string body = """{ "model": "dense-ceiling", "messages": [ { "role": "user", "content": "hi" } ], "options": { "num_ctx": 32768 } }""";
+        var context = BuildContext("/api/chat", body);
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(2_000);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(2_000, "dense-ceiling", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var (engine, _) = Dense131kEngine();
+        var captured = new string[1];
+        var sut = CreateSizingSut(
+            CaptureBodyDelegate(captured),
+            tokenEstimator,
+            routingDecisionService,
+            DenseSizingOptions(),
+            engine,
+            DigestCache("digest-1"),
+            recommendations: StoreWith(RoleMatrix(("senior_developer", "dense-ceiling", "Local", 49_152, null))));
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal(body, captured[0]); // byte-identical
+        Assert.False(context.Response.Headers.ContainsKey("X-OllamaRouter-Context-Mode"));
+        Assert.False(context.Response.Headers.ContainsKey("X-OllamaRouter-Context-Size"));
+    }
+
+    [Fact]
+    public async Task Sizing_MoeRecommendedBaseline_LowersBaselineBucket_NoStoreCeilingUnchanged()
+    {
+        // MoE: Modelfile num_ctx 131,072 with an active recommended baseline of 65,536 — a
+        // small prompt injects the LOWERED baseline (65,536), not the Modelfile 131,072.
+        var context = BuildContext("/api/chat", """{ "model": "moe-rec", "messages": [ { "role": "user", "content": "small" } ] }""");
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(2_000);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(2_000, "moe-rec", It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var (engine, catalogClient) = Dense131kEngine();
+        catalogClient
+            .Setup(c => c.GetShowAsync("http://localhost:11435", "moe-rec", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new JsonObject
+            {
+                ["parameters"] = "num_ctx 131072",
+                ["model_info"] = new JsonObject
+                {
+                    ["general.parameter_count"] = 35_000_000_000L,
+                    ["general.expert_count"] = 64,
+                    ["general.context_length"] = 131_072
+                }
+            });
+
+        var options = new OllamaRouterOptions { Targets = [new() { Name = "Local", Url = "http://localhost:11435", MaxVramMB = 98304 }] };
+        options.DynamicContext.Enabled = true;
+
+        // WITH the recommended baseline: the baseline bucket is lowered to 65,536.
+        var captured = new string[1];
+        var sut = CreateSizingSut(
+            CaptureBodyDelegate(captured),
+            tokenEstimator,
+            routingDecisionService,
+            options,
+            engine,
+            DigestCache("digest-1"),
+            recommendations: StoreWith(RoleMatrix(("junior_developer", "moe-rec", "Local", 131_072, 65_536))));
+
+        await sut.InvokeAsync(context);
+
+        Assert.NotNull(captured[0]);
+        using (var doc = JsonDocument.Parse(captured[0]!))
+        {
+            Assert.Equal(65_536, doc.RootElement.GetProperty("options").GetProperty("num_ctx").GetInt32());
+        }
+        Assert.Equal("Baseline", context.Response.Headers["X-OllamaRouter-Context-Mode"]);
+
+        // WITHOUT a store (regression guard): the same request injects the Modelfile baseline.
+        var context2 = BuildContext("/api/chat", """{ "model": "moe-rec", "messages": [ { "role": "user", "content": "small" } ] }""");
+        var captured2 = new string[1];
+        var sut2 = CreateSizingSut(
+            CaptureBodyDelegate(captured2),
+            tokenEstimator,
+            routingDecisionService,
+            options,
+            engine,
+            DigestCache("digest-1")); // recommendations: null → fail-open
+
+        await sut2.InvokeAsync(context2);
+
+        Assert.NotNull(captured2[0]);
+        using (var doc2 = JsonDocument.Parse(captured2[0]!))
+        {
+            Assert.Equal(131_072, doc2.RootElement.GetProperty("options").GetProperty("num_ctx").GetInt32());
+        }
     }
 }

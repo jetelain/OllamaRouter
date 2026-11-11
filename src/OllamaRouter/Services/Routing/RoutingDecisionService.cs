@@ -5,6 +5,7 @@ using OllamaRouter.Services.Hardware;
 using OllamaRouter.Services.Catalog;
 using OllamaRouter.Services.Monitoring;
 using OllamaRouter.Services.ContextSizing;
+using OllamaRouter.Services.Recommendations;
 
 namespace OllamaRouter.Services.Routing;
 
@@ -78,6 +79,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
     private readonly ITargetFailureStreakService _streakTracker;
     private readonly ISessionAffinityService? _sessionAffinity;
     private readonly IFleetHardwareService? _fleetHardware;
+    private readonly IRecommendationStore? _recommendations;
 
     /// <summary>
     /// Creates the routing decision pipeline over the configured fleet. The Cloud terminal
@@ -86,6 +88,9 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
     /// <paramref name="sessionAffinity"/> enables the multi-agent sticky-session Stage-2 bonus;
     /// when null (e.g. existing test constructions) the pipeline is fully stateless.
     /// <paramref name="fleetHardware"/> supplies dynamic hardware profiles when targets omit explicit <c>MaxVramMB</c>.
+    /// <paramref name="recommendations"/> supplies the active per-node context ceilings
+    /// (task #66) that can only LOWER the Stage-1 context-fit capacity; when null (existing
+    /// test constructions) the pipeline is byte-identical to the no-recommendation behavior.
     /// </summary>
     public RoutingDecisionService(
         IOptionsMonitor<OllamaRouterOptions> options,
@@ -98,7 +103,8 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         ILogger<RoutingDecisionService> logger,
         ITargetFailureStreakService? streakTracker = null,
         ISessionAffinityService? sessionAffinity = null,
-        IFleetHardwareService? fleetHardware = null)
+        IFleetHardwareService? fleetHardware = null,
+        IRecommendationStore? recommendations = null)
     {
         _options = options;
         _modelCatalogCacheService = modelCatalogCacheService;
@@ -113,6 +119,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         _streakTracker = streakTracker ?? new TargetFailureStreakService();
         _sessionAffinity = sessionAffinity;
         _fleetHardware = fleetHardware;
+        _recommendations = recommendations;
     }
 
     private int? GetEffectiveMaxVramMB(OllamaTargetOptions target) =>
@@ -491,7 +498,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         string? sessionId,
         CancellationToken cancellationToken)
     {
-        var fallbackCandidates = new List<(RoutingTarget Target, OllamaTargetOptions Options, TargetModelCapability Capability, int InFlight, int Index)>();
+        var fallbackCandidates = new List<(RoutingTarget Target, OllamaTargetOptions Options, TargetModelCapability Capability, int InFlight, int Index, int FitCapacity)>();
         for (var i = 0; i < fleetTargets.Count; i++)
         {
             var targetOptions = fleetTargets[i];
@@ -503,7 +510,11 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
                 if (capability is not null)
                 {
                     var inFlight = context.GetExecutionState(target)?.InFlightRequests ?? 0;
-                    fallbackCandidates.Add((target, targetOptions, capability, inFlight, i));
+                    // Task #66: the ranking + clamp use the SAME lowered capacity as Stage 1
+                    // (an active per-node ceiling can only LOWER the largest-capacity overflow
+                    // clamp — it never injects above the active ceiling).
+                    var fitCapacity = EffectiveContextCapacityForFit(capability, thresholds, target, context.ModelName);
+                    fallbackCandidates.Add((target, targetOptions, capability, inFlight, i, fitCapacity));
                 }
             }
         }
@@ -514,7 +525,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         }
 
         var fallbackRanked = fallbackCandidates
-            .OrderByDescending(c => ContextCapacityForFit(c.Capability, thresholds))
+            .OrderByDescending(c => c.FitCapacity)
             .ThenBy(c => c.InFlight)
             .ThenBy(c => c.Index)
             .ToList();
@@ -524,8 +535,9 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
 
         // The true largest-capacity candidate (drives the warning header's
         // "Max available" figure) — the MoE-aware capacity for MoE candidates,
-        // the pre-configured CMax for dense (task #26, Option A).
-        var maxAvailableCapacity = ContextCapacityForFit(maxAvailableCandidate.Capability, thresholds);
+        // the pre-configured CMax for dense (task #26, Option A), with the active
+        // per-node recommendation ceiling applied (task #66, lowered only).
+        var maxAvailableCapacity = maxAvailableCandidate.FitCapacity;
 
         // ---- Failure-streak circuit-breaker cooldown (task #94): resolved ONCE per decision
         // (the fallback hatch is part of the same decision). ----
@@ -565,10 +577,11 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         }
 
         // The capacity actually served by the (possibly streak-switched) winner
-        // (MoE: extensible limit; dense: pre-configured CMax) — drives the
+        // (MoE: extensible limit; dense: pre-configured CMax; both with the active
+        // per-node recommendation ceiling applied — task #66) — drives the
         // middleware's explicit clamp and the warning header. Computed AFTER the
         // failure-streak switch so it reflects the final winner.
-        var winnerCapacity = ContextCapacityForFit(winnerCandidate.Capability, thresholds);
+        var winnerCapacity = winnerCandidate.FitCapacity;
 
         var margin = Math.Max(0, settings.ContextFitMarginTokens);
         var breakdown = BuildCandidateBreakdown(fleetTargets, evaluations.ToList(), context);
@@ -681,7 +694,7 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
             effectiveRequired = Math.Min(effectiveRequired, context.ClientRequestedNumCtx.Value);
         }
 
-        var capacityForFit = ContextCapacityForFit(capability, context.Thresholds);
+        var capacityForFit = EffectiveContextCapacityForFit(capability, context.Thresholds, target, context.ModelName);
 
         if (!ModelCapabilityEngine.EvaluateClientContext(
                 context.TokenCount,
@@ -813,6 +826,30 @@ public sealed class RoutingDecisionService : IRoutingDecisionService
         return capability.Architecture == ModelArchitectureKind.Moe
             ? ModelCapabilityEngine.GetMoeExtensibleCapacity(capability, thresholds?.MaxContextTokens)
             : capability.CMax;
+    }
+
+    /// <summary>
+    /// The Stage-1 context-fit capacity with the ACTIVE per-node recommendation ceiling
+    /// (task #66) applied: <c>min(capacity, activeCeiling)</c>. The ceiling can only LOWER
+    /// the capacity — never raise it — and a missing store, an inactive pair or a ceiling
+    /// at/above the capacity leaves the behavior byte-identical to the
+    /// no-recommendation path (fail-open, the codebase's standard permissive policy).
+    /// </summary>
+    private int EffectiveContextCapacityForFit(
+        TargetModelCapability capability,
+        ModelThresholds? thresholds,
+        RoutingTarget target,
+        string modelName)
+    {
+        var capacity = ContextCapacityForFit(capability, thresholds);
+        if (_recommendations is not null &&
+            _recommendations.TryGetNodeContextCeiling(target.Value, modelName, out var ceiling) &&
+            ceiling > 0 && ceiling < capacity)
+        {
+            return ceiling;
+        }
+
+        return capacity;
     }
 
     /// <summary>

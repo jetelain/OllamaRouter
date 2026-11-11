@@ -275,7 +275,31 @@ DELETE /api/router/benchmark/results  # → 200 {"cleared":true}; removes benchm
                                        #   benchmark-seeded (source:"benchmark") speed entries
 ```
 
-The ladder **stops at the first non-viable, OOM, or error row** (larger contexts only get worse). Results persist to the state directory (`%LOCALAPPDATA%\OllamaRouter\state` on Windows) as `benchmarks.json` (per-target rows incl. per-context tps, viable flag, sizing provenance) and seed `targets-speed.json` — a per-(target, model) tokens/sec snapshot (`tokensPerSecond`, `samples`, `source`, `updatedAt`) where `tokensPerSecond` is the measured speed of the **largest viable context**. Entries with `source: "learned"` (written by later routing-speed learning) are never overwritten by benchmark seeding. This task does not alter routing itself; routing still uses the static `SpeedFactor` hint today.
+The ladder **stops at the first non-viable, OOM, or error row** (larger contexts only get worse). Results persist to the state directory (`%LOCALAPPDATA%\OllamaRouter\state` on Windows) as `benchmarks.json` (per-target rows incl. per-context tps, viable flag, sizing provenance) and seed `targets-speed.json` — a per-(target, model) tokens/sec snapshot (`tokensPerSecond`, `samples`, `source`, `updatedAt`) where `tokensPerSecond` is the measured speed of the **largest viable context**. Entries with `source: "learned"` (written by later routing-speed learning) are never overwritten by benchmark seeding.
+
+### Role recommendations
+
+On top of the raw benchmark data, the router can assemble the **optimal role → native-model assignment** with **per-node context ceilings** and persist it to `<stateDir>/recommended.json` (machine-generated state, alongside `benchmarks.json` / `targets-hardware.json`). This is the input to NightCodeForge's Phase 12 Environment Wizard.
+
+```http
+GET  /api/router/recommendations       # → 200 live matrix (role → native model + per-node
+                                        #   ceilings + MoE baselines); stable empty shape
+                                        #   (generatedAt null, empty roles/models) when inactive
+POST /api/router/recommendations/generate  # (API key) recompute from benchmarks + hardware
+                                        #   profiles → persist recommended.json (atomic)
+                                        #   → activate in the live store; 409 when no terminal
+                                        #   benchmark results exist (nothing is written)
+POST /api/router/recommendations/apply     # (API key) idempotent re-activation of the current
+                                        #   file (manual edit / fleet change / restart re-sync);
+                                        #   reports the per-target ceilings now enforced; 409
+                                        #   when no file exists
+```
+
+**Native model names, never aliases:** Ollama keys model processes by name string, so the recommendation matrix always carries **native catalog names** (e.g. `qwen3.8:27b`). Roles with an identical optimal model (Agentic Chat, Software Architect, Senior Developer → `qwen3.8:27b`) share one resident model across all their turns — zero evictions. If a client or agent sends a **virtual role alias** (`basic`, `agentic_chat`, `software_architect`, `senior_developer`, `junior_developer`; case-insensitive) as `model` on any completion endpoint, the router transparently rewrites the body to the native model name before forwarding; the response echoes `X-OllamaRouter-Role: <alias>` (only when a translation happened) and `X-OllamaRouter-Model: <native>`. With no active matrix (or a role absent from it) the name is forwarded literally — a model genuinely named `basic` keeps working.
+
+**Enforcement (lower-only, fail-open):** once a (model, node) ceiling is active it can only LOWER capacities — with no active ceiling every behavior is byte-identical to the no-recommendation path. Stage-1 context fit uses `min(node CMax, active ceiling)` (a 40k prompt + 8k margin qualifies a 49 152-ceiling desktop while a 100k prompt qualifies only the 262 144-ceiling server). Dense dynamic context sizing clamps a client `num_ctx` above the ceiling, passes client values at/below it through untouched, and **injects** the ceiling when the client sends no `num_ctx` and the ceiling is strictly below the node's pre-configured window (mode `RecommendedCeiling` on `X-OllamaRouter-Context-Mode`; the `/context/evaluate` preview reports `recommended_ceiling`) — no separate Modelfiles per node. MoE requests use the recommended **baseline** (largest viable measured row, as the Auto-Shrink target) with the model's native context as the extensible limit.
+
+The matrix **auto-loads at startup** (missing/corrupt file = warn + empty matrix, the router never fails to start), so ceilings survive restarts; `POST .../apply` re-syncs after manual edits without a restart.
 
 ## Setup Ollama instances
 
@@ -526,6 +550,8 @@ nThe router's Setup API can edit persistent configuration (fleet targets, hardwa
 | `PUT` | `/api/router/fleet/hardware/{targetName}` |
 | `POST` | `/api/router/benchmark` |
 | `DELETE` | `/api/router/benchmark/results` |
+| `POST` | `/api/router/recommendations/generate` |
+| `POST` | `/api/router/recommendations/apply` |
 | `GET`, `POST` | `/api/router/api-keys` (key management) |
 | `DELETE` | `/api/router/api-keys/{name}` (key management) |
 | `POST` | `/api/router/api-keys/default/rotate` (key management) |
@@ -587,7 +613,7 @@ The full router management API is documented as an OpenAPI 3.1 JSON document, ge
 GET {bind-address}/api/router/openapi.json
 ```
 
-e.g. `http://localhost:11434/api/router/openapi.json`. Point any OpenAPI tooling (Swagger Editor, Redoc, code generators) at that URL. The document covers the 29 `/api/router/*` operations in ten functional groups:
+e.g. `http://localhost:11434/api/router/openapi.json`. Point any OpenAPI tooling (Swagger Editor, Redoc, code generators) at that URL. The document covers the 32 `/api/router/*` operations in eleven functional groups:
 
 - **Identity & Fleet** — `/info`, `/fleet`
 - **Hardware Profiling** — `/hardware`, `/fleet/hardware` (GET + PUT)
@@ -599,6 +625,7 @@ e.g. `http://localhost:11434/api/router/openapi.json`. Point any OpenAPI tooling
 - **Session Usage & Savings** — `/monitor/sessions`, `/monitor/sessions/{*sessionId}`
 - **Session Affinity** — `/sessions/affinity/release` (POST)
 - **Admin & Lifecycle** — `/admin/shutdown` (POST, key-protected graceful host stop)
+- **Recommendations** — `/recommendations` (GET), `/recommendations/generate`, `/recommendations/apply` (POST)
 
 The `RouterApiKey` security scheme (http/bearer/base64url — `Authorization: Bearer <key>` or `X-Api-Key: <key>`) is applied to exactly the default protected route set above; with `ApiSecurity.RequireKeyForAllEndpoints: true` every route (including the document endpoint) requires a key. The document is regenerated per request from the same AOT source-generated DTO records the endpoints use — no drift, and it works in AOT-published builds.
 

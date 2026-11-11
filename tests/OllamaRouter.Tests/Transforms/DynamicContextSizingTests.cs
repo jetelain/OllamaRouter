@@ -205,6 +205,90 @@ public class DynamicContextSizingTests
     }
 
     // ================================================================================
+    //  Recommendation ceilings (task #66): lower-only parameters
+    // ================================================================================
+
+    [Fact]
+    public void Decide_Dense_ActiveCeiling_ClientAboveCeiling_ClampedToCeiling()
+    {
+        // CMax 131,072, active ceiling 49,152, client num_ctx 131,072 → clamped DOWN to the
+        // tighter ceiling (49,152), not the legacy CMax.
+        var cap = DenseCap(null, 131_072);
+        var d = DynamicContextSizingEngine.Decide(DefaultOptions(), cap, 2_000, 131_072, 8_192, null, activeCeiling: 49_152);
+
+        Assert.Equal(ContextSizingMode.Clamped, d.Mode);
+        Assert.Equal(49_152, d.InjectedNumCtx);
+        Assert.True(d.ClientRequestedClamped);
+    }
+
+    [Fact]
+    public void Decide_Dense_ActiveCeiling_NoClientNumCtx_InjectsRecommendedCeiling()
+    {
+        // No client num_ctx and the active ceiling (49,152) is strictly below CMax (131,072)
+        // → inject the ceiling with the NEW RecommendedCeiling mode (serialized lowercase as
+        // "recommended_ceiling" by the context sizing preview's default switch arm).
+        var cap = DenseCap(null, 131_072);
+        var d = DynamicContextSizingEngine.Decide(DefaultOptions(), cap, 2_000, null, 8_192, null, activeCeiling: 49_152);
+
+        Assert.Equal(ContextSizingMode.RecommendedCeiling, d.Mode);
+        Assert.Equal(49_152, d.InjectedNumCtx);
+        Assert.False(d.ClientRequestedClamped);
+    }
+
+    [Fact]
+    public void Decide_Dense_ActiveCeiling_ClientAtOrBelowCeiling_PassThroughUntouched()
+    {
+        // Client num_ctx 32,768 ≤ ceiling 49,152 ≤ CMax → never raised: PassThrough, no rewrite.
+        var cap = DenseCap(null, 131_072);
+        var d = DynamicContextSizingEngine.Decide(DefaultOptions(), cap, 2_000, 32_768, 8_192, null, activeCeiling: 49_152);
+
+        Assert.Equal(ContextSizingMode.PassThrough, d.Mode);
+        Assert.Equal(0, d.InjectedNumCtx);
+    }
+
+    [Fact]
+    public void Decide_Dense_CeilingAtOrAboveCMax_NoEffect_PassThroughUnchanged()
+    {
+        // A ceiling at/above CMax never RAISES the effective default: no client num_ctx +
+        // ceiling 262,144 ≥ CMax 131,072 → unchanged PassThrough (no injection).
+        var cap = DenseCap(null, 131_072);
+        var d = DynamicContextSizingEngine.Decide(DefaultOptions(), cap, 2_000, null, 8_192, null, activeCeiling: 262_144);
+
+        Assert.Equal(ContextSizingMode.PassThrough, d.Mode);
+        Assert.Equal(0, d.InjectedNumCtx);
+
+        // And the legacy clamp target is unchanged (client > CMax still clamps to CMax).
+        var clamped = DynamicContextSizingEngine.Decide(DefaultOptions(), cap, 2_000, 131_072, 8_192, null, activeCeiling: 262_144);
+        Assert.Equal(ContextSizingMode.PassThrough, clamped.Mode); // 131,072 is NOT above the ceiling
+    }
+
+    [Fact]
+    public void Decide_Moe_RecommendedBaseline_LowersBaselineBucket_ExtensibleCeilingLowers()
+    {
+        // Modelfile 131,072 baseline; recommended baseline 65,536 → a small prompt injects the
+        // LOWERED baseline (the Auto-Shrink shrink target inherits it).
+        var cap = MoeCap(131_072, 131_072);
+        var d = DynamicContextSizingEngine.Decide(DefaultOptions(), cap, 2_000, null, 8_192, null, activeCeiling: null, recommendedBaselineTokens: 65_536);
+
+        Assert.Equal(ContextSizingMode.Baseline, d.Mode);
+        Assert.Equal(65_536, d.InjectedNumCtx);
+        Assert.Equal(65_536, d.BaselineBucket);
+        Assert.Equal(131_072, d.EffectiveCeiling);
+
+        // An active ceiling also LOWERS the extensible limit: expanded prompts inject the
+        // ceiling, never the native limit.
+        var expanded = DynamicContextSizingEngine.Decide(DefaultOptions(), cap, 100_000, null, 8_192, null, activeCeiling: 98_304, recommendedBaselineTokens: 65_536);
+        Assert.Equal(ContextSizingMode.Expanded, expanded.Mode);
+        Assert.Equal(98_304, expanded.InjectedNumCtx);
+        Assert.Equal(98_304, expanded.EffectiveCeiling);
+        Assert.True(expanded.ClientRequestedClamped == false);
+
+        // No ceilings (null): byte-identical legacy decisions.
+        var legacy = DynamicContextSizingEngine.Decide(DefaultOptions(), cap, 2_000, null, 8_192, null);
+        Assert.Equal(131_072, legacy.InjectedNumCtx);
+    }
+
+    // ================================================================================
     //  SelectBucket (public two-bucket helper)
     // ================================================================================
 
