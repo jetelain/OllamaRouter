@@ -54,7 +54,8 @@ public sealed class OllamaRoutingMiddleware(
     OllamaChatRequestParser? ollamaRequestParser = null,
     OpenAIChatRequestParser? openAiRequestParser = null,
     ITargetChatClientProvider? targetChatClientProvider = null,
-    ISessionUsageStore? sessionUsage = null)
+    ISessionUsageStore? sessionUsage = null,
+    ILocalClientIdentityResolver? localClientIdentity = null)
     {
     // During the first 10 s after the liveness prober started, an unresolved (Unknown)
     // target is treated as routable rather than offline, so a request arriving before the
@@ -156,6 +157,19 @@ public sealed class OllamaRoutingMiddleware(
     /// with a warning (every cross-protocol candidate is skipped as unconfigured).
     /// </summary>
     private readonly ITargetChatClientProvider? _targetChatClientProvider = targetChatClientProvider;
+
+    /// <summary>
+    /// The best-effort local client process identity resolver (task #106): for UNtagged loopback
+    /// completion requests (no X-OllamaRouter-Session-Id AND no X-OllamaRouter-Agent-Id header) it
+    /// attributes the request to the owning local process (<c>process:&lt;Name&gt;</c>) so local
+    /// applications are visible in the activity monitor and per-session usage aggregates.
+    /// NULLABLE FOR UNIT-TEST COMPATIBILITY: when null, untagged requests keep the exact
+    /// pre-attribution anonymous behavior (no TCP-table lookup). Registered as a singleton in
+    /// production (see <c>AddOllamaRouter</c>); display/attribution only — the sticky KV-cache
+    /// lease (above) and the X-OllamaRouter-Session-Id response echo keep their
+    /// explicit-headers-only semantics.
+    /// </summary>
+    private readonly ILocalClientIdentityResolver? _localClientIdentity = localClientIdentity;
 
     // One-shot guard for the converter-degradation warning (the middleware is a singleton;
     // test hosts create fresh instances so each warns exactly once).
@@ -924,6 +938,22 @@ public sealed class OllamaRoutingMiddleware(
         // and X-OllamaRouter-Agent-Id captured INDEPENDENTLY; trimmed; empty ⇒ null). Never
         // participates in routing — the merged sticky-routing id above keeps its own semantics.
         TryExtractSessionAndAgentIds(context, out var rawSessionId, out var rawAgentId);
+
+        // Fallback display identity (task #106): ONLY when no explicit session/agent header is
+        // present — explicit headers always take precedence and never trigger the TCP-table lookup.
+        // Display/attribution only: the sticky-routing sessionId above and the response echo keep
+        // their explicit-headers-only semantics (two windows of one IDE share a usage aggregate
+        // but never a sticky KV-cache lease).
+        if (rawSessionId is null && rawAgentId is null && _localClientIdentity is not null)
+        {
+            var processIdentity = _localClientIdentity.TryResolveClientIdentity(
+                context.Connection.RemoteIpAddress, context.Connection.RemotePort, context.Connection.LocalPort);
+            if (processIdentity is not null)
+            {
+                rawSessionId = processIdentity;
+                rawAgentId = processIdentity;
+            }
+        }
 
         // The target currently holding an in-flight accounting slot (the decided primary);
         // reassigned to the finally-served target after the dispatch loop so a request that

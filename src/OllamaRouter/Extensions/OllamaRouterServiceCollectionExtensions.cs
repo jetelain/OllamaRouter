@@ -427,6 +427,13 @@ public static class OllamaRouterServiceCollectionExtensions
             sp.GetService<ILoggerFactory>()?.CreateLogger<SessionUsageStore>(),
             Path.Combine(effectiveStateDirectory, "session-usage.json"),
             sp.GetService<IHostApplicationLifetime>() ?? NullHostApplicationLifetime.Instance));
+        // Best-effort local client process identity resolver (task #106): maps an untagged
+        // loopback caller's source TCP port to the owning local process name for monitoring /
+        // usage attribution (display-only — never fed to sticky KV-cache routing or the session
+        // response echo). Singleton: the bounded 30 s per-source-port cache is shared across all
+        // requests so HTTP keep-alive traffic resolves with zero repeated OS syscalls; the
+        // parameterless constructor wires the platform implementation (NativeAOT-safe).
+        services.AddSingleton<ILocalClientIdentityResolver, LocalClientIdentityResolver>();
 
         // OpenAI-compatible dispatch client factory (task #60): pooled per (base address, API key)
         // with the codebase-standard 10 s PooledConnectionLifetime handlers and infinite client

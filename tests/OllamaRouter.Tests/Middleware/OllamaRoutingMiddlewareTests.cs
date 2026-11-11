@@ -1,5 +1,6 @@
 using OllamaRouter.Tests.TestHelpers;
 using System.Diagnostics;
+using System.Net;
 using System.Net.Http;
 using System.Net.Sockets;
 using System.Text;
@@ -45,8 +46,10 @@ public class OllamaRoutingMiddlewareTests
         Mock<IHttpForwarder>? forwarder = null,
         ITargetFailureStreakService? streakTracker = null,
         ISessionAffinityService? sessionAffinity = null,
-        ITokenMetricsRecorder? tokenMetricsRecorder = null) =>
-        CreateSut(next, tokenEstimator.Object, routingDecisionService, modelCatalogCache, activityMonitor, activityStatistics, inferenceRequestRecorder, targetAvailability, targetLiveness, capabilityEngine, forwarder, streakTracker, sessionAffinity, tokenMetricsRecorder);
+        ITokenMetricsRecorder? tokenMetricsRecorder = null,
+        ILocalClientIdentityResolver? localClientIdentity = null,
+        ISessionUsageStore? sessionUsage = null) =>
+        CreateSut(next, tokenEstimator.Object, routingDecisionService, modelCatalogCache, activityMonitor, activityStatistics, inferenceRequestRecorder, targetAvailability, targetLiveness, capabilityEngine, forwarder, streakTracker, sessionAffinity, tokenMetricsRecorder, localClientIdentity, sessionUsage);
 
     private static OllamaRoutingMiddleware CreateSut(
         RequestDelegate next,
@@ -62,7 +65,9 @@ public class OllamaRoutingMiddlewareTests
         Mock<IHttpForwarder>? forwarder = null,
         ITargetFailureStreakService? streakTracker = null,
         ISessionAffinityService? sessionAffinity = null,
-        ITokenMetricsRecorder? tokenMetricsRecorder = null)
+        ITokenMetricsRecorder? tokenMetricsRecorder = null,
+        ILocalClientIdentityResolver? localClientIdentity = null,
+        ISessionUsageStore? sessionUsage = null)
         {
         var effectiveTargetAvailability = targetAvailability ?? new Mock<ITargetAvailabilityService>();
         if (targetAvailability is null)
@@ -121,7 +126,9 @@ public class OllamaRoutingMiddlewareTests
             new Mock<ITargetExecutionTracker>().Object,
             contextShrinkManager: null,
             sessionAffinity,
-            tokenMetricsRecorder);
+            tokenMetricsRecorder,
+            localClientIdentity: localClientIdentity,
+            sessionUsage: sessionUsage);
     }
 
             // Builds the forwarder used by the middleware. When the caller does not supply an explicit
@@ -4195,5 +4202,322 @@ public class OllamaRoutingMiddlewareTests
                 It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.Is<string?>(s => s == "session-1"),
                 It.Is<IReadOnlySet<TargetLocation>>(s => !ReferenceEquals(s, null) && s.SetEquals(LocalRemoteScopeSet)), It.IsAny<CancellationToken>()),
             Times.Once);
+    }
+
+    // ------------------------------------------------------------------
+    // Task #106 — best-effort local client process identity fallback: UNTAGGED loopback
+    // completion requests are attributed to the owning local process for the monitor and the
+    // session usage store; explicit headers ALWAYS take precedence and skip the resolver.
+    // ------------------------------------------------------------------
+
+    private static Mock<ILocalClientIdentityResolver> CreateIdentityResolver(string? identity)
+    {
+        var resolver = new Mock<ILocalClientIdentityResolver>();
+        resolver
+            .Setup(r => r.TryResolveClientIdentity(It.IsAny<IPAddress>(), It.IsAny<int>(), It.IsAny<int>()))
+            .Returns(identity);
+        return resolver;
+    }
+
+    private static void SetLoopbackConnection(HttpContext context)
+    {
+        context.Connection.RemoteIpAddress = IPAddress.Loopback;
+        context.Connection.RemotePort = 49152;
+        context.Connection.LocalPort = 11434;
+    }
+
+    [Fact]
+    public async Task UntaggedLoopbackRequest_FallsBackToResolvedProcessIdentity()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "qwen", "prompt": "Hello" }""");
+        SetLoopbackConnection(context);
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var requestId = Guid.NewGuid();
+        var activityMonitor = new Mock<IActivityMonitorService>();
+        string? startedSession = null, startedAgent = null;
+        activityMonitor
+            .Setup(m => m.StartRequest(It.IsAny<RoutingTarget>(), It.IsAny<string>(), It.IsAny<int>(), It.IsAny<string?>(), It.IsAny<string?>(), It.IsAny<string?>()))
+            .Callback<RoutingTarget, string, int, string?, string?, string?>((_, _, _, _, session, agent) =>
+            {
+                startedSession = session;
+                startedAgent = agent;
+            })
+            .Returns(requestId);
+
+        var activityStatistics = new Mock<IActivityStatisticsService>();
+        ActivityLogEntry? loggedEntry = null;
+        activityStatistics.Setup(s => s.Add(It.IsAny<ActivityLogEntry>()))
+            .Callback<ActivityLogEntry>(e => loggedEntry = e);
+
+        var sut = CreateSut(
+            _ => Task.CompletedTask,
+            tokenEstimator,
+            routingDecisionService,
+            activityMonitor: activityMonitor,
+            activityStatistics: activityStatistics,
+            localClientIdentity: CreateIdentityResolver("process:Code").Object);
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal("process:Code", startedSession);
+        Assert.Equal("process:Code", startedAgent);
+        Assert.NotNull(loggedEntry);
+        Assert.Equal("process:Code", loggedEntry!.SessionId);
+        Assert.Equal("process:Code", loggedEntry.AgentId);
+    }
+
+    [Fact]
+    public async Task UntaggedLoopbackRequest_NullResolution_StaysAnonymous()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "qwen", "prompt": "Hello" }""");
+        SetLoopbackConnection(context);
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var activityStatistics = new Mock<IActivityStatisticsService>();
+        ActivityLogEntry? loggedEntry = null;
+        activityStatistics.Setup(s => s.Add(It.IsAny<ActivityLogEntry>()))
+            .Callback<ActivityLogEntry>(e => loggedEntry = e);
+
+        var sut = CreateSut(
+            _ => Task.CompletedTask,
+            tokenEstimator,
+            routingDecisionService,
+            activityStatistics: activityStatistics,
+            localClientIdentity: CreateIdentityResolver(null).Object);
+
+        await sut.InvokeAsync(context);
+
+        Assert.NotNull(loggedEntry);
+        Assert.Null(loggedEntry!.SessionId);
+        Assert.Null(loggedEntry.AgentId);
+    }
+
+    [Fact]
+    public async Task ExplicitSessionHeader_TakesPrecedence_AndSkipsResolver()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "qwen", "prompt": "Hello" }""");
+        SetLoopbackConnection(context);
+        context.Request.Headers["X-OllamaRouter-Session-Id"] = "explicit-sess";
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var activityStatistics = new Mock<IActivityStatisticsService>();
+        ActivityLogEntry? loggedEntry = null;
+        activityStatistics.Setup(s => s.Add(It.IsAny<ActivityLogEntry>()))
+            .Callback<ActivityLogEntry>(e => loggedEntry = e);
+
+        var resolver = CreateIdentityResolver("process:Code");
+        var sut = CreateSut(
+            _ => Task.CompletedTask,
+            tokenEstimator,
+            routingDecisionService,
+            activityStatistics: activityStatistics,
+            localClientIdentity: resolver.Object);
+
+        await sut.InvokeAsync(context);
+
+        resolver.Verify(
+            r => r.TryResolveClientIdentity(It.IsAny<IPAddress>(), It.IsAny<int>(), It.IsAny<int>()),
+            Times.Never);
+        Assert.NotNull(loggedEntry);
+        Assert.Equal("explicit-sess", loggedEntry!.SessionId);
+    }
+
+    [Fact]
+    public async Task ExplicitAgentHeader_TakesPrecedence_AndSkipsResolver()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "qwen", "prompt": "Hello" }""");
+        SetLoopbackConnection(context);
+        context.Request.Headers["X-OllamaRouter-Agent-Id"] = "explicit-agent";
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var activityStatistics = new Mock<IActivityStatisticsService>();
+        ActivityLogEntry? loggedEntry = null;
+        activityStatistics.Setup(s => s.Add(It.IsAny<ActivityLogEntry>()))
+            .Callback<ActivityLogEntry>(e => loggedEntry = e);
+
+        var resolver = CreateIdentityResolver("process:Code");
+        var sut = CreateSut(
+            _ => Task.CompletedTask,
+            tokenEstimator,
+            routingDecisionService,
+            activityStatistics: activityStatistics,
+            localClientIdentity: resolver.Object);
+
+        await sut.InvokeAsync(context);
+
+        resolver.Verify(
+            r => r.TryResolveClientIdentity(It.IsAny<IPAddress>(), It.IsAny<int>(), It.IsAny<int>()),
+            Times.Never);
+        Assert.NotNull(loggedEntry);
+        Assert.Equal("explicit-agent", loggedEntry!.AgentId);
+        Assert.Null(loggedEntry.SessionId);
+    }
+
+    [Fact]
+    public async Task FallbackIdentity_IsAggregatedInSessionUsageStore()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "qwen", "stream": true }""");
+        SetLoopbackConnection(context);
+        context.Response.Body = new MemoryStream();
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        // A successful NDJSON completion tail with daemon-reported usage.
+        const string ndjsonResponse =
+            """{"model":"qwen","done":true,"prompt_eval_count":100,"eval_count":50}""" + "\n";
+        RequestDelegate next = c =>
+        {
+            c.Response.WriteAsync(ndjsonResponse);
+            return Task.CompletedTask;
+        };
+
+        var store = new SessionUsageStore(
+            new TestOptionsMonitor<OllamaRouterOptions>(new OllamaRouterOptions { SessionUsageMaxSessions = 1000 }));
+        var sut = CreateSut(
+            next,
+            tokenEstimator,
+            routingDecisionService,
+            localClientIdentity: CreateIdentityResolver("process:Code").Object,
+            sessionUsage: store);
+
+        await sut.InvokeAsync(context);
+
+        var snapshot = store.GetSessions().FirstOrDefault(s => s.SessionId == "process:Code");
+        Assert.NotNull(snapshot);
+        Assert.Equal(1, snapshot!.ByTarget.Values.Sum(t => t.Requests));
+        Assert.Equal(100, snapshot.ByTarget.Values.Sum(t => t.InputTokens));
+        Assert.Equal(50, snapshot.ByTarget.Values.Sum(t => t.OutputTokens));
+    }
+
+    [Fact]
+    public async Task FallbackIdentity_NeverFeedsStickyAffinity()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "qwen", "prompt": "Hello" }""");
+        SetLoopbackConnection(context);
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var decision = new Mock<IRoutingDecisionService>();
+        decision
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var affinity = new Mock<ISessionAffinityService>();
+        var sut = CreateSut(
+            _ => Task.CompletedTask,
+            tokenEstimator,
+            decision,
+            sessionAffinity: affinity.Object,
+            localClientIdentity: CreateIdentityResolver("process:Code").Object);
+
+        await sut.InvokeAsync(context);
+
+        // The stateless decision overloads are used (no session argument).
+        decision.Verify(r => r.DecideDetailedAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.Is<string?>(s => s == null), It.IsAny<CancellationToken>()), Times.Once);
+        decision.Verify(r => r.DecideDetailedAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.Is<string?>(s => s != null), It.IsAny<CancellationToken>()), Times.Never);
+        decision.Verify(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()), Times.Once);
+        decision.Verify(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Never);
+        // No lease is ever written with the fallback identity.
+        affinity.Verify(a => a.SetAffinity(It.IsAny<string>(), It.IsAny<RoutingTarget>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task FallbackIdentity_IsNotEchoedInResponseHeaders()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "qwen", "prompt": "Hello" }""");
+        SetLoopbackConnection(context);
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Local);
+
+        var sut = CreateSut(
+            _ => Task.CompletedTask,
+            tokenEstimator,
+            routingDecisionService,
+            localClientIdentity: CreateIdentityResolver("process:Code").Object);
+
+        await sut.InvokeAsync(context);
+
+        Assert.False(
+            context.Response.Headers.ContainsKey(OllamaReverseProxyConfig.PublicSessionIdHeader),
+            "the fallback identity is display-only; the session response echo stays explicit-headers-only");
+    }
+
+    [Fact]
+    public async Task UntaggedNonLoopbackRequest_ResolvesNull_WithoutSideEffects()
+    {
+        var context = BuildContext("/api/chat", """{ "model": "qwen", "prompt": "Hello" }""");
+        context.Connection.RemoteIpAddress = IPAddress.Parse("192.168.1.10");
+        context.Connection.RemotePort = 49152;
+        context.Connection.LocalPort = 11434;
+
+        var tokenEstimator = new Mock<ITokenEstimator>();
+        tokenEstimator.Setup(t => t.EstimateTokens(It.IsAny<IReadOnlyList<string>>())).Returns(100);
+
+        var routingDecisionService = new Mock<IRoutingDecisionService>();
+        routingDecisionService
+            .Setup(r => r.DecideAsync(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RoutingTarget.Remote);
+
+        var activityStatistics = new Mock<IActivityStatisticsService>();
+        ActivityLogEntry? loggedEntry = null;
+        activityStatistics.Setup(s => s.Add(It.IsAny<ActivityLogEntry>()))
+            .Callback<ActivityLogEntry>(e => loggedEntry = e);
+
+        var sut = CreateSut(
+            _ => Task.CompletedTask,
+            tokenEstimator,
+            routingDecisionService,
+            activityStatistics: activityStatistics,
+            localClientIdentity: CreateIdentityResolver(null).Object);
+
+        await sut.InvokeAsync(context);
+
+        // Routing completed normally and the entry stayed anonymous.
+        Assert.NotNull(loggedEntry);
+        Assert.Null(loggedEntry!.SessionId);
+        Assert.Null(loggedEntry.AgentId);
+        Assert.Equal(RoutingTarget.Remote, loggedEntry.Target);
     }
 }
