@@ -30,16 +30,19 @@
     <PackageReference Include="Microsoft.ML.Tokenizers" Version="2.0.0" />
     <PackageReference Include="Microsoft.ML.Tokenizers.Data.Cl100kBase" Version="2.0.0" />
     <PackageReference Include="Pmad.AI" Version="0.0.1" />
-    <!-- DPAPI for the API key store (task #50): ProtectedData left the .NET 10 shared
-         framework; the official package provides it (P/Invoke-based, NativeAOT-safe,
-         Windows-only at runtime). -->
-    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
     <PackageReference Include="Yarp.ReverseProxy" Version="2.3.0" />
     <PackageReference Include="Serilog.AspNetCore" Version="10.0.0" />
   </ItemGroup>
 
   <ItemGroup>
     <InternalsVisibleTo Include="OllamaRouter.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Shared client SDK (task #98): wire DTOs + IKeyProtector/SecretFilePermissions moved
+         out of the server; System.Security.Cryptography.ProtectedData now flows here
+         transitively (only DpapiKeyProtector consumes it). -->
+    <ProjectReference Include="..\OllamaRouter.Client\OllamaRouter.Client.csproj" />
   </ItemGroup>
 
   <ItemGroup>

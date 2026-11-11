@@ -8,7 +8,6 @@ using System.Net.Http.Headers;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Options;
 using OllamaRouter.Converters;
@@ -2610,26 +2609,3 @@ public sealed class OllamaRoutingMiddleware(
         }
     }
 }
-
-public sealed record OllamaErrorResponse(
-    [property: JsonPropertyName("error")] string Error);
-
-/// <summary>
-/// Diagnostics payload returned as <c>503 Service Unavailable</c> when all enabled
-/// fleet targets are offline/unknown and Cloud Overflow is not available for the
-/// request. The <c>error</c> field mirrors <see cref="OllamaErrorResponse"/> so clients
-/// that parse <c>error</c> keep working.
-/// </summary>
-public sealed record AllOfflineDiagnostics(
-    [property: JsonPropertyName("error")] string Error,
-    [property: JsonPropertyName("targets")] IReadOnlyList<OfflineTargetInfo> Targets,
-    [property: JsonPropertyName("cloud_enabled")] bool CloudEnabled);
-
-/// <summary>
-/// Per-target diagnostics for the all-offline payload: the raw (non-TTL) liveness
-/// state, lowercased, plus the most recent probe error (null for Unknown).
-/// </summary>
-public sealed record OfflineTargetInfo(
-    [property: JsonPropertyName("name")] string Name,
-    [property: JsonPropertyName("state")] string State,
-    [property: JsonPropertyName("last_error")] string? LastError);

@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsAotCompatible>true</IsAotCompatible>
+    <RootNamespace>OllamaRouter.Client</RootNamespace>
+    <Description>
+      Shared OllamaRouter client SDK (task #98): the /api/router/* + /monitor/api wire DTOs,
+      the local default-key reader (IKeyProtector / DefaultKeyReader) and the strongly-typed
+      management/monitoring HTTP client. Leaf library: no ASP.NET Core, no YARP, no
+      Microsoft.Extensions.* — AOT/trim-safe for CLI and desktop (Avalonia) consumers.
+    </Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- DPAPI for DpapiKeyProtector (Windows at-rest protection of default-key.dat).
+         P/Invoke-based, NativeAOT-safe; the only package reference of this library. -->
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="OllamaRouter.Tests" />
+  </ItemGroup>
+
+</Project>

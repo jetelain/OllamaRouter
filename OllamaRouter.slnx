@@ -5,6 +5,7 @@
     <File Path="README.md" />
   </Folder>
   <Folder Name="/src/">
+    <Project Path="src/OllamaRouter.Client/OllamaRouter.Client.csproj" />
     <Project Path="src/OllamaRouter/OllamaRouter.csproj" />
   </Folder>
   <Folder Name="/tests/">
