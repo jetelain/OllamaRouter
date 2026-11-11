@@ -59,14 +59,12 @@ builder.Services.ConfigureHttpJsonOptions(options =>
 // Full service registration + request pipeline (YARP from the effective fleet target list, the
 // routing middleware before UseRouting, hybrid endpoints, monitor endpoints, YARP catch-all).
 // Options are configuration-driven: IOptionsMonitor re-binds on the reloadOnChange change token
-// (config/config.json) and the normalizer re-applies the clamps on every rebind; --no-tui is
-// enforced via a PostConfigure that re-runs on every bind/reload.
-builder.Services.AddOllamaRouter(builder.Configuration, enableTui: !IsTuiDisabled(args));
+// (config/config.json) and the normalizer re-applies the clamps on every rebind. The server is
+// a PURE HEADLESS daemon (task #100): the live TUI ships with the CLI (ollamarouter monitor).
+builder.Services.AddOllamaRouter(builder.Configuration);
 
 var app = builder.Build();
 appLogger = app.Logger;
-
-static bool IsTuiDisabled(string[] args) => args.Any(a => string.Equals(a, "--no-tui", StringComparison.OrdinalIgnoreCase));
 
 // Startup-scoped options reads (fleet log line, DynamicContext startup logging, fleet targets,
 // process launch, bind address, monitor URL) use the live monitor's CURRENT value; structural
@@ -97,16 +95,15 @@ app.Services.GetRequiredService<IOllamaProcessLauncher>().EnsureRunning(ollamaOp
 
 app.UseOllamaRouterPipeline();
 
-// Print a clickable link to the monitoring UI once the server has started (fallback when TUI is disabled).
+// Startup banner once the server has started: the live TUI moved to the CLI (task #100), so
+// the /monitor HTML link is replaced by the /monitor/api JSON endpoint + a CLI TUI hint.
 app.Lifetime.ApplicationStarted.Register(() =>
 {
-    var monitorUrl = ollamaOptions.BindAddress.TrimEnd('/').Replace("+", "localhost") + "/monitor";
-    if (!ollamaOptions.TerminalMonitoring.Enabled || Console.IsOutputRedirected)
-    {
-        Console.WriteLine("✅ Ollama Router is running");
-        Console.WriteLine();
-        Console.WriteLine($"\uD83D\uDCCA Activity monitor available at: {monitorUrl}");
-    }
+    var monitorApiUrl = ollamaOptions.BindAddress.TrimEnd('/').Replace("+", "localhost") + "/monitor/api";
+    Console.WriteLine("✅ Ollama Router is running");
+    Console.WriteLine();
+    Console.WriteLine($"📊 Monitor API available at: {monitorApiUrl}");
+    Console.WriteLine("💻 Live activity monitor: ollamarouter monitor");
 });
 
 // Listen on the configured address (defaults to the standard Ollama port).

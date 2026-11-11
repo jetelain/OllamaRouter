@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
@@ -27,6 +27,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\OllamaRouter\OllamaRouter.csproj" />
+    <!-- Task #100: CLI project under test (InternalsVisibleTo exposes the runner/command seams). -->
+    <ProjectReference Include="..\..\src\OllamaRouter.Cli\OllamaRouter.Cli.csproj" />
   </ItemGroup>
 
 </Project>

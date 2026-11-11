@@ -1,8 +1,9 @@
 using OllamaRouter.Endpoints;
+using OllamaRouter.Cli.Rendering;
 using OllamaRouter.Services.Monitoring;
 using OllamaRouter.Services.Routing;
 
-namespace OllamaRouter.Tests.Services.Monitoring;
+namespace OllamaRouter.Tests.Cli;
 
 public class TerminalMonitorRendererTests
 {
@@ -300,19 +301,19 @@ public class TerminalMonitorRendererTests
         var output = TerminalMonitorRenderer.Render(state, monitorUrl, enableAnsi: false);
 
         Assert.Contains("Ollama Router - Activity Monitor", output);
-        Assert.Contains("Full monitor: http://localhost:11434/monitor", output);
+        // Task #100: the footer links the /monitor/api JSON endpoint (the /monitor HTML page
+        // moved out of the server) and advertises the detached TUI hotkey legend.
+        Assert.Contains("Monitor API:", output);
+        Assert.Contains("q quit", output);
+        Assert.Contains("1-9 toggle", output);
         Assert.Contains("FLEET", output);
         Assert.Contains("\u25CF Online", output);
         Assert.Contains("No request in progress", output);
         Assert.Contains("No recent requests", output);
         Assert.Contains("No token activity in the last 7 days", output);
 
-        // Verify NO actions or buttons
-        Assert.DoesNotContain("Reclaim", output, StringComparison.OrdinalIgnoreCase);
+        // Verify NO overhead recommendation (the TUI renders hotkeys, not HTML buttons).
         Assert.DoesNotContain("checkbox", output, StringComparison.OrdinalIgnoreCase);
-        Assert.DoesNotContain("toggle", output, StringComparison.OrdinalIgnoreCase);
-
-        // Verify NO overhead recommendation
         Assert.DoesNotContain("Overhead factor", output, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("TokenEstimationOverheadFactor", output, StringComparison.OrdinalIgnoreCase);
     }

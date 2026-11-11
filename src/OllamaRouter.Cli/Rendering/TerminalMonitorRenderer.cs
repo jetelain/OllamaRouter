@@ -1,15 +1,21 @@
 using System.Globalization;
 using System.Text;
-using Microsoft.Extensions.Primitives;
 using OllamaRouter.Endpoints;
+using OllamaRouter.Services.Monitoring;
 using OllamaRouter.Services.Routing;
 
-namespace OllamaRouter.Services.Monitoring;
+namespace OllamaRouter.Cli.Rendering;
 
 /// <summary>
 /// Renders a lightweight, flicker-free Terminal UI (TUI) dashboard displaying the same
-/// monitoring information as the /monitor web page, but without actions (no interactive toggles
-/// or buttons) and without token estimation overhead recommendations.
+/// monitoring information as the /monitor web page.
+/// <para>
+/// Task #100: relocated from the server assembly into the CLI (namespace
+/// <c>OllamaRouter.Cli.Rendering</c>): the renderer is now driven by the detached
+/// <see cref="DetachedTerminalMonitorRunner"/> (an HTTP-polling TUI client) instead of the
+/// removed server-side <c>TerminalMonitoringHostedService</c>. The footer now carries the
+/// TUI hotkey legend and links the <c>/monitor/api</c> JSON endpoint.
+/// </para>
 /// </summary>
 public static class TerminalMonitorRenderer
 {
@@ -595,8 +601,8 @@ public static class TerminalMonitorRenderer
         lines.Add("   " + new string('─', 76));
 
         var sb = new StringBuilder();
-        var prefix = "   Full monitor: ";
-        var suffix = " (2s) • Ctrl+C to quit";
+        var prefix = "   Monitor API: ";
+        var suffix = " (2s) • q quit • r reclaim VRAM • 1-9 toggle • Ctrl+C";
         int availableUrlWidth = Math.Max(10, 79 - prefix.Length - suffix.Length);
         var displayUrl = monitorUrl.Length <= availableUrlWidth
             ? monitorUrl

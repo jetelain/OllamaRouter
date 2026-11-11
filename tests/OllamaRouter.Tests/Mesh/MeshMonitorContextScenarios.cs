@@ -98,10 +98,5 @@ public class MeshMonitorContextScenarios
         Assert.True(settled,
             "the /monitor/api fleet rows must show the daemon-reported context: '4k' on the modern " +
             "desktop row, '-' on the legacy server row and the Cloud row (no lease fallback)");
-
-        // The /monitor HTML page is still served unchanged and keeps the Context column header.
-        using var page = await router.Client.GetAsync("/monitor");
-        Assert.Equal(HttpStatusCode.OK, page.StatusCode);
-        Assert.Contains("Context", await page.Content.ReadAsStringAsync(), StringComparison.Ordinal);
     }
 }

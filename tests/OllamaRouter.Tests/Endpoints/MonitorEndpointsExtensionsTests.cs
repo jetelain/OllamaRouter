@@ -121,73 +121,6 @@ public class MonitorEndpointsExtensionsTests
         Mock<IModelCatalogCacheService> ModelCatalogCache);
 
     [Fact]
-    public async Task GetMonitor_ReturnsHtmlWithReclaimVramButton()
-    {
-        var (app, client, _) = await CreateTestAppAsync();
-        try
-        {
-            var response = await client.GetAsync("/monitor");
-
-            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            var html = await response.Content.ReadAsStringAsync();
-            Assert.Contains("\uD83C\uDFAE Reclaim local VRAM", html);
-            Assert.Contains("reclaimLocalVram", html);
-            Assert.Contains("reclaimBtn", html);
-            Assert.Contains("reclaimStatus", html);
-        }
-        finally
-        {
-            await app.StopAsync();
-            await app.DisposeAsync();
-        }
-    }
-
-    [Fact]
-    public void MonitorPageHtml_IsLoadedFromEmbeddedResource()
-    {
-        // Reviewer-driven guard: the page markup must come from the embedded
-        // 'monitor.html' resource, not from a string literal baked into source.
-        var resourceName = "OllamaRouter.Endpoints.monitor.html";
-        using var stream = typeof(MonitorEndpointsExtensions).Assembly.GetManifestResourceStream(resourceName);
-        Assert.NotNull(stream);
-
-        using var reader = new StreamReader(stream, System.Text.Encoding.UTF8);
-        var expected = reader.ReadToEnd();
-
-        var actual = typeof(MonitorEndpointsExtensions)
-            .GetField("MonitorPageHtml", BindingFlags.NonPublic | BindingFlags.Static)
-            ?.GetValue(null) as string;
-
-        Assert.Equal(expected, actual);
-        Assert.StartsWith("<!DOCTYPE html>", actual);
-    }
-
-    [Fact]
-    public async Task GetMonitor_ServesEmbeddedHtml_AsTextHtml()
-    {
-        var (app, client, _) = await CreateTestAppAsync();
-        try
-        {
-            var response = await client.GetAsync("/monitor");
-
-            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            Assert.Equal("text/html", response.Content.Headers.ContentType!.ToString());
-            var html = await response.Content.ReadAsStringAsync();
-
-            // The page served over HTTP must be exactly the embedded resource content.
-            var resourceName = "OllamaRouter.Endpoints.monitor.html";
-            using var stream = typeof(MonitorEndpointsExtensions).Assembly.GetManifestResourceStream(resourceName)!;
-            using var reader = new StreamReader(stream, System.Text.Encoding.UTF8);
-            Assert.Equal(reader.ReadToEnd(), html);
-        }
-        finally
-        {
-            await app.StopAsync();
-            await app.DisposeAsync();
-        }
-    }
-
-    [Fact]
     public async Task PostTargets_UpdatesTargetAvailability()
     {
         var (app, client, mocks) = await CreateTestAppAsync();
@@ -928,62 +861,6 @@ public class MonitorEndpointsExtensionsTests
     }
 
     [Fact]
-    public async Task GetMonitor_ReturnsHtmlWithFleetTableStylesAndScript()
-    {
-        var (app, client, _) = await CreateTestAppAsync();
-        try
-        {
-            var response = await client.GetAsync("/monitor");
-
-            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            var html = await response.Content.ReadAsStringAsync();
-            Assert.Contains("fleetTable", html);
-            Assert.Contains("fleetRows", html);
-            Assert.Contains("lv-offline", html);
-            Assert.Contains("lv-probing", html);
-            Assert.Contains("lv-disabled", html);
-            Assert.Contains("statusText = 'Offline'", html);
-            Assert.Contains("statusText = 'Probing'", html);
-            Assert.Contains("renderFleet", html);
-            Assert.Contains("lv-offline", html);
-            Assert.Contains("lv-probing", html);
-            Assert.Contains("lv-disabled", html);
-            Assert.Contains("statusText = 'Offline'", html);
-            Assert.Contains("statusText = 'Probing'", html);
-            Assert.Contains("renderFleet", html);
-            // Location-based rendering: location-driven CSS classes and the JS lookup built
-            // from data.fleet (t.location), not the legacy name-keyed targetIcons map.
-            Assert.Contains(".target-local { color: #3f9eff; }", html);
-            Assert.Contains(".target-remote { color: #34e0a1; }", html);
-            Assert.Contains(".target-cloud { color: #c48bff; }", html);
-            Assert.Contains("locationIcons", html);
-            Assert.Contains("updateLocationByName", html);
-            Assert.Contains("t.location", html);
-            // The fleet-row span must derive its color class from the location lookup, not the raw name.
-            Assert.Contains("span.className = 'target-' + targetColorClass(target);", html);
-            Assert.DoesNotContain("const targetIcons", html);
-
-            // Task #45 (residency visibility): the fleet table gains a Keep-Alive column
-            // (after Active Model), the compact formatKeepAlive helper (∞ for -1, 15m for 900),
-            // the +N multi-resident display with the comma-separated tooltip list, and the
-            // static preload-policy legend line below the fleet table.
-            Assert.Contains("<th>Active Model</th><th>Keep-Alive</th><th>In-Flight</th>", html);
-            Assert.Contains("formatKeepAlive", html);
-            Assert.Contains("keepAliveSeconds", html);
-            Assert.Contains("keepAliveSource", html);
-            Assert.Contains("t.residentModels", html);
-            Assert.Contains("preload-legend", html);
-            Assert.Contains("Preload policy: cloud/server = ∞ (forever) · desktop = 15m · unclassifiable = router default (PreloadDefaultKeepAliveSeconds)", html);
-            Assert.Contains("return '∞';", html); // -1 (forever) renders ∞
-        }
-        finally
-        {
-            await app.StopAsync();
-            await app.DisposeAsync();
-        }
-    }
-
-    [Fact]
     public async Task GetMonitorApi_FleetLocationIsClassifiedPerUrl_AndOverrideWins()
     {
         var (app, client, _) = await CreateTestAppAsync(
@@ -1045,35 +922,6 @@ public class MonitorEndpointsExtensionsTests
             var fleet = json["fleet"]!.AsArray();
             Assert.Equal("Online", fleet[0]!["liveness"]?.GetValue<string>());
             Assert.Equal("Offline", fleet[1]!["liveness"]?.GetValue<string>()); // cloud models not configured
-        }
-        finally
-        {
-            await app.StopAsync();
-            await app.DisposeAsync();
-        }
-    }
-
-    [Fact]
-    public async Task GetMonitor_ReturnsHtmlWithProgressBarAndCostElements()
-    {
-        var (app, client, _) = await CreateTestAppAsync();
-        try
-        {
-            var response = await client.GetAsync("/monitor");
-
-            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            var html = await response.Content.ReadAsStringAsync();
-            Assert.Contains("statsSummaryRow", html);
-            Assert.Contains("usageRatioContainer", html);
-            Assert.Contains("usageProgressBar", html);
-            Assert.Contains("usageProgressLegend", html);
-            Assert.Contains("renderUsageRatio", html);
-            Assert.Contains("costContainer", html);
-            Assert.Contains("has-cloud", html);
-            Assert.Contains("estimatedSavingsValue", html);
-            Assert.Contains("cloudCostValue", html);
-            Assert.Contains("renderCost", html);
-            Assert.Contains("formatCost", html);
         }
         finally
         {

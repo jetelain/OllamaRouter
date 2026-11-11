@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>ollamarouter</AssemblyName>
+    <RootNamespace>OllamaRouter.Cli</RootNamespace>
+    <Description>
+      OllamaRouter user CLI (task #100): daemon lifecycle commands (start/stop/restart/status/
+      logs) + the detached live Terminal UI (ollamarouter monitor). NativeAOT BCL-only executable:
+      references the shared OllamaRouter.Client SDK and NOTHING else — no NuGet packages, no
+      Microsoft.Extensions.*, never the server assembly.
+    </Description>
+  </PropertyGroup>
+
+  <!-- NativeAOT (mirrors the server daemon csproj so a plain `dotnet build` stays warning-free). -->
+  <PropertyGroup>
+    <PublishAot>true</PublishAot>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <IsAotCompatible>true</IsAotCompatible>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="OllamaRouter.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Shared AOT leaf SDK: wire DTOs, IOllamaRouterApiClient, IOllamaRouterDaemonLauncher,
+         IDefaultKeyReader, and (task #100) the TargetLocation enum. -->
+    <ProjectReference Include="..\OllamaRouter.Client\OllamaRouter.Client.csproj" />
+  </ItemGroup>
+
+</Project>

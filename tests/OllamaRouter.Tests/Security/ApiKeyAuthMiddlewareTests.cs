@@ -245,7 +245,7 @@ public class ApiKeyAuthMiddlewareTests
         var (targets, _, _) = await SendAsync(host.Client, Request("POST", "/targets", """{"targets": []}"""));
         Assert.NotEqual(401, targets);
 
-        var (monitor, _, _) = await SendAsync(host.Client, Request("GET", "/monitor"));
+        var (monitor, _, _) = await SendAsync(host.Client, Request("GET", "/monitor/api"));
         Assert.Equal(200, monitor);
     }
 
@@ -431,7 +431,7 @@ public class ApiKeyAuthMiddlewareTests
         // Default mode: reads / monitor / toggle / proxy paths are all open.
         var (openBefore, _, _) = await SendAsync(host.Client, Request("GET", "/api/router/fleet"));
         Assert.Equal(200, openBefore);
-        var (monitorBefore, _, _) = await SendAsync(host.Client, Request("GET", "/monitor"));
+        var (monitorBefore, _, _) = await SendAsync(host.Client, Request("GET", "/monitor/api"));
         Assert.Equal(200, monitorBefore);
 
         // LIVE switch: mutate the shared options instance (the middleware reads
@@ -442,7 +442,7 @@ public class ApiKeyAuthMiddlewareTests
         Assert.Equal(401, fleetLocked);
         Assert.Equal("Bearer", www);
 
-        var (monitorLocked, _, _) = await SendAsync(host.Client, Request("GET", "/monitor"));
+        var (monitorLocked, _, _) = await SendAsync(host.Client, Request("GET", "/monitor/api"));
         Assert.Equal(401, monitorLocked);
 
         var (targetsLocked, _, _) = await SendAsync(host.Client, Request("POST", "/targets", """{"targets": []}"""));
@@ -457,7 +457,7 @@ public class ApiKeyAuthMiddlewareTests
         // The key opens everything again.
         var (fleetWithKey, _, _) = await SendAsync(host.Client, Request("GET", "/api/router/fleet", null, key));
         Assert.Equal(200, fleetWithKey);
-        var (monitorWithKey, _, _) = await SendAsync(host.Client, Request("GET", "/monitor", null, key));
+        var (monitorWithKey, _, _) = await SendAsync(host.Client, Request("GET", "/monitor/api", null, key));
         Assert.Equal(200, monitorWithKey);
 
         // Toggle back: the routes re-open WITHOUT a key (live, no restart).

@@ -80,8 +80,6 @@ public static partial class MonitorEndpointsExtensions
                 disableTarget ?? false, catalogClient, targetAvailability, options,
                 serviceProvider.GetService<IContextAutoShrinkManager>(), cancellationToken));
 
-        app.MapGet("/monitor", () => Results.Content(MonitorPageHtml, "text/html"));
-
         return app;
     }
 

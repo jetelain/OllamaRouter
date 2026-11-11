@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 
-namespace OllamaRouter.Services.Process;
+namespace OllamaRouter.Cli.Rendering;
 
 internal static class ConsoleHelper
 {

@@ -8,7 +8,6 @@ namespace OllamaRouter.E2ETests.Scenarios;
 
 /// <summary>
 /// Scenarios exercising the management, monitoring, and error-handling endpoints of OllamaRouter:
-/// - GET  /monitor
 /// - GET  /monitor/api
 /// - POST /targets
 /// - POST /monitor/reclaim-vram
@@ -16,35 +15,6 @@ namespace OllamaRouter.E2ETests.Scenarios;
 /// </summary>
 internal static class MonitorScenarios
 {
-    public static Scenario GetMonitorHtml() => new("Activity monitor /monitor returns HTML page", async config =>
-    {
-        using var http = new HttpClient { BaseAddress = new Uri(config.RouterUrl) };
-
-        var response = await http.GetAsync("/monitor");
-        if (!response.IsSuccessStatusCode)
-        {
-            return $"Expected 200 OK from /monitor, got {(int)response.StatusCode} {response.ReasonPhrase}.";
-        }
-
-        var contentType = response.Content.Headers.ContentType?.MediaType;
-        if (contentType != "text/html")
-        {
-            return $"Expected Content-Type 'text/html', got '{contentType}'.";
-        }
-
-        var html = await response.Content.ReadAsStringAsync();
-        if (!html.Contains("OllamaRouter - Activity Monitor"))
-        {
-            return "Expected HTML to contain 'OllamaRouter - Activity Monitor'.";
-        }
-
-        if (!html.Contains("reclaimLocalVram"))
-        {
-            return "Expected HTML to contain reclaim script function 'reclaimLocalVram'.";
-        }
-
-        return null;
-    });
 
     public static Scenario GetMonitorApi() => new("Activity monitor /monitor/api returns valid state JSON", async config =>
     {

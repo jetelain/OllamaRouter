@@ -1,6 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
+    <!-- Task #100: the split daemon binary (the CLI is src/OllamaRouter.Cli). -->
+    <AssemblyName>ollamarouter-server</AssemblyName>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
       <PublishAot>true</PublishAot>
@@ -43,10 +45,5 @@
          out of the server; System.Security.Cryptography.ProtectedData now flows here
          transitively (only DpapiKeyProtector consumes it). -->
     <ProjectReference Include="..\OllamaRouter.Client\OllamaRouter.Client.csproj" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <!-- Monitor page served verbatim by GET /monitor (OllamaRouter.Endpoints.monitor.html). -->
-    <EmbeddedResource Include="Endpoints\monitor.html" />
   </ItemGroup>
 </Project>

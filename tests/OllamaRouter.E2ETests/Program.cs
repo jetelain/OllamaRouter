@@ -15,7 +15,6 @@ Scenario[] scenarios =
     OllamaNativeScenarios.Chat(),
     OpenAiCompatibleScenarios.ListModels(),
     OpenAiCompatibleScenarios.ChatCompletion(),
-    MonitorScenarios.GetMonitorHtml(),
     MonitorScenarios.GetMonitorApi(),
     MonitorScenarios.UpdateTargets(),
     MonitorScenarios.ReclaimVram(),

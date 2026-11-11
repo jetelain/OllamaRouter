@@ -479,10 +479,6 @@ public static class OllamaRouterServiceCollectionExtensions
             Path.Combine(effectiveStateDirectory, "recommended.json"),
             sp.GetService<ILoggerFactory>()?.CreateLogger<RecommendationStore>()));
 
-        // In-terminal activity monitor (registered always; disabled via the option's
-        // TerminalMonitoring.Enabled, enforced by the caller overload at registration time).
-        services.AddHostedService<TerminalMonitoringHostedService>();
-
         // Target liveness prober (singleton + hosted service): boot probe + background re-prober.
         // The IHostedService registration uses a DIRECT factory (not AddHostedService(sp => ...))
         // because the factory-form overload trips a .NET 10 TryAddEnumerable type-validation
