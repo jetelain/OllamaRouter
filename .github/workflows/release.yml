@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 jobs:
-  test-and-publish:
+  test:
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -22,14 +22,86 @@ jobs:
       - name: Run unit tests
         run: dotnet test tests/OllamaRouter.Tests/OllamaRouter.Tests.csproj -c Release
 
-      - name: Publish single file (win-x64)
-        run: dotnet publish src/OllamaRouter/OllamaRouter.csproj -c Release -r win-x64 -o OllamaRouter-win-x64
+  publish:
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            rid: win-x64
+          - os: windows-latest
+            rid: win-arm64
+          - os: macos-15-intel
+            rid: osx-x64
+          - os: macos-15-intel
+            rid: osx-arm64
+          - os: ubuntu-latest
+            rid: linux-x64
+          - os: ubuntu-24.04-arm
+            rid: linux-arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Bundle release artifact
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Install Native AOT toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lldb zlib1g-dev libicu-dev libssl-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxcb-dri3-dev libfontconfig1-dev
+
+      - name: Publish Native AOT binaries
+        shell: bash
+        run: |
+          dotnet publish src/OllamaRouter/OllamaRouter.csproj -c Release -r ${{ matrix.rid }} -o "dist/OllamaRouter-${{ matrix.rid }}"
+          dotnet publish src/OllamaRouter.Cli/OllamaRouter.Cli.csproj -c Release -r ${{ matrix.rid }} -o "dist/OllamaRouter-${{ matrix.rid }}"
+          dotnet publish src/OllamaRouter.App/OllamaRouter.App.csproj -c Release -r ${{ matrix.rid }} -o "dist/OllamaRouter-${{ matrix.rid }}"
+
+      - name: Add bundle metadata
+        shell: bash
+        run: |
+          version=$(dotnet msbuild src/OllamaRouter/OllamaRouter.csproj -getProperty:Version || true)
+          version=${version:-1.0.0}
+          printf '%s\n' "$version" > "dist/OllamaRouter-${{ matrix.rid }}/VERSION"
+          cp README.md "dist/OllamaRouter-${{ matrix.rid }}/"
+          cp LICENSE "dist/OllamaRouter-${{ matrix.rid }}/"
+
+      - name: Archive bundle (Windows)
+        if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path OllamaRouter-win-x64/* -DestinationPath OllamaRouter-win-x64.zip
+        run: Compress-Archive -Path "dist/OllamaRouter-${{ matrix.rid }}/*" -DestinationPath "OllamaRouter-${{ matrix.rid }}.zip"
+
+      - name: Archive bundle (macOS / Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: tar -czf "OllamaRouter-${{ matrix.rid }}.tar.gz" -C dist "OllamaRouter-${{ matrix.rid }}"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OllamaRouter-${{ matrix.rid }}
+          path: |
+            OllamaRouter-${{ matrix.rid }}.zip
+            OllamaRouter-${{ matrix.rid }}.tar.gz
+
+  release:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: OllamaRouter-win-x64.zip
+          files: release-artifacts/OllamaRouter-*

@@ -8,6 +8,13 @@
     <RootNamespace>OllamaRouter.App</RootNamespace>
     <AssemblyName>ollamarouter-app</AssemblyName>
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+    <!-- Native AOT: publish as a single self-contained native executable. Avalonia stays AOT-compatible here
+         because bindings are compiled by default, XAML is source-generated at build time, and all JSON flows
+         through the source-generated OllamaRouterClientJsonContext, so no TrimmerRootDescriptor/RootDescriptor is required. -->
+    <PublishAot>true</PublishAot>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <IsAotCompatible>true</IsAotCompatible>
   </PropertyGroup>
 
   <ItemGroup>

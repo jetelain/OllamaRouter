@@ -2,7 +2,8 @@
 .SYNOPSIS
     Builds, installs, and configures OllamaRouter locally in user AppData.
 .DESCRIPTION
-    Publishes OllamaRouter, installs it to the user-local application directory
+    Publishes the three Native AOT executables (ollamarouter-server daemon, ollamarouter CLI,
+    ollamarouter-app Avalonia GUI), installs them to the user-local application directory
     (%LOCALAPPDATA%\OllamaRouter or ~/.ollamarouter), configures state, config,
     and logs directories, and sets up launchers and user PATH.
 .PARAMETER Configuration
@@ -80,8 +81,8 @@ if ($Uninstall) {
     Write-Host " Uninstalling OllamaRouter                                " -ForegroundColor Cyan
     Write-Host "==========================================================" -ForegroundColor Cyan
 
-    # Stop any running instances of OllamaRouter
-    $runningProcesses = Get-Process -Name "OllamaRouter" -ErrorAction SilentlyContinue
+    # Stop any running instances of OllamaRouter (daemon + desktop GUI)
+    $runningProcesses = Get-Process -Name "ollamarouter-server", "OllamaRouter", "ollamarouter-app" -ErrorAction SilentlyContinue
     if ($runningProcesses) {
         Write-Host "Stopping running OllamaRouter processes..." -ForegroundColor Yellow
         $runningProcesses | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -189,14 +190,37 @@ Write-Host " Logs Folder     : $LogsDir"
 Write-Host " Launcher Bin Dir: $BinDir"
 Write-Host "==========================================================" -ForegroundColor Cyan
 
-# 3. Stop running process to avoid publish file locks
-# $runningProcesses = Get-Process -Name "OllamaRouter" -ErrorAction SilentlyContinue
-# if ($runningProcesses) {
-#     Write-Warning "OllamaRouter is currently running. Stopping process to allow file updates..."
-#     $runningProcesses | Stop-Process -Force -ErrorAction SilentlyContinue
-#     $runningProcesses | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
-#     Start-Sleep -Milliseconds 250
-# }
+# 3. Gracefully stop running processes to avoid publish file locks
+# 3a. Best-effort graceful stop via the installed CLI shim (bounded 30s wait; never fails the install)
+$cliShim = Join-Path $BinDir "ollamarouter.cmd"
+if (-not (Test-Path $cliShim)) {
+    $cliShim = Join-Path $BinDir "ollamarouter"
+}
+if (Test-Path $cliShim) {
+    Write-Host "`nStopping running OllamaRouter daemon via 'ollamarouter stop' (best effort)..." -ForegroundColor Yellow
+    try {
+        $stopJob = Start-Job -ScriptBlock { param($shim) & $shim stop } -ArgumentList $cliShim
+        if (Wait-Job $stopJob -Timeout 30) {
+            Remove-Job $stopJob -Force -ErrorAction SilentlyContinue
+        } else {
+            Stop-Job $stopJob -ErrorAction SilentlyContinue
+            Remove-Job $stopJob -Force -ErrorAction SilentlyContinue
+            Write-Warning "'ollamarouter stop' did not complete within 30 seconds; falling back to Stop-Process."
+        }
+    }
+    catch {
+        Write-Warning "Best-effort 'ollamarouter stop' failed ($($_.Exception.Message)); falling back to Stop-Process."
+    }
+}
+
+# 3b. Fallback: force-kill any remaining daemon/GUI processes
+$runningProcesses = Get-Process -Name "ollamarouter-server", "OllamaRouter", "ollamarouter-app" -ErrorAction SilentlyContinue
+if ($runningProcesses) {
+    Write-Warning "OllamaRouter is currently running. Stopping process to allow file updates..."
+    $runningProcesses | Stop-Process -Force -ErrorAction SilentlyContinue
+    $runningProcesses | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 250
+}
 
 # 4. Ensure directories exist
 foreach ($dir in @($InstallDir, $ConfigDir, $StateDir, $LogsDir, $BinDir)) {
@@ -205,41 +229,41 @@ foreach ($dir in @($InstallDir, $ConfigDir, $StateDir, $LogsDir, $BinDir)) {
     }
 }
 
-# 5. Publish OllamaRouter
-Write-Host "`nPublishing OllamaRouter..." -ForegroundColor Yellow
-
-$publishArgs = @(
-    "publish", $webProjectPath,
-    "-c", $Configuration,
-    "-r", $Runtime,
-    "-p:DebugType=none",
-    "-p:Version=$version",
-    "-o", $InstallDir
+# 5. Publish all three Native AOT executables (server -> cli -> app)
+$publishProjects = @(
+    @{ Name = "OllamaRouter server (ollamarouter-server)"; Path = (Join-Path $repoRoot "src\OllamaRouter\OllamaRouter.csproj") },
+    @{ Name = "OllamaRouter CLI (ollamarouter)";           Path = (Join-Path $repoRoot "src\OllamaRouter.Cli\OllamaRouter.Cli.csproj") },
+    @{ Name = "OllamaRouter App (ollamarouter-app)";       Path = (Join-Path $repoRoot "src\OllamaRouter.App\OllamaRouter.App.csproj") }
 )
 
-& dotnet @publishArgs
-if ($LASTEXITCODE -ne 0) {
-    throw "dotnet publish failed with exit code $LASTEXITCODE."
+foreach ($proj in $publishProjects) {
+    Write-Host "`nPublishing $($proj.Name)..." -ForegroundColor Yellow
+    if (-not (Test-Path $proj.Path)) {
+        throw "Project not found: $($proj.Path)"
+    }
+    & dotnet publish $proj.Path -c $Configuration -r $Runtime -p:DebugType=none -p:Version=$version -o $InstallDir
+    if ($LASTEXITCODE -ne 0) {
+        throw "dotnet publish failed for $($proj.Name) with exit code $LASTEXITCODE."
+    }
 }
 
-# 6. Normalize the binary name and record installed version
-if ($Runtime -match 'win') {
-    $publishedBinary = Join-Path $InstallDir "OllamaRouter.exe"
+# 6. Verify the published Native AOT binaries and record installed version
+$exeSuffix = if ($Runtime -match 'win') { ".exe" } else { "" }
+foreach ($binaryName in @("ollamarouter-server", "ollamarouter", "ollamarouter-app")) {
+    $publishedBinary = Join-Path $InstallDir "$binaryName$exeSuffix"
     if (-not (Test-Path $publishedBinary)) {
-        $candidate = Join-Path $InstallDir "OllamaRouter"
-        if (Test-Path $candidate) {
-            Rename-Item -Path $candidate -NewName "OllamaRouter.exe"
-        } else {
-            throw "Published binary not found in $InstallDir."
-        }
-    }
-} else {
-    $publishedBinary = Join-Path $InstallDir "OllamaRouter"
-    if (-not (Test-Path $publishedBinary)) {
-        throw "Published binary not found in $InstallDir."
+        throw "Published binary not found in $InstallDir: $publishedBinary"
     }
 }
 Set-Content -Path (Join-Path $InstallDir "VERSION") -Value "$version`n"
+
+# 6a. Upgrade cleanup: remove legacy single-binary artifacts (idempotent)
+foreach ($legacyName in @("OllamaRouter.exe", "OllamaRouter", "ollamarouter-web.cmd")) {
+    $legacyPath = Join-Path $InstallDir $legacyName
+    if (Test-Path $legacyPath) {
+        Remove-Item -Path $legacyPath -Force -ErrorAction SilentlyContinue
+    }
+}
 
 # 7. Configure runtime directories in appsettings.Production.json
 Write-Host "`nConfiguring runtime directories in appsettings.Production.json..." -ForegroundColor Yellow
@@ -288,42 +312,54 @@ Write-Host "  - LogsDirectory     : $logsDirPath" -ForegroundColor Gray
 # 8. Launcher Commands & PATH configuration
 Write-Host "`nSetting up launcher commands..." -ForegroundColor Yellow
 
-# In InstallDir:
+# In InstallDir: legacy alias, now forwarded to the CLI binary
 $installCmd = Join-Path $InstallDir "ollamarouter.cmd"
 $installCmdContent = @"
 @echo off
 setlocal
 cd /d "%~dp0"
-"%~dp0OllamaRouter.exe" %*
+"%~dp0ollamarouter.exe" %*
 "@
 Set-Content -Path $installCmd -Value $installCmdContent -Encoding ASCII
 
-# Backwards compatibility alias in InstallDir
-$installWebCmd = Join-Path $InstallDir "ollamarouter-web.cmd"
-Set-Content -Path $installWebCmd -Value $installCmdContent -Encoding ASCII
-
-# In BinDir:
+# In BinDir: CLI launcher on PATH (forwards all arguments to the CLI binary)
 $binCmd = Join-Path $BinDir "ollamarouter.cmd"
 $binCmdContent = @"
 @echo off
 setlocal
 cd /d "%~dp0.."
-"%~dp0..\OllamaRouter.exe" %*
+"%~dp0..\ollamarouter.exe" %*
 "@
 Set-Content -Path $binCmd -Value $binCmdContent -Encoding ASCII
 
-# Bash launcher in BinDir for WSL / Git Bash
+# In BinDir: desktop GUI launcher on PATH
+$binAppCmd = Join-Path $BinDir "ollamarouter-app.cmd"
+$binAppCmdContent = @"
+@echo off
+setlocal
+cd /d "%~dp0.."
+"%~dp0..\ollamarouter-app.exe" %*
+"@
+Set-Content -Path $binAppCmd -Value $binAppCmdContent -Encoding ASCII
+
+# Bash launcher in BinDir for WSL / Git Bash (CLI, forwards all arguments)
 $binBash = Join-Path $BinDir "ollamarouter"
 $binBashContent = @"
 #!/usr/bin/env bash
 DIR="`$( cd "`$( dirname "`${BASH_SOURCE[0]}" )" && pwd )"
 cd "`$DIR/.."
-if [ -f "`$DIR/../OllamaRouter.exe" ]; then
-    "`$DIR/../OllamaRouter.exe" "`$@"
-elif [ -f "`$DIR/../OllamaRouter" ]; then
-    "`$DIR/../OllamaRouter" "`$@"
+if [ -f "`$DIR/../ollamarouter.exe" ]; then
+    "`$DIR/../ollamarouter.exe" "`$@"
+elif [ -f "`$DIR/../ollamarouter" ]; then
+    "`$DIR/../ollamarouter" "`$@"
 fi
 "@
+
+# Remove legacy web alias left over from single-binary installs
+$installWebCmd = Join-Path $InstallDir "ollamarouter-web.cmd"
+if (Test-Path $installWebCmd) {
+    Remove-Item -Path $installWebCmd -Force -ErrorAction SilentlyContinue
+}
 Set-Content -Path $binBash -Value $binBashContent -Encoding UTF8 -NoNewline
 
 # Idempotent User PATH update for BinDir
@@ -331,7 +367,7 @@ $pathAdded = $false
 try {
     $userPath = [System.Environment]::GetEnvironmentVariable("Path", [System.EnvironmentVariableTarget]::User)
     $pathParts = if ($userPath) { $userPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } } else { @() }
-    
+
     $alreadyInUserPath = $false
     foreach ($entry in $pathParts) {
         if ([string]::Equals($entry.TrimEnd('\/'), $BinDir.TrimEnd('\/'), [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -368,11 +404,14 @@ catch {
 Write-Host "`n==========================================================" -ForegroundColor Green
 Write-Host " OllamaRouter Publish & Install Successful!               " -ForegroundColor Green
 Write-Host "==========================================================" -ForegroundColor Green
-Write-Host "Binary Location : $(Join-Path $InstallDir 'OllamaRouter.exe')" -ForegroundColor Green
+Write-Host "Server Binary   : $(Join-Path $InstallDir "ollamarouter-server$exeSuffix")" -ForegroundColor Green
+Write-Host "CLI Binary      : $(Join-Path $InstallDir "ollamarouter$exeSuffix")" -ForegroundColor Green
+Write-Host "App Binary      : $(Join-Path $InstallDir "ollamarouter-app$exeSuffix")" -ForegroundColor Green
 Write-Host "Config Folder   : $ConfigDir" -ForegroundColor Green
 Write-Host "State Folder    : $StateDir" -ForegroundColor Green
 Write-Host "Logs Folder     : $LogsDir" -ForegroundColor Green
-Write-Host "Launch Command  : 'ollamarouter'" -ForegroundColor Green
+Write-Host "CLI Command     : 'ollamarouter'" -ForegroundColor Green
+Write-Host "GUI Command     : 'ollamarouter-app'" -ForegroundColor Green
 
 if ($pathAdded) {
     Write-Host "`nNote: Added '$BinDir' to your user PATH." -ForegroundColor Yellow

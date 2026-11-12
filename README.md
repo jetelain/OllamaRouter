@@ -711,27 +711,61 @@ The simulated fleet (two in-process routers + N daemon stubs), the full §4 acce
 ## Installation
 
 
-### Manual (Windows)
+### Release binaries
 
-Download the latest [`OllamaRouter-win-x64.zip`](../../releases) from the [releases page](../../releases), extract it into a folder of your choice and run `OllamaRouter.exe`. The executable is self-contained: no .NET installation is required.
+Download the latest bundle for your platform and architecture from the [releases page](../../releases), extract it, and run `ollamarouter-server` (or simply `ollamarouter start`). All three executables in the bundle are **self-contained Native AOT** binaries: no .NET runtime installation is required.
 
-### macOS
+| Platform | Architectures | Bundles |
+|---|---|---|
+| Windows | x64, arm64 | `OllamaRouter-win-x64.zip`, `OllamaRouter-win-arm64.zip` |
+| macOS | Intel x64, Apple Silicon arm64 | `OllamaRouter-osx-x64.tar.gz`, `OllamaRouter-osx-arm64.tar.gz` |
+| Linux | x64, arm64 | `OllamaRouter-linux-x64.tar.gz`, `OllamaRouter-linux-arm64.tar.gz` |
 
-No macOS release zip is published yet. Build a self-contained native executable (requires the Xcode Command Line Tools, `xcode-select --install`):
+Each bundle contains the three Native AOT executables — `ollamarouter-server` (headless daemon), `ollamarouter` (CLI), and `ollamarouter-app` (Avalonia desktop GUI) — plus `VERSION`, `README.md`, and `LICENSE`.
 
-```bash
-dotnet publish src/OllamaRouter/OllamaRouter.csproj -c Release -r osx-arm64 -o OllamaRouter-osx-arm64
+### Windows local install (`publish.ps1`)
+
+On a Windows development machine, `publish.ps1` builds and installs the three Native AOT executables to `%LOCALAPPDATA%\OllamaRouter` and puts launcher shims on your user PATH:
+
+```powershell
+.\publish.ps1                    # build + install (Release, win-x64)
+.\publish.ps1 -Uninstall         # stop daemon + GUI, remove install dir and PATH entry
 ```
 
 ### From source
 
-```powershell
-dotnet run --project src\OllamaRouter\OllamaRouter.csproj
+Requires the .NET 10 SDK (and the native AOT toolchain for the target OS). Publish each executable for your runtime identifier:
+
+```bash
+dotnet publish src/OllamaRouter/OllamaRouter.csproj      -c Release -r <rid> -o dist   # ollamarouter-server
+dotnet publish src/OllamaRouter.Cli/OllamaRouter.Cli.csproj -c Release -r <rid> -o dist # ollamarouter
+dotnet publish src/OllamaRouter.App/OllamaRouter.App.csproj -c Release -r <rid> -o dist # ollamarouter-app
 ```
+
+## CLI
+
+The `ollamarouter` command is the Native AOT CLI for managing the router daemon and fleet:
+
+| Command | Description |
+|---|---|
+| `ollamarouter start` | Start the daemon in the background. |
+| `ollamarouter stop` | Stop the daemon. |
+| `ollamarouter restart` | Restart the daemon. |
+| `ollamarouter status [--json]` | Show daemon status (`--json` for machine-readable output). |
+| `ollamarouter logs [--follow]` | Show daemon logs (`--follow` to tail). |
+| `ollamarouter monitor [--interval <s>]` | In-terminal activity monitor (TUI), see [In-terminal activity monitor (TUI)](#in-terminal-activity-monitor-tui). |
+| `ollamarouter setup [--wizard] [--wait]` | Open the desktop app's [Setup Wizard](#desktop-app-ollamarouter-app); `--wait` blocks and propagates the wizard exit code. |
+| `ollamarouter fleet [--json]` | Show per-target fleet status. |
+| `ollamarouter cartography [--json]` | Show fleet cartography (topology view). |
+| `ollamarouter vram reclaim [--keep-enabled] [--target <name>] [--json]` | Unload models to reclaim VRAM. |
+| `ollamarouter preload <model> [...]` | Preload one or more models onto their targets. |
+| `ollamarouter target list\|add\|remove\|enable\|disable\|reset-streak` | Manage routing targets. |
+| `ollamarouter benchmark run\|status\|clear` | Run, inspect, or clear fleet micro-benchmarks. |
+| `ollamarouter help` | Show usage. |
 
 ## Running
 
-After installation, start the router by launching `OllamaRouter.exe`, or from source:
+After installation, start the router with `ollamarouter start` (the CLI auto-resolves the `ollamarouter-server` daemon binary), or run `ollamarouter-server` directly. From source:
 
 ```powershell
 dotnet run --project src\OllamaRouter\OllamaRouter.csproj
@@ -741,9 +775,11 @@ By default, the router listens on `http://localhost:11434`, the standard Ollama 
 
 On startup the router ensures the local Ollama is running (Windows and macOS only): on **Windows** it launches `%LOCALAPPDATA%\Programs\Ollama\ollama app.exe`, and on **macOS** it starts `/Applications/Ollama.app` (or `~/Applications/Ollama.app`) in the background with `OLLAMA_HOST` set to the host:port of the first loopback `Targets` entry (falling back to `LocalUrl`). An already-running Ollama is left exactly as is (it must already listen on the expected port — the router probes it and never starts a competing daemon). On other platforms Ollama is expected to be managed by the OS or started manually.
 
-## Setup Wizard (first-run onboarding)
+## Desktop app (`ollamarouter-app`)
 
-The desktop app (`ollamarouter-app`) includes a guided, four-step **Setup Wizard** — the turnkey initial onboarding for standalone users and the delegated LLM environment-setup step for NightCodeForge. It walks you through getting a local Ollama serving on the router's expected port, wiring up your fleet, measuring it, and applying role-to-model recommendations.
+`ollamarouter-app` is the Avalonia desktop GUI, published as a self-contained **Native AOT** binary. It runs in a **0-VRAM software rendering mode** (software-only swapchains on Win32 and X11), so the app never allocates GPU memory — all VRAM stays available for the LLMs. Launch it with `ollamarouter-app` (`ollamarouter-app.cmd` on Windows).
+
+The app also hosts a guided, four-step **Setup Wizard** — the turnkey initial onboarding for standalone users and the delegated LLM environment-setup step for NightCodeForge. It walks you through getting a local Ollama serving on the router's expected port, wiring up your fleet, measuring it, and applying role-to-model recommendations.
 
 ### Launching the wizard
 
@@ -810,7 +846,7 @@ The terminal UI is completely read-only (actions and token estimation overhead r
 It starts automatically when running interactively. If standard output is redirected (e.g. running as a background service or in CI), it automatically falls back to standard log output. You can also explicitly disable it by passing `--no-tui`:
 
 ```powershell
-OllamaRouter.exe --no-tui
+ollamarouter-server --no-tui
 ```
 
 ### Per-session usage & savings
@@ -856,7 +892,7 @@ curl -X POST -H "X-OllamaRouter-Session-Id: sess-86" \
 
 ## Requirements
 
-- .NET 9 / .NET 10 SDK
+- Release binaries are self-contained **Native AOT** executables — no .NET runtime is required to run them. The .NET 10 SDK (plus the native AOT compiler toolchain for your OS) is only needed to build from source.
 - Two reachable Ollama instances (local and remote)
 - A GPU VRAM probe tool on the local machine (see “GPU/VRAM detection”); if none is present the probe returns 0, which effectively disables VRAM-gated local routing. To report the free VRAM of the local machine: Windows / Linux: `nvidia-smi` (returns 0 if unavailable); macOS (Apple Silicon): nothing to install — `sysctl` and `vm_stat`
 
