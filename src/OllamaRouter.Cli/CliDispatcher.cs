@@ -33,6 +33,12 @@ internal static class CliDispatcher
             new MonitorCommand(),
             new LogsCommand(),
             new SetupCommand(),
+            new FleetCommand(),
+            new CartographyCommand(),
+            new VramCommand(),
+            new PreloadCommand(),
+            new TargetCommand(),
+            new BenchmarkCommand(),
             new HelpCommand(),
         };
 
