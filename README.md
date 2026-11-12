@@ -741,6 +741,37 @@ By default, the router listens on `http://localhost:11434`, the standard Ollama 
 
 On startup the router ensures the local Ollama is running (Windows and macOS only): on **Windows** it launches `%LOCALAPPDATA%\Programs\Ollama\ollama app.exe`, and on **macOS** it starts `/Applications/Ollama.app` (or `~/Applications/Ollama.app`) in the background with `OLLAMA_HOST` set to the host:port of the first loopback `Targets` entry (falling back to `LocalUrl`). An already-running Ollama is left exactly as is (it must already listen on the expected port — the router probes it and never starts a competing daemon). On other platforms Ollama is expected to be managed by the OS or started manually.
 
+## Setup Wizard (first-run onboarding)
+
+The desktop app (`ollamarouter-app`) includes a guided, four-step **Setup Wizard** — the turnkey initial onboarding for standalone users and the delegated LLM environment-setup step for NightCodeForge. It walks you through getting a local Ollama serving on the router's expected port, wiring up your fleet, measuring it, and applying role-to-model recommendations.
+
+### Launching the wizard
+
+```bash
+ollamarouter setup                # open the wizard (detached)
+ollamarouter setup --wait          # block until the wizard exits, propagating its exit code
+ollamarouter-app --wizard          # open the wizard directly from the app
+```
+
+`--wizard` is an explicit no-op marker — `setup` always launches the app in wizard mode. The app also **opens the wizard automatically on first run** (when `config/config.json` exists in none of the config roots: `$OLLAMAROUTER_HOME`, then the app directory, then the platform install dir); otherwise the dashboard opens.
+
+**Exit codes (the NightCodeForge handoff contract):**
+
+- `0` — the user clicked **Finish** (setup complete).
+- `1` — the wizard window was closed **without** Finish (abandoned); with `--wait` this propagates to the `ollamarouter setup` exit code.
+
+If the `ollamarouter-app` executable cannot be found in any probed location, `setup` exits `1` and lists the locations it probed; an unknown flag exits `2` with the usage text.
+
+### The four steps
+
+1. **Environment** — detects a local Ollama and what owns `:11434` (a running router, a *raw* Ollama sitting on the router's port — the conflict case — or a free port). The one-click **"Configure Local Ollama for Router"** (Windows + macOS) migrates Ollama off the router's default port to `:11435`, then starts the router daemon on `:11434`:
+   - **Windows**: sets the **User** environment variables `OLLAMA_HOST` (`127.0.0.1:11435`, or `0.0.0.0:11435` with the *Expose on the LAN* option), `OLLAMA_FLASH_ATTENTION=1`, and `OLLAMA_KV_CACHE_TYPE=q8_0`; stops any running `ollama` process; restarts Ollama with an **explicit** environment (so it never inherits a stale `OLLAMA_HOST`) and waits for `:11435`.
+   - **macOS**: writes the same three variables via `launchctl setenv` (so a GUI-launched `Ollama.app` inherits them) and restarts it with `open -g --env OLLAMA_HOST=… -a /Applications/Ollama.app` (or `ollama serve` when only the CLI binary is installed).
+   - **Linux**: one-click is disabled and manual `export OLLAMA_HOST=…` instructions are shown instead.
+2. **Targets** — adds the local node (`http://127.0.0.1:11435`), remote LAN nodes, and OpenAI-compatible providers (OpenRouter / Groq / OpenAI presets with an API key), and toggles the built-in **Cloud** overflow (ollama.com, no key). Every target gets a server-probed liveness check (`testConnectionFirst`) plus live 2 s fleet polling.
+3. **Benchmark** — shows per-node GPU/VRAM (`GET /api/router/fleet/hardware`) and runs micro-benchmarks over all active non-Cloud targets (`POST /api/router/benchmark`), with live 2 s polling showing per-target, per-context-window **tokens/sec** and viability (≥ 20 t/s). The poll stops automatically once every queued target reaches a terminal state.
+4. **Recommendations** — generates (`POST /api/router/recommendations/generate`) and applies (`POST /api/router/recommendations/apply`) the role-to-model matrix: per-role native model, recommended context window, and per-node context ceilings. A `409` (no benchmark data yet) shows a "run the Step 3 micro-benchmark first" hint. The router persists the applied matrix to the **state directory** (`<state>/recommended.json`) — `config/` holds only user configuration.
+
 ## Monitoring
 
 OllamaRouter exposes a very lightweight, dependency-free monitoring page at `/monitor` (e.g. `http://localhost:11434/monitor`), backed by a JSON endpoint at `/monitor/api`.

@@ -1,6 +1,10 @@
+using Avalonia.Controls;
+using Avalonia.Controls.ApplicationLifetimes;
 using OllamaRouter.App.Connection;
 using OllamaRouter.App.ViewModels;
+using OllamaRouter.App.ViewModels.Wizard;
 using OllamaRouter.App.Views;
+using OllamaRouter.App.Views.Wizard;
 using OllamaRouter.Security;
 
 namespace OllamaRouter.App;
@@ -44,5 +48,35 @@ internal static class CompositionRoot
         var settings = new SettingsViewModel(connection.GetClient);
         var mainViewModel = new MainWindowViewModel(connection, monitor, fleet, cartography, settings);
         return new MainWindow { DataContext = mainViewModel };
+    }
+
+    /// <summary>
+    /// Builds the 4-step Setup Wizard window with its full view-model tree (task #103, spec
+    /// §3.3). The local-profile connection, the real <see cref="LocalOllamaConfigurator"/>, the
+    /// four step view models and the root view model (whose <c>exitSignal</c> wires to
+    /// <see cref="IClassicDesktopStyleApplicationLifetime.TryShutdown"/> for the
+    /// Finish=0 / abandoned=1 exit-code contract).
+    /// </summary>
+    public static Window CreateWizardWindow(IClassicDesktopStyleApplicationLifetime lifetime)
+    {
+        var connection = CreateConnectionService();
+        var configurator = new LocalOllamaConfigurator();
+        var environmentStep = new WizardEnvironmentStepViewModel(configurator, connection);
+
+        WizardTargetsStepViewModel targetsStep = null!;
+        targetsStep = new WizardTargetsStepViewModel(connection.GetClient, ct => targetsStep.RefreshAsync(ct));
+
+        WizardBenchmarkStepViewModel benchmarkStep = null!;
+        benchmarkStep = new WizardBenchmarkStepViewModel(connection.GetClient, ct => benchmarkStep.RefreshAsync(ct));
+
+        SetupWizardViewModel root = null!;
+        var recommendationsStep = new WizardRecommendationsStepViewModel(
+            connection.GetClient, goToBenchmark: () => _ = root.GoToAsync(2));
+
+        root = new SetupWizardViewModel(
+            connection, environmentStep, targetsStep, benchmarkStep, recommendationsStep,
+            exitSignal: code => lifetime.TryShutdown(code));
+
+        return new SetupWizardWindow { DataContext = root };
     }
 }

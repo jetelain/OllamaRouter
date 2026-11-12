@@ -1,0 +1,51 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:conv="using:OllamaRouter.App.Converters"
+        xmlns:views="using:OllamaRouter.App.Views.Wizard"
+        xmlns:wvm="using:OllamaRouter.App.ViewModels.Wizard"
+        x:Class="OllamaRouter.App.Views.Wizard.SetupWizardWindow"
+        x:DataType="wvm:SetupWizardViewModel"
+        Title="OllamaRouter Setup"
+        Width="1020" Height="700"
+        MinWidth="860" MinHeight="560">
+  <DockPanel>
+    <!-- 4-step progress header: all titles visible, the active step is bold -->
+    <Border DockPanel.Dock="Top" Padding="12,10" BorderBrush="#333" BorderThickness="0,0,0,1">
+      <StackPanel Orientation="Horizontal" Spacing="18">
+        <TextBlock Text="1 · Local Ollama"
+                   FontWeight="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToFontWeightConverter.Instance}, ConverterParameter=0}"/>
+        <TextBlock Text="2 · Fleet Targets"
+                   FontWeight="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToFontWeightConverter.Instance}, ConverterParameter=1}"/>
+        <TextBlock Text="3 · Micro-Benchmark"
+                   FontWeight="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToFontWeightConverter.Instance}, ConverterParameter=2}"/>
+        <TextBlock Text="4 · Recommendations"
+                   FontWeight="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToFontWeightConverter.Instance}, ConverterParameter=3}"/>
+      </StackPanel>
+    </Border>
+
+    <!-- Bottom navigation bar (Finish is the only hard gate) -->
+    <Border DockPanel.Dock="Bottom" Padding="12,10" BorderBrush="#333" BorderThickness="0,1,0,0">
+      <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
+        <Button Content="Back" Command="{Binding BackCommand}"/>
+        <Button Content="Next" Command="{Binding NextCommand}"/>
+        <Button Content="Finish" Command="{Binding FinishCommand}"/>
+      </StackPanel>
+    </Border>
+
+    <!-- Step body: all four overlap; visibility driven by SelectedStep -->
+    <Grid>
+      <Border IsVisible="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToVisibilityConverter.Instance}, ConverterParameter=0}">
+        <views:WizardEnvironmentStepView DataContext="{Binding EnvironmentStep}"/>
+      </Border>
+      <Border IsVisible="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToVisibilityConverter.Instance}, ConverterParameter=1}">
+        <views:WizardTargetsStepView DataContext="{Binding TargetsStep}"/>
+      </Border>
+      <Border IsVisible="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToVisibilityConverter.Instance}, ConverterParameter=2}">
+        <views:WizardBenchmarkStepView DataContext="{Binding BenchmarkStep}"/>
+      </Border>
+      <Border IsVisible="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToVisibilityConverter.Instance}, ConverterParameter=3}">
+        <views:WizardRecommendationsStepView DataContext="{Binding RecommendationsStep}"/>
+      </Border>
+    </Grid>
+  </DockPanel>
+</Window>

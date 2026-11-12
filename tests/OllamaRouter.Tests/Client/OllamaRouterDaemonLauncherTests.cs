@@ -14,12 +14,14 @@ using OllamaRouter.Endpoints.RouterApi.Fleet;
 using OllamaRouter.Endpoints.RouterApi.Info;
 using OllamaRouter.Endpoints.RouterApi.Models;
 using OllamaRouter.Endpoints.RouterApi.Preload;
+using OllamaRouter.Endpoints.RouterApi.Recommendations;
 using OllamaRouter.Endpoints.RouterApi.SessionAffinity;
 using OllamaRouter.Endpoints.RouterApi.Sessions;
 using OllamaRouter.Endpoints.RouterApi.Targets;
 using OllamaRouter.Endpoints.RouterApi.Vram;
 using OllamaRouter.Security;
 using OllamaRouter.Services.Hardware;
+using OllamaRouter.Services.Recommendations;
 
 namespace OllamaRouter.Tests.Client;
 
@@ -766,6 +768,11 @@ public sealed class OllamaRouterDaemonLauncherTests : IDisposable
         public Task<ApiKeyCreatedResponse> CreateApiKeyAsync(ApiKeyCreateRequest request, CancellationToken ct = default) => Unavailable<ApiKeyCreatedResponse>();
         public Task<ApiKeyDeletedResponse> DeleteApiKeyAsync(string name, CancellationToken ct = default) => Unavailable<ApiKeyDeletedResponse>();
         public Task<ApiKeyRotatedResponse> RotateDefaultKeyAsync(CancellationToken ct = default) => Unavailable<ApiKeyRotatedResponse>();
+        public Task<FleetRecommendations> GetRecommendationsAsync(CancellationToken ct = default) => Unavailable<FleetRecommendations>();
+        public Task<RouterRecommendationsGeneratedResponse> GenerateRecommendationsAsync(CancellationToken ct = default)
+            => Unavailable<RouterRecommendationsGeneratedResponse>();
+        public Task<RouterRecommendationsAppliedResponse> ApplyRecommendationsAsync(CancellationToken ct = default)
+            => Unavailable<RouterRecommendationsAppliedResponse>();
 
         private static Task<T> Unavailable<T>() =>
             Task.FromException<T>(new NotImplementedException("not part of the launcher contract"));

@@ -10,6 +10,7 @@ using OllamaRouter.Endpoints.RouterApi.Fleet;
 using OllamaRouter.Endpoints.RouterApi.Info;
 using OllamaRouter.Endpoints.RouterApi.Models;
 using OllamaRouter.Endpoints.RouterApi.Preload;
+using OllamaRouter.Endpoints.RouterApi.Recommendations;
 using OllamaRouter.Endpoints.RouterApi.SessionAffinity;
 using OllamaRouter.Endpoints.RouterApi.Sessions;
 using OllamaRouter.Endpoints.RouterApi.Targets;
@@ -19,6 +20,7 @@ using OllamaRouter.Options;
 using OllamaRouter.Services.Benchmarking;
 using OllamaRouter.Services.Hardware;
 using OllamaRouter.Services.Monitoring;
+using OllamaRouter.Services.Recommendations;
 
 namespace OllamaRouter.Client;
 
@@ -130,6 +132,15 @@ namespace OllamaRouter.Client;
 [JsonSerializable(typeof(ApiKeyDeletedResponse))]
 [JsonSerializable(typeof(ApiKeyRotatedResponse))]
 [JsonSerializable(typeof(ApiSecurityConfigDto))]
+// Role recommendation matrix (task #66; wire contracts relocated into the Client SDK in
+// task #103 — the wizard's Generate/Apply/Read surface, AOT-safe, no new packages).
+[JsonSerializable(typeof(FleetRecommendations))]
+[JsonSerializable(typeof(RoleRecommendation))]
+[JsonSerializable(typeof(ModelNodeProfile))]
+[JsonSerializable(typeof(NodeRoleProfile))]
+[JsonSerializable(typeof(RouterRecommendationsGeneratedResponse))]
+[JsonSerializable(typeof(RouterRecommendationsAppliedResponse))]
+[JsonSerializable(typeof(RouterRecommendationsAppliedTarget))]
 // Shared error / diagnostics records (also the non-2xx error-parsing target).
 [JsonSerializable(typeof(OllamaErrorResponse))]
 [JsonSerializable(typeof(AllOfflineDiagnostics))]

@@ -9,11 +9,13 @@ using OllamaRouter.Endpoints.RouterApi.Fleet;
 using OllamaRouter.Endpoints.RouterApi.Info;
 using OllamaRouter.Endpoints.RouterApi.Models;
 using OllamaRouter.Endpoints.RouterApi.Preload;
+using OllamaRouter.Endpoints.RouterApi.Recommendations;
 using OllamaRouter.Endpoints.RouterApi.SessionAffinity;
 using OllamaRouter.Endpoints.RouterApi.Sessions;
 using OllamaRouter.Endpoints.RouterApi.Targets;
 using OllamaRouter.Endpoints.RouterApi.Vram;
 using OllamaRouter.Services.Hardware;
+using OllamaRouter.Services.Recommendations;
 
 namespace OllamaRouter.Tests.App;
 
@@ -95,6 +97,24 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
     /// <summary>Scripted <c>PUT /api/router/config</c> failure.</summary>
     public (HttpStatusCode Status, string Error)? UpdateConfigError { get; set; }
 
+    /// <summary>The <c>GET /api/router/recommendations</c> matrix (stable empty shape by default).</summary>
+    public FleetRecommendations Recommendations { get; set; } = new(
+        null, new Dictionary<string, RoleRecommendation>(), new Dictionary<string, ModelNodeProfile>());
+
+    /// <summary>Scripted <c>POST /api/router/recommendations/generate</c> 200 response (served when
+    /// <see cref="GenerateError"/> is null; when null a generated default matrix is returned).</summary>
+    public RouterRecommendationsGeneratedResponse? GenerateResponse { get; set; }
+
+    /// <summary>Scripted <c>POST /api/router/recommendations/generate</c> failure (e.g. 409 no benchmark data).</summary>
+    public (HttpStatusCode Status, string Error)? GenerateError { get; set; }
+
+    /// <summary>Scripted <c>POST /api/router/recommendations/apply</c> 200 response (served when
+    /// <see cref="ApplyError"/> is null; when null an applied default is returned).</summary>
+    public RouterRecommendationsAppliedResponse? ApplyResponse { get; set; }
+
+    /// <summary>Scripted <c>POST /api/router/recommendations/apply</c> failure (e.g. 409 no recommendations file).</summary>
+    public (HttpStatusCode Status, string Error)? ApplyError { get; set; }
+
     // -- Captured calls ----------------------------------------------------------
 
     /// <summary>Every <c>POST /targets</c> flag map, in call order.</summary>
@@ -126,6 +146,12 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
 
     /// <summary>Every default-key rotation (the new raw key).</summary>
     public List<ApiKeyRotatedResponse> RotatedKeys { get; } = [];
+
+    /// <summary>Captured <c>POST /api/router/recommendations/generate</c> calls (call-order record).</summary>
+    public List<RouterRecommendationsGeneratedResponse> GenerateCalls { get; } = [];
+
+    /// <summary>Captured <c>POST /api/router/recommendations/apply</c> calls (call-order record).</summary>
+    public List<RouterRecommendationsAppliedResponse> ApplyCalls { get; } = [];
 
     /// <summary>The masked user-key store (the raw keys are NEVER retained).</summary>
     public List<ApiKeyInfoResponse> ApiKeys { get; } = [];
@@ -501,6 +527,72 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
         var rotated = new ApiKeyRotatedResponse(true, rawKey, DateTimeOffset.UtcNow);
         RotatedKeys.Add(rotated);
         return Task.FromResult(rotated);
+    }
+
+    /// <inheritdoc />
+    public Task<FleetRecommendations> GetRecommendationsAsync(CancellationToken ct = default)
+    {
+        Log(nameof(GetRecommendationsAsync));
+        return Task.FromResult(Recommendations);
+    }
+
+    /// <inheritdoc />
+    public Task<RouterRecommendationsGeneratedResponse> GenerateRecommendationsAsync(CancellationToken ct = default)
+    {
+        Log(nameof(GenerateRecommendationsAsync));
+        if (GenerateError is { } error)
+        {
+            throw new OllamaRouterApiException(error.Status, error.Error);
+        }
+
+        if (GenerateResponse is { } response)
+        {
+            GenerateCalls.Add(response);
+            return Task.FromResult(response);
+        }
+
+        // Default: a freshly generated single-role matrix over a "Local" node.
+        var generatedAt = DateTimeOffset.UtcNow;
+        var matrix = new FleetRecommendations(
+            generatedAt,
+            new Dictionary<string, RoleRecommendation>
+            {
+                ["basic"] = new RoleRecommendation(
+                    "basic", "llama3:8b", 4096, "Generated from benchmark evidence.",
+                    [new NodeRoleProfile("Local", 4096, 2048, 24.5, 8192)]),
+            },
+            new Dictionary<string, ModelNodeProfile>
+            {
+                ["llama3:8b"] = new ModelNodeProfile(
+                    "llama3:8b", "llama", 8192, "q8_0",
+                    [new NodeRoleProfile("Local", 4096, 2048, 24.5, 8192)]),
+            });
+        var generated = new RouterRecommendationsGeneratedResponse(
+            true, generatedAt, 1, 1, ["Local"], matrix);
+        GenerateCalls.Add(generated);
+        return Task.FromResult(generated);
+    }
+
+    /// <inheritdoc />
+    public Task<RouterRecommendationsAppliedResponse> ApplyRecommendationsAsync(CancellationToken ct = default)
+    {
+        Log(nameof(ApplyRecommendationsAsync));
+        if (ApplyError is { } error)
+        {
+            throw new OllamaRouterApiException(error.Status, error.Error);
+        }
+
+        if (ApplyResponse is { } response)
+        {
+            ApplyCalls.Add(response);
+            return Task.FromResult(response);
+        }
+
+        var applied = new RouterRecommendationsAppliedResponse(
+            true, DateTimeOffset.UtcNow,
+            [new RouterRecommendationsAppliedTarget("Local", 1, 4096)]);
+        ApplyCalls.Add(applied);
+        return Task.FromResult(applied);
     }
 
     private static Task<T> NotImplemented<T>(string method) =>

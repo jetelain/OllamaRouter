@@ -1,0 +1,76 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:OllamaRouter.App.ViewModels.Wizard"
+             xmlns:rec="using:OllamaRouter.Endpoints.RouterApi.Recommendations"
+             x:Class="OllamaRouter.App.Views.Wizard.WizardRecommendationsStepView"
+             x:DataType="vm:WizardRecommendationsStepViewModel">
+  <ScrollViewer Padding="12">
+    <StackPanel Spacing="12">
+      <TextBlock Text="Step 4 — Role Recommendations" FontSize="18" FontWeight="Bold"/>
+      <TextBlock TextWrapping="Wrap"
+                 Text="Generate a role-to-model assignment from the Step 3 benchmark evidence, then apply it as per-node context ceilings."/>
+
+      <StackPanel Orientation="Horizontal" Spacing="8">
+        <Button Content="Generate recommendations" Command="{Binding GenerateCommand}"/>
+        <Button Content="Apply recommendations" Command="{Binding ApplyCommand}"/>
+        <Button Content="Go to benchmark" Command="{Binding GoToBenchmarkCommand}"/>
+      </StackPanel>
+
+      <StackPanel Orientation="Horizontal" Spacing="16">
+        <TextBlock Text="{Binding GeneratedAtText}"/>
+        <TextBlock Text="{Binding SummaryText}" Foreground="#9AA0B5"/>
+      </StackPanel>
+
+      <!-- Role matrix (stable 5-alias order; absent roles show the benchmark hint) -->
+      <TextBlock Text="Roles" FontWeight="SemiBold"/>
+      <ItemsControl ItemsSource="{Binding RoleRows}">
+        <ItemsControl.ItemTemplate>
+          <DataTemplate x:DataType="vm:RecommendationRoleRow">
+            <StackPanel Spacing="2" Margin="0,3">
+              <StackPanel Orientation="Horizontal" Spacing="10">
+                <TextBlock Text="{Binding Role}" Width="170" FontWeight="SemiBold"/>
+                <TextBlock Text="{Binding Model}" Width="200"/>
+                <TextBlock Text="{Binding ContextText}" Width="90"/>
+              </StackPanel>
+              <TextBlock Text="{Binding Description}" Foreground="#9AA0B5"/>
+              <TextBlock Text="{Binding NodesText}" Foreground="#8BC34A"/>
+            </StackPanel>
+          </DataTemplate>
+        </ItemsControl.ItemTemplate>
+      </ItemsControl>
+
+      <!-- Model index -->
+      <TextBlock Text="Models" FontWeight="SemiBold"/>
+      <ItemsControl ItemsSource="{Binding ModelRows}">
+        <ItemsControl.ItemTemplate>
+          <DataTemplate x:DataType="vm:RecommendationModelRow">
+            <StackPanel Orientation="Horizontal" Spacing="10" Margin="0,2">
+              <TextBlock Text="{Binding Model}" Width="200" FontWeight="SemiBold"/>
+              <TextBlock Text="{Binding Architecture}" Width="120"/>
+              <TextBlock Text="{Binding Quantization}" Width="80"/>
+              <TextBlock Text="{Binding NodesText}"/>
+            </StackPanel>
+          </DataTemplate>
+        </ItemsControl.ItemTemplate>
+      </ItemsControl>
+
+      <!-- Applied ceilings -->
+      <TextBlock Text="Applied ceilings" FontWeight="SemiBold"/>
+      <ItemsControl ItemsSource="{Binding AppliedTargets}">
+        <ItemsControl.ItemTemplate>
+          <DataTemplate x:DataType="rec:RouterRecommendationsAppliedTarget">
+            <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,2">
+              <TextBlock Text="{Binding Target}" Width="130" FontWeight="SemiBold"/>
+              <TextBlock Text="max ceiling"/>
+              <TextBlock Text="{Binding MaxContextCeiling}" Width="80"/>
+              <TextBlock Text="ctx"/>
+            </StackPanel>
+          </DataTemplate>
+        </ItemsControl.ItemTemplate>
+      </ItemsControl>
+
+      <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4"/>
+      <TextBlock Text="{Binding Message}" TextWrapping="Wrap" Foreground="#8BC34A"/>
+    </StackPanel>
+  </ScrollViewer>
+</UserControl>

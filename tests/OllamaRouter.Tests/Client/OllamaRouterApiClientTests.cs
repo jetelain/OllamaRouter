@@ -13,6 +13,7 @@ using OllamaRouter.Endpoints.RouterApi.Fleet;
 using OllamaRouter.Endpoints.RouterApi.Info;
 using OllamaRouter.Endpoints.RouterApi.Models;
 using OllamaRouter.Endpoints.RouterApi.Preload;
+using OllamaRouter.Endpoints.RouterApi.Recommendations;
 using OllamaRouter.Endpoints.RouterApi.SessionAffinity;
 using OllamaRouter.Endpoints.RouterApi.Sessions;
 using OllamaRouter.Endpoints.RouterApi.Targets;
@@ -21,6 +22,7 @@ using OllamaRouter.Options;
 using OllamaRouter.Security;
 using OllamaRouter.Services.Benchmarking;
 using OllamaRouter.Services.Hardware;
+using OllamaRouter.Services.Recommendations;
 
 namespace OllamaRouter.Tests.Client;
 
@@ -338,7 +340,73 @@ public sealed class OllamaRouterApiClientTests : IDisposable
         Assert.True(handler.Requests.Count <= 1, $"expected no retry, got {handler.Requests.Count} requests");
     }
 
-    // ------------------------------------------------- 30-method route-table round-trip
+    // ------------------------------------------------- role recommendations (task #66 wire surface)
+
+    [Fact]
+    public async Task GetRecommendationsAsync_Keyless_SendsNoAuthorizationHeader_AndRoundTripsMatrix()
+    {
+        var handler = new FakeHttpMessageHandler(_ => JsonResponse(HttpStatusCode.OK, RecommendationsJson));
+        using var client = CreateClient(handler, keyReader: KeyReader());
+
+        var matrix = await client.GetRecommendationsAsync();
+
+        var request = Assert.Single(handler.Requests);
+        Assert.Equal("GET", request.Method);
+        Assert.Equal("/api/router/recommendations", request.PathAndQuery);
+        Assert.Null(request.Authorization); // keyless default mode
+        Assert.Equal(GeneratedAt, matrix.GeneratedAt);
+        Assert.Equal("llama3:8b", matrix.Roles["basic"].Model);
+        Assert.Equal(24.5, matrix.Models["llama3:8b"].Nodes[0].TokensPerSecond);
+    }
+
+    [Fact]
+    public async Task GetRecommendationsAsync_WithExplicitKey_SendsBearerHeader()
+    {
+        var handler = new FakeHttpMessageHandler(_ => JsonResponse(HttpStatusCode.OK, RecommendationsJson));
+        using var client = CreateClient(handler, apiKey: "rec-key");
+
+        await client.GetRecommendationsAsync();
+
+        var request = Assert.Single(handler.Requests);
+        Assert.Equal("Bearer rec-key", request.Authorization);
+    }
+
+    [Fact]
+    public async Task GenerateRecommendationsAsync_PostsNoBody_And409SurfacesApiExceptionWithParsedError()
+    {
+        var handler = new FakeHttpMessageHandler(_ => JsonResponse(
+            HttpStatusCode.Conflict, """{"error":"no benchmark results available"}"""));
+        using var client = CreateClient(handler);
+
+        var ex = await Assert.ThrowsAsync<OllamaRouterApiException>(() => client.GenerateRecommendationsAsync());
+
+        Assert.Equal(HttpStatusCode.Conflict, ex.Status);
+        Assert.Equal("no benchmark results available", ex.Error);
+        var request = Assert.Single(handler.Requests);
+        Assert.Equal("POST", request.Method);
+        Assert.Equal("/api/router/recommendations/generate", request.PathAndQuery);
+        Assert.Null(request.Body); // no request body
+    }
+
+    [Fact]
+    public async Task ApplyRecommendationsAsync_RoundTripsPerTargetMaxContextCeiling()
+    {
+        var handler = new FakeHttpMessageHandler(_ => JsonResponse(HttpStatusCode.OK, RecommendationsAppliedJson));
+        using var client = CreateClient(handler);
+
+        var applied = await client.ApplyRecommendationsAsync();
+
+        var request = Assert.Single(handler.Requests);
+        Assert.Equal("POST", request.Method);
+        Assert.Equal("/api/router/recommendations/apply", request.PathAndQuery);
+        Assert.Null(request.Body);
+        Assert.True(applied.Applied);
+        var target = Assert.Single(applied.Targets);
+        Assert.Equal("Local", target.Target);
+        Assert.Equal(8192, target.MaxContextCeiling);
+    }
+
+    // ------------------------------------------------- 33-method route-table round-trip
 
     [Theory]
     [InlineData("GetInfoAsync")]
@@ -371,6 +439,9 @@ public sealed class OllamaRouterApiClientTests : IDisposable
     [InlineData("DeleteApiKeyAsync")]
     [InlineData("RotateDefaultKeyAsync")]
     [InlineData("ShutdownAsync")]
+    [InlineData("GetRecommendationsAsync")]
+    [InlineData("GenerateRecommendationsAsync")]
+    [InlineData("ApplyRecommendationsAsync")]
     public async Task RouteTable_EveryMethod_RoundTripsRequestSerializationAndResponseParsing(string method)
     {
         var route = RouteCases[method];
@@ -767,6 +838,43 @@ public sealed class OllamaRouterApiClientTests : IDisposable
                 Assert.True(r.Stopping);
                 Assert.Equal(4242, r.ProcessId);
             }),
+
+        ["GetRecommendationsAsync"] = new(
+            "GET", "/api/router/recommendations", null, null, HttpStatusCode.OK, RecommendationsJson,
+            async client => await client.GetRecommendationsAsync(),
+            result =>
+            {
+                var r = (FleetRecommendations)result!;
+                Assert.Equal(GeneratedAt, r.GeneratedAt);
+                Assert.True(r.Roles.ContainsKey("basic"));
+                Assert.Equal(4096, r.Roles["basic"].RecommendedContextWindow);
+                Assert.Equal(8192, r.Models["llama3:8b"].NativeContext);
+            }),
+
+        ["GenerateRecommendationsAsync"] = new(
+            "POST", "/api/router/recommendations/generate", null, null, HttpStatusCode.OK, RecommendationsGeneratedJson,
+            async client => await client.GenerateRecommendationsAsync(),
+            result =>
+            {
+                var r = (RouterRecommendationsGeneratedResponse)result!;
+                Assert.True(r.Generated);
+                Assert.Equal(1, r.RoleCount);
+                Assert.Equal(1, r.ModelCount);
+                Assert.Equal(["Local"], r.Targets);
+                Assert.True(r.Recommendations.Roles.ContainsKey("basic"));
+            }),
+
+        ["ApplyRecommendationsAsync"] = new(
+            "POST", "/api/router/recommendations/apply", null, null, HttpStatusCode.OK, RecommendationsAppliedJson,
+            async client => await client.ApplyRecommendationsAsync(),
+            result =>
+            {
+                var r = (RouterRecommendationsAppliedResponse)result!;
+                Assert.True(r.Applied);
+                var target = Assert.Single(r.Targets);
+                Assert.Equal("Local", target.Target);
+                Assert.Equal(8192, target.MaxContextCeiling);
+            }),
     };
 
     // ------------------------------------------------------------------ canned JSON
@@ -969,6 +1077,31 @@ public sealed class OllamaRouterApiClientTests : IDisposable
         """;
 
     private const string BenchmarkClearedJson = """{"cleared":true}""";
+
+    private const string RecommendationsJson = """
+        {"generatedAt":"2026-11-10T12:00:00.000Z",
+         "roles":{"basic":{"role":"basic","model":"llama3:8b","recommendedContextWindow":4096,
+          "description":"smallest fast general model","nodes":[{"target":"Local","contextCeiling":4096,
+           "baselineContext":2048,"tokensPerSecond":24.5,"vramMB":8192}]}},
+         "models":{"llama3:8b":{"model":"llama3:8b","architecture":"llama","nativeContext":8192,
+          "quantization":"q8_0","nodes":[{"target":"Local","contextCeiling":4096,
+           "baselineContext":2048,"tokensPerSecond":24.5,"vramMB":8192}]}}}
+        """;
+
+    private const string RecommendationsGeneratedJson = """
+        {"generated":true,"generatedAt":"2026-11-10T12:00:00.000Z","roleCount":1,"modelCount":1,
+         "targets":["Local"],
+         "recommendations":{"generatedAt":"2026-11-10T12:00:00.000Z",
+          "roles":{"basic":{"role":"basic","model":"llama3:8b","recommendedContextWindow":4096,
+           "description":"smallest fast general model","nodes":[]}},
+          "models":{"llama3:8b":{"model":"llama3:8b","architecture":"llama","nativeContext":8192,
+           "quantization":"q8_0","nodes":[]}}}}
+        """;
+
+    private const string RecommendationsAppliedJson = """
+        {"applied":true,"generatedAt":"2026-11-10T12:00:00.000Z",
+         "targets":[{"target":"Local","models":2,"maxContextCeiling":8192}]}
+        """;
 
     private const string SessionsJson = """
         {"currency":"$","count":1,

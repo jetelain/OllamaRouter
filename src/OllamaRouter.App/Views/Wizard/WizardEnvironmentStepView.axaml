@@ -1,0 +1,43 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:OllamaRouter.App.ViewModels.Wizard"
+             x:Class="OllamaRouter.App.Views.Wizard.WizardEnvironmentStepView"
+             x:DataType="vm:WizardEnvironmentStepViewModel">
+  <ScrollViewer Padding="12">
+    <StackPanel Spacing="12">
+      <TextBlock Text="Step 1 — Local Ollama for the Router" FontSize="18" FontWeight="Bold"/>
+      <TextBlock TextWrapping="Wrap"
+                 Text="Move a raw Ollama daemon off the router port to :11435 and start ollamarouter-server on :11434."/>
+
+      <Border Padding="10" CornerRadius="6" Background="#1E1E2A">
+        <StackPanel Spacing="6">
+          <TextBlock Text="{Binding DetectionText}" FontWeight="SemiBold" TextWrapping="Wrap"/>
+          <TextBlock Text="{Binding RouterStatusLabel}" FontWeight="Bold" TextWrapping="Wrap"/>
+        </StackPanel>
+      </Border>
+
+      <CheckBox IsChecked="{Binding LanMeshEnabled}"
+                Content="Expose local Ollama on the LAN (0.0.0.0:11435) instead of loopback"/>
+
+      <StackPanel Orientation="Horizontal" Spacing="8">
+        <Button Content="Configure Local Ollama for Router" Command="{Binding ConfigureForRouterCommand}"/>
+        <Button Content="Start Ollama" Command="{Binding StartOllamaCommand}"/>
+        <Button Content="Re-check" Command="{Binding RecheckCommand}"/>
+      </StackPanel>
+
+      <!-- Linux: one-click is disabled; show the manual steps (per maintainer decision D3). -->
+      <Border Padding="10" CornerRadius="6" Background="#2A2A1E" IsVisible="{Binding IsLinux}">
+        <StackPanel Spacing="4">
+          <TextBlock Text="Linux: one-click is not supported — configure manually:" FontWeight="Bold"/>
+          <TextBlock Text="export OLLAMA_HOST=127.0.0.1:11435" FontFamily="monospace"/>
+          <TextBlock Text="export OLLAMA_FLASH_ATTENTION=1" FontFamily="monospace"/>
+          <TextBlock Text="export OLLAMA_KV_CACHE_TYPE=q8_0" FontFamily="monospace"/>
+          <TextBlock Text="ollama serve   # then: ollamarouter start" FontFamily="monospace"/>
+        </StackPanel>
+      </Border>
+
+      <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4"/>
+      <TextBlock Text="{Binding Message}" TextWrapping="Wrap" Foreground="#8BC34A"/>
+    </StackPanel>
+  </ScrollViewer>
+</UserControl>

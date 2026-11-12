@@ -37,6 +37,8 @@ public sealed class HelpCommand : IRouterCommand
             writer.WriteLine("                           1-9 = toggle the Nth fleet target.");
             writer.WriteLine("  logs [--follow|-f]     Tail the latest logs/ollamarouter-*.log file.");
             writer.WriteLine("       [--lines|-n N]           (default last 50 lines)");
+            writer.WriteLine("  setup [--wizard] [--wait]  Launch the app in Setup Wizard mode");
+            writer.WriteLine("                           (--wait propagates the wizard exit code).");
             writer.WriteLine("  help                   Show this help.");
             writer.WriteLine("  --version              Print the CLI version.");
             writer.WriteLine();

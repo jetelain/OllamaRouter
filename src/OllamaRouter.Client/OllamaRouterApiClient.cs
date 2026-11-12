@@ -13,6 +13,7 @@ using OllamaRouter.Endpoints.RouterApi.Fleet;
 using OllamaRouter.Endpoints.RouterApi.Info;
 using OllamaRouter.Endpoints.RouterApi.Models;
 using OllamaRouter.Endpoints.RouterApi.Preload;
+using OllamaRouter.Endpoints.RouterApi.Recommendations;
 using OllamaRouter.Endpoints.RouterApi.SessionAffinity;
 using OllamaRouter.Endpoints.RouterApi.Sessions;
 using OllamaRouter.Endpoints.RouterApi.Targets;
@@ -20,6 +21,7 @@ using OllamaRouter.Endpoints.RouterApi.Vram;
 using OllamaRouter.Middleware;
 using OllamaRouter.Security;
 using OllamaRouter.Services.Hardware;
+using OllamaRouter.Services.Recommendations;
 
 namespace OllamaRouter.Client;
 
@@ -183,6 +185,30 @@ public interface IOllamaRouterApiClient
 
     /// <summary><c>POST /api/router/api-keys/default/rotate</c>: rotates the default key (previous key invalid immediately).</summary>
     Task<ApiKeyRotatedResponse> RotateDefaultKeyAsync(CancellationToken ct = default);
+
+    // ------------------------------------------------------------------
+    //  Role recommendations (task #66 wire surface; the Setup Wizard's Step 4)
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// <c>GET /api/router/recommendations</c>: the live role recommendation matrix (read-only;
+    /// the stable empty shape when nothing is active). Keyless in default mode.
+    /// </summary>
+    Task<FleetRecommendations> GetRecommendationsAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// <c>POST /api/router/recommendations/generate</c> (no body): recompute + persist +
+    /// activate the matrix from the persisted benchmark results. 409 (no terminal benchmark
+    /// data) surfaces as <see cref="OllamaRouterApiException"/> with the parsed <c>Error</c>.
+    /// </summary>
+    Task<RouterRecommendationsGeneratedResponse> GenerateRecommendationsAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// <c>POST /api/router/recommendations/apply</c> (no body): idempotent re-activation of the
+    /// current <c>recommended.json</c>, reporting the per-target ceilings now enforced. 409 (no
+    /// file) surfaces as <see cref="OllamaRouterApiException"/> with the parsed <c>Error</c>.
+    /// </summary>
+    Task<RouterRecommendationsAppliedResponse> ApplyRecommendationsAsync(CancellationToken ct = default);
 }
 
 /// <summary>
@@ -538,6 +564,25 @@ public sealed class OllamaRouterApiClient : IOllamaRouterApiClient, IDisposable
     public Task<ApiKeyRotatedResponse> RotateDefaultKeyAsync(CancellationToken ct = default) =>
         SendAsync(HttpMethod.Post, "api/router/api-keys/default/rotate",
             OllamaRouterClientJsonContext.Default.ApiKeyRotatedResponse, ct);
+
+    // ------------------------------------------------------------------
+    //  IOllamaRouterApiClient — role recommendations (task #66 wire surface)
+    // ------------------------------------------------------------------
+
+    /// <inheritdoc />
+    public Task<FleetRecommendations> GetRecommendationsAsync(CancellationToken ct = default) =>
+        SendAsync(HttpMethod.Get, "api/router/recommendations",
+            OllamaRouterClientJsonContext.Default.FleetRecommendations, ct);
+
+    /// <inheritdoc />
+    public Task<RouterRecommendationsGeneratedResponse> GenerateRecommendationsAsync(CancellationToken ct = default) =>
+        SendAsync(HttpMethod.Post, "api/router/recommendations/generate",
+            OllamaRouterClientJsonContext.Default.RouterRecommendationsGeneratedResponse, ct);
+
+    /// <inheritdoc />
+    public Task<RouterRecommendationsAppliedResponse> ApplyRecommendationsAsync(CancellationToken ct = default) =>
+        SendAsync(HttpMethod.Post, "api/router/recommendations/apply",
+            OllamaRouterClientJsonContext.Default.RouterRecommendationsAppliedResponse, ct);
 
     // ------------------------------------------------------------------
     //  Plumbing

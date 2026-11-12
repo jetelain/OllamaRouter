@@ -32,6 +32,7 @@ internal static class CliDispatcher
             new StatusCommand(),
             new MonitorCommand(),
             new LogsCommand(),
+            new SetupCommand(),
             new HelpCommand(),
         };
 

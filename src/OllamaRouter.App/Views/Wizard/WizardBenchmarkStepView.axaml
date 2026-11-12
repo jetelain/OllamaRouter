@@ -1,0 +1,69 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:OllamaRouter.App.ViewModels.Wizard"
+             x:Class="OllamaRouter.App.Views.Wizard.WizardBenchmarkStepView"
+             x:DataType="vm:WizardBenchmarkStepViewModel">
+  <ScrollViewer Padding="12">
+    <StackPanel Spacing="12">
+      <TextBlock Text="Step 3 — Micro-Benchmark" FontSize="18" FontWeight="Bold"/>
+      <TextBlock TextWrapping="Wrap"
+                 Text="Benchmark every active node's candidate models. A context is viable when it decodes at 20 tokens/s or faster."/>
+
+      <StackPanel Orientation="Horizontal" Spacing="8">
+        <Button Content="Run benchmarks (all nodes)" Command="{Binding RunBenchmarksCommand}"/>
+        <Button Content="Clear results" Command="{Binding ClearResultsCommand}"/>
+      </StackPanel>
+
+      <!-- Per-node hardware -->
+      <TextBlock Text="Node hardware" FontWeight="SemiBold"/>
+      <ItemsControl ItemsSource="{Binding HardwareRows}">
+        <ItemsControl.ItemTemplate>
+          <DataTemplate x:DataType="vm:BenchmarkHardwareRow">
+            <StackPanel Orientation="Horizontal" Spacing="10" Margin="0,2">
+              <TextBlock Text="{Binding Target}" Width="130" FontWeight="SemiBold"/>
+              <TextBlock Text="{Binding GpuName}" Width="220"/>
+              <TextBlock Text="{Binding VramText}" Width="150"/>
+              <TextBlock Text="{Binding BandwidthText}" Width="150"/>
+              <TextBlock Text="{Binding Note}" Foreground="#FFB74D"/>
+            </StackPanel>
+          </DataTemplate>
+        </ItemsControl.ItemTemplate>
+      </ItemsControl>
+
+      <!-- Run status per target -->
+      <TextBlock Text="Run status" FontWeight="SemiBold"/>
+      <ItemsControl ItemsSource="{Binding BenchmarkRows}">
+        <ItemsControl.ItemTemplate>
+          <DataTemplate x:DataType="vm:BenchmarkRow">
+            <StackPanel Orientation="Horizontal" Spacing="10" Margin="0,2">
+              <TextBlock Text="{Binding Target}" Width="130" FontWeight="SemiBold"/>
+              <TextBlock Text="{Binding StatusText}" Width="120"/>
+            </StackPanel>
+          </DataTemplate>
+        </ItemsControl.ItemTemplate>
+      </ItemsControl>
+
+      <!-- Per-context results -->
+      <TextBlock Text="Results (per model × context)" FontWeight="SemiBold"/>
+      <ItemsControl ItemsSource="{Binding ResultRows}">
+        <ItemsControl.ItemTemplate>
+          <DataTemplate x:DataType="vm:BenchmarkResultRow">
+            <StackPanel Orientation="Horizontal" Spacing="10" Margin="0,2">
+              <TextBlock Text="{Binding Target}" Width="110"/>
+              <TextBlock Text="{Binding Model}" Width="150"/>
+              <TextBlock Text="{Binding Role}" Width="150"/>
+              <TextBlock Text="{Binding ContextText}" Width="90"/>
+              <TextBlock Text="{Binding ThroughputText}" Width="100"/>
+              <TextBlock Text="viable" Foreground="#8BC34A" IsVisible="{Binding Viable}"/>
+              <TextBlock Text="{Binding Reason}" Foreground="#FF7B7B"/>
+            </StackPanel>
+          </DataTemplate>
+        </ItemsControl.ItemTemplate>
+      </ItemsControl>
+
+      <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4"/>
+      <TextBlock Text="{Binding Message}" TextWrapping="Wrap" Foreground="#8BC34A"/>
+      <TextBlock Text="{Binding Error}" TextWrapping="Wrap" Foreground="#FF7B7B"/>
+    </StackPanel>
+  </ScrollViewer>
+</UserControl>
