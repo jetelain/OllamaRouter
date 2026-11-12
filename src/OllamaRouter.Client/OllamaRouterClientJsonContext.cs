@@ -101,6 +101,10 @@ namespace OllamaRouter.Client;
 [JsonSerializable(typeof(UpdateTargetResponse))]
 [JsonSerializable(typeof(TargetModelDto))]
 [JsonSerializable(typeof(DeleteTargetResponse))]
+// Failure-streak reset (task #95).
+[JsonSerializable(typeof(ResetTargetStreakResponse))]
+[JsonSerializable(typeof(ResetFleetStreaksResponse))]
+[JsonSerializable(typeof(ResetFleetStreaksTarget))]
 // Benchmarks + catalog roles.
 [JsonSerializable(typeof(RouterBenchmarkRequest))]
 [JsonSerializable(typeof(RouterBenchmarkRunResponse))]

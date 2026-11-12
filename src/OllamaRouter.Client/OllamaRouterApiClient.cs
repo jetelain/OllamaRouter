@@ -121,6 +121,20 @@ public interface IOllamaRouterApiClient
     /// <summary><c>DELETE /api/router/targets/{name}</c>: removes a fleet target.</summary>
     Task<DeleteTargetResponse> DeleteTargetAsync(string name, CancellationToken ct = default);
 
+    /// <summary>
+    /// <c>POST /api/router/targets/{name}/reset-streak</c> (task #95): resets the target's
+    /// failure streak + circuit-breaker cooldown (200 with streak 0 / "Closed"; 404 unknown
+    /// target — surfaced as <see cref="OllamaRouterApiException"/>).
+    /// </summary>
+    Task<ResetTargetStreakResponse> ResetTargetStreakAsync(string name, CancellationToken ct = default);
+
+    /// <summary>
+    /// <c>POST /api/router/fleet/reset-streaks</c> (task #95): resets the failure streak of
+    /// every fleet target (the Cloud pseudo-target when cloud overflow is enabled); returns
+    /// the per-target previousStreak/reset summary.
+    /// </summary>
+    Task<ResetFleetStreaksResponse> ResetFleetStreaksAsync(CancellationToken ct = default);
+
     // ------------------------------------------------------------------
     //  Benchmarks
     // ------------------------------------------------------------------
@@ -439,6 +453,16 @@ public sealed class OllamaRouterApiClient : IOllamaRouterApiClient, IDisposable
     public Task<DeleteTargetResponse> DeleteTargetAsync(string name, CancellationToken ct = default) =>
         SendAsync(HttpMethod.Delete, BuildPath("api/router/targets", name),
             OllamaRouterClientJsonContext.Default.DeleteTargetResponse, ct);
+
+    /// <inheritdoc />
+    public Task<ResetTargetStreakResponse> ResetTargetStreakAsync(string name, CancellationToken ct = default) =>
+        SendAsync(HttpMethod.Post, BuildPath("api/router/targets", name, "reset-streak"),
+            OllamaRouterClientJsonContext.Default.ResetTargetStreakResponse, ct);
+
+    /// <inheritdoc />
+    public Task<ResetFleetStreaksResponse> ResetFleetStreaksAsync(CancellationToken ct = default) =>
+        SendAsync(HttpMethod.Post, "api/router/fleet/reset-streaks",
+            OllamaRouterClientJsonContext.Default.ResetFleetStreaksResponse, ct);
 
     // ------------------------------------------------------------------
     //  IOllamaRouterApiClient — benchmarks

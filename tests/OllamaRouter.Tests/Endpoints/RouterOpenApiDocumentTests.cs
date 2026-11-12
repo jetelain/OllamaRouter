@@ -116,7 +116,7 @@ public class RouterOpenApiDocumentTests
     }
 
     /// <summary>
-    /// The approved 32 router operations: (method, document path) pairs — 28 path items.
+    /// The approved 34 router operations: (method, document path) pairs — 30 path items.
     /// NOTE: the generator emits the catch-all templates with the leading <c>*</c> stripped
     /// (the framework's documented template normalization: the registered
     /// <c>/api/router/models/{*modelName}</c> / <c>POST /api/router/models/{*tail}</c> /
@@ -146,6 +146,8 @@ public class RouterOpenApiDocumentTests
         ("POST", "/api/router/targets"),
         ("PUT", "/api/router/targets/{name}"),
         ("DELETE", "/api/router/targets/{name}"),
+        ("POST", "/api/router/targets/{name}/reset-streak"),
+        ("POST", "/api/router/fleet/reset-streaks"),
         ("GET", "/api/router/api-keys"),
         ("POST", "/api/router/api-keys"),
         ("DELETE", "/api/router/api-keys/{name}"),
@@ -202,6 +204,8 @@ public class RouterOpenApiDocumentTests
             { ("POST", "/api/router/targets"), "PostRouterTarget" },
             { ("PUT", "/api/router/targets/{name}"), "PutRouterTarget" },
             { ("DELETE", "/api/router/targets/{name}"), "DeleteRouterTarget" },
+            { ("POST", "/api/router/targets/{name}/reset-streak"), "PostRouterTargetResetStreak" },
+            { ("POST", "/api/router/fleet/reset-streaks"), "PostRouterFleetResetStreaks" },
             { ("GET", "/api/router/api-keys"), "GetRouterApiKeys" },
             { ("POST", "/api/router/api-keys"), "PostRouterApiKey" },
             { ("DELETE", "/api/router/api-keys/{name}"), "DeleteRouterApiKey" },
@@ -256,6 +260,10 @@ public class RouterOpenApiDocumentTests
                 [("200", "UpdateTargetResponse"), ("400", "UpdateTargetResponse"), ("404", "UpdateTargetResponse"), ("500", "UpdateTargetResponse")] },
             { ("DELETE", "/api/router/targets/{name}"),
                 [("200", "DeleteTargetResponse"), ("404", "DeleteTargetResponse"), ("500", "DeleteTargetResponse")] },
+            { ("POST", "/api/router/targets/{name}/reset-streak"),
+                [("200", "ResetTargetStreakResponse"), ("404", "ResetTargetStreakResponse")] },
+            { ("POST", "/api/router/fleet/reset-streaks"),
+                [("200", "ResetFleetStreaksResponse")] },
             { ("GET", "/api/router/api-keys"),
                 [("200", "ApiKeysListResponse"), ("500", "OllamaErrorResponse")] },
             { ("POST", "/api/router/api-keys"),
@@ -298,6 +306,7 @@ public class RouterOpenApiDocumentTests
                 [("model", "string"), ("keepAliveSeconds", "integer"), ("contextIntentTokens", "integer"), ("target", "string")] },
             { ("PUT", "/api/router/targets/{name}"), [("name", "string")] },
             { ("DELETE", "/api/router/targets/{name}"), [("name", "string")] },
+            { ("POST", "/api/router/targets/{name}/reset-streak"), [("name", "string")] },
             { ("DELETE", "/api/router/api-keys/{name}"), [("name", "string")] },
             { ("GET", "/api/router/monitor/sessions/{sessionId}"), [("sessionId", "string")] }
         };
@@ -377,14 +386,14 @@ public class RouterOpenApiDocumentTests
     }
 
     [Fact]
-    public async Task Document_ContainsExactlyThe32RouterOperations_AndExcludesEverythingElse()
+    public async Task Document_ContainsExactlyThe34RouterOperations_AndExcludesEverythingElse()
     {
         await using var harness = await DocHarness.StartAsync(requireKeyForAllEndpoints: false);
         var document = await FetchDocumentAsync(harness);
         var paths = (JsonObject)document["paths"]!;
 
-        // Exactly the 32 approved (method, path) pairs (28 path items).
-        Assert.Equal(28, paths.Count);
+        // Exactly the 34 approved (method, path) pairs (30 path items).
+        Assert.Equal(30, paths.Count);
         var pathKeys = JsonObjectKeys(paths);
         var actualOperations = pathKeys
             .Select(path => (Path: path, Item: (JsonObject)paths[path]!))
@@ -536,7 +545,7 @@ public class RouterOpenApiDocumentTests
         await using var harness = await DocHarness.StartAsync(requireKeyForAllEndpoints: false);
         var document = await FetchDocumentAsync(harness);
 
-        // The body-accepting endpoints carry the typed request body; the other 19 do not
+        // The body-accepting endpoints carry the typed request body; the other 24 do not
         // (the plan's "nine" body list plus POST /api/router/api-keys from task #50).
         foreach (var (method, path) in ApprovedOperations)
         {
@@ -577,7 +586,7 @@ public class RouterOpenApiDocumentTests
         Assert.False(string.IsNullOrWhiteSpace(scheme["description"]?.GetValue<string>()));
 
         // The requirement is applied to EXACTLY the operations the production policy protects
-        // (15 of the 32), each with a documented 401 OllamaErrorResponse.
+        // (17 of the 34), each with a documented 401 OllamaErrorResponse.
         var protectedCount = 0;
         foreach (var (method, path) in ApprovedOperations)
         {
@@ -606,9 +615,10 @@ public class RouterOpenApiDocumentTests
             }
         }
 
-        // The #50 default protected set (incl. the #99 admin shutdown route and the #66
-        // recommendation writes) is exactly 15 operations.
-        Assert.Equal(15, protectedCount);
+        // The #50 default protected set (incl. the #99 admin shutdown route, the #66
+        // recommendation writes and the two #95 failure-streak reset admin actions) is
+        // exactly 17 operations.
+        Assert.Equal(17, protectedCount);
     }
 
     [Fact]

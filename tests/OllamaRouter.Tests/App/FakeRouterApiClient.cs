@@ -393,6 +393,26 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
     }
 
     /// <inheritdoc />
+    public Task<ResetTargetStreakResponse> ResetTargetStreakAsync(string name, CancellationToken ct = default)
+    {
+        Log(nameof(ResetTargetStreakAsync));
+        if (!_targets.ContainsKey(name))
+        {
+            throw new OllamaRouterApiException(
+                HttpStatusCode.NotFound, $"target not found: {name}");
+        }
+
+        return Task.FromResult(new ResetTargetStreakResponse(true, name, 0, "Closed"));
+    }
+
+    /// <inheritdoc />
+    public Task<ResetFleetStreaksResponse> ResetFleetStreaksAsync(CancellationToken ct = default)
+    {
+        Log(nameof(ResetFleetStreaksAsync));
+        return Task.FromResult(new ResetFleetStreaksResponse(true, 0, []));
+    }
+
+    /// <inheritdoc />
     public Task<RouterBenchmarkRunResponse> StartBenchmarkAsync(
         RouterBenchmarkRequest? request, CancellationToken ct = default) =>
         NotImplemented<RouterBenchmarkRunResponse>(nameof(StartBenchmarkAsync));

@@ -115,6 +115,10 @@ namespace OllamaRouter.Serialization;
 [JsonSerializable(typeof(AddTargetResponse))]
 [JsonSerializable(typeof(TargetModelDto))]
 [JsonSerializable(typeof(DeleteTargetResponse))]
+// Failure-streak reset admin endpoints (task #95).
+[JsonSerializable(typeof(ResetTargetStreakResponse))]
+[JsonSerializable(typeof(ResetFleetStreaksResponse))]
+[JsonSerializable(typeof(ResetFleetStreaksTarget))]
 // API key management DTOs (task #50).
 [JsonSerializable(typeof(ApiSecurityConfigDto))]
 [JsonSerializable(typeof(ApiKeysListResponse))]

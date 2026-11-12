@@ -3,6 +3,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using OllamaRouter.Configuration;
 using OllamaRouter.Endpoints.RouterApi.Config;
+using OllamaRouter.Endpoints.RouterApi.Shared;
 using OllamaRouter.Options;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services.Catalog;
@@ -54,6 +55,29 @@ public static class RouterTargetsEndpoints
                 + "config/config.json (file-first, atomic). Liveness slots / session-affinity leases of the removed name are "
                 + "orphaned but inert (the re-prober and routing only ever see live fleet names; leases expire by TTL). 500 = "
                 + "persistence failure (NO in-memory change). Protected by the API-key middleware (default protected set).");
+        app.MapPost("/api/router/targets/{name}/reset-streak", ResetTargetStreakHandler)
+            .WithName("PostRouterTargetResetStreak")
+            .WithTags("Setup & Configuration")
+            .WithSummary("Reset a target's failure streak + circuit-breaker state (protected: API key required).")
+            .WithDescription("Resets the target's consecutive-failure streak to 0 and clears its circuit-breaker cooldown "
+                + "(task #95): the target becomes immediately routable on the very next routing decision (no restart, NO "
+                + "config write). Runtime failure-streak state only — liveness state, availability toggles and "
+                + "session-affinity leases are untouched. Case-insensitive target lookup; unknown name (or 'Cloud' — "
+                + "the pseudo-target is not in the effective fleet) → 404 'target not found: {name}' (checked BEFORE "
+                + "the streak-service availability). Protected by the API-key middleware (default protected set). "
+                + "Fleet-wide variant: POST /api/router/fleet/reset-streaks.");
+        app.MapPost("/api/router/fleet/reset-streaks", ResetFleetStreaksHandler)
+            .WithName("PostRouterFleetResetStreaks")
+            .WithTags("Identity & Fleet")
+            .WithSummary("Reset failure streaks + circuit-breaker state across the whole fleet (protected: API key required).")
+            .WithDescription("Resets the consecutive-failure streak of EVERY effective target (configuration order) plus "
+                + "the Cloud pseudo-target when cloud overflow is enabled (task #95) — a per-target no-op when the streak "
+                + "is untracked. Reports resetCount (the number of targets whose previousStreak was above zero) and the "
+                + "per-target previousStreak/reset rows; a second call reports resetCount 0 (idempotent). Runtime "
+                + "failure-streak state only — liveness state, availability toggles and session-affinity leases are "
+                + "untouched; every reset target is immediately routable on the very next routing decision (no restart, "
+                + "NO config write). Protected by the API-key middleware (default protected set). "
+                + "Per-target variant: POST /api/router/targets/{name}/reset-streak.");
         return app;
     }
 
@@ -533,6 +557,101 @@ public static class RouterTargetsEndpoints
         return Results.Json(
             new DeleteTargetResponse(true, $"Target '{name}' removed successfully."),
             OllamaRouterJsonSerializerContext.Default.DeleteTargetResponse);
+    }
+
+    /// <summary>
+    /// Handler of <c>POST /api/router/targets/{name}/reset-streak</c> (task #95): resets the
+    /// target's failure streak to 0 and clears its circuit-breaker cooldown — the target is
+    /// immediately routable on the next routing decision (no restart, no config write). The
+    /// case-insensitive membership check runs FIRST (unknown name / <c>Cloud</c> → 404 even
+    /// when the streak service is absent); 500 only for a host without the streak service.
+    /// </summary>
+    private static IResult ResetTargetStreakHandler(
+        IOptionsMonitor<OllamaRouterOptions> options,
+        IServiceProvider serviceProvider,
+        string name)
+    {
+        // 404 BEFORE 500: an unknown name wins even when the streak service is not registered.
+        var effectiveTargets = options.CurrentValue.GetEffectiveTargets();
+        if (!effectiveTargets.Any(t => string.Equals(t.Name, name, StringComparison.OrdinalIgnoreCase)))
+        {
+            return Results.Json(
+                new ResetTargetStreakResponse(false, name, null, null, $"target not found: {name}"),
+                OllamaRouterJsonSerializerContext.Default.ResetTargetStreakResponse,
+                statusCode: StatusCodes.Status404NotFound);
+        }
+
+        var streakService = serviceProvider.GetService<ITargetFailureStreakService>();
+        if (streakService is null)
+        {
+            return Results.Json(
+                new ResetTargetStreakResponse(
+                    false, name, null, null, "failure-streak tracking is not available in this host"),
+                OllamaRouterJsonSerializerContext.Default.ResetTargetStreakResponse,
+                statusCode: StatusCodes.Status500InternalServerError);
+        }
+
+        var routingTarget = (RoutingTarget)name;
+        // The shared singleton the routing middleware gates on: the reset takes effect on the
+        // very next routing decision. Liveness / availability flags / leases are untouched.
+        streakService.ResetStreak(routingTarget);
+        var opt = options.CurrentValue;
+        var status = FailureStreakWire.ToStateString(
+            streakService.GetCircuitState(
+                routingTarget, opt.MaxConsecutiveFailures, TimeSpan.FromSeconds(opt.FailureStreakCooldownSeconds)));
+
+        return Results.Json(
+            new ResetTargetStreakResponse(true, name, streakService.GetStreak(routingTarget), status),
+            OllamaRouterJsonSerializerContext.Default.ResetTargetStreakResponse);
+    }
+
+    /// <summary>
+    /// Handler of <c>POST /api/router/fleet/reset-streaks</c> (task #95): resets the failure
+    /// streak of every effective target (configuration order) plus the Cloud pseudo-target
+    /// when cloud overflow is enabled. Per-target: <c>previousStreak</c> = the streak read
+    /// BEFORE the reset, <c>reset: true</c> iff it was above zero; <c>resetCount</c> = the
+    /// number of reset targets. Idempotent (a second call reports <c>resetCount: 0</c>); a
+    /// host without the streak service → 500.
+    /// </summary>
+    private static IResult ResetFleetStreaksHandler(
+        IOptionsMonitor<OllamaRouterOptions> options,
+        IServiceProvider serviceProvider)
+    {
+        var streakService = serviceProvider.GetService<ITargetFailureStreakService>();
+        if (streakService is null)
+        {
+            return Results.Json(
+                new ResetFleetStreaksResponse(false, 0, null,
+                    "failure-streak tracking is not available in this host"),
+                OllamaRouterJsonSerializerContext.Default.ResetFleetStreaksResponse,
+                statusCode: StatusCodes.Status500InternalServerError);
+        }
+
+        var opt = options.CurrentValue;
+        var effectiveTargets = opt.GetEffectiveTargets();
+        var rows = new List<ResetFleetStreaksTarget>(effectiveTargets.Count + 1);
+        void ResetOne(RoutingTarget target)
+        {
+            var previousStreak = streakService.GetStreak(target);
+            streakService.ResetStreak(target);
+            rows.Add(new ResetFleetStreaksTarget(target.Value, previousStreak, previousStreak > 0));
+        }
+
+        foreach (var target in effectiveTargets)
+        {
+            ResetOne((RoutingTarget)target.Name!);
+        }
+
+        // The Cloud pseudo-target can carry a tracked streak (dispatch-loop relay failures);
+        // the reset is a no-op when untracked. Included only when cloud overflow is enabled.
+        if (opt.CloudOverflow.Enabled)
+        {
+            ResetOne(RoutingTarget.Cloud);
+        }
+
+        return Results.Json(
+            new ResetFleetStreaksResponse(true, rows.Count(r => r.PreviousStreak > 0), rows),
+            OllamaRouterJsonSerializerContext.Default.ResetFleetStreaksResponse);
     }
 
     private static readonly char[] InvalidTargetNameChars = ['/', '\\', ':'];

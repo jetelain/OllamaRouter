@@ -46,7 +46,10 @@ public static partial class MonitorEndpointsExtensions
                 includeOverhead: true,
                 liveness: serviceProvider.GetService<ITargetLivenessService>(),
                 executionTracker: serviceProvider.GetService<ITargetExecutionTracker>(),
-                fleetHardware: serviceProvider.GetService<IFleetHardwareService>());
+                // Task #95: the failure-streak service (null-tolerant; degraded defaults when
+                // the service is not registered).
+                fleetHardware: serviceProvider.GetService<IFleetHardwareService>(),
+                streakService: serviceProvider.GetService<ITargetFailureStreakService>());
 
             return Results.Json(monitorResponse, OllamaRouterJsonSerializerContext.Default.MonitorStateResponse);
         });

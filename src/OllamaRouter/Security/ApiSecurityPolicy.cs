@@ -12,8 +12,12 @@ namespace OllamaRouter.Security;
 /// (<c>POST /api/router/recommendations/generate</c>,
 /// <c>POST /api/router/recommendations/apply</c>) and the key-management endpoints
 /// (<c>GET/POST /api/router/api-keys</c>, <c>DELETE /api/router/api-keys/{name}</c>,
-/// <c>POST /api/router/api-keys/default/rotate</c> — key-protected by definition) and the
-/// daemon lifecycle endpoint <c>POST /api/router/admin/shutdown</c> (task #99: stopping the
+/// <c>POST /api/router/api-keys/default/rotate</c> — key-protected by definition), the
+/// failure-streak reset admin actions (task #95: <c>POST /api/router/targets/{name}/reset-streak</c>
+/// and <c>POST /api/router/fleet/reset-streaks</c> — they mutate live routing-reliability
+/// state fleet-wide and re-admit failing nodes, so they are admin actions like the shutdown,
+/// not browser runtime toggles) and the daemon lifecycle endpoint
+/// <c>POST /api/router/admin/shutdown</c> (task #99: stopping the
 /// host is config-lifetime-affecting and must never be reachable keyless).
 /// </para>
 /// <para>
@@ -89,6 +93,13 @@ public static class ApiSecurityPolicy
             return method == "POST";
         }
 
+        // Failure-streak reset fleet-wide (task #95): an admin action that re-admits failing
+        // nodes across the fleet (runtime routing-reliability state; POST only).
+        if (string.Equals(path, "/api/router/fleet/reset-streaks", StringComparison.OrdinalIgnoreCase))
+        {
+            return method == "POST";
+        }
+
         // ---- Key management (key-protected by definition) -----------------
         if (string.Equals(path, "/api/router/api-keys", StringComparison.OrdinalIgnoreCase))
         {
@@ -104,6 +115,14 @@ public static class ApiSecurityPolicy
         if (TryGetSingleSegment(path, "/api/router/targets/", out _))
         {
             return method is "PUT" or "DELETE";
+        }
+
+        // Per-target failure-streak reset (task #95): fixed prefix + exactly TWO non-empty
+        // segments whose LAST is 'reset-streak' (the single-segment rule above is NOT
+        // loosened). Admin action, POST only.
+        if (TryGetResetStreakSegment(path))
+        {
+            return method == "POST";
         }
 
         if (TryGetSingleSegment(path, "/api/router/fleet/hardware/", out _))
@@ -135,5 +154,26 @@ public static class ApiSecurityPolicy
 
         segment = path[prefix.Length..];
         return segment.Length > 0 && !segment.Contains('/');
+    }
+
+    /// <summary>
+    /// True when <paramref name="path"/> is <c>/api/router/targets/{name}/reset-streak</c>
+    /// (task #95): the fixed prefix (case-insensitive) followed by EXACTLY two non-empty
+    /// segments whose LAST equals <c>reset-streak</c> (case-insensitive).
+    /// </summary>
+    private static bool TryGetResetStreakSegment(string path)
+    {
+        const string prefix = "/api/router/targets/";
+        if (path.Length <= prefix.Length || !path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var rest = path[prefix.Length..];
+        var slashIndex = rest.IndexOf('/');
+        return slashIndex > 0 &&
+               slashIndex < rest.Length - 1 &&
+               !rest[(slashIndex + 1)..].Contains('/') &&
+               string.Equals(rest[(slashIndex + 1)..], "reset-streak", StringComparison.OrdinalIgnoreCase);
     }
 }

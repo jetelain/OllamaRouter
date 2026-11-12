@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Options;
+using OllamaRouter.Endpoints.RouterApi.Shared;
 using OllamaRouter.Options;
 using OllamaRouter.Services.Catalog;
 using OllamaRouter.Services.Monitoring;
@@ -20,7 +21,8 @@ public static partial class MonitorEndpointsExtensions
         bool includeOverhead = true,
         ITargetLivenessService? liveness = null,
         ITargetExecutionTracker? executionTracker = null,
-        IFleetHardwareService? fleetHardware = null)
+        IFleetHardwareService? fleetHardware = null,
+        ITargetFailureStreakService? streakService = null)
     {
         var snapshot = activityMonitor.GetSnapshot();
         var statistics = activityStatistics.GetSnapshot();
@@ -30,6 +32,12 @@ public static partial class MonitorEndpointsExtensions
 
         var effectiveTargets = options.CurrentValue.GetEffectiveTargets();
         var livenessEntries = liveness?.GetEntries();
+
+        // Task #95 (failure-streak observability): the per-row circuit-breaker read model is
+        // composed via the shared FailureStreakWire helper (single source of truth with the
+        // fleet / cartography builders); a null streak service degrades to the
+        // 0/"Closed"/omitted defaults on every row.
+        var routerOptions = options.CurrentValue;
 
         // Ordered fleet list: configured targets first (configuration order), Cloud always last.
         // (Invalid Targets entries were already warned about at startup; this read-only path
@@ -83,6 +91,12 @@ public static partial class MonitorEndpointsExtensions
                 ? (effectiveVram.Value > 1024 ? $"{Math.Round(effectiveVram.Value / 1024.0)} GB" : $"{effectiveVram.Value} MB")
                 : "-";
 
+            // Task #95: the failure-streak read model (streak / wire circuit state / remaining
+            // cooldown seconds; degraded defaults when the streak service is not registered).
+            var (streak, circuitState, cooldownRemainingSeconds) = FailureStreakWire.Describe(
+                streakService, (RoutingTarget)name, routerOptions.MaxConsecutiveFailures,
+                routerOptions.FailureStreakCooldownSeconds);
+
             // Append the configured speed factor to the HW cell (e.g. "16gb,2.0x") only when it
             // is above the fleet baseline (1.0); the TUI HW column is 9-wide to hold "16gb,2.0x".
             var effectiveSpeedFactor = target.GetEffectiveSpeedFactor();
@@ -104,7 +118,13 @@ public static partial class MonitorEndpointsExtensions
                 ResidentModels: residentModels,
                 KeepAliveSeconds: preloadResolution.Seconds,
                 KeepAliveSource: preloadResolution.Source,
-                ActiveKeepAliveSeconds: activeModelEntry?.KeepAliveSeconds));
+                ActiveKeepAliveSeconds: activeModelEntry?.KeepAliveSeconds,
+                // Task #95: the circuit-breaker read model of the target's failure streak
+                // (FailureStreakWire = the single source of truth shared by fleet / cartography /
+                // monitor).
+                FailureStreak: streak,
+                CircuitState: circuitState,
+                CooldownRemainingSeconds: cooldownRemainingSeconds));
 
             periodByName[name] = statistics.Last7Days.GetValueOrDefault((RoutingTarget)name) ?? new ActivityStatisticsTotals(0, 0, 0);
         }

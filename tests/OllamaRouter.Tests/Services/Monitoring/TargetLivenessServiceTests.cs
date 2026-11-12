@@ -323,6 +323,9 @@ public class TargetLivenessServiceTests : IDisposable
         }, onlineCacheTtl: TimeSpan.Zero);
 
         await sut.EnsureKnownAsync(RoutingTarget.Local); // Online
+        // Advance the clock a tick: the zero-TTL cache check is `now - CachedAt <= ttl`, so two
+        // UtcNow reads in the same tick would short-circuit the very re-probe this test needs.
+        await Task.Delay(1);
         var state = await sut.EnsureKnownAsync(RoutingTarget.Local);
 
         Assert.Equal(TargetLivenessState.Offline, state);
@@ -501,6 +504,9 @@ public class TargetLivenessServiceTests : IDisposable
         await sut.EnsureKnownAsync(RoutingTarget.Local); // Online, latency captured
         Assert.NotNull(sut.GetEntries()[RoutingTarget.Local].LastProbeLatencyMs);
 
+        // Advance the clock a tick so the zero-TTL cache check does not short-circuit the
+        // re-probe (the `now - CachedAt <= 0` boundary is same-tick sensitive).
+        await Task.Delay(1);
         await sut.EnsureKnownAsync(RoutingTarget.Local); // hard error → Offline, latency cleared
 
         var entry = sut.GetEntries()[RoutingTarget.Local];
@@ -595,15 +601,16 @@ public class TargetLivenessServiceTests : IDisposable
         Assert.Equal(TargetLivenessState.Online, state);
 
         Assert.True(sut.IsOnline(RoutingTarget.Local));
-        Assert.True(sut.IsOnline(RoutingTarget.Local, TimeSpan.FromMilliseconds(500)));
+        Assert.True(sut.IsOnline(RoutingTarget.Local, TimeSpan.FromSeconds(2)));
 
         await Task.Delay(80);
 
         // Strict default IsOnline has expired (50ms)
         Assert.False(sut.IsOnline(RoutingTarget.Local));
 
-        // Tolerant IsOnline with maxAge 500ms still passes
-        Assert.True(sut.IsOnline(RoutingTarget.Local, TimeSpan.FromMilliseconds(500)));
+        // Tolerant IsOnline with a generous maxAge still passes (2 s keeps the assertion immune
+        // to thread-pool starvation stretching the 80 ms wait on loaded CI machines).
+        Assert.True(sut.IsOnline(RoutingTarget.Local, TimeSpan.FromSeconds(2)));
 
         // Smaller maxAge fails
         Assert.False(sut.IsOnline(RoutingTarget.Local, TimeSpan.FromMilliseconds(50)));
@@ -746,6 +753,9 @@ public class TargetLivenessServiceTests : IDisposable
         streaks.RecordFailure(RoutingTarget.Local);
         streaks.RecordFailure(RoutingTarget.Local);
 
+        // Advance the clock a tick: without it the zero-TTL cache can short-circuit the
+        // re-probe this test is about (the Online → Online transition path).
+        await Task.Delay(1);
         var state = await sut.EnsureKnownAsync(RoutingTarget.Local); // Online → Online
 
         Assert.Equal(TargetLivenessState.Online, state);

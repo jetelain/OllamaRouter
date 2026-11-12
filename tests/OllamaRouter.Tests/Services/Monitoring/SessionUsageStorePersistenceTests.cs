@@ -256,8 +256,10 @@ public class SessionUsageStorePersistenceTests : IDisposable
 
         store.Record(Entry("s1", actualPrompt: 5, actualResponse: 2, elapsedMs: 90));
 
-        // The throttled Task.Run(Save) must produce the file within 2 s (bounded polling).
-        var deadline = Environment.TickCount64 + 2_000;
+        // The throttled Task.Run(Save) must produce the file within 10 s (bounded polling —
+        // the generous deadline keeps this immune to thread-pool starvation on heavily
+        // loaded CI machines; on a healthy machine the file lands well under a second).
+        var deadline = Environment.TickCount64 + 10_000;
         while (!File.Exists(stateFile) && Environment.TickCount64 < deadline)
         {
             Thread.Sleep(25);

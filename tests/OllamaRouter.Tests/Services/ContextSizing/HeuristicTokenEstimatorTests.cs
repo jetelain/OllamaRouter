@@ -86,10 +86,10 @@ public class HeuristicTokenEstimatorTests
     {
         var estimator = HeuristicTokenEstimator.ResolveEstimator(modelName);
         Assert.Same(HeuristicTokenEstimator.Qwen, estimator);
-        Assert.Equal(1.36, estimator.WordFactor);
-        Assert.Equal(0.66, estimator.SymbolFactor);
+        Assert.Equal(1.22, estimator.WordFactor);
+        Assert.Equal(0.86, estimator.SymbolFactor);
         Assert.Equal(0.40, estimator.NonAsciiFactor);
-        Assert.Equal(3.8, estimator.CharFloorFactor);
+        Assert.Equal(3.6, estimator.CharFloorFactor);
     }
 
     [Theory]
@@ -102,10 +102,10 @@ public class HeuristicTokenEstimatorTests
     {
         var estimator = HeuristicTokenEstimator.ResolveEstimator(modelName);
         Assert.Same(HeuristicTokenEstimator.Gemma, estimator);
-        Assert.Equal(1.43, estimator.WordFactor);
-        Assert.Equal(0.72, estimator.SymbolFactor);
+        Assert.Equal(1.21, estimator.WordFactor);
+        Assert.Equal(0.61, estimator.SymbolFactor);
         Assert.Equal(0.37, estimator.NonAsciiFactor);
-        Assert.Equal(3.6, estimator.CharFloorFactor);
+        Assert.Equal(3.8, estimator.CharFloorFactor);
     }
 
     [Theory]

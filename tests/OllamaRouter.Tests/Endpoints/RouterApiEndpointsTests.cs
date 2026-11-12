@@ -80,7 +80,8 @@ public class RouterApiEndpointsTests
         bool registerGpuVramProvider = true,
         bool registerCatalogCache = false,
         IFleetHardwareService? fleetHardware = null,
-        ISessionAffinityService? sessionAffinity = null)
+        ISessionAffinityService? sessionAffinity = null,
+        ITargetFailureStreakService? streakService = null)
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseUrls("http://127.0.0.1:0");
@@ -157,6 +158,13 @@ public class RouterApiEndpointsTests
         if (sessionAffinity is not null)
         {
             builder.Services.AddSingleton(sessionAffinity);
+        }
+
+        // Task #95: the failure-streak service (test-owned instance for seedable, deterministic
+        // streak state; null = the endpoint's degraded 0/"Closed"/omitted defaults).
+        if (streakService is not null)
+        {
+            builder.Services.AddSingleton(streakService);
         }
 
         if (fleetHardware is not null)
@@ -481,6 +489,52 @@ public class RouterApiEndpointsTests
         Assert.Equal("0", cloud["execution"]!["activeSessions"]!.ToString()); // Cloud is never leased
         Assert.Null(cloud["execution"]!["activeModel"]);
         Assert.Equal("baseline", cloud["execution"]!["contextAllocation"]!.ToString());
+
+        // Task #95 (degraded defaults — no streak service registered in this harness): every
+        // row carries failureStreak 0 / circuitState "Closed" / omitted cooldownRemainingSeconds.
+        foreach (var row in new[] { local, server, laptop, cloud })
+        {
+            Assert.Equal(0, row!["failureStreak"]!.GetValue<int>());
+            Assert.Equal("Closed", row["circuitState"]!.GetValue<string>());
+            Assert.Null(row["cooldownRemainingSeconds"]);
+        }
+    }
+
+    [Fact]
+    public async Task RouterFleet_TargetRows_ExposeFailureStreakCircuitStateAndCooldownRemainingSeconds()
+    {
+        // Task #95 (acceptance 4): the circuit-breaker read model on the fleet target rows —
+        // tripped target → "Cooldown" + remaining seconds in a tolerance band (the handler
+        // measures against the same wall clock the service stamps), clean target → defaults,
+        // Cloud pseudo-target → always the degraded defaults.
+        var options = ThreeTargetOptions(maxConsecutiveFailures: 3); // default 60 s cooldown
+        var streakService = new TargetFailureStreakService();
+        for (var i = 0; i < 4; i++)
+        {
+            streakService.RecordFailure(RoutingTarget.Local); // 4 > 3 ⇒ tripped (Open/"Cooldown")
+        }
+
+        await using var harness = await CreateTestAppAsync(options, streakService: streakService);
+
+        using var response = await harness.Client.GetAsync("/api/router/fleet");
+        Assert.Equal(System.Net.HttpStatusCode.OK, response.StatusCode);
+        var node = JsonNode.Parse(await response.Content.ReadAsStringAsync())!;
+
+        var local = TargetItem(node, "Local");
+        Assert.Equal(4, local!["failureStreak"]!.GetValue<int>());
+        Assert.Equal("Cooldown", local["circuitState"]!.GetValue<string>());
+        var remaining = local["cooldownRemainingSeconds"]!.GetValue<double>();
+        Assert.InRange(remaining, 55.0, 60.5);
+
+        var server = TargetItem(node, "Server");
+        Assert.Equal(0, server!["failureStreak"]!.GetValue<int>());
+        Assert.Equal("Closed", server["circuitState"]!.GetValue<string>());
+        Assert.Null(server["cooldownRemainingSeconds"]);
+
+        var cloud = TargetItem(node, "Cloud");
+        Assert.Equal(0, cloud!["failureStreak"]!.GetValue<int>());
+        Assert.Equal("Closed", cloud["circuitState"]!.GetValue<string>());
+        Assert.Null(cloud["cooldownRemainingSeconds"]);
     }
 
     [Fact]

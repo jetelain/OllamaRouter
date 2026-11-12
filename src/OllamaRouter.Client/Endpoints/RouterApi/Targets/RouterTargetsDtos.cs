@@ -99,5 +99,49 @@ public sealed record DeleteTargetResponse(
     [property: JsonPropertyName("message")] string Message);
 
 // ------------------------------------------------------------------
+//  DTOs: failure-streak reset (task #95)
+// ------------------------------------------------------------------
+
+/// <summary>
+/// Response of <c>POST /api/router/targets/{name}/reset-streak</c> (task #95): 200 with
+/// <c>success: true</c> + the reset target's name, its new streak (<c>0</c>) and circuit
+/// state ("Closed" — the target is immediately routable on the next routing decision);
+/// 404 (unknown target name) or 500 (streak service not registered) reuse the same shape
+/// with <c>success: false</c> and <c>error</c> set (<c>streak</c>/<c>status</c> omitted).
+/// </summary>
+public sealed record ResetTargetStreakResponse(
+    [property: JsonPropertyName("success")] bool Success,
+    [property: JsonPropertyName("target")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Target = null,
+    [property: JsonPropertyName("streak")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? Streak = null,
+    [property: JsonPropertyName("status")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Status = null,
+    [property: JsonPropertyName("error")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Error = null);
+
+/// <summary>
+/// One target row of <c>POST /api/router/fleet/reset-streaks</c> (task #95): the target
+/// name, the streak count read BEFORE the reset and whether the reset changed anything
+/// (<c>previousStreak &gt; 0</c>).
+/// </summary>
+public sealed record ResetFleetStreaksTarget(
+    [property: JsonPropertyName("target")] string Target,
+    [property: JsonPropertyName("previousStreak")] int PreviousStreak,
+    [property: JsonPropertyName("reset")] bool Reset);
+
+/// <summary>
+/// Response of <c>POST /api/router/fleet/reset-streaks</c> (task #95): 200 with
+/// <c>success: true</c>, the count of targets whose streak was above zero before the reset
+/// (<c>resetCount</c>) and the per-target rows for EVERY effective target (configuration
+/// order) plus the Cloud pseudo-target when cloud overflow is enabled; 500 (streak service
+/// not registered) reuses the same shape with <c>success: false</c>, <c>error</c> set and
+/// <c>targets</c> omitted.
+/// </summary>
+public sealed record ResetFleetStreaksResponse(
+    [property: JsonPropertyName("success")] bool Success,
+    [property: JsonPropertyName("resetCount")] int ResetCount = 0,
+    // Null (→ omitted) on the 500 error shape; the 200 shape ALWAYS carries the list
+    // (possibly empty).
+    [property: JsonPropertyName("targets")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<ResetFleetStreaksTarget>? Targets = null,
+    [property: JsonPropertyName("error")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Error = null);
+
+// ------------------------------------------------------------------
 //  DTOs: API key management (task #50)
 // ------------------------------------------------------------------

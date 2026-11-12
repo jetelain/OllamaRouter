@@ -1,5 +1,6 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
+using OllamaRouter.Endpoints.RouterApi.Shared;
 using OllamaRouter.Options;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services.Catalog;
@@ -150,6 +151,11 @@ public static class RouterCartographyEndpoints
         var fleetAggregation = serviceProvider.GetService<IFleetAggregationService>();
         var capabilityEngine = serviceProvider.GetService<ModelCapabilityEngine>();
 
+        // Task #95 (failure-streak observability): resolve the shared singleton ONCE (the same
+        // instance the routing middleware gates on); null-tolerant — hosts without the service
+        // degrade to the 0/"Closed"/omitted defaults via FailureStreakWire.Describe.
+        var streakService = serviceProvider.GetService<ITargetFailureStreakService>();
+
         // ---- nodes[] (effective targets in configuration order) ----
         var nodes = new List<CartographyNodeRow>(effectiveTargets.Count + 1);
         foreach (var target in effectiveTargets)
@@ -217,6 +223,11 @@ public static class RouterCartographyEndpoints
                 executionState = null;
             }
 
+            // Task #95: the failure-streak read model (streak / wire circuit state / remaining
+            // cooldown seconds; degraded defaults when the streak service is not registered).
+            var (streak, circuitState, cooldownRemainingSeconds) = FailureStreakWire.Describe(
+                streakService, routingTarget, opt.MaxConsecutiveFailures, opt.FailureStreakCooldownSeconds);
+
             nodes.Add(new CartographyNodeRow(
                 Name: name,
                 Url: target.Url,
@@ -240,7 +251,13 @@ public static class RouterCartographyEndpoints
                     Name: m.Name,
                     SizeVramBytes: m.SizeVramBytes,
                     Quantization: m.QuantizationLevel,
-                    ContextLength: m.ContextLength)).ToArray() ?? []));
+                    ContextLength: m.ContextLength)).ToArray() ?? [],
+                // Task #95: the circuit-breaker read model of the node's failure streak
+                // (FailureStreakWire = the single source of truth shared by fleet / cartography /
+                // monitor).
+                FailureStreak: streak,
+                CircuitState: circuitState,
+                CooldownRemainingSeconds: cooldownRemainingSeconds));
         }
 
         // The Cloud pseudo-target row (last), mirroring the /fleet cloud semantics: never

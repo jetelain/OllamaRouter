@@ -39,6 +39,9 @@ public class TerminalMonitorRendererTests
         string localContext = "-",
         string remoteContext = "-",
         string cloudContext = "-",
+        int localFailureStreak = 0,
+        string localCircuitState = "Closed",
+        double? localCooldownRemainingSeconds = null,
         ActivityStatisticsTotals? todayLocal = null,
         ActivityStatisticsTotals? todayRemote = null,
         ActivityStatisticsTotals? todayCloud = null,
@@ -68,7 +71,15 @@ public class TerminalMonitorRendererTests
 
         var fleet = new List<MonitorFleetTargetItem>
         {
-            FleetItem("Local", "http://localhost:11434", localEnabled, localLiveness, localActiveModel, localInFlight, "16gb", localContext),
+            FleetItem("Local", "http://localhost:11434", localEnabled, localLiveness, localActiveModel, localInFlight, "16gb", localContext)
+                with
+                {
+                    // Task #95: optional failure-streak read model on the Local row (the
+                    // 79-column test renders the streak warning sub-line through this).
+                    FailureStreak = localFailureStreak,
+                    CircuitState = localCircuitState,
+                    CooldownRemainingSeconds = localCooldownRemainingSeconds
+                },
             FleetItem("Remote", "http://192.168.1.2:11434", remoteEnabled, remoteLiveness, remoteActiveModel, remoteInFlight, "16gb", remoteContext)
         };
         // The Cloud pseudo-target is always present and always last.
@@ -645,6 +656,11 @@ public class TerminalMonitorRendererTests
             localActiveModel: "qwen2.5-coder:32b-instruct-q4_K_M",
             localContext: "262k",
             remoteContext: "33k",
+            // Task #95: an active failure streak on the Local row — the widest realistic
+            // sub-line ("   ⚠ Streak 99 · Cooldown 99999s") must still fit the 79-column budget.
+            localFailureStreak: 99,
+            localCircuitState: "Cooldown",
+            localCooldownRemainingSeconds: 99999.0,
             todayLocal: new ActivityStatisticsTotals(120, 450000, 120000),
             todayRemote: new ActivityStatisticsTotals(80, 890000, 340000),
             todayCloud: new ActivityStatisticsTotals(15, 230000, 45000),
@@ -715,6 +731,89 @@ public class TerminalMonitorRendererTests
     {
         // A sixth-ish oddball name beyond the truncation budget.
         return FleetItem($"extra-target-node-{index}-very-long-name", "http://192.168.1.14:11434", true, "Online", null, 0, null, "-");
+    }
+
+    // ------------------------------------------------------------------
+    //  Task #95 — failure-streak warning sub-line in the fleet table
+    // ------------------------------------------------------------------
+
+    private static MonitorStateResponse StreakFleetState()
+    {
+        var fleet = new List<MonitorFleetTargetItem>
+        {
+            FleetItem("Local", "http://localhost:11434", true, "Online", null, 0, "16gb", "-")
+                with { FailureStreak = 4, CircuitState = "Cooldown", CooldownRemainingSeconds = 42.3 },
+            FleetItem("Remote", "http://192.168.1.2:11434", true, "Offline", null, 0, "96gb", "-")
+                with { FailureStreak = 5, CircuitState = "HalfOpen" },
+            FleetItem("Laptop", "http://192.168.1.3:11435", true, "Online", null, 0, "8gb", "-")
+                with { FailureStreak = 2, CircuitState = "Closed" }, // below the threshold (3)
+            FleetItem("Cloud", null, true, "Online", null, 0, null, "-") // clean row: no sub-line
+        };
+
+        return new MonitorStateResponse(
+            CloudEnabled: true,
+            Fleet: fleet,
+            Statistics: new MonitorStatisticsStatus(
+                new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["total"] = new ActivityStatisticsTotals(0, 0, 0)
+                },
+                new Dictionary<string, ActivityStatisticsTotals>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["total"] = new ActivityStatisticsTotals(0, 0, 0)
+                }),
+            InProgress: [],
+            Requests: [],
+            Cost: null,
+            Overhead: null);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Render_Fleet_FailureStreakSubLine_RendersForActiveStreaks_WithTheExactWording(bool enableAnsi)
+    {
+        var rendered = TerminalMonitorRenderer.Render(StreakFleetState(), "http://localhost:11434/monitor", 80, 24, enableAnsi);
+
+        // Cooldown: rounded remaining seconds (42.3 → 42s).
+        Assert.Contains("⚠ Streak 4 · Cooldown 42s", rendered);
+        // HalfOpen: no seconds segment.
+        Assert.Contains("⚠ Streak 5 · HalfOpen", rendered);
+        // Below the threshold (streak > 0, Closed): streak only.
+        Assert.Contains("⚠ Streak 2", rendered);
+
+        // The sub-lines are indented by 3 spaces (they live under the target row, not inside
+        // the table; the ANSI color code follows the indent when enableAnsi).
+        var lines = rendered.Split(["\r\n", "\n"], StringSplitOptions.None);
+        foreach (var line in lines.Where(line => line.Contains("⚠ Streak", StringComparison.Ordinal)))
+        {
+            Assert.StartsWith("   ", line, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void Render_Fleet_FailureStreakSubLine_CooldownIsBrightRed_OthersAreBrightYellow_WithAnsi()
+    {
+        var rendered = TerminalMonitorRenderer.Render(StreakFleetState(), "http://localhost:11434/monitor", 80, 24, enableAnsi: true);
+        var lines = rendered.Split(["\r\n", "\n"], StringSplitOptions.None);
+
+        var cooldownLine = lines.Single(line => line.Contains("⚠ Streak 4", StringComparison.Ordinal));
+        Assert.Contains("\x1b[91m", cooldownLine, StringComparison.Ordinal); // BrightRed
+
+        foreach (var line in lines.Where(line => line.Contains("⚠ Streak 5", StringComparison.Ordinal) || line.Contains("⚠ Streak 2", StringComparison.Ordinal)))
+        {
+            Assert.Contains("\x1b[93m", line, StringComparison.Ordinal); // BrightYellow
+        }
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Render_Fleet_CleanFleet_NeverRendersAFailureStreakSubLine(bool enableAnsi)
+    {
+        var state = CreateSampleState(cloudEnabled: true); // default: streak 0 / "Closed" everywhere
+        var rendered = TerminalMonitorRenderer.Render(state, "http://localhost:11434/monitor", 80, 24, enableAnsi);
+        Assert.DoesNotContain("⚠", rendered, StringComparison.Ordinal);
     }
 
     [Fact]

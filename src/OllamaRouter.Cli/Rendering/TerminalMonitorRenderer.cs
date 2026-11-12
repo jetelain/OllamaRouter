@@ -187,6 +187,33 @@ public static class TerminalMonitorRenderer
             row.Append(' ');
             row.Append(Truncate(item.ContextAllocation ?? "-", 16));
             lines.Add(row.ToString());
+
+            // Task #95 (failure-streak observability): an indented warning sub-line under any
+            // target with an active failure streak or a non-Closed circuit state (no new
+            // column — the 79-display-column contract of the fleet table is untouched). The
+            // sub-line is omitted for clean (streak 0, Closed) rows.
+            if (item.FailureStreak > 0 || !string.Equals(item.CircuitState, "Closed", StringComparison.Ordinal))
+            {
+                var subLine = new StringBuilder("   ");
+                var warningColor = string.Equals(item.CircuitState, "Cooldown", StringComparison.Ordinal)
+                    ? BrightRed
+                    : BrightYellow;
+                if (enableAnsi) subLine.Append(warningColor);
+                // The Cooldown sub-line renders the remaining seconds (rounded, InvariantCulture;
+                // "0" defensively when the value is absent for a Cooldown state).
+                var cooldownSecondsText = item.CooldownRemainingSeconds is { } cooldownRemaining
+                    ? ((int)Math.Round(cooldownRemaining)).ToString(CultureInfo.InvariantCulture)
+                    : "0";
+                var warningText = item.CircuitState switch
+                {
+                    "Cooldown" => $"⚠ Streak {item.FailureStreak} · Cooldown {cooldownSecondsText}s",
+                    "HalfOpen" => $"⚠ Streak {item.FailureStreak} · HalfOpen",
+                    _ => $"⚠ Streak {item.FailureStreak}"
+                };
+                subLine.Append(Truncate(warningText, 40));
+                if (enableAnsi) subLine.Append(Reset);
+                lines.Add(subLine.ToString());
+            }
         }
     }
 

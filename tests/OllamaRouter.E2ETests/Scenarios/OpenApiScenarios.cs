@@ -10,12 +10,13 @@ namespace OllamaRouter.E2ETests.Scenarios;
 ///   built-in generator from the same AOT source-generated DTOs the endpoints use (no drift;
 ///   this doubles as the AOT-published-build smoke check, since the E2E run hits the live
 ///   app produced by the release workflow's PublishAot publish).
-/// Public by default (read-only; the RouterApiKey requirement covers the 13 #50 protected
-/// operations only) — no key is needed for this scenario.
+/// Public by default (read-only; the RouterApiKey requirement covers the 17 default-protected
+/// operations only: the #50 set plus the #66 recommendation writes, the #99 admin shutdown and
+/// the #95 failure-streak reset admin actions) — no key is needed for this scenario.
 /// </summary>
 internal static class OpenApiScenarios
 {
-    /// <summary>The 29 (method, path) operations the document must contain (25 path items).</summary>
+    /// <summary>The 34 (method, path) operations the document must contain (30 path items).</summary>
     private static readonly (string Method, string Path)[] ExpectedOperations =
     [
         ("GET", "/api/router/info"),
@@ -41,6 +42,8 @@ internal static class OpenApiScenarios
         ("POST", "/api/router/targets"),
         ("PUT", "/api/router/targets/{name}"),
         ("DELETE", "/api/router/targets/{name}"),
+        ("POST", "/api/router/targets/{name}/reset-streak"),
+        ("POST", "/api/router/fleet/reset-streaks"),
         ("GET", "/api/router/api-keys"),
         ("POST", "/api/router/api-keys"),
         ("DELETE", "/api/router/api-keys/{name}"),
@@ -50,10 +53,13 @@ internal static class OpenApiScenarios
         ("GET", "/api/router/monitor/sessions"),
         ("GET", "/api/router/monitor/sessions/{sessionId}"),
         ("POST", "/api/router/sessions/affinity/release"),
+        ("GET", "/api/router/recommendations"),
+        ("POST", "/api/router/recommendations/generate"),
+        ("POST", "/api/router/recommendations/apply"),
         ("POST", "/api/router/admin/shutdown")
     ];
 
-    public static Scenario GetRouterOpenApiDocument() => new("Router OpenAPI document /api/router/openapi.json (29 operations, OpenAPI 3.x)", async config =>
+    public static Scenario GetRouterOpenApiDocument() => new("Router OpenAPI document /api/router/openapi.json (34 operations, OpenAPI 3.x)", async config =>
     {
         using var http = new HttpClient { BaseAddress = new Uri(config.RouterUrl) };
 

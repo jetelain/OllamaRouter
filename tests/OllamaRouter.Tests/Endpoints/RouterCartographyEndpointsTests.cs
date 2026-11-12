@@ -273,7 +273,13 @@ public class RouterCartographyEndpointsTests
         builder.Services.AddSingleton(availability.Object);
         builder.Services.AddSingleton(tracker.Object);
         builder.Services.AddMemoryCache();
-        builder.Services.AddSingleton<ITargetFailureStreakService, TargetFailureStreakService>();
+        // Task #95: the failure-streak service. A test may pre-register its OWN instance (e.g.
+        // a deterministic, seedable one) via additionalServices — the LAST registration wins
+        // for ITargetFailureStreakService, so skip the default when one is already present.
+        if (!builder.Services.Any(s => s.ServiceType == typeof(ITargetFailureStreakService)))
+        {
+            builder.Services.AddSingleton<ITargetFailureStreakService, TargetFailureStreakService>();
+        }
 
         if (registerCapabilityStack)
         {
@@ -964,5 +970,94 @@ public class RouterCartographyEndpointsTests
 
         var json2 = JsonSerializer.Serialize(roundTripped, OllamaRouterJsonSerializerContext.Default.RouterCartographyResponse);
         Assert.Equal(json, json2);
+    }
+
+    // ------------------------------------------------------------------
+    //  Task #95 — failure-streak observability on the node rows
+    // ------------------------------------------------------------------
+
+    private static async Task<Harness> StartStreakHarnessAsync(
+        OllamaRouterOptions options,
+        ITargetFailureStreakService streakService)
+    {
+        var catalog = CreateCartographyCatalogMock();
+        // Register the test-owned streak service instance (seeded by the caller before the
+        // request) so the node rows read deterministic streak state.
+        return await CreateTestAppAsync(
+            options, catalog,
+            livenessStates: new Dictionary<RoutingTarget, TargetLivenessState>
+            {
+                [Local] = TargetLivenessState.Online,
+                [Server] = TargetLivenessState.Online,
+                [Laptop] = TargetLivenessState.Online
+            },
+            additionalServices: services => services.AddSingleton<ITargetFailureStreakService>(streakService));
+    }
+
+    [Fact]
+    public async Task Cartography_NodeRows_ExposeFailureStreak_CircuitState_AndCooldownRemainingSeconds()
+    {
+        var options = ThreeTargetOptions(cloudEnabled: true, cloudDefaultModel: CloudModelName);
+        // Default 60 s cooldown: a freshly tripped target is Open ("Cooldown") with ~60 s left.
+        options.FailureStreakCooldownSeconds = 60;
+        var streakService = new TargetFailureStreakService();
+
+        // Trip Server (4 > threshold 3) — record the failure right before the request so the
+        // remaining cooldown is measured against the same wall clock the service uses.
+        for (var i = 0; i < 4; i++)
+        {
+            streakService.RecordFailure(Server);
+        }
+
+        await using var harness = await StartStreakHarnessAsync(options, streakService);
+
+        using var response = await harness.Client.GetAsync("/api/router/cartography");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var root = (JsonObject)JsonNode.Parse(await response.Content.ReadAsStringAsync())!;
+
+        // Tripped node: streak 4, "Cooldown", non-null cooldownRemainingSeconds in a tolerance
+        // band (the handler's remaining-time math uses wall UtcNow — same clock as the service).
+        var serverNode = NodeNode(root, "Server")!;
+        Assert.Equal(4, serverNode["failureStreak"]!.GetValue<int>());
+        Assert.Equal("Cooldown", serverNode["circuitState"]!.GetValue<string>());
+        var remaining = serverNode["cooldownRemainingSeconds"]!.GetValue<double>();
+        Assert.InRange(remaining, 55.0, 60.5);
+
+        // Clean node: streak 0, "Closed", cooldownRemainingSeconds omitted.
+        var localNode = NodeNode(root, "Local")!;
+        Assert.Equal(0, localNode["failureStreak"]!.GetValue<int>());
+        Assert.Equal("Closed", localNode["circuitState"]!.GetValue<string>());
+        Assert.Null(localNode["cooldownRemainingSeconds"]);
+
+        // Cloud pseudo-target node: always the degraded defaults.
+        var cloudNode = NodeNode(root, "Cloud")!;
+        Assert.Equal(0, cloudNode["failureStreak"]!.GetValue<int>());
+        Assert.Equal("Closed", cloudNode["circuitState"]!.GetValue<string>());
+        Assert.Null(cloudNode["cooldownRemainingSeconds"]);
+    }
+
+    [Fact]
+    public async Task Cartography_NodeRows_TrippedTargetWithZeroCooldown_IsHalfOpen_WithoutCooldownRemainingSeconds()
+    {
+        var options = ThreeTargetOptions(cloudEnabled: true, cloudDefaultModel: CloudModelName);
+        // Cooldown 0: the Open window is disabled — a tripped target is IMMEDIATELY HalfOpen.
+        options.FailureStreakCooldownSeconds = 0;
+        var streakService = new TargetFailureStreakService();
+        for (var i = 0; i < 4; i++)
+        {
+            streakService.RecordFailure(Server);
+        }
+
+        await using var harness = await StartStreakHarnessAsync(options, streakService);
+
+        using var response = await harness.Client.GetAsync("/api/router/cartography");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var root = (JsonObject)JsonNode.Parse(await response.Content.ReadAsStringAsync())!;
+
+        var serverNode = NodeNode(root, "Server")!;
+        Assert.Equal(4, serverNode["failureStreak"]!.GetValue<int>());
+        Assert.Equal("HalfOpen", serverNode["circuitState"]!.GetValue<string>());
+        // cooldownRemainingSeconds is present ONLY while in "Cooldown".
+        Assert.Null(serverNode["cooldownRemainingSeconds"]);
     }
 }

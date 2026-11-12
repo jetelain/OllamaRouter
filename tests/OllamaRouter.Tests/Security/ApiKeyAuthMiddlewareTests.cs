@@ -196,6 +196,9 @@ public class ApiKeyAuthMiddlewareTests
     [InlineData("POST", "/api/router/api-keys", """{"name": "ci"}""")]
     [InlineData("DELETE", "/api/router/api-keys/ci", null)]
     [InlineData("POST", "/api/router/api-keys/default/rotate", null)]
+    // Task #95: the failure-streak reset admin actions (key-protected in default mode).
+    [InlineData("POST", "/api/router/targets/Dummy/reset-streak", null)]
+    [InlineData("POST", "/api/router/fleet/reset-streaks", null)]
     public async Task ProtectedRoute_WithoutKey_Returns401_WithWwwAuthenticateAndJsonError(string method, string path, string? body)
     {
         await using var host = await Host.StartAsync();

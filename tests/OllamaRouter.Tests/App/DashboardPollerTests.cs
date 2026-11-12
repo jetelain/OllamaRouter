@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using OllamaRouter.App.ViewModels;
 
 namespace OllamaRouter.Tests.App;
@@ -16,12 +17,26 @@ public sealed class DashboardPollerTests
 
     /// <summary>
     /// A bounded, AWAITING wait loop (no sleep): yields to the scheduler until
-    /// <paramref name="condition"/> holds or the beat budget is exhausted.
+    /// <paramref name="condition"/> holds. The wait is bounded by BOTH the beat budget AND
+    /// the wall-clock <paramref name="maxSeconds"/> deadline (it extends until whichever
+    /// runs out LAST) — a beat budget alone can be exhausted before a co-operative task gets
+    /// scheduled under heavy xUnit parallel-suite load. Negative assertions pass a tight beat
+    /// budget with <paramref name="maxSeconds"/> = 0 to stay fast and deterministic.
     /// </summary>
-    private static async Task WaitUntilAsync(Func<bool> condition, int maxBeats = 10000)
+    private static async Task WaitUntilAsync(Func<bool> condition, int maxBeats = 10000, int maxSeconds = 10)
     {
-        for (var i = 0; i < maxBeats && !condition(); i++)
+        var stopwatch = Stopwatch.StartNew();
+        var beats = 0;
+        while (!condition())
         {
+            var beatsExhausted = beats >= maxBeats;
+            var deadlineExceeded = maxSeconds <= 0 || stopwatch.Elapsed.TotalSeconds >= maxSeconds;
+            if (beatsExhausted && deadlineExceeded)
+            {
+                break;
+            }
+
+            beats++;
             await Task.Yield();
         }
     }
@@ -40,7 +55,7 @@ public sealed class DashboardPollerTests
         Assert.True(ticks >= 1, "the first tick must run immediately");
 
         var afterFirst = ticks;
-        await WaitUntilAsync(() => ticks >= 2, maxBeats: 500);
+        await WaitUntilAsync(() => ticks >= 2, maxBeats: 500, maxSeconds: 0);
         Assert.Equal(afterFirst, ticks); // the gated delay parked the loop — no second tick
         await poller.DisposeAsync();
     }
@@ -115,7 +130,7 @@ public sealed class DashboardPollerTests
         await poller.StartAsync();
         await poller.StartAsync();
         await WaitUntilAsync(() => ticks >= 1);
-        await WaitUntilAsync(() => ticks >= 2, maxBeats: 500);
+        await WaitUntilAsync(() => ticks >= 2, maxBeats: 500, maxSeconds: 0);
 
         Assert.Equal(1, ticks); // exactly one loop ran — the second start was a no-op
         await poller.DisposeAsync();

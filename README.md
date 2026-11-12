@@ -421,7 +421,7 @@ appsettings.json  <  config/config.json  <  user secrets  <  environment variabl
 | `DispatchToLargestCapacityOnOverflow` | When `true` and all enabled fleet targets fail Stage-1 context qualification due to context overflow, the router dispatches the request to the online, capable target with the largest context capacity (`Max(CMax)`) with `options.num_ctx` clamped to that ceiling, rather than rejecting with a 503 error. This clamped local dispatch runs **before** Cloud Overflow is considered: a context-overflowing request is served by the largest-capacity fleet node even when a `CloudModel` is configured — Cloud Overflow is the **terminal fallback**, reached only when this option is `false`, when no fleet target can serve the overflow (offline, disabled, model absent, or hardware incapable), or when every largest-capacity fallback candidate has an active failure streak above `MaxConsecutiveFailures`. Defaults to `true`. |
 | `DynamicContext:Enabled` | Enables dynamic context sizing (MoE two-bucket ladder + dense clamp-only). Defaults to `false`. See [Dynamic context sizing (MoE only)](#dynamic-context-sizing-moe-only). |
 | `DynamicContext:DenseClampEnabled` | When `true` (default), a request on a **dense** model rewrites `options.num_ctx` only when the client's static value exceeds the node's pre-configured context, clamping it down (one-time KV reallocation; OOM protection). Set to `false` for pure dense pass-through. Dense values are never raised, bucketed, or leased. |
-| `MaxConsecutiveFailures` | Number of consecutive failures on a target for adjacent requests within `ConsecutiveFailuresTokenTolerance` before triggering fallback or cloud overflow. Defaults to `3`. Set to `0` to disable automatic target switching. |
+| `MaxConsecutiveFailures` | Number of consecutive failures on a target for adjacent requests within `ConsecutiveFailuresTokenTolerance` before triggering fallback or cloud overflow. Defaults to `3`. Set to `0` to disable automatic target switching. An operator can clear an active streak on demand (no restart) with the key-protected admin endpoints `POST /api/router/targets/{name}/reset-streak` (single target) and `POST /api/router/fleet/reset-streaks` (whole fleet). |
 | `ConsecutiveFailuresTokenTolerance` | Maximum difference in estimated prompt tokens between adjacent requests to consider them part of the same retry streak. Defaults to `4000`. Set to `0` to require an exact match. |
 | `SessionUsageMaxSessions` | Bound of the [per-session usage LRU](#per-session-usage--savings): the maximum number of distinct `X-OllamaRouter-Session-Id` values kept (sessions are best-effort persisted to `session-usage.json` in the same state directory as `activity-statistics.json` — raw counters only, costs stay computed at read time). When a NEW session arrives beyond the cap, the least-recently-active stored session is evicted. Defaults to `1000`. LIVE: a `config/config.json` change takes effect on the next recorded request (a shrunk cap evicts down to the new bound). Non-positive values normalize back to `1000`. |
 | `Recording:Enabled` | Enables the optional [inference request recording](#inference-request-recording-optional), saving each request's metadata and full request body for investigation of estimated vs actual token counts. Defaults to `false`. |
@@ -557,9 +557,13 @@ nThe router's Setup API can edit persistent configuration (fleet targets, hardwa
 | `GET`, `POST` | `/api/router/api-keys` (key management) |
 | `DELETE` | `/api/router/api-keys/{name}` (key management) |
 | `POST` | `/api/router/api-keys/default/rotate` (key management) |
+| `POST` | `/api/router/targets/{name}/reset-streak` (failure-streak reset — admin action) |
+| `POST` | `/api/router/fleet/reset-streaks` (fleet-wide failure-streak reset — admin action) |
 | `POST` | `/api/router/admin/shutdown` (daemon lifecycle — graceful host stop) |
 
-The monitor availability toggle (`POST /targets`) is **not** protected in default mode (runtime state, not persistent config — the browser flow needs no key).
+The monitor availability toggle (`POST /targets`) is **not** protected in default mode (runtime state, not persistent config — the browser flow needs no key). The failure-streak reset endpoints **are** protected: they are admin actions that re-admit failing nodes fleet-wide, but they touch **runtime failure-streak state only** — liveness state, availability toggles and session-affinity leases are untouched, and no config file is written.
+
+**Failure-streak reset** — `POST /api/router/targets/{name}/reset-streak` (key-protected) resets one target's consecutive-failure streak to `0` and clears its circuit-breaker cooldown: `200` with `{"success":true,"target":"...","streak":0,"status":"Closed"}` (the target is immediately routable on the very next routing decision — no restart), `404` for an unknown name (also for `Cloud`), `500` on hosts without the streak service. `POST /api/router/fleet/reset-streaks` (key-protected, no body) does the fleet-wide variant: `200` with `resetCount` and a per-target `previousStreak`/`reset` row for every effective target (plus the Cloud pseudo-target when cloud overflow is enabled); it is idempotent (a second call reports `resetCount: 0`).
 
 **Graceful daemon shutdown** — `POST /api/router/admin/shutdown` (key-protected) returns `202 Accepted` with `{"stopping":true,"processId":...}` and triggers a graceful host stop via `IHostApplicationLifetime.StopApplication()` *after* the response starts flowing: Kestrel stops the listener and drains the in-flight request, so the complete `202` body is always delivered, and the hosted statistics persistence (activity statistics + per-session usage) flushes its in-memory state on `ApplicationStopped`. The daemon also reports its own process telemetry on `GET /api/router/info` (`processId`, `startedAtUtc`, `uptimeSeconds`).
 
@@ -615,14 +619,14 @@ The full router management API is documented as an OpenAPI 3.1 JSON document, ge
 GET {bind-address}/api/router/openapi.json
 ```
 
-e.g. `http://localhost:11434/api/router/openapi.json`. Point any OpenAPI tooling (Swagger Editor, Redoc, code generators) at that URL. The document covers the 32 `/api/router/*` operations in eleven functional groups:
+e.g. `http://localhost:11434/api/router/openapi.json`. Point any OpenAPI tooling (Swagger Editor, Redoc, code generators) at that URL. The document covers the 34 `/api/router/*` operations in eleven functional groups:
 
-- **Identity & Fleet** — `/info`, `/fleet`
+- **Identity & Fleet** — `/info`, `/fleet`, `/fleet/reset-streaks` (POST, key-protected)
 - **Hardware Profiling** — `/hardware`, `/fleet/hardware` (GET + PUT)
 - **Benchmarking** — `/benchmark`, `/benchmark/results`
 - **Model Catalog & Cartography** — `/models`, `/models/{*modelName}`, `/cartography`
 - **Fleet Operations** — `/vram/reclaim`, `/fleet/unload`, `/context/evaluate`, `/models/{*tail}/preload` (POST catch-all), `/preload/preview`
-- **Setup & Configuration** — `/config`, `/targets` (POST/PUT/DELETE)
+- **Setup & Configuration** — `/config`, `/targets` (POST/PUT/DELETE), `/targets/{name}/reset-streak` (POST, key-protected)
 - **API Key Security** — `/api-keys` (GET/POST/DELETE `{name}`), `/api-keys/default/rotate`
 - **Session Usage & Savings** — `/monitor/sessions`, `/monitor/sessions/{*sessionId}`
 - **Session Affinity** — `/sessions/affinity/release` (POST)
@@ -751,6 +755,7 @@ The page shows:
 - A **target usage ratio progress bar** visually breaking down the share of tokens processed by each target (**Local**, **Remote**, and **Cloud**) over the **last 7 days**.
 - **Actual savings and cloud overflow cost** based on the **last 7 days**, displayed whenever a token price rate is configured in `Pricing`. Savings are the **actual** savings of serving requests locally and remotely: per non-Cloud target, the token cloud value minus the target's node electricity cost — `electricityCost = (elapsedSeconds / 3600) × (watts / 1000) × ElectricityPricePerKwh` (defaults: `0.20`/kWh and `150` W when unset; the per-target `PowerWatts` override, then `Pricing:DefaultNodePowerWatts`, then the 150 W default resolve the wattage). Cloud targets never consume router-side electricity (their electricity cost is `0`; the Cloud overflow itself is reported separately as `cloudOverflowCost`). Negative savings (electricity exceeding the cloud value) are reported as-is, not clamped. Cached prompt tokens (a subset of the input tokens, reported by Ollama's `prompt_eval_cached_count` / OpenAI-compatible `usage.prompt_tokens_details.cached_tokens`) are valued at the cached rate when `Pricing:CachedPromptPricePerMillion` is configured (otherwise at the regular input rate), so the per-1M cloud value of a request is `(input − cached) × promptPrice + cached × cachedPrice + output × completionPrice`. The electricity cost (`electricityCost` total + `perTargetElectricityCost` per target) is rendered in the savings card and the TUI cost line. If no token price rate is configured, this section is completely hidden (the electricity price alone never surfaces it).
 - A **live token estimation overhead recommendation** card at the bottom of the page, computed from recent requests by comparing raw estimator token counts against the actual prompt tokens reported by Ollama. It displays the overall observed factor, per-model factors, and the exact recommended value to put in `config/config.json` (or `appsettings.json` factory defaults).
+- **Failure-streak observability** (task #95): the per-target fleet rows of `/monitor/api`, `GET /api/router/fleet` and `GET /api/router/cartography` carry `failureStreak` (the target's current consecutive-failure streak count), `circuitState` (`"Closed"` | `"Cooldown"` | `"HalfOpen"` — `"Cooldown"` is the breaker's Open state: the streak is above `MaxConsecutiveFailures` and the cooldown window is still active, so the target is skipped as a routing candidate) and `cooldownRemainingSeconds` (present **only** while in `"Cooldown"`: the seconds left in the `FailureStreakCooldownSeconds` window). Hosts without the streak service degrade to `0` / `"Closed"` / omitted.
 
 The page auto-refreshes every 2 seconds by polling `/monitor/api`. A clickable link to this page is printed to the console when the router starts (see [Running](#running)).
 
@@ -762,6 +767,7 @@ To monitor traffic without keeping a GPU-accelerated web browser running (which 
 
 It displays the same live information as the monitoring page:
 - Instance states (**Local**, **Remote**, **Cloud**: Idle, Busy, Offline, Disabled);
+- An indented failure-streak warning sub-line under any target with an active streak or a non-`Closed` circuit state — e.g. `⚠ Streak 4 · Cooldown 42s` (red while in cooldown), `⚠ Streak 5 · HalfOpen` or `⚠ Streak 2` (yellow) — omitted for clean targets (the 79-column TUI budget is untouched);
 - Token statistics (**Today** and **Last 7 days**: requests, input tokens, output tokens, totals);
 - Target usage ratio breakdown progress bar and legend (last 7 days);
 - Actual savings (cloud value − node electricity cost, including the electricity readout) and cloud overflow costs (when a token price rate is configured);

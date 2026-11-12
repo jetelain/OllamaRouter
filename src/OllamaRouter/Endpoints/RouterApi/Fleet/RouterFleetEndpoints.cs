@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using OllamaRouter.Middleware;
+using OllamaRouter.Endpoints.RouterApi.Shared;
 using OllamaRouter.Options;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services.Catalog;
@@ -158,6 +159,11 @@ public static class RouterFleetEndpoints
         var sessionAffinity = serviceProvider.GetService<ISessionAffinityService>();
         var reservationWindow = TimeSpan.FromSeconds(Math.Max(0, opt.SessionReservationWindowSeconds));
 
+        // Task #95 (failure-streak observability): resolve the shared singleton ONCE (the same
+        // instance the routing middleware gates on); null-tolerant — hosts without the service
+        // degrade to the 0/"Closed"/omitted defaults via FailureStreakWire.Describe.
+        var streakService = serviceProvider.GetService<ITargetFailureStreakService>();
+
         var targets = new List<RouterTargetItem>(effectiveTargets.Count + 1);
         foreach (var target in effectiveTargets)
         {
@@ -202,6 +208,11 @@ public static class RouterFleetEndpoints
             // Task #45: the CONFIGURED (router-owned) effective preload keep-alive policy + source
             // (shared single source of truth with the preload load path).
             var preloadResolution = PreloadKeepAlivePolicy.ResolvePreloadKeepAlive(target, opt, fleetHardware);
+
+            // Task #95: the failure-streak read model (streak / wire circuit state / remaining
+            // cooldown seconds; degraded defaults when the streak service is not registered).
+            var (streak, circuitState, cooldownRemainingSeconds) = FailureStreakWire.Describe(
+                streakService, routingTarget, opt.MaxConsecutiveFailures, opt.FailureStreakCooldownSeconds);
 
             // speedFactor: always present; null when the effective factor is 1.0 (unset/default),
             // consistent with maxVramMB's nullable semantics.
@@ -268,7 +279,13 @@ public static class RouterFleetEndpoints
                     ActiveKeepAliveSeconds: activeKeepAliveSeconds),
                 Preload: new RouterTargetPreload(
                     KeepAliveSeconds: preloadResolution.Seconds,
-                    KeepAliveSource: preloadResolution.Source)));
+                    KeepAliveSource: preloadResolution.Source),
+                // Task #95: the circuit-breaker read model of the target's failure streak
+                // (FailureStreakWire = the single source of truth shared by fleet / cartography /
+                // monitor).
+                FailureStreak: streak,
+                CircuitState: circuitState,
+                CooldownRemainingSeconds: cooldownRemainingSeconds));
         }
 
         // The Cloud pseudo-target is never probed/tracked: it is "Online" iff cloud is

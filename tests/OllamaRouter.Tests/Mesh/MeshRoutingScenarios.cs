@@ -29,8 +29,15 @@ public class MeshRoutingScenarios
         var r2 = await fleet.CreateRouterAsync("R2");
         await MeshTestHelpers.WarmupAsync(r1, MeshCatalog.MoeModel);
         await MeshTestHelpers.WarmupAsync(r2, MeshCatalog.MoeModel);
-        await MeshTestHelpers.WaitAllOnlineAsync(r1, TimeSpan.FromSeconds(5));
-        await MeshTestHelpers.WaitAllOnlineAsync(r2, TimeSpan.FromSeconds(5));
+        // All fleet targets must be Online before the scenario assertions: under heavy CI
+        // load the liveness probes can lag, and failing loudly here beats a racy downstream
+        // assertion (the helper returns whether all targets came up).
+        Assert.True(
+            await MeshTestHelpers.WaitAllOnlineAsync(r1, TimeSpan.FromSeconds(10)),
+            "router R1 must see every fleet target Online");
+        Assert.True(
+            await MeshTestHelpers.WaitAllOnlineAsync(r2, TimeSpan.FromSeconds(10)),
+            "router R2 must see every fleet target Online");
 
         // Config invariant: each router's targets resolve ONLY to the physical daemons' ports
         // — a peer router's port must never be a configured destination (loop-free by
@@ -80,8 +87,15 @@ public class MeshRoutingScenarios
         var r2 = await fleet.CreateRouterAsync("R2");
         await MeshTestHelpers.WarmupAsync(r1, MeshCatalog.MoeModel);
         await MeshTestHelpers.WarmupAsync(r2, MeshCatalog.MoeModel);
-        await MeshTestHelpers.WaitAllOnlineAsync(r1, TimeSpan.FromSeconds(5));
-        await MeshTestHelpers.WaitAllOnlineAsync(r2, TimeSpan.FromSeconds(5));
+        // All fleet targets must be Online before the scenario assertions: under heavy CI
+        // load the liveness probes can lag, and failing loudly here beats a racy downstream
+        // assertion (the helper returns whether all targets came up).
+        Assert.True(
+            await MeshTestHelpers.WaitAllOnlineAsync(r1, TimeSpan.FromSeconds(10)),
+            "router R1 must see every fleet target Online");
+        Assert.True(
+            await MeshTestHelpers.WaitAllOnlineAsync(r2, TimeSpan.FromSeconds(10)),
+            "router R2 must see every fleet target Online");
         fleet.ResetObservation();
 
         const int total = 12;
@@ -114,8 +128,15 @@ public class MeshRoutingScenarios
         var r2 = await fleet.CreateRouterAsync("R2");
         await MeshTestHelpers.WarmupAsync(r1, MeshCatalog.MoeModel);
         await MeshTestHelpers.WarmupAsync(r2, MeshCatalog.MoeModel);
-        await MeshTestHelpers.WaitAllOnlineAsync(r1, TimeSpan.FromSeconds(5));
-        await MeshTestHelpers.WaitAllOnlineAsync(r2, TimeSpan.FromSeconds(5));
+        // All fleet targets must be Online before the scenario assertions: under heavy CI
+        // load the liveness probes can lag, and failing loudly here beats a racy downstream
+        // assertion (the helper returns whether all targets came up).
+        Assert.True(
+            await MeshTestHelpers.WaitAllOnlineAsync(r1, TimeSpan.FromSeconds(10)),
+            "router R1 must see every fleet target Online");
+        Assert.True(
+            await MeshTestHelpers.WaitAllOnlineAsync(r2, TimeSpan.FromSeconds(10)),
+            "router R2 must see every fleet target Online");
 
         const int batch = 8;
         const int rounds = 3; // 24 total, 4 in flight per router at once
@@ -154,8 +175,15 @@ public class MeshRoutingScenarios
         var r2 = await fleet.CreateRouterAsync("R2");
         await MeshTestHelpers.WarmupAsync(r1, MeshCatalog.MoeModel);
         await MeshTestHelpers.WarmupAsync(r2, MeshCatalog.MoeModel);
-        await MeshTestHelpers.WaitAllOnlineAsync(r1, TimeSpan.FromSeconds(5));
-        await MeshTestHelpers.WaitAllOnlineAsync(r2, TimeSpan.FromSeconds(5));
+        // All fleet targets must be Online before the scenario assertions: under heavy CI
+        // load the liveness probes can lag, and failing loudly here beats a racy downstream
+        // assertion (the helper returns whether all targets came up).
+        Assert.True(
+            await MeshTestHelpers.WaitAllOnlineAsync(r1, TimeSpan.FromSeconds(10)),
+            "router R1 must see every fleet target Online");
+        Assert.True(
+            await MeshTestHelpers.WaitAllOnlineAsync(r2, TimeSpan.FromSeconds(10)),
+            "router R2 must see every fleet target Online");
         fleet.ResetObservation();
 
         // Keep the other router busy while each router's aggregation endpoints are queried.

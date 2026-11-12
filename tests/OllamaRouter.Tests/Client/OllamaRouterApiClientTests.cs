@@ -338,7 +338,7 @@ public sealed class OllamaRouterApiClientTests : IDisposable
         Assert.True(handler.Requests.Count <= 1, $"expected no retry, got {handler.Requests.Count} requests");
     }
 
-    // ------------------------------------------------- 28-method route-table round-trip
+    // ------------------------------------------------- 30-method route-table round-trip
 
     [Theory]
     [InlineData("GetInfoAsync")]
@@ -358,6 +358,8 @@ public sealed class OllamaRouterApiClientTests : IDisposable
     [InlineData("AddTargetAsync")]
     [InlineData("UpdateTargetAsync")]
     [InlineData("DeleteTargetAsync")]
+    [InlineData("ResetTargetStreakAsync")]
+    [InlineData("ResetFleetStreaksAsync")]
     [InlineData("StartBenchmarkAsync")]
     [InlineData("GetBenchmarkResultsAsync")]
     [InlineData("ClearBenchmarkResultsAsync")]
@@ -623,6 +625,35 @@ public sealed class OllamaRouterApiClientTests : IDisposable
                 var r = (DeleteTargetResponse)result!;
                 Assert.True(r.Success);
                 Assert.Equal("target deleted: Edge", r.Message);
+            }),
+
+        ["ResetTargetStreakAsync"] = new(
+            "POST", "/api/router/targets/Edge/reset-streak", null, null, HttpStatusCode.OK,
+            ResetTargetStreakResponseJson,
+            async client => await client.ResetTargetStreakAsync("Edge"),
+            result =>
+            {
+                var r = (ResetTargetStreakResponse)result!;
+                Assert.True(r.Success);
+                Assert.Equal("Edge", r.Target);
+                Assert.Equal(0, r.Streak);
+                Assert.Equal("Closed", r.Status);
+            }),
+
+        ["ResetFleetStreaksAsync"] = new(
+            "POST", "/api/router/fleet/reset-streaks", null, null, HttpStatusCode.OK,
+            ResetFleetStreaksResponseJson,
+            async client => await client.ResetFleetStreaksAsync(),
+            result =>
+            {
+                var r = (ResetFleetStreaksResponse)result!;
+                Assert.True(r.Success);
+                Assert.Equal(1, r.ResetCount);
+                Assert.Equal(2, r.Targets!.Count);
+                Assert.Equal(4, r.Targets[0].PreviousStreak);
+                Assert.True(r.Targets[0].Reset);
+                Assert.Equal(0, r.Targets[1].PreviousStreak);
+                Assert.False(r.Targets[1].Reset);
             }),
 
         ["StartBenchmarkAsync"] = new(
@@ -915,6 +946,16 @@ public sealed class OllamaRouterApiClientTests : IDisposable
 
     private const string DeleteTargetResponseJson =
         """{"success":true,"message":"target deleted: Edge"}""";
+
+    private const string ResetTargetStreakResponseJson =
+        """{"success":true,"target":"Edge","streak":0,"status":"Closed"}""";
+
+    private const string ResetFleetStreaksResponseJson =
+        """
+        {"success":true,"resetCount":1,
+         "targets":[{"target":"Edge","previousStreak":4,"reset":true},
+                     {"target":"Local","previousStreak":0,"reset":false}]}
+        """;
 
     private const string BenchmarkRunJson =
         """{"started":true,"queuedTargets":["Desktop","Server"]}""";

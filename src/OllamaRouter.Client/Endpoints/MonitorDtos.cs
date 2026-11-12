@@ -119,7 +119,15 @@ public sealed record MonitorFleetTargetItem(
     // Best-effort daemon-observed keep_alive (seconds; -1 = indefinitely) of the FIRST resident
     // model from the existing /api/ps refresh; null (→ omitted) when absent or no model is
     // resident. Deliberately distinct from the configured KeepAliveSeconds above.
-    [property: JsonPropertyName("activeKeepAliveSeconds")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? ActiveKeepAliveSeconds = null);
+    [property: JsonPropertyName("activeKeepAliveSeconds")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] int? ActiveKeepAliveSeconds = null,
+    // Task #95 (failure-streak observability): the circuit-breaker read model of the target's
+    // consecutive-failure streak (task #94 service): the live streak count, the wire circuit
+    // state ("Closed"/"Cooldown"/"HalfOpen" — "Cooldown" = the breaker's Open state: tripped
+    // + cooldown window active) and the remaining cooldown seconds (present ONLY while in
+    // "Cooldown"; omitted for "Closed"/"HalfOpen" and for hosts without the streak service).
+    [property: JsonPropertyName("failureStreak")] int FailureStreak = 0,
+    [property: JsonPropertyName("circuitState")] string CircuitState = "Closed",
+    [property: JsonPropertyName("cooldownRemainingSeconds")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] double? CooldownRemainingSeconds = null);
 
 public sealed record MonitorStateResponse(
     [property: JsonPropertyName("cloudEnabled")] bool CloudEnabled,

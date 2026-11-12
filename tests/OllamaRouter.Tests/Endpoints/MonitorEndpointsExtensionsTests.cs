@@ -28,7 +28,8 @@ public class MonitorEndpointsExtensionsTests
         OllamaRouterOptions? options = null,
         ITargetLivenessService? liveness = null,
         ITargetExecutionTracker? executionTracker = null,
-        IContextAutoShrinkManager? contextShrinkManager = null)
+        IContextAutoShrinkManager? contextShrinkManager = null,
+        ITargetFailureStreakService? streakService = null)
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseUrls("http://127.0.0.1:0");
@@ -97,6 +98,12 @@ public class MonitorEndpointsExtensionsTests
         if (contextShrinkManager != null)
         {
             builder.Services.AddSingleton(contextShrinkManager);
+        }
+        // Task #95: the failure-streak service (test-owned instance for seedable, deterministic
+        // streak state; null = the /monitor/api degraded 0/"Closed"/omitted defaults).
+        if (streakService != null)
+        {
+            builder.Services.AddSingleton(streakService);
         }
 
         var app = builder.Build();
@@ -1696,6 +1703,81 @@ public class MonitorEndpointsExtensionsTests
             Assert.Equal("true", req["reasoningEffort"]?.GetValue<string>());
             Assert.Equal("s1", req["sessionId"]?.GetValue<string>());
             Assert.Null(req["agentId"]); // null value ⇒ property omitted from JSON
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    //  Task #95 — failure-streak observability on the /monitor/api fleet rows
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task MonitorApi_FleetRows_ExposeFailureStreakCircuitStateAndCooldownRemainingSeconds()
+    {
+        var options = new OllamaRouterOptions
+        {
+            LocalUrl = "http://127.0.0.1:11435",
+            MaxConsecutiveFailures = 3, // default 60 s cooldown
+            FailureStreakCooldownSeconds = 60
+        };
+        var streakService = new TargetFailureStreakService();
+        for (var i = 0; i < 4; i++)
+        {
+            streakService.RecordFailure(RoutingTarget.Local); // 4 > 3 ⇒ tripped (Open/"Cooldown")
+        }
+
+        var (app, client, _) = await CreateTestAppAsync(options: options, streakService: streakService);
+        try
+        {
+            var response = await client.GetAsync("/monitor/api");
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var json = (JsonObject)JsonNode.Parse(await response.Content.ReadAsStringAsync())!;
+            var fleet = json["fleet"]!.AsArray();
+
+            // Tripped row: streak 4, "Cooldown", remaining seconds in a tolerance band (the
+            // handler measures against the same wall clock the service stamps).
+            var local = fleet[0]!;
+            Assert.Equal(4, local["failureStreak"]!.GetValue<int>());
+            Assert.Equal("Cooldown", local["circuitState"]!.GetValue<string>());
+            var remaining = local["cooldownRemainingSeconds"]!.GetValue<double>();
+            Assert.InRange(remaining, 55.0, 60.5);
+
+            // Cloud pseudo-target row: always the degraded defaults.
+            var cloud = fleet[1]!;
+            Assert.Equal("Cloud", cloud["name"]?.GetValue<string>());
+            Assert.Equal(0, cloud["failureStreak"]!.GetValue<int>());
+            Assert.Equal("Closed", cloud["circuitState"]!.GetValue<string>());
+            Assert.Null(cloud["cooldownRemainingSeconds"]);
+        }
+        finally
+        {
+            await app.StopAsync();
+            await app.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task MonitorApi_FleetRows_NoStreakService_DegradeToClosedDefaults()
+    {
+        var (app, client, _) = await CreateTestAppAsync(); // no ITargetFailureStreakService registered
+        try
+        {
+            var response = await client.GetAsync("/monitor/api");
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var json = (JsonObject)JsonNode.Parse(await response.Content.ReadAsStringAsync())!;
+
+            // Every fleet row degrades to 0 / "Closed" / omitted cooldownRemainingSeconds.
+            foreach (var row in json["fleet"]!.AsArray())
+            {
+                Assert.NotNull(row);
+                Assert.Equal(0, row!["failureStreak"]!.GetValue<int>());
+                Assert.Equal("Closed", row["circuitState"]!.GetValue<string>());
+                Assert.Null(row["cooldownRemainingSeconds"]);
+            }
         }
         finally
         {

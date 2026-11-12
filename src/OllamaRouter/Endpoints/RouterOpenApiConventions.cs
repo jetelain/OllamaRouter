@@ -29,11 +29,11 @@ namespace OllamaRouter.Endpoints;
 /// <c>HttpJsonOptions</c>) and is served at exactly <c>GET /api/router/openapi.json</c>
 /// (document name <see cref="DocumentName"/> + the <c>{documentName}</c> route parameter).
 /// <para>
-/// Scope: the 32 <c>/api/router/*</c> management operations ONLY (monitor, Ollama-compatible
+/// Scope: the 34 <c>/api/router/*</c> management operations ONLY (monitor, Ollama-compatible
 /// hybrid and YARP routes are excluded via <see cref="OpenApiOptions.ShouldInclude"/>, and the
 /// document endpoint's own template route is dropped). The security requirement is derived by
 /// calling the production <see cref="ApiSecurityPolicy.IsProtectedRoute"/> on each route
-/// template, so the document can never drift from the enforced set (15 protected operations
+/// template, so the document can never drift from the enforced set (17 protected operations
 /// in default mode; <c>ApiSecurity.RequireKeyForAllEndpoints: true</c> protects every route).
 /// </para>
 /// <para>
@@ -236,7 +236,7 @@ internal static class RouterOpenApiDocumentTransformer
         }
 
         // Security: derived from the PRODUCTION policy called with the route template (the
-        // single-segment logic matches template segments; exactly 15 of the 32 operations
+        // single- and two-segment logic match their templates; exactly 17 of the 34 operations
         // match). A 401 response is documented on exactly those operations.
         if (ApiSecurityPolicy.IsProtectedRoute(method, path))
         {
@@ -478,6 +478,19 @@ internal static class RouterOpenApiDocumentTransformer
                     ("200", typeof(DeleteTargetResponse), "Target removed (success:true)."),
                     ("404", typeof(DeleteTargetResponse), "target not found: {name} (success:false)."),
                     ("500", typeof(DeleteTargetResponse), "Persistence failure (success:false, NO in-memory change).")
+                ]),
+
+            ["POST /api/router/targets/*/reset-streak"] = new(typeof(ResetTargetStreakResponse),
+                responses:
+                [
+                    ("200", typeof(ResetTargetStreakResponse), "Streak reset: streak 0 and status \"Closed\" — the target is immediately routable on the next routing decision (no restart, no config write; liveness / availability / leases untouched)."),
+                    ("404", typeof(ResetTargetStreakResponse), "target not found: {name} (success:false; also for the 'Cloud' pseudo-target, checked before the streak-service availability).")
+                ]),
+
+            ["POST /api/router/fleet/reset-streaks"] = new(typeof(ResetFleetStreaksResponse),
+                responses:
+                [
+                    ("200", typeof(ResetFleetStreaksResponse), "Fleet-wide streak reset: resetCount = the number of targets whose previousStreak was above zero, plus the per-target previousStreak/reset rows (effective targets in configuration order, Cloud pseudo-target last when cloud overflow is enabled; idempotent — a second call reports resetCount 0).")
                 ]),
 
             ["GET /api/router/api-keys"] = new(typeof(ApiKeysListResponse),

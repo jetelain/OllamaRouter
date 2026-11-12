@@ -28,6 +28,9 @@ public class ApiSecurityPolicyTests
     [InlineData("DELETE", "/api/router/api-keys/{name}")]
     [InlineData("POST", "/api/router/api-keys/default/rotate")]
     [InlineData("POST", "/api/router/admin/shutdown")]
+    // Task #95: the failure-streak reset admin actions (key-protected in default mode).
+    [InlineData("POST", "/api/router/fleet/reset-streaks")]
+    [InlineData("POST", "/api/router/targets/{name}/reset-streak")]
     public void IsProtectedRoute_DefaultSet_IncludesConfigAffectingRoutes(string method, string path)
     {
         Assert.True(ApiSecurityPolicy.IsProtectedRoute(method, path), $"{method} {path} must be protected");
@@ -41,6 +44,16 @@ public class ApiSecurityPolicyTests
     public void IsProtectedRoute_TemplateRoutes_MatchSingleSegmentParameterization(string method, string path)
     {
         Assert.True(ApiSecurityPolicy.IsProtectedRoute(method, path), $"{method} {path} must be protected");
+    }
+
+    [Theory]
+    [InlineData("POST", "/api/router/targets/Local/reset-streak")]
+    [InlineData("POST", "/api/router/targets/remote-node/reset-streak")]
+    [InlineData("post", "/api/router/targets/LOCAL/RESET-STREAK")] // case-insensitive name + suffix
+    [InlineData("POST", "/api/router/targets/Local/reset-streak/")] // trailing slash (endpoint-routing semantics)
+    public void IsProtectedRoute_ResetStreakTemplate_MatchesTwoSegmentParameterization(string method, string path)
+    {
+        Assert.True(ApiSecurityPolicy.IsProtectedRoute(method, path), $"{method} {path} must be protected (task #95)");
     }
 
     [Theory]
@@ -107,7 +120,7 @@ public class ApiSecurityPolicyTests
     [InlineData("GET", "/api/router/targets")]
     [InlineData("PUT", "/api/router/targets")]
     [InlineData("DELETE", "/api/router/targets")]
-    [InlineData("POST", "/api/router/targets/alpha")]
+    [InlineData("POST", "/api/router/targets/alpha")] // one segment: the reset-streak suffix is absent
     [InlineData("GET", "/api/router/targets/alpha")]
     [InlineData("GET", "/api/router/fleet/hardware/Peer")]
     [InlineData("DELETE", "/api/router/fleet/hardware/Peer")]
@@ -118,7 +131,13 @@ public class ApiSecurityPolicyTests
     [InlineData("DELETE", "/api/router/api-keys/default/rotate")]
     [InlineData("GET", "/api/router/api-keys/default/rotate")]
     [InlineData("POST", "/api/router/api-keys/name")]
-    [InlineData("DELETE", "/api/router/api-keys/name/sub")] // two segments: no single-segment match
+    [InlineData("POST", "/api/router/api-keys/name/sub")] // two segments: no single-segment match
+    [InlineData("GET", "/api/router/targets/alpha/reset-streak")] // wrong method on the #95 template
+    [InlineData("POST", "/api/router/targets/reset-streak")] // one segment: no two-segment match
+    [InlineData("POST", "/api/router/targets/alpha/reset-streak/deeper")] // three segments: no two-segment match
+    [InlineData("POST", "/api/router/fleet/reset-streak")] // wrong path (no -s)
+    [InlineData("GET", "/api/router/fleet/reset-streaks")] // wrong method on the #95 fleet route
+    [InlineData("DELETE", "/api/router/fleet/reset-streaks")] // wrong method on the #95 fleet route
     [InlineData("GET", "/api/router/unknown")]
     [InlineData("GET", "/api/router/admin/shutdown")] // wrong method on the admin route
     [InlineData("POST", "/api/router/admin/other")] // unknown path under the admin prefix

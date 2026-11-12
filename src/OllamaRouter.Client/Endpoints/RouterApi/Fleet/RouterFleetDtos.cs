@@ -18,7 +18,15 @@ public sealed record RouterTargetItem(
     // Task #45 (residency visibility): the CONFIGURED (router-owned) effective preload keep-alive
     // policy and its source discriminator; null (→ omitted from the JSON) for the Cloud
     // pseudo-target, which has no OllamaTargetOptions and never hosts models.
-    [property: JsonPropertyName("preload")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] RouterTargetPreload? Preload = null);
+    [property: JsonPropertyName("preload")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] RouterTargetPreload? Preload = null,
+    // Task #95 (failure-streak observability): the circuit-breaker read model of the target's
+    // consecutive-failure streak (task #94 service): the live streak count, the wire circuit
+    // state ("Closed"/"Cooldown"/"HalfOpen" — "Cooldown" = the breaker's Open state: tripped
+    // + cooldown window active) and the remaining cooldown seconds (present ONLY while in
+    // "Cooldown"; omitted for "Closed"/"HalfOpen" and for hosts without the streak service).
+    [property: JsonPropertyName("failureStreak")] int FailureStreak = 0,
+    [property: JsonPropertyName("circuitState")] string CircuitState = "Closed",
+    [property: JsonPropertyName("cooldownRemainingSeconds")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] double? CooldownRemainingSeconds = null);
 
 /// <summary>
 /// The CONFIGURED (router-owned) effective preload keep-alive policy of a fleet target

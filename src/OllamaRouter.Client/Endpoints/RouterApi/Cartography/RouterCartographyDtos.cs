@@ -34,7 +34,15 @@ public sealed record CartographyNodeRow(
     [property: JsonPropertyName("loadedModels")] IReadOnlyList<CartographyNodeLoadedModel> LoadedModels,
     [property: JsonPropertyName("url")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Url = null,
     [property: JsonPropertyName("lastRefreshedAtUtc")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] DateTimeOffset? LastRefreshedAtUtc = null,
-    [property: JsonPropertyName("hardware")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] CartographyNodeHardware? Hardware = null);
+    [property: JsonPropertyName("hardware")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] CartographyNodeHardware? Hardware = null,
+    // Task #95 (failure-streak observability): the circuit-breaker read model of the node's
+    // consecutive-failure streak (task #94 service): the live streak count, the wire circuit
+    // state ("Closed"/"Cooldown"/"HalfOpen" — "Cooldown" = the breaker's Open state: tripped
+    // + cooldown window active) and the remaining cooldown seconds (present ONLY while in
+    // "Cooldown"; omitted for "Closed"/"HalfOpen" and for hosts without the streak service).
+    [property: JsonPropertyName("failureStreak")] int FailureStreak = 0,
+    [property: JsonPropertyName("circuitState")] string CircuitState = "Closed",
+    [property: JsonPropertyName("cooldownRemainingSeconds")][property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] double? CooldownRemainingSeconds = null);
 
 /// <summary>Hardware summary of one cartography node (strictly numeric MB).</summary>
 public sealed record CartographyNodeHardware(
