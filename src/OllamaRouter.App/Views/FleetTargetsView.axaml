@@ -1,5 +1,6 @@
 <UserControl xmlns="https://github.com/avaloniaui"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:views="using:OllamaRouter.App.Views"
              xmlns:vm="using:OllamaRouter.App.ViewModels"
              x:Class="OllamaRouter.App.Views.FleetTargetsView"
              x:DataType="vm:FleetTargetsViewModel">
@@ -8,50 +9,65 @@
       <TextBlock Text="{Binding LastError}" Foreground="#FF7B7B" TextWrapping="Wrap" IsVisible="{Binding IsErrorVisible}"/>
       <StackPanel Orientation="Horizontal" Spacing="8">
         <Button Content="Refresh" Command="{Binding RefreshCommand}"/>
-        <Button Content="Add Target" Click="OnAddTargetClick"/>
+        <Button Content="Add Target" Classes="Primary" Click="OnAddTargetClick"/>
       </StackPanel>
 
       <ItemsControl ItemsSource="{Binding Rows}">
         <ItemsControl.ItemTemplate>
           <DataTemplate>
-            <Border Margin="0,0,0,8" Padding="8" Background="#161B22" CornerRadius="6">
-              <StackPanel Spacing="6">
+            <Border Margin="0,0,0,10" Padding="12" Theme="{DynamicResource CardBorder}">
+              <StackPanel Spacing="8">
                 <!-- Row header: identity + liveness + persisted enablement + actions -->
-                <Grid ColumnDefinitions="160,80,90,*,90,auto" ColumnSpacing="8">
-                  <TextBlock Grid.Column="0" Text="{Binding Name}" FontWeight="Bold"/>
-                  <TextBlock Grid.Column="1" Text="{Binding Liveness}"/>
-                  <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="4">
+                <Grid ColumnDefinitions="180,80,90,*,90,auto" ColumnSpacing="8">
+                  <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                    <TextBlock Text="{Binding Name, Converter={x:Static views:TargetEmojiConverter.Instance}}"
+                               FontFamily="Segoe UI Emoji, Apple Color Emoji" VerticalAlignment="Center"/>
+                    <TextBlock Text="{Binding Name, Converter={x:Static views:TargetNameConverter.Instance}}"
+                               Foreground="{Binding Location, Converter={x:Static views:TargetBrushConverter.Instance}}"
+                               FontWeight="Bold" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+                  </StackPanel>
+                  <TextBlock Grid.Column="1" Text="{Binding Liveness}" VerticalAlignment="Center"/>
+                  <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
                     <CheckBox IsChecked="{Binding Enabled, Mode=OneWay}" IsHitTestVisible="False" VerticalAlignment="Center"/>
                     <Button Content="Persist" Click="OnTogglePersistedClick"
                             Tag="{Binding}" ToolTip.Tip="Toggle the persisted (config) enablement flag"/>
                   </StackPanel>
-                  <StackPanel Grid.Column="3" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
-                    <TextBlock Text="{Binding Type}" Opacity="0.8"/>
-                    <TextBlock Text="{Binding Provider}" Opacity="0.8"/>
-                    <TextBlock Text="{Binding Url}" Opacity="0.7" TextTrimming="CharacterEllipsis" MaxWidth="300"/>
-                    <TextBlock Text="{Binding ApiKeyConfigured, StringFormat='key: {0}'}" Opacity="0.7"/>
+                  <StackPanel Grid.Column="3" Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+                    <Border Theme="{DynamicResource TagBorder}" Padding="6,2" CornerRadius="4">
+                      <StackPanel Orientation="Horizontal" Spacing="4">
+                        <TextBlock Text="{Binding Location, Converter={x:Static views:TargetEmojiConverter.Instance}}"
+                                   FontFamily="Segoe UI Emoji, Apple Color Emoji" FontSize="11" VerticalAlignment="Center"/>
+                        <TextBlock Text="{Binding Location, Converter={x:Static views:TargetNameConverter.Instance}}"
+                                   Foreground="{Binding Location, Converter={x:Static views:TargetBrushConverter.Instance}}"
+                                   FontSize="11" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                      </StackPanel>
+                    </Border>
+                    <TextBlock Text="{Binding Type}" Foreground="{DynamicResource SemiColorText2}"/>
+                    <TextBlock Text="{Binding Provider}" Foreground="{DynamicResource SemiColorText2}"/>
+                    <TextBlock Text="{Binding Url}" Foreground="{DynamicResource SemiColorText2}" TextTrimming="CharacterEllipsis" MaxWidth="300"/>
+                    <TextBlock Text="{Binding ApiKeyConfigured, StringFormat='key: {0}'}" Foreground="{DynamicResource SemiColorText2}"/>
                   </StackPanel>
                   <TextBlock Grid.Column="4" Text="{Binding ResidentModels.Count}"
                              ToolTip.Tip="Resident models" VerticalAlignment="Center"/>
                   <StackPanel Grid.Column="5" Orientation="Horizontal" Spacing="6">
                     <Button Content="Edit" Click="OnEditTargetClick" Tag="{Binding}"/>
-                    <Button Content="Delete" Click="OnDeleteTargetClick" Tag="{Binding}"/>
+                    <Button Content="Delete" Classes="Danger" Click="OnDeleteTargetClick" Tag="{Binding}"/>
                   </StackPanel>
                 </Grid>
 
                 <!-- Effective values (READ-ONLY: no wire API persists them) -->
-                <StackPanel Orientation="Horizontal" Spacing="12" Opacity="0.85">
+                <StackPanel Orientation="Horizontal" Spacing="12">
                   <TextBlock Text="{Binding SpeedFactor, StringFormat='SpeedFactor: {0:0.###}'}"/>
                   <TextBlock Text="{Binding MaxVramMB, StringFormat='MaxVramMB: {0}'}"/>
                   <TextBlock Text="{Binding MaxParallel, StringFormat='MaxParallel: {0}'}"/>
                   <TextBlock Text="{Binding EffectiveKeepAliveSeconds, StringFormat='KeepAlive: {0}s'}"/>
-                  <TextBlock Text="{Binding KeepAliveSource, StringFormat='({0})'}" Opacity="0.6"/>
+                  <TextBlock Text="{Binding KeepAliveSource, StringFormat='({0})'}" Foreground="{DynamicResource SemiColorText2}"/>
                   <TextBlock Text="{Binding PowerWatts, StringFormat='Power: {0:0.#} W'}"/>
-                  <TextBlock Text="{Binding HardwareHint}" Opacity="0.6"/>
+                  <TextBlock Text="{Binding HardwareHint}" Foreground="{DynamicResource SemiColorText2}"/>
                 </StackPanel>
 
                 <!-- Declared models roster -->
-                <TextBlock Text="{Binding ModelsCount, StringFormat='Declared models: {0}'}" Opacity="0.7"/>
+                <TextBlock Text="{Binding ModelsCount, StringFormat='Declared models: {0}'}" Foreground="{DynamicResource SemiColorText2}"/>
 
                 <!-- Hardware profile inspector -->
                 <Expander Header="{Binding HardwareSource, StringFormat='Hardware profile ({0})'}">

@@ -7,42 +7,64 @@
         Title="OllamaRouter"
         Width="1280" Height="800"
         MinWidth="960" MinHeight="600">
+  <Window.DataTemplates>
+    <DataTemplate DataType="vm:MonitorViewModel">
+      <views:MonitorView/>
+    </DataTemplate>
+    <DataTemplate DataType="vm:FleetTargetsViewModel">
+      <views:FleetTargetsView/>
+    </DataTemplate>
+    <DataTemplate DataType="vm:CartographyViewModel">
+      <views:CartographyView/>
+    </DataTemplate>
+    <DataTemplate DataType="vm:SettingsViewModel">
+      <views:SettingsView/>
+    </DataTemplate>
+  </Window.DataTemplates>
+
   <DockPanel>
-    <!-- Connection bar -->
-    <Border DockPanel.Dock="Top" Padding="8" BorderBrush="#333" BorderThickness="0,0,0,1">
-      <StackPanel Spacing="6">
-        <StackPanel Orientation="Horizontal" Spacing="8">
-          <TextBlock Text="{Binding StatusText}" FontWeight="Bold" VerticalAlignment="Center" Width="130"/>
-          <TextBlock Text="{Binding StatusDetail}" TextWrapping="Wrap" VerticalAlignment="Center"/>
-          <Button Content="Refresh" Command="{Binding RefreshStatusCommand}" Margin="12,0,0,0"/>
-          <Button Content="Start" Command="{Binding StartDaemonCommand}"/>
-          <Button Content="Stop" Command="{Binding StopDaemonCommand}"/>
-          <Button Content="Restart" Command="{Binding RestartDaemonCommand}"/>
-          <Button Content="Connect Local" Command="{Binding ConnectLocalCommand}"/>
-        </StackPanel>
-        <StackPanel Orientation="Horizontal" Spacing="8">
-          <TextBlock Text="Remote router:" VerticalAlignment="Center"/>
-          <TextBox Text="{Binding RemoteUrl}" Watermark="http://host:11434" Width="280"/>
-          <TextBox Text="{Binding RemoteApiKey}" PasswordChar="•" Watermark="API key (session only)" Width="220"/>
-          <Button Content="Connect Remote" Command="{Binding ConnectRemoteCommand}"/>
-        </StackPanel>
+    <!-- Modern Header / Connection bar -->
+    <Border DockPanel.Dock="Top" BorderBrush="{DynamicResource SemiColorBorder}" BorderThickness="0,0,0,1">
+      <StackPanel>
+        <Grid ColumnDefinitions="auto,*,auto" Margin="14,10" VerticalAlignment="Center">
+          <!-- Left: Title & Status -->
+          <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
+            <TextBlock Text="OllamaRouter" FontSize="16" FontWeight="Bold" VerticalAlignment="Center"/>
+            <Border Theme="{DynamicResource TagBorder}" Padding="8,3" CornerRadius="12">
+              <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                <Ellipse Width="8" Height="8" VerticalAlignment="Center">
+                  <Ellipse.Fill>
+                    <SolidColorBrush Color="#3BA55C"/>
+                  </Ellipse.Fill>
+                </Ellipse>
+                <TextBlock Text="{Binding StatusText}" FontWeight="SemiBold" FontSize="12" VerticalAlignment="Center"/>
+              </StackPanel>
+            </Border>
+            <TextBlock Text="{Binding StatusDetail}" TextTrimming="CharacterEllipsis" MaxWidth="400"
+                       Foreground="{DynamicResource SemiColorText2}" FontSize="12" VerticalAlignment="Center"/>
+          </StackPanel>
+
+          <!-- Right: Controls & Instance selector -->
+          <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+            <Button Content="Refresh" Command="{Binding RefreshStatusCommand}"/>
+            <Button Content="Start" Classes="Primary" Command="{Binding StartDaemonCommand}" IsVisible="{Binding IsLocalMode}"/>
+            <Button Content="Stop" Classes="Danger" Command="{Binding StopDaemonCommand}" IsVisible="{Binding IsLocalMode}"/>
+            <Button Content="Restart" Classes="Warning" Command="{Binding RestartDaemonCommand}" IsVisible="{Binding IsLocalMode}"/>
+            <Button Content="🌐 Select Instance..." Click="OnSelectInstanceClick"/>
+          </StackPanel>
+        </Grid>
+
+        <!-- Loading indicator -->
+        <ProgressBar Height="2" IsIndeterminate="True" IsVisible="{Binding IsBusy}"/>
       </StackPanel>
     </Border>
 
     <!-- Tabs -->
-    <TabControl SelectedIndex="{Binding SelectedTabIndex}">
-      <TabItem Header="Monitor &amp; Savings" DataContext="{Binding MonitorTab}">
-        <views:MonitorView/>
-      </TabItem>
-      <TabItem Header="Fleet &amp; Cloud Targets" DataContext="{Binding FleetTab}">
-        <views:FleetTargetsView/>
-      </TabItem>
-      <TabItem Header="Model Cartography" DataContext="{Binding CartographyTab}">
-        <views:CartographyView/>
-      </TabItem>
-      <TabItem Header="Settings &amp; API Keys" DataContext="{Binding SettingsTab}">
-        <views:SettingsView/>
-      </TabItem>
+    <TabControl SelectedIndex="{Binding SelectedTabIndex}" Margin="6">
+      <TabItem Header="Monitor &amp; Savings" Content="{Binding MonitorTab}"/>
+      <TabItem Header="Fleet &amp; Cloud Targets" Content="{Binding FleetTab}"/>
+      <TabItem Header="Model Cartography" Content="{Binding CartographyTab}"/>
+      <TabItem Header="Settings &amp; API Keys" Content="{Binding SettingsTab}"/>
     </TabControl>
   </DockPanel>
 </Window>

@@ -1,8 +1,22 @@
 <Application xmlns="https://github.com/avaloniaui"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:semi="https://irihi.tech/semi"
              x:Class="OllamaRouter.App.App"
              RequestedThemeVariant="Dark">
   <Application.Styles>
-    <FluentTheme />
+    <semi:SemiTheme Locale="en-US" />
   </Application.Styles>
+
+  <Application.Resources>
+    <!-- Target color conventions from web monitoring -->
+    <Color x:Key="TargetLocalColor">#3F9EFF</Color>
+    <Color x:Key="TargetRemoteColor">#34E0A1</Color>
+    <Color x:Key="TargetCloudColor">#C48BFF</Color>
+    <Color x:Key="TargetNeutralColor">#7A8AA0</Color>
+
+    <SolidColorBrush x:Key="TargetLocalBrush" Color="{StaticResource TargetLocalColor}" />
+    <SolidColorBrush x:Key="TargetRemoteBrush" Color="{StaticResource TargetRemoteColor}" />
+    <SolidColorBrush x:Key="TargetCloudBrush" Color="{StaticResource TargetCloudColor}" />
+    <SolidColorBrush x:Key="TargetNeutralBrush" Color="{StaticResource TargetNeutralColor}" />
+  </Application.Resources>
 </Application>

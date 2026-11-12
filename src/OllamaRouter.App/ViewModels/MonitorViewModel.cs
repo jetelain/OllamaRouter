@@ -88,7 +88,10 @@ public sealed partial class MonitorFleetRow : ObservableObject
         string? activeModel,
         IReadOnlyList<string> residentModels,
         string location,
-        string? url)
+        string? url,
+        string? hardwareProfile = null,
+        string? contextAllocation = null,
+        int? keepAliveSeconds = null)
     {
         Name = name;
         _enabled = enabled;
@@ -98,6 +101,9 @@ public sealed partial class MonitorFleetRow : ObservableObject
         ResidentModels = residentModels;
         Location = location;
         Url = url;
+        HardwareProfile = hardwareProfile;
+        ContextAllocation = contextAllocation;
+        KeepAliveSeconds = keepAliveSeconds;
     }
 
     /// <summary>The view-model toggle command (wired by the owner; keeps the row self-
@@ -131,6 +137,56 @@ public sealed partial class MonitorFleetRow : ObservableObject
 
     /// <summary>The target base URL (null for Cloud).</summary>
     public string? Url { get; }
+
+    /// <summary>The hardware profile summary (e.g. "16 GB").</summary>
+    public string? HardwareProfile { get; }
+
+    /// <summary>Context length allocation string (e.g. "262k").</summary>
+    public string? ContextAllocation { get; }
+
+    /// <summary>Effective keep-alive in seconds (-1 for indefinite).</summary>
+    public int? KeepAliveSeconds { get; }
+
+    /// <summary>Formatted keep-alive display (e.g. "15m", "∞", "-").</summary>
+    public string KeepAliveDisplay => KeepAliveSeconds switch
+    {
+        -1 => "\u221E",
+        null => "-",
+        >= 60 => $"{KeepAliveSeconds.Value / 60}m",
+        _ => $"{KeepAliveSeconds.Value}s"
+    };
+}
+
+public sealed class MonitorCombinedStatRow
+{
+    public string Target { get; init; } = "";
+    public int TodayRequests { get; init; }
+    public long TodayInputTokens { get; init; }
+    public long TodayOutputTokens { get; init; }
+    public int Last7DaysRequests { get; init; }
+    public long Last7DaysInputTokens { get; init; }
+    public long Last7DaysOutputTokens { get; init; }
+    public double Last7DaysElapsedSeconds { get; init; }
+    public bool IsTotal => Target.Equals("total", StringComparison.OrdinalIgnoreCase);
+}
+
+public sealed class MonitorUsageRatioItem
+{
+    public string Name { get; init; } = "";
+    public string Location { get; init; } = "";
+    public double Percentage { get; init; }
+    public long Tokens { get; init; }
+    public int Requests { get; init; }
+    public string FormattedSummary => $"{Views.HumanReadableFormatters.FormatTokens(Tokens)} ({Percentage:0.#}%)";
+}
+
+public sealed class MonitorTargetSavingsItem
+{
+    public string Name { get; init; } = "";
+    public string Location { get; init; } = "";
+    public double Savings { get; init; }
+    public string Currency { get; init; } = "$";
+    public string FormattedText => $"{Name}: {Currency} {Savings:F2}";
 }
 
 /// <summary>
@@ -163,6 +219,35 @@ public sealed partial class MonitorViewModel : RouterTabViewModel
     /// <summary>The 7-day per-target token breakdown (incl. the <c>total</c> row).</summary>
     public ObservableCollection<MonitorTargetStatRow> TargetBreakdown { get; } = [];
 
+    /// <summary>Combined today &amp; 7-day statistics table matching the web monitor.</summary>
+    public ObservableCollection<MonitorCombinedStatRow> StatisticsRows { get; } = [];
+
+    /// <summary>Usage ratio segments for the 7-day breakdown.</summary>
+    public ObservableCollection<MonitorUsageRatioItem> UsageRatios { get; } = [];
+
+    /// <summary>Summary text for the usage ratio progress bar (e.g. "9.7M tokens").</summary>
+    [ObservableProperty]
+    private string _usageRatioSummary = "0 tokens";
+
+    /// <summary>Whether cost &amp; savings data is available.</summary>
+    [ObservableProperty]
+    private bool _hasCost;
+
+    /// <summary>Formatted estimated savings string (e.g. "$ 70.78").</summary>
+    [ObservableProperty]
+    private string _formattedEstimatedSavings = "-";
+
+    /// <summary>Formatted cloud overflow cost string (e.g. "$ 1.22").</summary>
+    [ObservableProperty]
+    private string _formattedCloudOverflow = "-";
+
+    /// <summary>Formatted electricity cost line (e.g. "⚡ Electricity (last 7 days): $ 1.64").</summary>
+    [ObservableProperty]
+    private string _formattedElectricity = "-";
+
+    /// <summary>Per-target savings list for the savings card footer.</summary>
+    public ObservableCollection<MonitorTargetSavingsItem> PerTargetSavingsList { get; } = [];
+
     /// <summary>The cloud-vs-electricity savings/cost card (null before the first load).</summary>
     [ObservableProperty]
     private MonitorSavingsCard? _savingsCard;
@@ -192,61 +277,165 @@ public sealed partial class MonitorViewModel : RouterTabViewModel
     [ObservableProperty]
     private string? _reclaimResultText;
 
+    private static async Task RunOnUiAsync(Action action)
+    {
+        try
+        {
+            if (Avalonia.Threading.Dispatcher.UIThread.CheckAccess())
+            {
+                action();
+            }
+            else
+            {
+                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(action);
+            }
+        }
+        catch
+        {
+            action();
+        }
+    }
+
     /// <inheritdoc />
     protected override async Task RefreshCoreAsync(CancellationToken ct)
     {
         var state = await ClientAccessor().GetMonitorStateAsync(ct).ConfigureAwait(false);
 
-        ActiveRequests.Clear();
-        foreach (var item in state.InProgress)
+        await RunOnUiAsync(() =>
         {
-            ActiveRequests.Add(new MonitorActiveRequestRow(
-                item.Target, item.Model, item.EstimatedPromptTokens, item.ElapsedMs,
-                item.ReasoningEffort, item.SessionId, item.AgentId));
-        }
-
-        RecentRequests.Clear();
-        foreach (var item in state.Requests)
-        {
-            RecentRequests.Add(new MonitorRecentRequestRow(
-                item.Timestamp, item.Target, item.Model, item.EstimatedPromptTokens,
-                item.ActualPromptTokens, item.ActualResponseTokens, item.CachedInputTokens,
-                item.ElapsedMs, item.StatusCode, item.Success));
-        }
-
-        TargetBreakdown.Clear();
-        foreach (var (target, totals) in state.Statistics.Last7Days)
-        {
-            TargetBreakdown.Add(new MonitorTargetStatRow(
-                target, totals.Requests, totals.InputTokens, totals.OutputTokens,
-                totals.CachedInputTokens, totals.ElapsedMilliseconds / 1000.0));
-        }
-
-        SavingsCard = state.Cost is { } cost
-            ? new MonitorSavingsCard
+            ActiveRequests.Clear();
+            foreach (var item in state.InProgress)
             {
-                Currency = cost.Currency,
-                EstimatedSavings = cost.EstimatedSavings,
-                CloudOverflowCost = cost.CloudOverflowCost,
-                ElectricityCost = cost.ElectricityCost,
-                PerTargetSavings = cost.PerTargetSavings,
-                PerTargetElectricityCost = cost.PerTargetElectricityCost,
+                ActiveRequests.Add(new MonitorActiveRequestRow(
+                    item.Target, item.Model, item.EstimatedPromptTokens, item.ElapsedMs,
+                    item.ReasoningEffort, item.SessionId, item.AgentId));
             }
-            : null;
-        SavingsCurrency = state.Cost?.Currency;
-        SavingsEstimated = state.Cost?.EstimatedSavings;
-        SavingsCloudOverflow = state.Cost?.CloudOverflowCost;
-        SavingsElectricity = state.Cost?.ElectricityCost;
 
-        FleetRows.Clear();
-        foreach (var item in state.Fleet)
-        {
-            var row = new MonitorFleetRow(
-                item.Name, item.Enabled, item.Liveness, item.InFlightRequests, item.ActiveModel,
-                item.ResidentModels ?? (IReadOnlyList<string>)Array.Empty<string>(), item.Location, item.Url);
-            row.ToggleCommand = ToggleTargetCommand;
-            FleetRows.Add(row);
-        }
+            RecentRequests.Clear();
+            foreach (var item in state.Requests)
+            {
+                RecentRequests.Add(new MonitorRecentRequestRow(
+                    item.Timestamp, item.Target, item.Model, item.EstimatedPromptTokens,
+                    item.ActualPromptTokens, item.ActualResponseTokens, item.CachedInputTokens,
+                    item.ElapsedMs, item.StatusCode, item.Success));
+            }
+
+            TargetBreakdown.Clear();
+            foreach (var (target, totals) in state.Statistics.Last7Days)
+            {
+                TargetBreakdown.Add(new MonitorTargetStatRow(
+                    target, totals.Requests, totals.InputTokens, totals.OutputTokens,
+                    totals.CachedInputTokens, totals.ElapsedMilliseconds / 1000.0));
+            }
+
+            StatisticsRows.Clear();
+            var allTargets = state.Statistics.Today.Keys
+                .Union(state.Statistics.Last7Days.Keys)
+                .Where(k => !k.Equals("total", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            allTargets.Add("total");
+
+            foreach (var t in allTargets)
+            {
+                state.Statistics.Today.TryGetValue(t, out var today);
+                state.Statistics.Last7Days.TryGetValue(t, out var last7);
+                StatisticsRows.Add(new MonitorCombinedStatRow
+                {
+                    Target = t,
+                    TodayRequests = today?.Requests ?? 0,
+                    TodayInputTokens = today?.InputTokens ?? 0,
+                    TodayOutputTokens = today?.OutputTokens ?? 0,
+                    Last7DaysRequests = last7?.Requests ?? 0,
+                    Last7DaysInputTokens = last7?.InputTokens ?? 0,
+                    Last7DaysOutputTokens = last7?.OutputTokens ?? 0,
+                    Last7DaysElapsedSeconds = (last7?.ElapsedMilliseconds ?? 0) / 1000.0
+                });
+            }
+
+            // Usage ratios
+            UsageRatios.Clear();
+            var nonTotalEntries = state.Statistics.Last7Days
+                .Where(kv => !kv.Key.Equals("total", StringComparison.OrdinalIgnoreCase))
+                .Select(kv => new { Name = kv.Key, Tokens = (long)kv.Value.InputTokens + kv.Value.OutputTokens, Requests = kv.Value.Requests })
+                .ToList();
+            long totalTokens = nonTotalEntries.Sum(e => e.Tokens);
+            UsageRatioSummary = totalTokens > 0
+                ? $"{Views.HumanReadableFormatters.FormatTokens(totalTokens)} tokens"
+                : "0 tokens";
+
+            foreach (var e in nonTotalEntries)
+            {
+                var pct = totalTokens > 0 ? (e.Tokens * 100.0 / totalTokens) : 0;
+                UsageRatios.Add(new MonitorUsageRatioItem
+                {
+                    Name = e.Name,
+                    Location = Views.TargetLocationVisuals.ClassifyLocation(e.Name),
+                    Percentage = pct,
+                    Tokens = e.Tokens,
+                    Requests = e.Requests
+                });
+            }
+
+            // Savings & cost
+            HasCost = state.Cost != null;
+            if (state.Cost is { } cost)
+            {
+                var curr = cost.Currency ?? "$";
+                FormattedEstimatedSavings = $"{curr} {cost.EstimatedSavings:F2}";
+                FormattedCloudOverflow = $"{curr} {cost.CloudOverflowCost:F2}";
+                FormattedElectricity = $"⚡ Electricity (last 7 days): {curr} {cost.ElectricityCost:F2}";
+
+                PerTargetSavingsList.Clear();
+                if (cost.PerTargetSavings != null)
+                {
+                    foreach (var (tName, val) in cost.PerTargetSavings)
+                    {
+                        PerTargetSavingsList.Add(new MonitorTargetSavingsItem
+                        {
+                            Name = tName,
+                            Location = Views.TargetLocationVisuals.ClassifyLocation(tName),
+                            Savings = val,
+                            Currency = curr
+                        });
+                    }
+                }
+            }
+            else
+            {
+                FormattedEstimatedSavings = "-";
+                FormattedCloudOverflow = "-";
+                FormattedElectricity = "-";
+                PerTargetSavingsList.Clear();
+            }
+
+            SavingsCard = state.Cost is { } c
+                ? new MonitorSavingsCard
+                {
+                    Currency = c.Currency,
+                    EstimatedSavings = c.EstimatedSavings,
+                    CloudOverflowCost = c.CloudOverflowCost,
+                    ElectricityCost = c.ElectricityCost,
+                    PerTargetSavings = c.PerTargetSavings,
+                    PerTargetElectricityCost = c.PerTargetElectricityCost,
+                }
+                : null;
+            SavingsCurrency = state.Cost?.Currency;
+            SavingsEstimated = state.Cost?.EstimatedSavings;
+            SavingsCloudOverflow = state.Cost?.CloudOverflowCost;
+            SavingsElectricity = state.Cost?.ElectricityCost;
+
+            FleetRows.Clear();
+            foreach (var item in state.Fleet)
+            {
+                Views.TargetLocationVisuals.Register(item.Name, item.Location);
+                var row = new MonitorFleetRow(
+                    item.Name, item.Enabled, item.Liveness, item.InFlightRequests, item.ActiveModel,
+                    item.ResidentModels ?? (IReadOnlyList<string>)Array.Empty<string>(), item.Location, item.Url,
+                    item.HardwareProfile, item.ContextAllocation, item.KeepAliveSeconds);
+                row.ToggleCommand = ToggleTargetCommand;
+                FleetRows.Add(row);
+            }
+        });
     }
 
     /// <summary>

@@ -1,5 +1,7 @@
 using Avalonia.Controls;
+using Avalonia.Interactivity;
 using OllamaRouter.App.ViewModels;
+using OllamaRouter.App.Views.Dialogs;
 
 namespace OllamaRouter.App.Views;
 
@@ -14,6 +16,28 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+    }
+
+    private async void OnSelectInstanceClick(object? sender, RoutedEventArgs e)
+    {
+        if (DataContext is MainWindowViewModel viewModel)
+        {
+            var dialog = new ConnectInstanceDialog(viewModel.RemoteUrl, viewModel.RemoteApiKey, viewModel.IsLocalMode);
+            var result = await dialog.ShowDialog<ConnectInstanceResult>(this);
+            if (result != null)
+            {
+                if (result.IsLocal)
+                {
+                    viewModel.ConnectLocalCommand.Execute(null);
+                }
+                else if (!string.IsNullOrWhiteSpace(result.RemoteUrl))
+                {
+                    viewModel.RemoteUrl = result.RemoteUrl;
+                    viewModel.RemoteApiKey = result.RemoteApiKey ?? string.Empty;
+                    viewModel.ConnectRemoteCommand.Execute(null);
+                }
+            }
+        }
     }
 
     protected override async void OnOpened(System.EventArgs e)

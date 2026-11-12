@@ -175,6 +175,25 @@ public sealed partial class FleetTargetsViewModel : RouterTabViewModel
     /// the server).</summary>
     public ObservableCollection<FleetTargetRow> Rows { get; } = [];
 
+    private static async Task RunOnUiAsync(Action action)
+    {
+        try
+        {
+            if (Avalonia.Threading.Dispatcher.UIThread.CheckAccess())
+            {
+                action();
+            }
+            else
+            {
+                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(action);
+            }
+        }
+        catch
+        {
+            action();
+        }
+    }
+
     /// <inheritdoc />
     protected override async Task RefreshCoreAsync(CancellationToken ct)
     {
@@ -187,48 +206,53 @@ public sealed partial class FleetTargetsViewModel : RouterTabViewModel
         var configByName = config.Targets.ToDictionary(t => t.Name, StringComparer.OrdinalIgnoreCase);
         var hardwareByName = hardware.Nodes.ToDictionary(n => n.Target, StringComparer.OrdinalIgnoreCase);
 
-        Rows.Clear();
-        // Config order is the canonical row order.
-        foreach (var target in config.Targets)
+        await RunOnUiAsync(() =>
         {
-            fleetByName.TryGetValue(target.Name, out var fleetItem);
-            hardwareByName.TryGetValue(target.Name, out var node);
-            var hw = fleetItem?.Hardware;
-            Rows.Add(new FleetTargetRow
+            Rows.Clear();
+            // Config order is the canonical row order.
+            foreach (var target in config.Targets)
             {
-                Name = target.Name,
-                Url = target.Url,
-                Type = target.Type,
-                Provider = target.Provider,
-                Enabled = target.Enabled,
-                Liveness = fleetItem?.Liveness ?? "Unknown",
-                LatencyMs = fleetItem?.LatencyMs,
-                Location = fleetItem?.Location ?? "remote",
-                MaxVramMB = hw?.MaxVramMB,
-                SpeedFactor = hw?.SpeedFactor,
-                MaxParallel = hw?.MaxParallel ?? target.MaxParallel,
-                IsUnifiedMemory = hw?.IsUnifiedMemory ?? false,
-                SystemRamMB = hw?.SystemRamMB,
-                MemoryType = hw?.MemoryType,
-                BandwidthGBs = hw?.BandwidthGBs,
-                GpuName = hw?.GpuName,
-                GpuVendor = hw?.GpuVendor,
-                EffectiveKeepAliveSeconds = fleetItem?.Preload?.KeepAliveSeconds,
-                KeepAliveSource = fleetItem?.Preload?.KeepAliveSource,
-                HardwareHint = target.HardwareHint,
-                ConfigMaxParallel = target.MaxParallel,
-                ApiKeyConfigured = target.ApiKeyConfigured,
-                PowerWatts = target.PowerWatts,
-                Models = target.Models,
-                InFlightRequests = fleetItem?.Execution.InFlightRequests ?? 0,
-                ActiveModel = fleetItem?.Execution.ActiveModel,
-                ResidentModels = fleetItem?.Execution.ResidentModels
-                    ?? (IReadOnlyList<string>)Array.Empty<string>(),
-                HardwareSource = node?.Source,
-                HardwareReachable = node?.Reachable,
-                HardwareProfile = node?.Profile,
-            });
-        }
+                fleetByName.TryGetValue(target.Name, out var fleetItem);
+                hardwareByName.TryGetValue(target.Name, out var node);
+                var hw = fleetItem?.Hardware;
+                var loc = fleetItem?.Location ?? "remote";
+                Views.TargetLocationVisuals.Register(target.Name, loc);
+                Rows.Add(new FleetTargetRow
+                {
+                    Name = target.Name,
+                    Url = target.Url,
+                    Type = target.Type,
+                    Provider = target.Provider,
+                    Enabled = target.Enabled,
+                    Liveness = fleetItem?.Liveness ?? "Unknown",
+                    LatencyMs = fleetItem?.LatencyMs,
+                    Location = loc,
+                    MaxVramMB = hw?.MaxVramMB,
+                    SpeedFactor = hw?.SpeedFactor,
+                    MaxParallel = hw?.MaxParallel ?? target.MaxParallel,
+                    IsUnifiedMemory = hw?.IsUnifiedMemory ?? false,
+                    SystemRamMB = hw?.SystemRamMB,
+                    MemoryType = hw?.MemoryType,
+                    BandwidthGBs = hw?.BandwidthGBs,
+                    GpuName = hw?.GpuName,
+                    GpuVendor = hw?.GpuVendor,
+                    EffectiveKeepAliveSeconds = fleetItem?.Preload?.KeepAliveSeconds,
+                    KeepAliveSource = fleetItem?.Preload?.KeepAliveSource,
+                    HardwareHint = target.HardwareHint,
+                    ConfigMaxParallel = target.MaxParallel,
+                    ApiKeyConfigured = target.ApiKeyConfigured,
+                    PowerWatts = target.PowerWatts,
+                    Models = target.Models,
+                    InFlightRequests = fleetItem?.Execution.InFlightRequests ?? 0,
+                    ActiveModel = fleetItem?.Execution.ActiveModel,
+                    ResidentModels = fleetItem?.Execution.ResidentModels
+                        ?? (IReadOnlyList<string>)Array.Empty<string>(),
+                    HardwareSource = node?.Source,
+                    HardwareReachable = node?.Reachable,
+                    HardwareProfile = node?.Profile,
+                });
+            }
+        });
     }
 
     /// <summary>

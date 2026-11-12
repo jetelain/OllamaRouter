@@ -4,91 +4,151 @@
              xmlns:vm="using:OllamaRouter.App.ViewModels"
              x:Class="OllamaRouter.App.Views.CartographyView"
              x:DataType="vm:CartographyViewModel">
-  <ScrollViewer Padding="8">
-    <StackPanel Spacing="12">
+  <ScrollViewer Padding="12">
+    <StackPanel Spacing="16">
       <TextBlock Text="{Binding LastError}" Foreground="#FF7B7B" TextWrapping="Wrap" IsVisible="{Binding IsErrorVisible}"/>
-      <Button Content="Refresh" Command="{Binding RefreshCommand}"/>
+      <Grid ColumnDefinitions="*,auto">
+        <TextBlock Grid.Column="0" Text="Model Cartography &amp; Deployment Matrix" FontWeight="Bold" FontSize="16" VerticalAlignment="Center"/>
+        <Button Grid.Column="1" Content="Refresh" Command="{Binding RefreshCommand}"/>
+      </Grid>
 
-      <!-- Node header row (matrix columns, node order; Cloud pseudo-target last) -->
-      <StackPanel Orientation="Horizontal" Spacing="4">
-        <TextBlock Text="Model" FontWeight="Bold" Width="260" VerticalAlignment="Center"/>
-        <ItemsControl ItemsSource="{Binding Nodes}">
-          <ItemsControl.ItemsPanel>
-            <ItemsPanelTemplate><StackPanel Orientation="Horizontal"/></ItemsPanelTemplate>
-          </ItemsControl.ItemsPanel>
-          <ItemsControl.ItemTemplate>
-            <DataTemplate>
-              <Border Padding="4" Margin="2" Background="#1E2A38" CornerRadius="4" MinWidth="140">
-                <StackPanel Spacing="1">
-                  <TextBlock Text="{Binding Name}" FontWeight="Bold" TextTrimming="CharacterEllipsis"/>
-                  <TextBlock Text="{Binding Liveness}" Opacity="0.7"/>
-                  <TextBlock Text="{Binding TotalLoadedVramBytes, StringFormat='{}{0} B loaded'}" Opacity="0.7"/>
-                </StackPanel>
-              </Border>
-            </DataTemplate>
-          </ItemsControl.ItemTemplate>
-        </ItemsControl>
-      </StackPanel>
+      <!-- Matrix Container -->
+      <Border Theme="{DynamicResource CardBorder}" Padding="14">
+        <StackPanel Spacing="10">
+          <!-- Node header row (aligned: 320px model column + 150px target columns) -->
+          <Grid ColumnDefinitions="320,*">
+            <TextBlock Grid.Column="0" Text="MODEL" Foreground="{DynamicResource SemiColorText2}"
+                       FontSize="11" FontWeight="SemiBold" VerticalAlignment="Center" Margin="8,0"/>
+            <ItemsControl Grid.Column="1" ItemsSource="{Binding Nodes}">
+              <ItemsControl.ItemsPanel>
+                <ItemsPanelTemplate><StackPanel Orientation="Horizontal" Spacing="6"/></ItemsPanelTemplate>
+              </ItemsControl.ItemsPanel>
+              <ItemsControl.ItemTemplate>
+                <DataTemplate>
+                  <Border Width="150" Padding="8" Theme="{DynamicResource CardBorder}">
+                    <StackPanel Spacing="2">
+                      <StackPanel Orientation="Horizontal" Spacing="4">
+                        <TextBlock Text="{Binding Name, Converter={x:Static local:TargetEmojiConverter.Instance}}"
+                                   FontFamily="Segoe UI Emoji, Apple Color Emoji" VerticalAlignment="Center"/>
+                        <TextBlock Text="{Binding Name, Converter={x:Static local:TargetNameConverter.Instance}}"
+                                   Foreground="{Binding Name, Converter={x:Static local:TargetBrushConverter.Instance}}"
+                                   FontWeight="Bold" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+                      </StackPanel>
+                      <TextBlock Text="{Binding Liveness}" Foreground="{DynamicResource SemiColorText2}" FontSize="11"/>
+                      <TextBlock Text="{Binding TotalLoadedVramBytes, Converter={x:Static local:ByteSizeConverter.Instance}, StringFormat='{}{0} loaded'}"
+                                 Foreground="{DynamicResource SemiColorText2}" FontSize="11"/>
+                    </StackPanel>
+                  </Border>
+                </DataTemplate>
+              </ItemsControl.ItemTemplate>
+            </ItemsControl>
+          </Grid>
 
-      <!-- Model x target matrix -->
-      <ItemsControl ItemsSource="{Binding Models}">
-        <ItemsControl.ItemTemplate>
-          <DataTemplate>
-            <Border Margin="0,0,0,8" Padding="6" Background="#161B22" CornerRadius="6">
-              <StackPanel Spacing="6">
-                <StackPanel Orientation="Horizontal" Spacing="12">
-                  <TextBlock Text="{Binding Name}" FontWeight="Bold" Width="260" TextTrimming="CharacterEllipsis"/>
-                  <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
-                    <TextBlock Text="{Binding Architecture}" Opacity="0.8"/>
-                    <TextBlock Text="{Binding WeightSizeHuman}" Opacity="0.8"/>
-                    <TextBlock Text="{Binding Quantization, StringFormat='{}{0}'}" Opacity="0.6"/>
-                    <TextBlock Text="{Binding NativeContextWindow, StringFormat='native {0}'}" Opacity="0.7"/>
-                    <TextBlock Text="{Binding RecommendedContextWindow, StringFormat='rec {0}'}" Opacity="0.7"/>
-                  </StackPanel>
-                  <Button Content="Preload" Click="OnPreloadClick" Tag="{Binding}" HorizontalAlignment="Right"/>
-                </StackPanel>
-                <ItemsControl ItemsSource="{Binding Cells}">
-                  <ItemsControl.ItemsPanel>
-                    <ItemsPanelTemplate><StackPanel Orientation="Horizontal"/></ItemsPanelTemplate>
-                  </ItemsControl.ItemsPanel>
-                  <ItemsControl.ItemTemplate>
-                    <DataTemplate>
-                      <Border Padding="4" Margin="2" CornerRadius="4" MinWidth="140"
-                              Background="{Binding Present, Converter={x:Static local:CellBackgroundConverter.Instance}}">
-                        <StackPanel Spacing="1" ToolTip.Tip="{Binding Summary}">
-                          <TextBlock Text="{Binding Target}" TextTrimming="CharacterEllipsis"/>
-                          <TextBlock Text="{Binding Summary}" Opacity="0.75" TextTrimming="CharacterEllipsis" MaxWidth="150"/>
-                          <TextBlock Text="{Binding ContextCeiling, StringFormat='ctx {0}'}" Opacity="0.6"/>
-                        </StackPanel>
-                      </Border>
-                    </DataTemplate>
-                  </ItemsControl.ItemTemplate>
-                </ItemsControl>
-              </StackPanel>
-            </Border>
-          </DataTemplate>
-        </ItemsControl.ItemTemplate>
-      </ItemsControl>
+          <!-- Model x target matrix rows -->
+          <ItemsControl ItemsSource="{Binding Models}">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate>
+                <Border Margin="0,0,0,8" Padding="10" Theme="{DynamicResource CardBorder}">
+                  <Grid ColumnDefinitions="320,*">
+                    <!-- Left column: Model Metadata & Preload button -->
+                    <StackPanel Grid.Column="0" Spacing="6" Margin="0,0,12,0" VerticalAlignment="Center">
+                      <Grid ColumnDefinitions="*,auto">
+                        <TextBlock Grid.Column="0" Text="{Binding Name}" FontWeight="Bold" FontSize="14"
+                                   TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+                        <Button Grid.Column="1" Content="Preload" Classes="Primary" Click="OnPreloadClick"
+                                Tag="{Binding}" Padding="8,2" FontSize="11" VerticalAlignment="Center"/>
+                      </Grid>
+
+                      <WrapPanel>
+                        <Border Theme="{DynamicResource TagBorder}" Padding="6,2" Margin="0,0,4,4" CornerRadius="4">
+                          <TextBlock Text="{Binding Architecture}" FontSize="11"/>
+                        </Border>
+                        <Border Theme="{DynamicResource TagBorder}" Padding="6,2" Margin="0,0,4,4" CornerRadius="4">
+                          <TextBlock Text="{Binding WeightSizeHuman}" FontSize="11"/>
+                        </Border>
+                        <Border Theme="{DynamicResource TagBorder}" Padding="6,2" Margin="0,0,4,4" CornerRadius="4"
+                                IsVisible="{Binding Quantization, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+                          <TextBlock Text="{Binding Quantization}" FontSize="11"/>
+                        </Border>
+                        <Border Theme="{DynamicResource TagBorder}" Padding="6,2" Margin="0,0,4,4" CornerRadius="4">
+                          <TextBlock Text="{Binding NativeContextWindow, Converter={x:Static local:ContextSizeConverter.Instance}, StringFormat='native {0}'}" FontSize="11"/>
+                        </Border>
+                        <Border Theme="{DynamicResource TagBorder}" Padding="6,2" Margin="0,0,4,4" CornerRadius="4">
+                          <TextBlock Text="{Binding RecommendedContextWindow, Converter={x:Static local:ContextSizeConverter.Instance}, StringFormat='rec {0}'}" FontSize="11"/>
+                        </Border>
+                      </WrapPanel>
+                    </StackPanel>
+
+                    <!-- Right column: Target Cells, matching header 1-to-1 -->
+                    <ItemsControl Grid.Column="1" ItemsSource="{Binding Cells}">
+                      <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate><StackPanel Orientation="Horizontal" Spacing="6"/></ItemsPanelTemplate>
+                      </ItemsControl.ItemsPanel>
+                      <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                          <Border Width="150" Padding="8" CornerRadius="6"
+                                  Background="{Binding Present, Converter={x:Static local:CellBackgroundConverter.Instance}}">
+                            <StackPanel Spacing="3" ToolTip.Tip="{Binding Summary}" VerticalAlignment="Center">
+                              <StackPanel Orientation="Horizontal" Spacing="4">
+                                <TextBlock Text="{Binding Target, Converter={x:Static local:TargetEmojiConverter.Instance}}"
+                                           FontFamily="Segoe UI Emoji, Apple Color Emoji" VerticalAlignment="Center"/>
+                                <TextBlock Text="{Binding Target, Converter={x:Static local:TargetNameConverter.Instance}}"
+                                           Foreground="{Binding Target, Converter={x:Static local:TargetBrushConverter.Instance}}"
+                                           FontWeight="SemiBold" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+                              </StackPanel>
+                              <TextBlock Text="{Binding Summary}" Foreground="{DynamicResource SemiColorText1}"
+                                         FontSize="11" TextTrimming="CharacterEllipsis"/>
+                              <TextBlock Text="{Binding ContextCeiling, Converter={x:Static local:ContextSizeConverter.Instance}, StringFormat='ctx {0}'}"
+                                         Foreground="{DynamicResource SemiColorText2}" FontSize="11"/>
+                            </StackPanel>
+                          </Border>
+                        </DataTemplate>
+                      </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                  </Grid>
+                </Border>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+        </StackPanel>
+      </Border>
 
       <!-- Resident processes -->
-      <StackPanel Spacing="4">
-        <TextBlock Text="Resident Model Processes" FontWeight="Bold" FontSize="14"/>
-        <ItemsControl ItemsSource="{Binding LoadedProcesses}">
-          <ItemsControl.ItemTemplate>
-            <DataTemplate>
-              <Grid ColumnDefinitions="240,140,120,90,90,80,100" Margin="0,1">
-                <TextBlock Grid.Column="0" Text="{Binding Name}" TextTrimming="CharacterEllipsis"/>
-                <TextBlock Grid.Column="1" Text="{Binding Target}"/>
-                <TextBlock Grid.Column="2" Text="{Binding SizeVramBytes, StringFormat='{}{0} B'}"/>
-                <TextBlock Grid.Column="3" Text="{Binding Quantization}" Opacity="0.7"/>
-                <TextBlock Grid.Column="4" Text="{Binding ContextLength, TargetNullValue='-'}"/>
-                <TextBlock Grid.Column="5" Text="{Binding Liveness}" Opacity="0.7"/>
-                <TextBlock Grid.Column="6" Text="{Binding Stale, StringFormat='stale: {0}'}" Opacity="0.7"/>
-              </Grid>
-            </DataTemplate>
-          </ItemsControl.ItemTemplate>
-        </ItemsControl>
-      </StackPanel>
+      <Border Theme="{DynamicResource CardBorder}" Padding="14">
+        <StackPanel Spacing="8">
+          <TextBlock Text="Resident Model Processes" FontWeight="Bold" FontSize="16"/>
+          <Grid ColumnDefinitions="240,140,120,90,90,80,100" Margin="0,0,0,4">
+            <TextBlock Grid.Column="0" Text="MODEL" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="1" Text="TARGET" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="2" Text="VRAM SIZE" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="3" Text="QUANT" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="4" Text="CONTEXT" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="5" Text="LIVENESS" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="6" Text="STATUS" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+          </Grid>
+          <ItemsControl ItemsSource="{Binding LoadedProcesses}">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate>
+                <Grid ColumnDefinitions="240,140,120,90,90,80,100" Margin="0,2">
+                  <TextBlock Grid.Column="0" Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+                  <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
+                    <TextBlock Text="{Binding Target, Converter={x:Static local:TargetEmojiConverter.Instance}}"
+                               FontFamily="Segoe UI Emoji, Apple Color Emoji" VerticalAlignment="Center"/>
+                    <TextBlock Text="{Binding Target, Converter={x:Static local:TargetNameConverter.Instance}}"
+                               Foreground="{Binding Target, Converter={x:Static local:TargetBrushConverter.Instance}}"
+                               FontWeight="SemiBold" VerticalAlignment="Center"/>
+                  </StackPanel>
+                  <TextBlock Grid.Column="2" Text="{Binding SizeVramBytes, Converter={x:Static local:ByteSizeConverter.Instance}}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="3" Text="{Binding Quantization}" Foreground="{DynamicResource SemiColorText2}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="4" Text="{Binding ContextLength, Converter={x:Static local:ContextSizeConverter.Instance}}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="5" Text="{Binding Liveness}" Foreground="{DynamicResource SemiColorText2}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="6" Text="{Binding Stale, StringFormat='stale: {0}'}" Foreground="{DynamicResource SemiColorText2}" VerticalAlignment="Center"/>
+                </Grid>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+        </StackPanel>
+      </Border>
     </StackPanel>
   </ScrollViewer>
 </UserControl>

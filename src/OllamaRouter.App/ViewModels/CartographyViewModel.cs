@@ -187,28 +187,50 @@ public sealed partial class CartographyViewModel : RouterTabViewModel
     /// <summary>The flat loaded-process list (cartesian flatten of nodes × loaded models).</summary>
     public ObservableCollection<CartographyLoadedModelRow> LoadedProcesses { get; } = [];
 
+    private static async Task RunOnUiAsync(Action action)
+    {
+        try
+        {
+            if (Avalonia.Threading.Dispatcher.UIThread.CheckAccess())
+            {
+                action();
+            }
+            else
+            {
+                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(action);
+            }
+        }
+        catch
+        {
+            action();
+        }
+    }
+
     /// <inheritdoc />
     protected override async Task RefreshCoreAsync(CancellationToken ct)
     {
         var response = await ClientAccessor().GetCartographyAsync(ct).ConfigureAwait(false);
 
-        Nodes.Clear();
-        foreach (var node in response.Nodes)
+        await RunOnUiAsync(() =>
         {
-            Nodes.Add(node);
-        }
+            Nodes.Clear();
+            foreach (var node in response.Nodes)
+            {
+                Nodes.Add(node);
+            }
 
-        Models.Clear();
-        foreach (var model in response.Models)
-        {
-            Models.Add(new CartographyModelRowVm(model, response.Nodes));
-        }
+            Models.Clear();
+            foreach (var model in response.Models)
+            {
+                Models.Add(new CartographyModelRowVm(model, response.Nodes));
+            }
 
-        LoadedProcesses.Clear();
-        foreach (var loaded in response.LoadedModels)
-        {
-            LoadedProcesses.Add(loaded);
-        }
+            LoadedProcesses.Clear();
+            foreach (var loaded in response.LoadedModels)
+            {
+                LoadedProcesses.Add(loaded);
+            }
+        });
     }
 
     /// <summary>Creates the preload dialog view model for a model (the view shows the

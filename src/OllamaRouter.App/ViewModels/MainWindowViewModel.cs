@@ -58,7 +58,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
     /// <summary>The connection bar status text
     /// ("Running" / "Stopped" / "Port Conflict" / "Remote" / "Disconnected").</summary>
     [ObservableProperty]
-    private string _statusText = "Disconnected";
+    private string _statusText = "Connecting\u2026";
 
     /// <summary>The connection bar detail (PID, version, uptime, bind address, or the
     /// port-conflict / key-locked hint).</summary>
@@ -236,19 +236,32 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
     /// </summary>
     public async Task StartAsync(CancellationToken ct = default)
     {
-        if (IsLocalMode)
+        IsBusy = true;
+        StatusText = "Connecting\u2026";
+        StatusDetail = "Checking local router daemon\u2026";
+        RaiseCommandAvailability();
+        try
         {
-            await LocalInitializeAsync(ct).ConfigureAwait(false);
-        }
-        else
-        {
-            await ProbeRemoteAsync(ct).ConfigureAwait(false);
-        }
+            if (IsLocalMode)
+            {
+                await LocalInitializeAsync(ct).ConfigureAwait(false);
+            }
+            else
+            {
+                await ProbeRemoteAsync(ct).ConfigureAwait(false);
+            }
 
-        await MonitorTab.StartPollingAsync(ct).ConfigureAwait(false);
-        await FleetTab.StartPollingAsync(ct).ConfigureAwait(false);
-        await CartographyTab.StartPollingAsync(ct).ConfigureAwait(false);
-        await SettingsTab.RefreshAsync(ct).ConfigureAwait(false);
+            var monitorTask = MonitorTab.StartPollingAsync(ct);
+            var fleetTask = FleetTab.StartPollingAsync(ct);
+            var cartographyTask = CartographyTab.StartPollingAsync(ct);
+            var settingsTask = SettingsTab.RefreshAsync(ct);
+            await Task.WhenAll(monitorTask, fleetTask, cartographyTask, settingsTask).ConfigureAwait(false);
+        }
+        finally
+        {
+            IsBusy = false;
+            RaiseCommandAvailability();
+        }
     }
 
     /// <inheritdoc />
