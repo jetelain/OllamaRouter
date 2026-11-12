@@ -38,15 +38,19 @@ internal static class CompositionRoot
     public static IAppConnectionService CreateConnectionService() =>
         new AppConnectionService(DefaultKeyReader.CreateDefault());
 
-    /// <summary>Builds the main window with its full view-model tree.</summary>
-    public static MainWindow CreateMainWindow()
+    /// <summary>
+    /// Builds the main window with its full view-model tree, opening on
+    /// <paramref name="initialTabIndex"/> (0 = Monitor, 1 = Fleet, 2 = Cartography, 3 = Settings —
+    /// the <c>MainWindow.axaml</c> <c>TabItem</c> order).
+    /// </summary>
+    public static MainWindow CreateMainWindow(int initialTabIndex = 0)
     {
         var connection = CreateConnectionService();
         var monitor = new MonitorViewModel(connection.GetClient);
         var fleet = new FleetTargetsViewModel(connection.GetClient);
         var cartography = new CartographyViewModel(connection.GetClient);
         var settings = new SettingsViewModel(connection.GetClient);
-        var mainViewModel = new MainWindowViewModel(connection, monitor, fleet, cartography, settings);
+        var mainViewModel = new MainWindowViewModel(connection, monitor, fleet, cartography, settings, initialTabIndex);
         return new MainWindow { DataContext = mainViewModel };
     }
 

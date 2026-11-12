@@ -26,20 +26,23 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
 
     /// <summary>
     /// Creates the main view model over the composition-root connection service and the four
-    /// tab view models.
+    /// tab view models, opening on <paramref name="initialTabIndex"/> (0 = Monitor, 1 = Fleet,
+    /// 2 = Cartography, 3 = Settings — the <c>MainWindow.axaml</c> <c>TabItem</c> order; default 0).
     /// </summary>
     public MainWindowViewModel(
         IAppConnectionService connection,
         MonitorViewModel monitor,
         FleetTargetsViewModel fleet,
         CartographyViewModel cartography,
-        SettingsViewModel settings)
+        SettingsViewModel settings,
+        int initialTabIndex = 0)
     {
         _connection = connection ?? throw new ArgumentNullException(nameof(connection));
         MonitorTab = monitor ?? throw new ArgumentNullException(nameof(monitor));
         FleetTab = fleet ?? throw new ArgumentNullException(nameof(fleet));
         CartographyTab = cartography ?? throw new ArgumentNullException(nameof(cartography));
         SettingsTab = settings ?? throw new ArgumentNullException(nameof(settings));
+        _selectedTabIndex = initialTabIndex;
         _connection.ConnectionChanged += OnConnectionChanged;
     }
 

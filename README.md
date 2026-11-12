@@ -754,7 +754,7 @@ The `ollamarouter` command is the Native AOT CLI for managing the router daemon 
 | `ollamarouter status [--json]` | Show daemon status (`--json` for machine-readable output). |
 | `ollamarouter logs [--follow]` | Show daemon logs (`--follow` to tail). |
 | `ollamarouter monitor [--interval <s>]` | In-terminal activity monitor (TUI), see [In-terminal activity monitor (TUI)](#in-terminal-activity-monitor-tui). |
-| `ollamarouter setup [--wizard] [--wait]` | Open the desktop app's [Setup Wizard](#desktop-app-ollamarouter-app); `--wait` blocks and propagates the wizard exit code. |
+| `ollamarouter setup [--wizard] [--wait]` | Open the desktop app's [Setup Wizard](#desktop-app-ollamarouter-app); `--wait` blocks and propagates the wizard exit code. Also (re-)registers the user-scoped [`ollamarouter://`](#custom-uri-protocol-ollamarouter) protocol handler (no admin). |
 | `ollamarouter fleet [--json]` | Show per-target fleet status. |
 | `ollamarouter cartography [--json]` | Show fleet cartography (topology view). |
 | `ollamarouter vram reclaim [--keep-enabled] [--target <name>] [--json]` | Unload models to reclaim VRAM. |
@@ -789,6 +789,8 @@ ollamarouter setup --wait          # block until the wizard exits, propagating i
 ollamarouter-app --wizard          # open the wizard directly from the app
 ```
 
+The wizard is also reachable from any browser or web page via the [`ollamarouter://wizard`](#custom-uri-protocol-ollamarouter) URI (or `ollamarouter://setup`).
+
 `--wizard` is an explicit no-op marker — `setup` always launches the app in wizard mode. The app also **opens the wizard automatically on first run** (when `config/config.json` exists in none of the config roots: `$OLLAMAROUTER_HOME`, then the app directory, then the platform install dir); otherwise the dashboard opens.
 
 **Exit codes (the NightCodeForge handoff contract):**
@@ -797,6 +799,26 @@ ollamarouter-app --wizard          # open the wizard directly from the app
 - `1` — the wizard window was closed **without** Finish (abandoned); with `--wait` this propagates to the `ollamarouter setup` exit code.
 
 If the `ollamarouter-app` executable cannot be found in any probed location, `setup` exits `1` and lists the locations it probed; an unknown flag exits `2` with the usage text.
+
+### Custom URI protocol (`ollamarouter://`)
+
+Browser-based tools (such as the NightCodeForge Web UI) can launch the desktop app with a single click through the `ollamarouter://` custom URI scheme:
+
+| URI | Opens |
+|---|---|
+| `ollamarouter://` | the dashboard |
+| `ollamarouter://open` | the dashboard |
+| `ollamarouter://dashboard` | the dashboard |
+| `ollamarouter://dashboard?tab=monitor\|fleet\|cartography\|settings` | the dashboard on the matching tab (unknown tabs fall back to the default Monitor tab) |
+| `ollamarouter://wizard` (or `ollamarouter://setup`) | the 4-step [Setup Wizard](#launching-the-wizard) |
+
+The handler is registered **user-scoped (no administrator/root privileges required)** and is (re-)registered automatically by:
+
+- `ollamarouter setup` (for the app executable it resolves),
+- every `ollamarouter-app` launch (for the running executable), and
+- `publish.ps1` during installation.
+
+`publish.ps1 -Uninstall` removes the registration. Windows stores it under `HKCU:\Software\Classes\ollamarouter`; Linux writes an XDG desktop entry (`~/.local/share/applications/ollamarouter.desktop`, best-effort `xdg-mime` default-handler update). Registration is best-effort everywhere — a failure never blocks the app or the CLI. The `--wizard` flag always wins over a URI host, and a dashboard URI never suppresses the first-run onboarding wizard.
 
 ### The four steps
 

@@ -13,17 +13,20 @@ namespace OllamaRouter.App;
 public partial class App : Application
 {
     /// <summary>
-    /// Selects the main window: wizard mode when <c>--wizard</c> is present or this is a first
-    /// run (no configured install in any root), else the dashboard.
+    /// Selects the main window: wizard mode when the parsed launch options request it (the
+    /// <c>--wizard</c> flag or an <c>ollamarouter://wizard</c>/<c>ollamarouter://setup</c> URI)
+    /// OR this is a first run (no configured install in any root), else the dashboard on the
+    /// launch options' initial tab (default: Monitor).
     /// </summary>
     public override void OnFrameworkInitializationCompleted()
     {
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
-            var wizard = WizardArgs.IsWizard(desktop.Args) || FirstRunDetector.NeedsSetupWizard();
+            var launch = Program.LaunchOptions;
+            var wizard = launch.Wizard || FirstRunDetector.NeedsSetupWizard();
             desktop.MainWindow = wizard
                 ? CompositionRoot.CreateWizardWindow(desktop)
-                : CompositionRoot.CreateMainWindow();
+                : CompositionRoot.CreateMainWindow(launch.InitialTabIndex ?? 0);
         }
 
         base.OnFrameworkInitializationCompleted();

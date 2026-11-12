@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using OllamaRouter.Cli;
+using OllamaRouter.Client.Protocol;
 
 namespace OllamaRouter.Cli.Commands;
 
@@ -53,6 +54,13 @@ internal sealed class SetupCommand : IRouterCommand
     /// <summary>File-exists seam (tests: point the resolver at temp dirs without env mutation).</summary>
     internal Func<string, bool>? FileExistsProbe { get; set; }
 
+    /// <summary>
+    /// Protocol-registration seam (tests: recording stub — production path registers the user-scoped
+    /// <c>ollamarouter://</c> handler via <see cref="ProtocolRegistrationService.Register(string?)"/>;
+    /// best-effort, never blocks the wizard).
+    /// </summary>
+    internal Action<string>? ProtocolRegistrar { get; set; }
+
     /// <inheritdoc />
     public async Task<int> ExecuteAsync(CliContext context, IReadOnlyList<string> args, CancellationToken ct)
     {
@@ -87,6 +95,18 @@ internal sealed class SetupCommand : IRouterCommand
             context.Error.WriteLine(
                 "install the desktop app, or set OLLAMAROUTER_HOME to the folder containing ollamarouter-app.");
             return 1;
+        }
+
+        // Best-effort: (re-)register the user-scoped ollamarouter:// protocol handler for the
+        // resolved app executable (task #107) — a failure never blocks the wizard launch.
+        var registrar = ProtocolRegistrar ?? (path => ProtocolRegistrationService.Register(path));
+        try
+        {
+            registrar(appPath);
+        }
+        catch
+        {
+            // Best-effort: silent, non-blocking by contract.
         }
 
         var startInfo = new ProcessStartInfo(appPath, "--wizard")

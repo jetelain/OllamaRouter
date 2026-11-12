@@ -132,6 +132,28 @@ if ($Uninstall) {
         }
     }
 
+    # Remove the user-scoped ollamarouter:// protocol handler registration (best effort, non-fatal).
+    # Host-OS check: the registration lives on the host that ran the install/uninstall.
+    try {
+        if ([System.OperatingSystem]::IsWindows()) {
+            $protocolKey = "HKCU:\Software\Classes\ollamarouter"
+            if (Test-Path $protocolKey) {
+                Remove-Item -Path $protocolKey -Recurse -Force
+                Write-Host "Removed ollamarouter:// protocol handler registration."
+            }
+        }
+        else {
+            $desktopEntry = Join-Path $env:HOME ".local/share/applications/ollamarouter.desktop"
+            if (Test-Path $desktopEntry) {
+                Remove-Item -Path $desktopEntry -Force
+                Write-Host "Removed ollamarouter:// desktop entry."
+            }
+        }
+    }
+    catch {
+        Write-Warning "Could not remove the ollamarouter:// protocol handler registration: $($_.Exception.Message)"
+    }
+
     # Clean user PATH
     try {
         $userPath = [System.Environment]::GetEnvironmentVariable("Path", [System.EnvironmentVariableTarget]::User)
@@ -262,6 +284,28 @@ foreach ($legacyName in @("OllamaRouter.exe", "OllamaRouter", "ollamarouter-web.
     $legacyPath = Join-Path $InstallDir $legacyName
     if (Test-Path $legacyPath) {
         Remove-Item -Path $legacyPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# 6b. Register the ollamarouter:// protocol handler (user-scoped, NO elevation required; best effort, non-fatal)
+$protocolRegistered = $false
+if ($Runtime -match 'win') {
+    try {
+        $appExe = Join-Path $InstallDir "ollamarouter-app.exe"
+        $protocolKey = "HKCU:\Software\Classes\ollamarouter"
+        New-Item -Path $protocolKey -Force | Out-Null
+        Set-ItemProperty -Path $protocolKey -Name "(Default)" -Value "URL:OllamaRouter Protocol"
+        Set-ItemProperty -Path $protocolKey -Name "URL Protocol" -Value ""
+        New-Item -Path "$protocolKey\DefaultIcon" -Force | Out-Null
+        $iconValue = '"' + $appExe + '",0'
+        Set-ItemProperty -Path "$protocolKey\DefaultIcon" -Name "(Default)" -Value $iconValue
+        New-Item -Path "$protocolKey\shell\open\command" -Force | Out-Null
+        $commandValue = '"' + $appExe + '" "%1"'
+        Set-ItemProperty -Path "$protocolKey\shell\open\command" -Name "(Default)" -Value $commandValue
+        $protocolRegistered = $true
+    }
+    catch {
+        Write-Warning "Could not register the ollamarouter:// protocol handler: $($_.Exception.Message)"
     }
 }
 
@@ -412,6 +456,9 @@ Write-Host "State Folder    : $StateDir" -ForegroundColor Green
 Write-Host "Logs Folder     : $LogsDir" -ForegroundColor Green
 Write-Host "CLI Command     : 'ollamarouter'" -ForegroundColor Green
 Write-Host "GUI Command     : 'ollamarouter-app'" -ForegroundColor Green
+if ($protocolRegistered) {
+    Write-Host "URI Protocol    : 'ollamarouter://' handler registered (ollamarouter://open, ollamarouter://wizard)" -ForegroundColor Green
+}
 
 if ($pathAdded) {
     Write-Host "`nNote: Added '$BinDir' to your user PATH." -ForegroundColor Yellow

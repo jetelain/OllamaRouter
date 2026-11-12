@@ -65,6 +65,8 @@ public class SetupCommandTests
                 startInfos.Add(info);
                 return process;
             },
+            // Never touch the real host registry / XDG desktop entry from unit tests (task #107).
+            ProtocolRegistrar = _ => { },
         };
         return (command, startInfos, process);
     }
@@ -236,6 +238,8 @@ public class SetupCommandTests
                 startInfos.Add(info);
                 return process;
             },
+            // Never touch the real host registry / XDG desktop entry from unit tests (task #107).
+            ProtocolRegistrar = _ => { },
         };
         var context = Context(out _, out _);
 
@@ -243,6 +247,50 @@ public class SetupCommandTests
 
         Assert.Equal(0, exit);
         Assert.Equal(homeApp, startInfos[0].FileName);
+    }
+
+    // ------------------------------------------------------------------
+    //  task #107: setup (re-)registers the ollamarouter:// protocol handler
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task Setup_RegistersProtocolHandlerWithResolvedAppPath_BeforeLaunch()
+    {
+        var appPath = Path.Combine(AppContext.BaseDirectory, "ollamarouter-app");
+        var registeredPaths = new List<string>();
+        var process = new FakeAppProcess { ExitCode = 0 };
+        var command = new SetupCommand
+        {
+            FileExistsProbe = path => string.Equals(path, appPath, StringComparison.Ordinal),
+            ProcessStarter = _ => process,
+            ProtocolRegistrar = path => registeredPaths.Add(path),
+        };
+        var context = Context(out _, out _);
+
+        var exit = await command.ExecuteAsync(context, [], CancellationToken.None);
+
+        Assert.Equal(0, exit);
+        Assert.Equal([appPath], registeredPaths); // registered exactly once, for the RESOLVED path
+    }
+
+    [Fact]
+    public async Task Setup_RegistrarThrows_WizardStillLaunches()
+    {
+        var appPath = Path.Combine(AppContext.BaseDirectory, "ollamarouter-app");
+        var process = new FakeAppProcess { ExitCode = 0 };
+        var command = new SetupCommand
+        {
+            FileExistsProbe = path => string.Equals(path, appPath, StringComparison.Ordinal),
+            ProcessStarter = _ => process,
+            ProtocolRegistrar = _ => throw new InvalidOperationException("registration failed"),
+        };
+        var context = Context(out _, out _);
+
+        // Registration is best-effort: a throwing registrar must never block the wizard launch.
+        var exit = await command.ExecuteAsync(context, [], CancellationToken.None);
+
+        Assert.Equal(0, exit);
+        Assert.True(process.Disposed);
     }
 
     /// <summary>A self-deleting temp dir installed as <c>OLLAMAROUTER_HOME</c> (restored on dispose).</summary>
