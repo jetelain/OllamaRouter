@@ -497,7 +497,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
             ConnectRemoteCommand.NotifyCanExecuteChanged();
         }
 
-        if (Avalonia.Threading.Dispatcher.UIThread.CheckAccess())
+        if (Avalonia.Application.Current is null || Avalonia.Threading.Dispatcher.UIThread.CheckAccess())
         {
             Notify();
         }
