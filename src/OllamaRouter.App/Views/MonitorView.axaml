@@ -4,8 +4,8 @@
              xmlns:vm="using:OllamaRouter.App.ViewModels"
              x:Class="OllamaRouter.App.Views.MonitorView"
              x:DataType="vm:MonitorViewModel">
-  <ScrollViewer Padding="12">
-    <StackPanel Spacing="16">
+  <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto">
+    <StackPanel Spacing="16" Margin="12,12,12,48">
       <TextBlock Text="{Binding LastError}" Foreground="#FF7B7B" TextWrapping="Wrap" IsVisible="{Binding IsErrorVisible}"/>
 
       <!-- 1. FLEET STATUS & RUNTIME AVAILABILITY (Top section, exactly matching web monitor) -->

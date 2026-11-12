@@ -22,9 +22,9 @@
     </DataTemplate>
   </Window.DataTemplates>
 
-  <DockPanel>
+  <Grid RowDefinitions="Auto,*">
     <!-- Modern Header / Connection bar -->
-    <Border DockPanel.Dock="Top" BorderBrush="{DynamicResource SemiColorBorder}" BorderThickness="0,0,0,1">
+    <Border Grid.Row="0" BorderBrush="{DynamicResource SemiColorBorder}" BorderThickness="0,0,0,1">
       <StackPanel>
         <Grid ColumnDefinitions="auto,*,auto" Margin="14,10" VerticalAlignment="Center">
           <!-- Left: Title & Status -->
@@ -60,11 +60,15 @@
     </Border>
 
     <!-- Tabs -->
-    <TabControl SelectedIndex="{Binding SelectedTabIndex}" Margin="6">
+    <TabControl Grid.Row="1"
+                SelectedIndex="{Binding SelectedTabIndex}"
+                Margin="6,4,6,6"
+                HorizontalContentAlignment="Stretch"
+                VerticalContentAlignment="Stretch">
       <TabItem Header="Monitor &amp; Savings" Content="{Binding MonitorTab}"/>
       <TabItem Header="Fleet &amp; Cloud Targets" Content="{Binding FleetTab}"/>
       <TabItem Header="Model Cartography" Content="{Binding CartographyTab}"/>
       <TabItem Header="Settings &amp; API Keys" Content="{Binding SettingsTab}"/>
     </TabControl>
-  </DockPanel>
+  </Grid>
 </Window>

@@ -4,8 +4,8 @@
              xmlns:vm="using:OllamaRouter.App.ViewModels"
              x:Class="OllamaRouter.App.Views.CartographyView"
              x:DataType="vm:CartographyViewModel">
-  <ScrollViewer Padding="12">
-    <StackPanel Spacing="16">
+  <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto">
+    <StackPanel Spacing="16" Margin="12,12,12,48">
       <TextBlock Text="{Binding LastError}" Foreground="#FF7B7B" TextWrapping="Wrap" IsVisible="{Binding IsErrorVisible}"/>
       <Grid ColumnDefinitions="*,auto">
         <TextBlock Grid.Column="0" Text="Model Cartography &amp; Deployment Matrix" FontWeight="Bold" FontSize="16" VerticalAlignment="Center"/>
