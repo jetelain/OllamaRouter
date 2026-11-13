@@ -451,4 +451,5 @@ docs/transcripts/
 .nightcodeforge/logs/
 .nightcodeforge/audit-report.md
 # <<< nightcodeforge <<<
+
 src/OllamaRouter/config/default-key.dat
