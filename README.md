@@ -1,4 +1,4 @@
-# OllamaRouter
+# <img src="docs/icon.svg" alt="OllamaRouter icon" width="32" align="absmiddle" /> OllamaRouter
 
 OllamaRouter is a lightweight reverse proxy that sits in front of two [Ollama](https://ollama.com) instances and transparently routes each request to the most appropriate one:
 

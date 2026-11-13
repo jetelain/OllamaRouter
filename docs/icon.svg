@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1b1f27" />
+      <stop offset="100%" stop-color="#0f1116" />
+    </linearGradient>
+    <linearGradient id="llamaGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" />
+      <stop offset="100%" stop-color="#cbd5e1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded square badge -->
+  <rect x="6" y="6" width="116" height="116" rx="26" fill="url(#bg2)" stroke="#2d333f" stroke-width="2" />
+
+  <!-- Routing arcs radiating from llama to 3 targets -->
+  <path d="M 60 66 C 74 66, 76 34, 96 34" fill="none" stroke="#38bdf8" stroke-width="5.5" stroke-linecap="round" />
+  <path d="M 60 66 L 96 66" fill="none" stroke="#34d399" stroke-width="5.5" stroke-linecap="round" />
+  <path d="M 60 66 C 74 66, 76 98, 96 98" fill="none" stroke="#c084fc" stroke-width="5.5" stroke-linecap="round" />
+
+  <!-- Target dots -->
+  <circle cx="98" cy="34" r="7.5" fill="#38bdf8" />
+  <circle cx="98" cy="66" r="7.5" fill="#34d399" />
+  <circle cx="98" cy="98" r="7.5" fill="#c084fc" />
+
+  <!-- Minimalist geometric Llama silhouette (facing left, clean profile) -->
+  <path d="
+    M 46 106
+    L 46 72
+    L 33 72
+    C 25 72, 21 67, 21 61
+    C 21 55, 25 51, 32 51
+    L 36 51
+    L 36 33
+    C 36 25, 41 21, 44 21
+    C 47 21, 49 26, 49 33
+    L 49 41
+    L 53 41
+    L 53 29
+    C 53 22, 57 19, 60 19
+    C 63 19, 65 24, 65 32
+    L 65 56
+    C 65 65, 62 72, 62 82
+    L 62 106
+    Z"
+    fill="url(#llamaGrad)"
+  />
+
+  <!-- Llama eye -->
+  <circle cx="42" cy="54" r="2.8" fill="#111318" />
+
+  <!-- Junction ring on llama neck -->
+  <circle cx="56" cy="66" r="5" fill="#cbd5e1" stroke="#f8fafc" stroke-width="4" />
+</svg>
+

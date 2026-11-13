@@ -5,6 +5,7 @@
         x:Class="OllamaRouter.App.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
         Title="OllamaRouter"
+        Icon="avares://ollamarouter-app/Assets/icon.ico"
         Width="1280" Height="800"
         MinWidth="960" MinHeight="600">
   <Window.DataTemplates>

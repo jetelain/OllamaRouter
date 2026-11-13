@@ -6,6 +6,7 @@
         x:Class="OllamaRouter.App.Views.Wizard.SetupWizardWindow"
         x:DataType="wvm:SetupWizardViewModel"
         Title="OllamaRouter Setup"
+        Icon="avares://ollamarouter-app/Assets/icon.ico"
         Width="1020" Height="700"
         MinWidth="860" MinHeight="560">
   <DockPanel>

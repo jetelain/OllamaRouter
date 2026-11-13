@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -7,6 +7,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>OllamaRouter.App</RootNamespace>
     <AssemblyName>ollamarouter-app</AssemblyName>
+    <ApplicationIcon>Assets\icon.ico</ApplicationIcon>
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
     <!-- Native AOT: publish as a single self-contained native executable. Avalonia stays AOT-compatible here
          because bindings are compiled by default, XAML is source-generated at build time, and all JSON flows
@@ -15,6 +16,10 @@
     <ServerGarbageCollection>false</ServerGarbageCollection>
     <IsAotCompatible>true</IsAotCompatible>
   </PropertyGroup>
+
+  <ItemGroup>
+    <AvaloniaResource Include="Assets\icon.ico" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Avalonia" Version="12.1.6" />

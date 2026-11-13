@@ -6,6 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>ollamarouter</AssemblyName>
     <RootNamespace>OllamaRouter.Cli</RootNamespace>
+    <ApplicationIcon>..\OllamaRouter\icon.ico</ApplicationIcon>
     <Description>
       OllamaRouter user CLI (task #100): daemon lifecycle commands (start/stop/restart/status/
       logs) + the detached live Terminal UI (ollamarouter monitor). NativeAOT BCL-only executable:
