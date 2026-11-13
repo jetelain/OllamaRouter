@@ -1,22 +1,25 @@
 # <img src="docs/icon.svg" alt="OllamaRouter icon" width="32" align="absmiddle" /> OllamaRouter
 
-OllamaRouter is a lightweight reverse proxy that sits in front of two [Ollama](https://ollama.com) instances and transparently routes each request to the most appropriate one:
+OllamaRouter is a lightweight, Native AOT reverse proxy and fleet orchestrator for [Ollama](https://ollama.com). It sits on the standard Ollama port (`http://localhost:11434`) and transparently routes each request to the best available machine — for example, a **local** workstation with a fast GPU and limited VRAM, a **remote** server with large unified RAM/VRAM, or **ollama.com cloud** models when local/remote nodes are busy.
 
-- A **local** Ollama instance, running on a machine with a powerful GPU but **limited VRAM** (NVIDIA, AMD, or Intel GPU, or Apple Silicon Mac with unified memory).
-- A **remote** Ollama instance (e.g. a server), with a lot of **unified RAM or VRAM** but a **less powerful GPU**.
+## Key features
 
-The goal is to get the best of both worlds: use the fast local GPU whenever the request can fit in its available VRAM, and fall back to the remote server for everything else (larger contexts, models that don't fit locally, etc.).
+- **Two-stage fleet routing** — qualifies targets by liveness, model availability, and context capacity, then scores candidates by hot-model affinity, configured speed, anti-thrashing, and concurrency.
+- **Cloud overflow** — optionally overflows to [ollama.com cloud](https://ollama.com) models per model so busy or unavailable nodes never block incoming requests.
+- **Automatic failover on consecutive errors** — tracks token-correlated retry streaks and interrupted streams, automatically failing over along the target chain.
+- **Routing transparency & client target pinning** — emits `X-OllamaRouter-*` telemetry headers and lets clients pin exact targets or location scopes (`local`, `remote`, `cloud`, `local,remote`).
+- **MoE dynamic context sizing** — elastically expands MoE context up to native limits on demand and shrinks back when idle, while clamping oversized dense requests to prevent OOMs.
+- **Fleet cartography & model preload** — exposes live per-node hardware, loaded VRAM footprints, and an idempotent preload API with per-node keep-alive policies.
+- **Automated micro-benchmarking & role recommendations** — benchmarks candidate models across context windows (≥ 20 t/s viability) and maps agentic role aliases (`basic`, `agentic_chat`, `software_architect`, `senior_developer`, `junior_developer`) to optimal native models and per-node ceilings.
+- **Zero-VRAM monitoring (Web UI & TUI)** — built-in `/monitor` dashboard and console TUI with live target toggles, VRAM reclaim, failure-streak status, 7-day token/cost/electricity savings, and per-session analytics.
+- **Desktop app & Setup Wizard** — cross-platform Avalonia GUI (`ollamarouter-app`) with a 4-step Setup Wizard and `ollamarouter://` URI launcher.
+- **OpenAPI & API key security** — runtime OpenAPI 3.1 spec at `/api/router/openapi.json` and DPAPI/hashed API key protection for configuration and admin endpoints.
 
-OllamaRouter is more than a simple two-tier proxy, it also provides:
-
-- **Cloud overflow** (optional, per model). When both instances are busy, requests can **overflow to [ollama.com cloud](https://ollama.com)** models, so a slow/unavailable Local or Remote instance never fully blocks incoming requests. See [Cloud overflow](#cloud-overflow).
-- **Target failover on consecutive errors**. When client retries repeatedly fail on a target (e.g. context limit HTTP 400 or timeouts), requests automatically switch to the next target in the chain. See [Target failover on consecutive errors](#target-failover-on-consecutive-errors).
-- **Routing transparency & client target pinning**. Emits telemetry headers (`X-OllamaRouter-Target`, `X-OllamaRouter-Model`, `X-OllamaRouter-Estimated-Tokens`) on all completions, and allows clients to explicitly override routing via an incoming `X-OllamaRouter-Target` header. See [Routing transparency & target pinning](#routing-transparency--client-target-pinning).
-- **A built-in monitoring page**. A lightweight, dependency-free page at `/monitor` shows which targets are busy, which requests are in progress and what has been processed recently, and lets you enable/disable the **Local**, **Remote** and **Cloud** targets at runtime — switching the router between operating modes without restarting it. See [Monitoring](#monitoring).
+---
 
 ## How it works
 
-From the user's point of view, there is a single endpoint: the router listens on the standard Ollama port (`http://localhost:11434`) and transparently forwards each request to the local or the remote instance — or, optionally, to an [ollama.com cloud](https://ollama.com) model — depending on the model requested and the size of the prompt (a monitoring page is also available under `/monitor`, see [Monitoring](#monitoring)).
+From any Ollama or OpenAI-compatible client's perspective, OllamaRouter is a single endpoint on `http://localhost:11434`. It inspects inference requests and forwards them via [YARP](https://github.com/microsoft/reverse-proxy) to the optimal target:
 
 ```mermaid
 flowchart TD
@@ -41,352 +44,216 @@ flowchart TD
     style monitor fill:#fff3cd
 ```
 
-For every incoming request, OllamaRouter decides between `Local`, `Remote` and `Cloud` and forwards the request accordingly using [YARP](https://github.com/microsoft/reverse-proxy) (`Cloud` is physically routed to the **Local** instance, see [Cloud overflow](#cloud-overflow) below).
+### Routed & aggregated endpoints
 
-### Endpoints that are inspected and routed dynamically
-
-Requests to the following endpoints are inspected to extract the prompt and the model name:
+Inference requests to these endpoints are inspected to extract the model name and estimated prompt tokens:
 
 - `POST /api/chat`
 - `POST /api/generate`
 - `POST /v1/chat/completions`
 - `POST /v1/completions`
+- `POST /api/embeddings`
 
-For these requests, the routing decision is orchestrated by `RoutingDecisionService` using a two-stage evaluation engine over configured fleet `Targets`, with fallback to `CloudRoutingTargetHandler` when configured:
+For each request, the routing engine runs two stages over enabled `Targets` (supporting both standard `Ollama` daemons and `OpenAI`-compatible endpoints, with automatic protocol translation between Ollama NDJSON and OpenAI SSE on chat/generate routes):
 
-1. **Stage 1 — Hardware & Context Qualification:** The router evaluates all enabled targets to verify the target is online, possesses the requested model in its catalog, and has sufficient context capacity (`estimatedPromptTokens + ContextFitMarginTokens ≤ CMax`, where `CMax` is the target's pre-configured `num_ctx`).
-2. **Stage 2 — Heuristic Scoring & Dispatch:** Qualified candidates are scored based on state and capabilities:
-   - **Hot model bonus (+100):** If the model is already loaded in memory (verified via `/api/ps`).
-   - **Speed bonus (up to +150):** Scaled according to each target's configured `SpeedFactor`.
-   - **Anti-thrashing penalty (-100):** Avoids evicting a different active model when another node can take the request cold.
-   - **Load & concurrency penalties:** Prefers idle instances over instances already handling concurrent requests.
-3. **Cloud overflow fallback:** If primary fleet targets are busy, failing, or incapable of handling the request, OllamaRouter checks if cloud overflow is enabled and a `CloudModel` is configured for the requested model (see [Cloud overflow](#cloud-overflow)) — except when the *only* Stage-1 failure is context overflow, where the clamped `DispatchToLargestCapacityOnOverflow` local dispatch takes precedence over Cloud.
-4. If no enabled target is capable of handling the request, OllamaRouter rejects the request with HTTP `503 Service Unavailable`.
+1. **Stage 1 — Hardware & Context Qualification:** verifies the target is online, has the requested model in its catalog, is hardware-capable, and has enough context capacity (`estimatedPromptTokens + ContextFitMarginTokens ≤ CMax`, where `CMax` respects any active role recommendation ceiling).
+2. **Stage 2 — Heuristic Scoring & Dispatch:** scores qualified candidates using:
+   `Score = SpeedBonus(+0…150) + SessionAffinityBonus(+150) + AffinityBonus(+100) + HardwareBonus(+20) − EvictionPenalty(−80) − ConcurrencyPenalty − OtherSessionPenalty`
+   where `SpeedBonus` scales by `SpeedFactor`, `AffinityBonus` rewards models already resident in `/api/ps`, `EvictionPenalty` (`-80`) avoids evicting another active model, `ConcurrencyPenalty` (`40 × InFlight`, plus `+220` cliff at `MaxParallel`) prefers idle nodes, and `OtherSessionPenalty` (`-120`) avoids nodes reserved by another active session's KV cache.
+3. **Overflow & Fallback:** if all targets fail Stage-1 due to context size, `DispatchToLargestCapacityOnOverflow` can dispatch to the largest-capacity capable node with `num_ctx` clamped; otherwise (or when targets are busy/failing), the router falls back to **Cloud** when configured, or returns HTTP `503 Service Unavailable`.
 
-If the request body cannot be parsed for any reason, the request falls back to the default enabled primary target.
+Management & discovery endpoints are aggregated automatically:
 
-> **Note.** Each target in `Targets` as well as **Cloud** can be toggled individually, at any time, from the [monitoring page](#monitoring). If a target is disabled, it will **never** handle any request. A **busy** target can still accept queued requests as a fallback when all eligible instances are in use, but a **disabled** target is completely excluded from routing. Disabling **Cloud** disables cloud overflow for all models.
+- `GET /api/tags` and `GET /v1/models` return a **merged** model list across all targets (including configured `CloudModel` / `CloudOverflow:DefaultModel` entries and synthesized OpenAI target models).
+- `GET /api/ps` returns a **merged** list of currently loaded models across the fleet.
+- `POST /api/show` is model-directed across online targets (honoring `X-OllamaRouter-Target` pins) with a 30 s response cache.
+- `POST /api/router/vram/reclaim` (alias `POST /api/router/fleet/unload`), `POST /api/models/unload`, and `POST /monitor/reclaim-vram` unload running models to free VRAM (with optional `?disableTarget=false`).
+- Other management requests (`/api/pull`, `/api/delete`, `/api/copy`, `/api/create`) route to the primary target (or the pinned target/scope when specified).
+
+---
+
+## Core features
 
 ### Cloud overflow
 
-When a model's configuration includes a `CloudModel` entry (e.g. `deepseek-v3.1:671b-cloud` or `glm-4.6:cloud`), OllamaRouter can overflow to [ollama.com cloud](https://ollama.com) whenever using **Remote** would mean waiting behind an already-busy request:
+When Cloud Overflow is enabled (`CloudOverflow:Enabled`, default `true`) and a model resolves to a cloud model — via per-model `Models:{model}:CloudModel` (e.g. `deepseek-v3.1:671b-cloud`) or the global fallback `CloudOverflow:DefaultModel` (default `glm-5.3-flash:cloud` in `appsettings.json`) — OllamaRouter can overflow requests to [ollama.com cloud](https://ollama.com) whenever primary fleet targets are busy or failing:
 
-- The request is still physically forwarded to the **Local** instance (same YARP cluster), because it is expected to be **signed in to ollama.com** (`ollama signin`) and therefore able to relay chat/generate requests to the cloud on its own.
-- Before forwarding, the `model` field of the request body is rewritten to the configured `CloudModel` name, so the local Ollama process knows which cloud-hosted model to relay to.
-- "Busy" is a simple, already-in-use signal: an instance is considered busy as soon as it currently has at least one chat/generate request in flight (see `IActivityMonitorService.IsBusy`).
-- This is meant as a last resort for a model that has no directly usable ollama.com cloud equivalent (e.g. Qwen3.8 isn't offered as an ollama.com cloud model): configure a comparable/cheaper cloud model instead of leaving requests queued behind a busy Remote instance.
-- **Precedence with `DispatchToLargestCapacityOnOverflow`:** a request whose fleet targets are disqualified by context overflow is served by the largest-capacity fleet node with a clamped `options.num_ctx` *before* the Cloud relay is considered (task #53). Disabling `DispatchToLargestCapacityOnOverflow` makes such requests spill directly to Cloud when configured. Cloud likewise stays the terminal fallback when no fleet target can serve the overflow (offline / disabled / model absent / hardware incapable) or when every largest-capacity fallback candidate has an active failure streak above `MaxConsecutiveFailures`.
-- Cloud overflow is entirely opt-in per model: leave `CloudModel` unset (the default) to keep the original Local/Remote-only behavior.
+- Requests are physically relayed through the preferred fleet node (`CloudOverflow:PreferredRelayTarget`, default `Local`, falling back to any online fleet node) signed in to `ollama.com` (`ollama signin`), with the `model` field rewritten to the resolved cloud model — no separate API key is needed in OllamaRouter.
+- Cloud overflow acts as a terminal fallback after local/remote targets (and after `DispatchToLargestCapacityOnOverflow` for context-overflowing prompts).
 
-> **Note.** Unlike Local/Remote, OllamaRouter does not talk directly to ollama.com: it relies on the Local Ollama instance's own cloud relay and credentials. No API key or cloud URL needs to be configured in OllamaRouter itself.
+See [Configuration](docs/configuration.md) for `CloudOverflow:*` and `Models:*:CloudModel` options.
 
-### Target failover on consecutive errors
+### Target failover & circuit breaker
 
-When errors or timeouts arise (such as HTTP 400 Bad Request because a prompt exceeds an instance's context size, or gateway timeouts), LLM clients typically retry the request repeatedly until success. If the chosen target cannot process the request, these retries can take an extremely long time.
+OllamaRouter handles both uncommitted connection failures and mid-stream drops automatically:
 
-To alleviate this, OllamaRouter correlates requests using their **estimated prompt token count** and tracks consecutive failures across **adjacent requests**:
-
-- If adjacent requests within the token tolerance margin fail **3 times** on the same target (configurable via `MaxConsecutiveFailures`, defaulting to `3`), the router dynamically skips that target and routes subsequent retries to the next target in the chain (**Local** → **Remote** → **Cloud**).
-- For example, if a large 91.3k-token request fails 3 times on **Remote** (e.g. returning 400 errors or timing out):
-  ```
-  02:36:08   📡 Remote   Qwen3.8-27B:latest   91.3k / -   -   307.3s   400
-  02:42:08   📡 Remote   Qwen3.8-27B:latest   91.3k / -   -   358.1s   400
-  02:43:59   📡 Remote   Qwen3.8-27B:latest   91.3k / -   -   332.4s   400
-  ```
-  The next retry will be dispatched to **Cloud** if enabled. If Cloud is disabled or has no `CloudModel` configured, it keeps the Remote target as fallback.
-- Similarly, if a request fails 3 times on **Local**, it fails over to **Remote**; if Remote also fails 3 times, it fails over to **Cloud**.
-- **Tolerance margin**: Because AI agents frequently append conversation turns, retry notes, or error context on retries (causing prompt token size to slightly increase on each attempt), adjacency allows a configurable margin of tolerance via `ConsecutiveFailuresTokenTolerance` (defaulting to `4000` tokens). Requests that increase or vary within this margin remain part of the same failure streak. Set to `0` to require an exact token count.
-- **Interrupted request detection**: When an OpenAI-compatible caller aborts or times out mid-stream (e.g. client-side timeout during large prompt evaluation), the response may have already committed HTTP 200 headers. OllamaRouter inspects client disconnects (`RequestAborted`), YARP forwarder errors, and stream completion sentinels (`data: [DONE]` for SSE, `"done": true` for NDJSON). Interrupted streams are automatically detected, marked as failures (`HTTP 499` Client Closed Request or `HTTP 502`), and counted toward consecutive failures so cloud overflow can unstuck the agent.
-- Any fully completed successful response (`HTTP status < 400`) clears the failure count.
+- **In-request uncommitted failover:** if a target fails before committing the first response byte (connection refused, timeout, transport error), the dispatch loop rewinds the buffered request body, records a failure streak and liveness strike, and immediately fails over to the next qualified candidate in the chain (**Local → Remote → Cloud**).
+- **Interrupted stream detection:** mid-stream server/forwarder drops and missing stream completion sentinels (`data: [DONE]` for SSE, `"done": true` for NDJSON) after HTTP 200 headers are committed are recorded as `HTTP 502` and increment the target's failure streak. Genuine client disconnects (`RequestAborted`) are recorded as `HTTP 499` and **never** increment the failure streak or trigger failover.
+- **Three-state circuit breaker (`Closed` → `Cooldown` → `HalfOpen`):** once a target's consecutive failures exceed `MaxConsecutiveFailures` (code default `3`, factory `appsettings.json` default `2`), it enters a `Cooldown` (Open) window for `FailureStreakCooldownSeconds` (default `60` s) during which it is skipped by routing. After the cooldown elapses, it enters `HalfOpen` and admits a single trial request: a completed response (`HTTP < 400`) closes the circuit and resets the streak, while a failure re-arms the cooldown.
+- Streaks also reset automatically when an offline target recovers liveness (`ResetStreakOnLivenessRecovery`, default `true`), or on demand via `POST /api/router/targets/{name}/reset-streak` and `POST /api/router/fleet/reset-streaks`.
 
 ### Routing transparency & client target pinning
 
-AI agent frameworks, orchestrators (such as [NightCodeForge](https://github.com/jetelain/NightCodeForge), OpenCode, Aider, Zed AI), and telemetry pipelines benefit from knowing which physical backend processed each inference request, or being able to force a specific destination when necessary:
+Every chat and completion response includes telemetry headers (streamed immediately via `OnStarting` on chunked NDJSON/SSE responses):
 
-1. **Routing transparency headers:** OllamaRouter emits headers on all chat and completion responses (`/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/completions`):
-   - `X-OllamaRouter-Target`: The physical routing destination (`Local`, `Remote`, or `Cloud`).
-   - `X-OllamaRouter-Model`: The model name extracted from the request.
-   - `X-OllamaRouter-Estimated-Tokens`: The estimated prompt tokens used for routing decisions.
+- `X-OllamaRouter-Target`: The concrete target that finally served the request (`Local`, `Remote`, `Cloud`, etc.).
+- `X-OllamaRouter-Model`: The resolved model name dispatched to the target.
+- `X-OllamaRouter-Role`: The virtual role alias (`basic`, `agentic_chat`, `software_architect`, `senior_developer`, `junior_developer`), emitted when role-to-model translation occurred.
+- `X-OllamaRouter-Estimated-Tokens`: The estimated prompt tokens used for routing.
+- `X-OllamaRouter-Dispatch-Mode`: The dispatch path used (`yarp` for same-protocol zero-copy forwarding, or `converter` for cross-protocol translation).
+- `X-OllamaRouter-Session-Id`: Echoed when a session or agent ID (`X-OllamaRouter-Session-Id` or `X-OllamaRouter-Agent-Id`) was recognized.
+- `X-OllamaRouter-Context-Size` / `X-OllamaRouter-Context-Mode`: Effective `num_ctx` and lease mode (`baseline`, `fresh-expanded`, `retained`, `shrunk`, `recommended_ceiling`) when dynamic context sizing or clamping rewrote the payload.
+- `X-OllamaRouter-Fallback` / `X-OllamaRouter-Context-Warning`: Emitted when `DispatchToLargestCapacityOnOverflow` clamped an oversized prompt to the largest node's `CMax`.
 
-   Headers are registered via `OnStarting` so they stream immediately on chunked NDJSON and SSE connections:
-   ```http
-   HTTP/1.1 200 OK
-   Content-Type: application/x-ndjson
-   X-OllamaRouter-Target: Local
-   X-OllamaRouter-Model: qwen2.5-coder:32b
-   X-OllamaRouter-Estimated-Tokens: 1420
-   ```
+Clients can also override routing by sending an inbound `X-OllamaRouter-Target` header with either an **exact target name** or a **location scope** (`local`, `remote`, `cloud`, or comma-separated allow-lists like `local,remote`):
 
-2. **Client target pinning (inbound header):** Clients can explicitly pin or prefer a target by supplying the `X-OllamaRouter-Target` request header:
-   ```http
-   POST /v1/chat/completions HTTP/1.1
-   Host: localhost:11434
-   X-OllamaRouter-Target: Cloud
-   Content-Type: application/json
-   ```
-   - **Zero-VRAM Cloud Diagnostics:** Force execution to `Cloud` so large failure transcripts or debug analysis consume zero local VRAM and bypass the local dev queue.
-   - **Air-Gapped / Untrusted Triage:** Force execution to `Local` to guarantee no external network transmission for untrusted or sensitive code.
-   - **JIT Model Preload:** Force `Local` on empty `POST /api/generate` requests to ensure weights are resident in GPU memory.
+| Header value | Effect |
+|---|---|
+| `local` | Only targets classified 🖥️ **Local** (loopback) may serve. |
+| `remote` | Only targets classified 📡 **Remote** (LAN / private) may serve. |
+| `cloud` | Routes to the **Cloud** pseudo-target. |
+| `local,remote` | Allow-list: keeps inference on-prem and never leaks to ollama.com. |
 
-   If the requested target is enabled in `targetAvailability`, OllamaRouter honors the pin immediately. If the requested target is currently disabled, it logs a warning and falls back to dynamic routing.
+Exact target names take precedence over scope keywords. If a scope excludes `cloud` and no in-scope target can serve, the router returns `503` rather than falling back to Cloud.
 
-   **Location-scoped pins (allow-lists):** Instead of a concrete target name, the header may carry a *location scope* — the case-insensitive keywords `local`, `remote`, or `cloud`, optionally comma-separated (e.g. `local,remote`):
+### Dynamic context sizing (MoE)
 
-   | Header value | Effect |
-   |---|---|
-   | `local` | Only targets classified 🖥️ **Local** (loopback: `localhost`, `127.0.0.1`, `::1`) may serve. |
-   | `remote` | Only targets classified 📡 **Remote** (LAN: RFC 1918 / ULA / link-local IPs, `.local`, `.ts.net`, single-label hostnames) may serve. |
-   | `cloud` | The **Cloud** pseudo-target (exact pin, identical to today's `Cloud` behavior). |
-   | `local,remote` | Allow-list: only Local- and Remote-classified targets may serve (the "keep it off ollama.com" privacy scope). Duplicates collapse; each comma-separated token is trimmed individually. |
+When enabled, OllamaRouter sizes `options.num_ctx` per request:
 
-   - **Exact-name precedence:** A configured target *named* `remote` (or `local`/`cloud`) is always an exact pin — scope keywords are only parsed after exact-name matching fails.
-   - **No-cloud-leak semantics:** A scope that excludes `cloud` (e.g. `local,remote`) never fails over to the Cloud relay: if no in-scope target can serve, the existing `503` all-offline diagnostics are returned rather than silently sending the request to ollama.com. A `{Cloud}`-only scope with Cloud Overflow unavailable mirrors today's pinned-`Cloud` behavior (warning + unscooped dynamic routing, not a hard 503).
-   - **Invalid tokens:** Any empty or unknown token (e.g. `local,,remote`, `banana`) invalidates the whole header — the request falls back to dynamic routing (completions) or the primary target (pinned-management), exactly as with an unrecognized name.
-   - **Telemetry:** The response `X-OllamaRouter-Target` header always echoes the **concrete** target that served the request, never a scope keyword.
-   - **Pinned-management endpoints** (`/api/pull`, `/api/delete`, `/api/copy`, `/api/create`) honor a scope by routing to the first enabled + routable target of an allowed location (declaration order), falling back to the primary target with a warning when none is routable.
+- **MoE models** use a **two-bucket ladder** between the node's pre-configured `num_ctx` (optimal baseline, or active recommended baseline) and the model's native context length (extensible bucket, optionally capped by `Models:{model}:MaxContextTokens`). The **Auto-Shrink Manager** preserves the expanded KV prefix cache across a cooldown of normal turns (`AutoShrinkCooldownTurns`) before shrinking back on a 50% token drop or idle timeout (`AutoShrinkIdleTimeoutSeconds`).
+- **Dense models** use **clamp-only pass-through**: `options.num_ctx` is clamped down if the client requests more than the node's effective `CMax` (protecting against OOMs without causing slow KV-cache reallocations), or injected when an active role recommendation ceiling (`recommended.json`) is strictly below the node's Modelfile window.
 
-   Example — LAN-only inference that never touches ollama.com:
-   ```http
-   POST /api/chat HTTP/1.1
-   Host: localhost:11434
-   X-OllamaRouter-Target: local,remote
-   Content-Type: application/json
-   ```
+See [Dynamic context sizing](docs/configuration.md#dynamic-context-sizing-moe-only) for details.
 
-   Target locations are classified by the `OllamaRouter:Targets[i]:Location` override when set, otherwise from the configured `Url` (see the monitor UI's 🖥️/📡/☁️ icons, which show the same classification).
+### Fleet cartography & model preload
 
+- **Fleet Cartography (`GET /api/router/cartography`):** returns a single-call snapshot of all fleet `nodes[]` (hardware, liveness, context lease, loaded VRAM), merged `models[]` (architecture, quantization, native/recommended context, per-target `deployments[]` matrix), and flat `loadedModels[]` footprints. Reads in-memory snapshots only — never hangs on offline nodes.
+- **Model Preload (`POST /api/router/models/{model}/preload`, `GET /api/router/preload/preview`):** selects the best capable idle node (preferring server/cloud-class nodes for intents ≥ 65,536 tokens), issues a bounded empty-prompt load with explicit `num_ctx` and `keep_alive`, and confirms residency via `/api/ps`. Per-node keep-alive defaults (`-1` for server/cloud, `900s` for desktop) can be overridden per target or globally; see [Preload keep-alive policy](docs/configuration.md#preload-keep-alive-policy).
 
-### Other endpoints
+### Model benchmarking & role recommendations
 
-- All other requests (model pull/push/delete, etc.) are routed to **Local** by default.
-- `GET /api/tags` and `GET /v1/models` return a **merged** list of models available on both instances (local models take priority in case of a name conflict), including configured `CloudModel` overflow options so client model pickers auto-discover cloud models.
-- `GET /api/ps` returns a **merged** list of models currently loaded/running on both instances.
-- `POST /api/models/unload` unloads running models from the local instance without disabling the `Local` routing target.
-- `POST /monitor/reclaim-vram` unloads running models and accepts an optional query parameter `disableTarget` (defaults to `true` to disable Local for gaming/editing, or pass `?disableTarget=false` for non-destructive unloading).
-- Any other request is proxied as a catch-all to the instance selected by the routing decision.
+- **Micro-benchmarking (`POST /api/router/benchmark`, `GET/DELETE /api/router/benchmark/results`):** tests candidate models (`gemma4:e4b`, `qwen3.8:27b`, `qwen3.6:35b-a3b`) across a context ladder (`16k` → `256k`), pruning out-of-VRAM candidates pre-flight (92% fast-memory check) and verifying **≥ 20 tokens/sec** decode throughput. Seeds `targets-speed.json` with measured speeds.
+- **Role recommendations (`GET /api/router/recommendations`, `POST .../generate`, `POST .../apply`):** computes the optimal role → native-model assignment and lower-only per-node context ceilings (`recommended.json`, auto-loaded at startup). Clients can send virtual role aliases (`basic`, `agentic_chat`, `software_architect`, `senior_developer`, `junior_developer`) as `model`; the router rewrites them to the native model name (sharing resident weights with zero evictions) and echoes `X-OllamaRouter-Role`.
 
-### Fleet cartography
+### Dual-router mesh
 
-`GET /api/router/cartography` answers the whole fleet deployment question in one call — where every model lives, with its quantization, context ceilings, and the actual per-process VRAM footprint:
+OllamaRouter can run as a **symmetrical, loop-free mesh** (e.g. one router on a desktop and one on a laptop), where each router forwards directly to physical Ollama daemons on `:11435` and never to a peer router. See [Dual-Router Mesh setup](docs/ollama-setup.md#dual-router-mesh-desktop--laptop).
 
-```json
-{
-  "nodes": [
-    {
-      "name": "Local",
-      "url": "http://127.0.0.1:11435",
-      "location": "local",
-      "enabled": true,
-      "liveness": "Online",
-      "stale": false,
-      "lastRefreshedAtUtc": "2026-11-01T12:00:00Z",
-      "hardware": { "gpuName": "NVIDIA GeForce RTX 4090", "gpuVendor": "NVIDIA", "totalVramMB": 24576, "isUnifiedMemory": false, "systemRamMB": 65536 },
-      "contextAllocation": "32k (expanded)",
-      "inFlightRequests": 1,
-      "totalLoadedVramBytes": 33285996544,
-      "loadedModels": [ { "name": "qwen3.6-35b-a3b:latest", "sizeVramBytes": 33285996544, "quantization": "Q4_K_M", "contextLength": 16384 } ]
-    },
-    { "name": "Cloud", "location": "cloud", "enabled": true, "liveness": "Online", "stale": false, "contextAllocation": "baseline", "inFlightRequests": 0, "totalLoadedVramBytes": 0, "loadedModels": [] }
-  ],
-  "models": [
-    {
-      "name": "qwen3.6-35b-a3b:latest",
-      "architecture": "Moe",
-      "parameterCount": 35000000000,
-      "weightSizeBytes": 21474836480,
-      "quantization": "Q4_K_M",
-      "nativeContextWindow": 131072,
-      "recommendedContextWindow": 131072,
-      "cloudOverflowAvailable": true,
-      "deployments": [
-        { "target": "Local", "present": true, "capable": true, "contextCeiling": 131072, "isResident": true, "loadedSizeVramBytes": 33285996544, "inFlightRequests": 1, "quantization": "Q4_K_M" },
-        { "target": "Laptop", "present": false, "capable": false, "contextCeiling": 4096, "isResident": false, "inFlightRequests": 0, "vetoReason": "model not present in target catalog" }
-      ]
-    }
-  ],
-  "loadedModels": [
-    { "name": "qwen3.6-35b-a3b:latest", "target": "Local", "sizeVramBytes": 33285996544, "quantization": "Q4_K_M", "contextLength": 16384, "contextAllocation": "32k (expanded)", "liveness": "Online", "stale": false }
-  ]
-}
+---
+
+## Monitoring & session analytics
+
+### Web monitor (`/monitor`)
+
+A lightweight, dependency-free dashboard at `http://localhost:11434/monitor` (backed by `/monitor/api`) refreshes every 2 seconds and shows:
+
+- **Target status & runtime toggles:** live Busy/Idle/Offline/Disabled states with checkboxes to enable/disable targets at runtime (persisted to `targets.json`), plus active failure-streak and circuit-breaker cooldown indicators.
+- **In-progress & recent requests:** running requests and the last 50 completed requests (model, estimated vs. actual tokens, elapsed time, HTTP status).
+- **Token statistics & usage ratio:** today and 7-day request/token/GPU-time totals per target (persisted to `activity-statistics.json`) and a visual usage breakdown bar.
+- **Actual savings & cloud cost:** when token rates are configured in `Pricing`, computes 7-day cloud-equivalent value minus node electricity cost (accounting for cached prompt tokens and per-node wattage).
+- **Live token estimation overhead recommendation:** compares raw estimated tokens against Ollama's actual reported prompt tokens and suggests the optimal `TokenEstimationOverheadFactor`.
+
+![Monitor screenshot](docs/monitor.png)
+
+### In-terminal activity monitor (TUI)
+
+When running interactively, OllamaRouter renders a **0-VRAM Terminal UI** directly in the server console with the same live fleet status, failure-streak warnings, 7-day statistics, savings, and recent requests. Pass `--no-tui` (or set `TerminalMonitoring:Enabled: false`) to use standard log output.
+
+### Per-session usage & sticky routing
+
+Clients passing `X-OllamaRouter-Session-Id` (or the fallback `X-OllamaRouter-Agent-Id` header) get:
+
+- **Per-session usage & savings:** tracked in a bounded LRU (`session-usage.json`, capped by `SessionUsageMaxSessions`) and queryable via `GET /api/router/monitor/sessions` and `GET /api/router/monitor/sessions/{sessionId}`. Untagged loopback requests are automatically attributed to their owning local process (`process:<Name>`) for monitoring and session usage visibility.
+- **Sticky routing (KV-cache affinity):** pins explicit sessions to their serving target (`SessionAffinityTtlMinutes`, default 30-min sliding TTL) and reserves that node against contention from other sessions during inter-turn tool/compile gaps (`SessionReservationWindowSeconds`, default 30 s) to maximize prompt-prefix cache hits. Release a session's lease explicitly when done or compacted:
+
+```bash
+curl -X POST -H "X-OllamaRouter-Session-Id: sess-86" \
+  http://localhost:11434/api/router/sessions/affinity/release
 ```
 
-- **`nodes[]`** — every effective target in configuration order, plus the Cloud pseudo-target last (when cloud is enabled). Each carries the hardware summary (`totalVramMB` = effective VRAM budget, null when unknown), the active KV-cache context lease (`contextAllocation`), liveness (same `Online`/`Offline`/`Probing` vocabulary as `/api/router/fleet`), the raw loaded-VRAM total (`totalLoadedVramBytes`, the tracker's sum of `size_vram` — no computed "free" value, since `size_vram` excludes OS/driver allocations), and every currently loaded process with its **live `/api/ps`-sourced** `quantization`.
-- **`models[]`** — every model in the merged fleet catalog (including cloud syntheses, which carry `deployments: []` and `cloudOverflowAvailable: true`), with **catalog-sourced** `quantization` (the target's `/api/tags` `details.quantization_level`, falling back to `/api/show`), and a per-target `deployments[]` matrix that agrees exactly with `GET /api/router/models/{name}` on `present`/`capable`/`contextCeiling`/`vetoReason`/`isResident`/`inFlightRequests` — plus the exact resident `loadedSizeVramBytes` (null-omitted when not resident) and that target's catalog quantization.
-- **`loadedModels[]`** — the flat, non-deduped list of every loaded model process (node rows flattened in order), each annotated with its hosting node's `contextAllocation`, `liveness` and `stale`.
-- **Sizing is strictly numeric**: bytes (`long`) where ps-derived (`sizeVramBytes`, `weightSizeBytes`, `loadedSizeVramBytes`), MB (`int`) where hardware-derived (`totalVramMB`, `systemRamMB`). No humanized aliases.
-- **Performance contract**: the endpoint reads in-memory snapshots (liveness, tracker, lease, hardware store) and the 30 s single-flight capability cache — it never triggers a fresh `/api/ps` refresh. Offline nodes appear with their stale cached data flagged (`stale: true`) and never hang the response. A minimal host (only options + availability registered) answers `200` with degraded rows.
+---
 
-### Model preload
+## Desktop app (`ollamarouter-app`) & Setup Wizard
 
-The router is the authority on *which* node should host a model, *for how long* it should stay resident, and *at what context size* — so a large-context ask (e.g. 260k tokens) lands on a capable server rather than a dense desktop, and a busy node is bypassed in favor of a capable idle one. The API is stateless and idempotent: it selects a target by reusing the EXISTING capability machinery (no new scoring pipeline, no inference), issues ONE bounded `keep_alive`-aware load directly to that daemon, and reports exactly what it did.
+`ollamarouter-app` is a cross-platform Avalonia desktop GUI published as a self-contained Native AOT binary. It runs in **0-VRAM software rendering mode** so all GPU memory stays available for LLMs.
 
-```http
-POST /api/router/models/{*modelName}/preload   # optional query and/or JSON body: {"keepAliveSeconds": -1, "contextIntentTokens": 260000, "target": "server"}
-GET  /api/router/preload/preview?model={model} # side-effect-free preview: which node WOULD be preloaded, with what keep_alive (zero daemon load calls)
-```
+On first run (or via `ollamarouter setup` / `ollamarouter-app --wizard` / `ollamarouter://wizard`), it opens a 4-step **Setup Wizard**:
 
-**Selection rules** (the same per-target capability discovery as `GET /api/router/models/{name}`): every enabled + liveness-online target is gated in order — routable → model present in its catalog → capability discoverable (digest-keyed `/api/show`) → hardware-capable (the exact LargeDense veto reason) → context ceiling (`intent + ContextFitMarginTokens ≤ ceiling`; the MoE extensible capacity or the node's pre-configured `CMax`). Among the eligible candidates the router ranks **idle-first** (a busy node — `inFlightRequests > 0` — is bypassed in favor of an idle capable node), **server/cloud-class first when the intent is ≥ 65,536 tokens**, then lowest in-flight, then declaration order. The Cloud pseudo-target is never a preload candidate (cloud-overflow synthesis-only models resolve but 503 with the skip reasons). When `contextIntentTokens` is omitted, the model's `recommendedContextWindow` (max effective ceiling over the hardware-capable hosters) is used as a soft intent; `numCtx = min(intent, selected ceiling)` is always pinned explicitly on the load.
+1. **Environment** — detects local Ollama and port `:11434` conflicts, with one-click migration of Ollama to `:11435` (Windows & macOS) and router startup.
+2. **Targets** — adds local, remote LAN, and OpenAI-compatible targets plus Cloud overflow with live liveness checks.
+3. **Benchmark** — inspects fleet GPU/VRAM and runs micro-benchmarks across all active nodes.
+4. **Recommendations** — generates and applies the role-to-model matrix and per-node context ceilings.
 
-**Load primitive:** ONE bounded, non-streaming `POST /api/generate` with an empty prompt, the resolved `keep_alive`, and `options.num_ctx` (when positive) — Ollama's documented empty-prompt load behavior — followed by a bounded `/api/ps` residency confirmation. Fail-soft by design: an unreachable daemon, a rejected load, or an unconfirmed residency never 5xxs — the response is a 200 with `loadAccepted: false` / `residencyConfirmed: false` (both calls are bounded by the 4 s catalog-client timeout; a large-model cold load that misses the bound reports `loadAccepted: false`).
+`ollamarouter setup --wait` propagates exit code `0` on Finish or `1` if abandoned. The `ollamarouter://` URI scheme (`ollamarouter://dashboard?tab=monitor|fleet|cartography|settings`, `ollamarouter://wizard`) is registered user-scoped (no admin required) by `ollamarouter setup`, `ollamarouter-app`, and `publish.ps1`.
 
-**Status codes:** `200` with the full selection report (selected target, applied `keep_alive`/`num_ctx`, load/residency flags, every candidate with its skip reason); `400` for `keepAliveSeconds` = 0 or ≤ -2 (immediate unload is not a preload intent) or `contextIntentTokens` < 1; `404` for an unknown model, an unknown explicit `target` (case-insensitive pin — overrides selection, never the safety gates), or a POST path without the `/preload` suffix; `503` when no target qualifies for the requested context.
+---
 
-**Per-node keep-alive convention** (applied when the request omits `keepAliveSeconds`; an explicit request value wins verbatim, including `-1` on a desktop-class node). The same resolution is surfaced live on the fleet/monitor surfaces with a `keepAliveSource` discriminator naming the rule that produced it:
+## CLI (`ollamarouter`)
 
-| Rule | Effective `keep_alive` | `keepAliveSource` |
+The `ollamarouter` Native AOT CLI manages the daemon and fleet (running `ollamarouter` with no arguments in an interactive terminal launches `monitor`; override the daemon URL with `OLLAMAROUTER_URL`):
+
+| Command | Description |
+|---|---|
+| `ollamarouter start` / `stop` / `restart` | Manage the background daemon. |
+| `ollamarouter status [--json]` | Show daemon status and per-target fleet summary. |
+| `ollamarouter logs [--follow\|-f] [--lines\|-n N]` | Show or tail daemon logs (default last 50 lines). |
+| `ollamarouter monitor [--interval <s>]` | Launch the interactive TUI (alias: `top`; keys: `q` quit, `r` reclaim VRAM, `1`–`9` toggle target). |
+| `ollamarouter setup [--wizard] [--wait]` | Open the desktop app's Setup Wizard. |
+| `ollamarouter fleet [--json]` | Show per-target fleet status (alias: `ps`). |
+| `ollamarouter cartography [--json]` | Show fleet cartography (nodes, loaded models, deployment matrix). |
+| `ollamarouter vram reclaim [--keep-enabled] [--target <name>] [--json\|-j]` | Unload resident models to reclaim VRAM (disables target by default unless `--keep-enabled`). |
+| `ollamarouter preload <model> [--context <tokens>] [--keep-alive <s>] [--target <name>] [--preview] [--json\|-j]` | Preload a model on the selected target (`--preview` for dry-run selection). |
+| `ollamarouter target list\|add\|remove\|enable\|disable\|reset-streak` | Manage targets (`add <name> <url> [--type ollama\|openai\|osnative] [--provider <label>] [--api-key <key>] [--power-watts <w>]`; `reset-streak <name>\|--all`). |
+| `ollamarouter benchmark run\|status\|clear` | Run (`[--target <name>] [--model <name>] [--wait]`), inspect (`[--json]`), or clear (`[--json]`) fleet micro-benchmarks. |
+| `ollamarouter help` / `--version` | Show usage (`-h`) or print CLI version (`-v`). |
+
+---
+
+## Installation & running
+
+### Release binaries
+
+Download the latest bundle from the [releases page](../../releases) and extract it. All three executables — `ollamarouter-server` (daemon), `ollamarouter` (CLI), and `ollamarouter-app` (desktop GUI) — are **self-contained Native AOT** binaries with no .NET runtime required:
+
+| Platform | Architectures | Bundles |
 |---|---|---|
-| Explicit `Targets:*:KeepAliveSeconds` override | the configured value verbatim (incl. `-1` on a desktop-class node) | `"explicit"` |
-| Cloud class (`Location` override or URL classification) | `-1` (resident indefinitely) | `"class"` |
-| Server class (effective VRAM ≥ 32,768 MB) | `-1` (resident indefinitely) | `"class"` |
-| Desktop/laptop class (known VRAM below the server threshold) | `900` (15 minutes) | `"class"` |
-| Unclassifiable (unknown VRAM, not cloud) | `PreloadDefaultKeepAliveSeconds` (default `900`) | `"default"` |
+| Windows | x64, arm64 | `OllamaRouter-win-x64.zip`, `OllamaRouter-win-arm64.zip` |
+| macOS | Intel x64, Apple Silicon arm64 | `OllamaRouter-osx-x64.tar.gz`, `OllamaRouter-osx-arm64.tar.gz` |
+| Linux | x64, arm64 | `OllamaRouter-linux-x64.tar.gz`, `OllamaRouter-linux-arm64.tar.gz` |
 
-#### Residency visibility (fleet / monitor)
+### Windows local install (`publish.ps1`)
 
-The preload/keep-alive policy and the per-node model residency are visible on the existing monitoring surfaces — no new route is needed (the full model→node→footprint read remains `GET /api/router/cartography`, `loadedModels[]`):
-
-- **`GET /api/router/fleet`** — every configured target row carries:
-  - `preload.keepAliveSeconds` — the CONFIGURED (router-owned) effective policy, identical to the resolver above (`-1` = resident forever, serialized as the literal `-1`); the answer to "what WOULD the router apply on a preload of this node";
-  - `preload.keepAliveSource` — `"explicit"` / `"class"` / `"default"`;
-  - `execution.residentModels` — the FULL list of models currently resident on the node (in-memory execution tracker order; `[]` when idle); `execution.activeModel` remains the FIRST loaded model (`residentModels[0] == activeModel`);
-  - `execution.activeKeepAliveSeconds` — the best-effort OBSERVED daemon `keep_alive` of the first resident model, sourced from the existing `/api/ps` refresh; omitted when the daemon does not report it. It is deliberately DISTINCT from `preload.keepAliveSeconds` (observed ≠ configured) and is never fabricated from the policy.
-  - The Cloud pseudo-target row carries NO policy (`preload` key absent, `residentModels: []`) — it never hosts models.
-- **Web monitor `/monitor`** — a Keep-Alive column (∞ / `45s` / `15m` / `2h`, tooltip naming the source rule), the preload-policy legend below the fleet table, and a `model+N` Active Model cell (full comma-separated resident list in the tooltip) wherever more than one model is resident.
-- **TUI** — the same legend under the `FLEET` header and the keep-alive token inside the Active Model cell.
-- Snapshots only: both surfaces read the in-memory execution-tracker state — no `/api/ps` or other HTTP calls on the fleet/monitor request paths (never 5xx, never hangs; stale residency flagged exactly as today).
-
-### Model benchmarking
-
-OllamaRouter can automatically determine which candidate models and context sizes are viable on each fleet node. A candidate is **viable** only if it sustains at least **20 tokens/second** decode throughput (measured as `eval_count / (eval_duration × 1e-9)` from a fixed 64-token generation).
-
-**Candidate catalog (code-defined in v1):** `gemma4:e4b` (Basic Model, ~4.5B dense), `qwen3.8:27b` (Agentic Chat / Software Architect / Senior Developer, ~27.8B dense), `qwen3.6:35b-a3b` (Junior Developer, 35B/3.3B-active MoE). Each candidate is tested across the context ladder `16k → 32k → 49k → 65k → 128k → 184k → 256k` (ascending, capped by the model's native context and the target's Modelfile `num_ctx`), with a deterministic real-text filler prompt sized to the context.
-
-**Pre-flight memory residency check:** before any `POST /api/pull` is issued, a pure sizing calculator verifies that weights + KV cache fit within **92% of the node's fast memory** (dedicated VRAM or unified RAM; MiB throughout). Candidates that would spill layers to DDR system RAM are pruned (`reason: "sizing-pruned"`) because 20 t/s is mathematically unreachable at system-RAM bandwidth. MoE models are sized on **active** parameters for the decode test (e.g. ~1.6 GB active buffer for `qwen3.6:35b-a3b` q4), while the full weights must still be resident in fast+system memory (fast-only on unified nodes). Nodes with an **unknown hardware profile fail open** (no pruning, `sizingSource: "assumed"`); an OOM at runtime is the empirical safety net and is recorded as an `oom` row.
-
-**Endpoints:**
-
-```http
-POST /api/router/benchmark            # body optional; {"target":"name","roles":["AgenticChat"],"model":"qwen3.8:27b"}
-                                       # omitted target → all effective non-Cloud targets, config order
-                                       # → 202 {"started":true,"queuedTargets":[...]}; 409 while a run is in flight;
-                                       #   404 for an unknown target; 400 for malformed JSON
-GET  /api/router/benchmark/results    # → 200 {"targets":[...]} including in-flight "Running" rows
-DELETE /api/router/benchmark/results  # → 200 {"cleared":true}; removes benchmarks.json and only
-                                       #   benchmark-seeded (source:"benchmark") speed entries
-```
-
-The ladder **stops at the first non-viable, OOM, or error row** (larger contexts only get worse). Results persist to the state directory (`%LOCALAPPDATA%\OllamaRouter\state` on Windows) as `benchmarks.json` (per-target rows incl. per-context tps, viable flag, sizing provenance) and seed `targets-speed.json` — a per-(target, model) tokens/sec snapshot (`tokensPerSecond`, `samples`, `source`, `updatedAt`) where `tokensPerSecond` is the measured speed of the **largest viable context**. Entries with `source: "learned"` (written by later routing-speed learning) are never overwritten by benchmark seeding.
-
-### Role recommendations
-
-On top of the raw benchmark data, the router can assemble the **optimal role → native-model assignment** with **per-node context ceilings** and persist it to `<stateDir>/recommended.json` (machine-generated state, alongside `benchmarks.json` / `targets-hardware.json`). This is the input to NightCodeForge's Phase 12 Environment Wizard.
-
-```http
-GET  /api/router/recommendations       # → 200 live matrix (role → native model + per-node
-                                        #   ceilings + MoE baselines); stable empty shape
-                                        #   (generatedAt null, empty roles/models) when inactive
-POST /api/router/recommendations/generate  # (API key) recompute from benchmarks + hardware
-                                        #   profiles → persist recommended.json (atomic)
-                                        #   → activate in the live store; 409 when no terminal
-                                        #   benchmark results exist (nothing is written)
-POST /api/router/recommendations/apply     # (API key) idempotent re-activation of the current
-                                        #   file (manual edit / fleet change / restart re-sync);
-                                        #   reports the per-target ceilings now enforced; 409
-                                        #   when no file exists
-```
-
-**Native model names, never aliases:** Ollama keys model processes by name string, so the recommendation matrix always carries **native catalog names** (e.g. `qwen3.8:27b`). Roles with an identical optimal model (Agentic Chat, Software Architect, Senior Developer → `qwen3.8:27b`) share one resident model across all their turns — zero evictions. If a client or agent sends a **virtual role alias** (`basic`, `agentic_chat`, `software_architect`, `senior_developer`, `junior_developer`; case-insensitive) as `model` on any completion endpoint, the router transparently rewrites the body to the native model name before forwarding; the response echoes `X-OllamaRouter-Role: <alias>` (only when a translation happened) and `X-OllamaRouter-Model: <native>`. With no active matrix (or a role absent from it) the name is forwarded literally — a model genuinely named `basic` keeps working.
-
-**Enforcement (lower-only, fail-open):** once a (model, node) ceiling is active it can only LOWER capacities — with no active ceiling every behavior is byte-identical to the no-recommendation path. Stage-1 context fit uses `min(node CMax, active ceiling)` (a 40k prompt + 8k margin qualifies a 49 152-ceiling desktop while a 100k prompt qualifies only the 262 144-ceiling server). Dense dynamic context sizing clamps a client `num_ctx` above the ceiling, passes client values at/below it through untouched, and **injects** the ceiling when the client sends no `num_ctx` and the ceiling is strictly below the node's pre-configured window (mode `RecommendedCeiling` on `X-OllamaRouter-Context-Mode`; the `/context/evaluate` preview reports `recommended_ceiling`) — no separate Modelfiles per node. MoE requests use the recommended **baseline** (largest viable measured row, as the Auto-Shrink target) with the model's native context as the extensible limit.
-
-The matrix **auto-loads at startup** (missing/corrupt file = warn + empty matrix, the router never fails to start), so ceilings survive restarts; `POST .../apply` re-syncs after manual edits without a restart.
-
-## Setup Ollama instances
-
-OllamaRouter expects both instances to expose the **same model names**, so that a request can be transparently routed to either one. The steps below set up a quantized model locally (to fit in limited VRAM) and a less-quantized (or full-precision) version of the same model remotely (to take advantage of the larger unified RAM/VRAM), both aliased under the same model name.
-
-### Local Ollama
-
-Set the following environment variables:
-- `OLLAMA_HOST` to `127.0.0.1:11435`
-- `OLLAMA_KV_CACHE_TYPE` to `q8_0`
-- `OLLAMA_FLASH_ATTENTION` to `1`
-
-Then install (or restart) Ollama for the changes to take effect.
-
-> **macOS.** On macOS the daemon is launched by the `Ollama.app` menu bar app, so the environment must be set in the user's launchd session: run `launchctl setenv OLLAMA_HOST 127.0.0.1:11435` and then restart Ollama. These values are lost on reboot — either re-set them from a LaunchAgent, or let OllamaRouter start Ollama itself (see [Running](#running)), which passes `OLLAMA_HOST` at launch. Beware the default-port pitfall: an Ollama left on its default `127.0.0.1:11434` keeps listening alongside the router on `11434`, letting local clients bypass the router.
-
-Pull the model you want to use locally, e.g.:
 ```powershell
-ollama pull jetelain/Qwen3.8-27B:iq3
+.\publish.ps1                    # build + install to %LOCALAPPDATA%\OllamaRouter + add to user PATH
+.\publish.ps1 -Uninstall         # stop daemon + GUI, remove install dir and PATH entry
 ```
 
-Create an alias for this model, so it matches the name used on the remote instance (feel free to tune the parameters), e.g.:
-```powershell
-Invoke-RestMethod -Uri 'http://localhost:11435/api/create' -Method Post -ContentType 'application/json' -Body '{
-  "model": "Qwen3.8-27B",
-  "from": "jetelain/Qwen3.8-27B:iq3",
-  "parameters": {
-    "num_ctx": 49152
-  }
-}'
-```
+### From source
 
-> **This target alias `num_ctx` is the source of truth for the router's context capacity.** Each target's maximum context (`CMax`) is exactly the `num_ctx` pre-configured on its alias — the router does *not* invent a ceiling from the hardware. A dense request of T estimated tokens is qualified for a target only when `T + ContextFitMarginTokens ≤ CMax` (the default margin is `8192`; see [Configuration](#configuration)). Only when a node's alias sets **no** `num_ctx` does the router fall back to the model's native GGUF context length, then to an assumed 128,000 tokens. For **MoE** models the pre-configured `num_ctx` is the *optimal baseline bucket*; when the request exceeds it, the router may elastically expand up to the model's native context limit (the *extensible* bucket, optionally capped by `Models:{model}:MaxContextTokens`) — see [Dynamic context sizing (MoE only)](#dynamic-context-sizing-moe-only).
+Requires the .NET 10 SDK (and native AOT toolchain for the target OS):
 
-### Remote Ollama
-
-See [this guide](https://github.com/jetelain/wiki/blob/main/ai/server.md) for a more comprehensive walkthrough of setting up a remote Ollama instance.
-
-Set the following environment variable:
-- `OLLAMA_HOST` to `0.0.0.0:11434`
-
-Then install (or restart) Ollama for the change to take effect.
-
-Pull the model you want to use, e.g.:
 ```bash
-ollama pull jetelain/Qwen3.8-27B:latest
+dotnet publish src/OllamaRouter/OllamaRouter.csproj         -c Release -r <rid> -o dist
+dotnet publish src/OllamaRouter.Cli/OllamaRouter.Cli.csproj -c Release -r <rid> -o dist
+dotnet publish src/OllamaRouter.App/OllamaRouter.App.csproj -c Release -r <rid> -o dist
 ```
 
-Create an alias for this model using the exact same name as on the local instance (feel free to tune the parameters), e.g.:
-```bash
-curl http://localhost:11434/api/create -d '{
-  "model": "Qwen3.8-27B",
-  "from": "jetelain/Qwen3.8-27B",
-  "parameters": {
-    "num_ctx": 196608
-  }
-}'
-```
+### Starting the router
 
-> The remote instance's larger `num_ctx` (`196608`) allows it to qualify for larger context workloads whenever a smaller node's context capacity is exceeded.
+Run `ollamarouter start` (or `ollamarouter-server`, or `dotnet run --project src\OllamaRouter\OllamaRouter.csproj`). On Windows and macOS, the router automatically probes the local Ollama port and launches Ollama if not already running.
 
-## Configuration
+---
 
-Configuration uses a two-layer model so user settings survive application updates:
+## Configuration & setup
 
-- **`appsettings.json`** (next to the executable) holds **read-only factory defaults**. It ships with the app, is never modified at runtime, and is replaced by a software update.
-- **`config/config.json`** (in a `config/` directory next to the executable) is the **optional user-owned layer** for all user-changeable settings. It is created lazily (by the Setup API or manually), is absent on a fresh install, and — because it lives beside the executable, outside the files a publish/upgrade replaces — it **survives updates and deletions of the application**. The provider is wired with `reloadOnChange: true` so `IOptionsMonitor` consumers observe file changes at runtime. If the file exists but contains invalid JSON, the router **fails open**: it logs a prominent error, ignores the file, and boots with factory defaults (fix or delete the file to apply user settings). See `config/README.md`.
-
-Configuration is provided through the `OllamaRouter` section of `config/config.json` (user values) or `appsettings.json` (factory defaults), or any other standard .NET configuration source such as environment variables. Effective precedence (later wins):
-
-```
-appsettings.json  <  config/config.json  <  user secrets  <  environment variables  <  command-line arguments
-```
+User settings live in **`config/config.json`** (next to the executable, surviving updates) and override the read-only **`appsettings.json`** factory defaults:
 
 ```json
 {
   "OllamaRouter": {
     "Targets": [
-      {
-        "Name": "Local",
-        "Url": "http://127.0.0.1:11435",
-        "SpeedFactor": 2.0
-      },
-      {
-        "Name": "Remote",
-        "Url": "http://aiserver.local:11434"
-      }
+      { "Name": "Local",  "Url": "http://127.0.0.1:11435", "SpeedFactor": 2.0 },
+      { "Name": "Remote", "Url": "http://aiserver.local:11434" }
     ],
     "Models": {
       "Qwen3.8-27B": {
@@ -397,617 +264,74 @@ appsettings.json  <  config/config.json  <  user secrets  <  environment variabl
 }
 ```
 
-> **Note on model names.** Configuration keys **must not include the tag suffix** (`:latest`, `:8b`, …): the .NET configuration binder treats `:` as a path separator, so a key such as `"Qwen3.8-27B:latest"` does not bind to the dictionary. Clients also frequently send the implicit `:latest` tag even when the model is stored without one, so the router strips the tag part before looking up the configuration (see `RoutingDecisionService.NormalizeModelName`). Use a single entry per base model name; all tag variants will share the same thresholds.
+Full documentation has been moved to `docs/`:
 
-| Setting            | Description                                                                                     |
-|--------------------|---------------------------------------------------------------------------------------------------|
-| `Targets`          | Array of named fleet targets (`Name`, `Url`, `RouterUrl`, `Location`, `MaxVramMB`, `MaxParallel`, `SpeedFactor`, `Enabled`). See [Fleet Targets](#dual-router-mesh-desktop--laptop). |
-| `Targets:*:RouterUrl` | Optional base address of the OllamaRouter instance running on this node (e.g. `http://192.168.1.20:11434`). Used for router-to-router management operations (such as hardware discovery via `/api/router/hardware`). When omitted, falls back by convention to the same host on port `11434` only if `Url` uses port `11435`. |
-| `Targets:*:Location` | Optional explicit target-location override: `"local"`, `"remote"`, or `"cloud"` (case-insensitive). When set, it wins over the [URL-based classification](#target-location-classification). Defaults to unset (classified from `Url`). |
-| `Targets:*:MaxVramMB` | Optional explicit maximum VRAM (in MB) available on this target. When omitted, VRAM is auto-discovered dynamically via `IFleetHardwareService`. |
-| `Targets:*:KeepAliveSeconds` | Optional per-node **preload keep-alive override** (seconds; `-1` = resident indefinitely) applied by the [model preload](#model-preload) endpoint when the request omits `keepAliveSeconds`. When omitted, the per-node class convention applies (server/cloud = `-1` indefinitely, desktop = 15 min, unclassifiable = `PreloadDefaultKeepAliveSeconds`). `0` and values `≤ -2` are invalid (immediate unload is not a preload intent) and are normalized to `null` at startup. Surfaced live (with its `"explicit"` source) by `GET /api/router/fleet` (`preload.*`) and the monitor Keep-Alive column. |
-| `Targets:*:SpeedFactor` | Optional per-target **static processing-speed hint**: relative generation-throughput multiplier vs the fleet baseline (`1.0` = fleet average / unset; only values `> 1.0` mean something). At routing time the qualified candidate with the highest effective factor earns the full Stage-2 speed bonus (+150), and the others are scaled linearly between 0 and +150 — so a fast cold node (e.g. your local workstation) can be preferred over a slower node that happens to hold the model hot, while Stage-1 hardware/context gates are untouched (a 48k-ceiling request never routes to a too-small fast node) and a fast node that would evict another model still loses to the hot one (70 < 100, anti-thrash). Recommended heterogenous setup: fast workstation `"SpeedFactor": 2.0`, servers default/omitted. Non-finite or `≤ 1.0` values are treated as `1.0` (zero bonus). See also `GET /api/router/fleet` (`hardware.speedFactor`) and the terminal monitor HW column (`16gb,2.0x`). |
-| `Models`           | Dictionary of model names (base name, no tag) to model-specific routing settings (`CloudModel`, `MaxContextTokens`). |
-| `Models:*:CloudModel`| Optional name of the equivalent model hosted on [ollama.com cloud](https://ollama.com) (e.g. `glm-5.3-flash:cloud`). When set, enables overflow to **Cloud** for this model whenever primary targets are busy or failing (see [Cloud overflow](#cloud-overflow)). Leave unset to disable cloud overflow for this model. |
-| `Models:*:MaxContextTokens` | Optional operator cap (in tokens) on a model's **extensible** context limit, applied across all nodes as `min(native context ?? 128k, MaxContextTokens)`. Affects MoE dynamic sizing and Stage-1 MoE qualification only (it does not change a node's pre-configured `CMax`). Example: a VRAM-tuned or Q8-lossless ceiling. Defaults to unset (no cap). |
-| `LocalUrl`         | Base URL of the local Ollama instance (Legacy; prefer configuring `Targets`).                     |
-| `RemoteUrl`        | Base URL of the remote Ollama instance (Legacy; prefer configuring `Targets`).                    |
-| `BindAddress`      | Address the router itself listens on. Defaults to `http://localhost:11434`. Set it to e.g. `http://0.0.0.0:11434` to accept connections from other machines. |
-| `TokenEstimator`   | Token estimation strategy: `"Heuristic"` (default, fast, zero heap memory overhead, saves ~24 MB RAM by omitting the BPE dictionary) or `"Tiktoken"` (uses Microsoft.ML.Tokenizers `cl100k_base`). |
-| `TokenEstimationOverheadFactor` | Multiplicative correction applied to the estimated token count, to compensate for the systematic underestimation of the generic tokenizer versus the actual tokenizer and chat template of targeted models. Defaults to `1.0` (no correction); see [recommendations below](#token-estimation-overhead-recommendations). |
-| `ContextFitMarginTokens` | Additive **reasoning-fit margin** (in tokens) added to the estimated prompt token count before qualifying a target: a prompt of T tokens is routed to a target only when `T + ContextFitMarginTokens ≤ CMax` (the target's [pre-configured node context](#setup-ollama-instances)). The margin reserves a typical high-reasoning/generation budget so the model's output never overflows the node's context. Defaults to `8192`; for long-thinking agent models a larger value (e.g. `10240`) is recommended. Negative values are clamped to `0`. Applied even when `DynamicContext:Enabled` is `false`. |
-| `PreloadDefaultKeepAliveSeconds` | Last-resort router-level **preload retention** (seconds) used by the [model preload](#model-preload) endpoint for nodes the class convention cannot classify (unknown VRAM and no cloud signal). Defaults to `900` (15 min). `-1` (indefinite) and `0` (no extra retention beyond the daemon default) are legitimate router-level policies; values `≤ -2` are clamped to `900` at startup. Surfaced live (with its `"default"` source) by `GET /api/router/fleet` (`preload.*`) and the monitor Keep-Alive column. |
-| `PreloadLoadTimeoutSeconds` | Timeout (in seconds) that bounds ONLY the preload **load call** (`POST /api/generate`, `stream=false`, empty prompt) of the [model preload](#model-preload) endpoint: a cold load of a large model (e.g. a 27B model with a large `num_ctx`) regularly exceeds the `4 s` bound of the shared catalog client, so the load call rides a dedicated client with this timeout (LIVE — a `config/config.json` change applies to the next load call without a restart). Defaults to `20` seconds; values `≤ 0` are clamped to `20` at startup. Every OTHER catalog call (tags/show/ps, catalog seeding) keeps the `4 s` catalog client bound, so a stalled peer daemon never slows routing or catalog fan-out; a load that still misses the bound is reported as not accepted (`accepted=false`, fail-soft), never a `5xx`. Raise it (e.g. `60`) for very large models over a slow network. |
-| `DispatchToLargestCapacityOnOverflow` | When `true` and all enabled fleet targets fail Stage-1 context qualification due to context overflow, the router dispatches the request to the online, capable target with the largest context capacity (`Max(CMax)`) with `options.num_ctx` clamped to that ceiling, rather than rejecting with a 503 error. This clamped local dispatch runs **before** Cloud Overflow is considered: a context-overflowing request is served by the largest-capacity fleet node even when a `CloudModel` is configured — Cloud Overflow is the **terminal fallback**, reached only when this option is `false`, when no fleet target can serve the overflow (offline, disabled, model absent, or hardware incapable), or when every largest-capacity fallback candidate has an active failure streak above `MaxConsecutiveFailures`. Defaults to `true`. |
-| `DynamicContext:Enabled` | Enables dynamic context sizing (MoE two-bucket ladder + dense clamp-only). Defaults to `false`. See [Dynamic context sizing (MoE only)](#dynamic-context-sizing-moe-only). |
-| `DynamicContext:DenseClampEnabled` | When `true` (default), a request on a **dense** model rewrites `options.num_ctx` only when the client's static value exceeds the node's pre-configured context, clamping it down (one-time KV reallocation; OOM protection). Set to `false` for pure dense pass-through. Dense values are never raised, bucketed, or leased. |
-| `MaxConsecutiveFailures` | Number of consecutive failures on a target for adjacent requests within `ConsecutiveFailuresTokenTolerance` before triggering fallback or cloud overflow. Defaults to `3`. Set to `0` to disable automatic target switching. An operator can clear an active streak on demand (no restart) with the key-protected admin endpoints `POST /api/router/targets/{name}/reset-streak` (single target) and `POST /api/router/fleet/reset-streaks` (whole fleet). |
-| `ConsecutiveFailuresTokenTolerance` | Maximum difference in estimated prompt tokens between adjacent requests to consider them part of the same retry streak. Defaults to `4000`. Set to `0` to require an exact match. |
-| `SessionUsageMaxSessions` | Bound of the [per-session usage LRU](#per-session-usage--savings): the maximum number of distinct `X-OllamaRouter-Session-Id` values kept (sessions are best-effort persisted to `session-usage.json` in the same state directory as `activity-statistics.json` — raw counters only, costs stay computed at read time). When a NEW session arrives beyond the cap, the least-recently-active stored session is evicted. Defaults to `1000`. LIVE: a `config/config.json` change takes effect on the next recorded request (a shrunk cap evicts down to the new bound). Non-positive values normalize back to `1000`. |
-| `Recording:Enabled` | Enables the optional [inference request recording](#inference-request-recording-optional), saving each request's metadata and full request body for investigation of estimated vs actual token counts. Defaults to `false`. |
-| `Recording:OutputDirectory` | Directory where the records are stored: a `requests.jsonl` manifest plus one pretty-printed payload file per request. Defaults to the `inference-requests` folder in the local application data folder (`%LOCALAPPDATA%\OllamaRouter\inference-requests` on Windows). |
-| `Recording:MaxFiles` | Maximum number of payload files to keep in the output directory; the oldest records are deleted once this count is exceeded (and the manifest is trimmed to match). Defaults to `500`. Set to `0` to keep all files. |
-| `Recording:TokenMetricsCsv:Enabled` | Enables the optional [token metrics CSV export](#token-metrics-csv-export-optional): each recorded request produces one aggregate CSV row pairing the prompt's structural text metrics (words, symbols, non-ASCII, char count) with the actual prompt/response token counts reported by Ollama. Defaults to `false`. Independent of `Recording:Enabled` (the full JSON payload mode). |
-| `Recording:TokenMetricsCsv:OutputDirectory` | Directory where the CSV files are written. Defaults to the `token-metrics` folder in the local application data folder (`%LOCALAPPDATA%\OllamaRouter\token-metrics` on Windows). |
-| `Recording:TokenMetricsCsv:MaxFiles` | Maximum number of per-request `*_metrics.csv` files to keep; the oldest are deleted once the count is exceeded (the consolidated `token-metrics.csv` is never pruned). Defaults to `1000`. Set to `0` to keep all files. |
-| `Recording:TokenMetricsCsv:GenerateIndividualFiles` | When `true` (default), each recorded request produces an individual CSV file (header + one row) named `{timestamp}_{sequence}_{model}_metrics.csv`. |
-| `Recording:TokenMetricsCsv:AppendConsolidatedFile` | When `true` (default), each recorded request appends one row to the consolidated `token-metrics.csv` dataset (header written once at file creation). |
-| `Pricing:PromptPricePerMillion` | Optional price per 1,000,000 prompt / input tokens. Used to calculate 7-day estimated savings and cloud overflow cost. Alias: `InputPricePerMillion`. |
-| `Pricing:CompletionPricePerMillion` | Optional price per 1,000,000 completion / output tokens. Used to calculate 7-day estimated savings and cloud overflow cost. Alias: `OutputPricePerMillion`. |
-| `Pricing:CachedPromptPricePerMillion` | Optional price per 1,000,000 **cached** prompt / input tokens (the prompt-cache-hit subset of input tokens). Cloud providers price cached input tokens cheaper than fresh ones. When unset, cached tokens fall back to `PromptPricePerMillion` (then `PricePerMillion`). Alias: `CachedInputPricePerMillion`. |
-| `Pricing:PricePerMillion` | Optional flat price per 1,000,000 tokens when prompt and completion rates are not differentiated. |
-| `Pricing:Currency` | Currency symbol or label to display in the monitoring UI (e.g. `$`, `€`, `USD`). Defaults to `$`. |
-| `Pricing:ElectricityPricePerKwh` | Optional electricity price per kilowatt-hour (in the display currency, e.g. `0.20` = `$0.20`/kWh) used for the node electricity-cost leg of the monitor's **actual savings** (see [Monitoring](#monitoring)). When unset, the `0.20`/kWh default applies. Setting it alone does **not** show the cost section (a token price rate must also be configured). |
-| `Pricing:DefaultNodePowerWatts` | Optional global default node power draw (in watts) applied to every non-Cloud fleet target without its own `PowerWatts` override. When unset, the `150` W default applies. |
-| `Targets:{n}:PowerWatts` | Optional per-target node power draw (in watts) for the electricity-cost leg (e.g. `400` for a desktop GPU node, `130` for a remote node). `0` marks a zero-consumption node; unset (default) resolves via the chain `Targets:{n}:PowerWatts` → `Pricing:DefaultNodePowerWatts` → `150` W. Editable via the Setup API (`POST`/`PUT /api/router/targets`, `powerWatts`). |
-| `TerminalMonitoring:Enabled` | Enables the in-terminal live activity monitor in the server console (zero VRAM consumption). Defaults to `true`. Can also be disabled via `--no-tui`. |
-| `TerminalMonitoring:RefreshIntervalSeconds` | Refresh interval in seconds for the in-terminal live monitor. Defaults to `2.0`. |
+- **[Configuration Reference](docs/configuration.md)** — two-layer config model, all `OllamaRouter` settings, target location classification, preload keep-alive policy, MoE dynamic context sizing, token estimation overhead, inference request recording, token metrics CSV export, pricing/electricity, and API key security.
+- **[Ollama Instance & Mesh Setup](docs/ollama-setup.md)** — configuring local and remote Ollama instances (`OLLAMA_HOST`, model aliases, `num_ctx`) and setting up a symmetrical Dual-Router Mesh with firewall rules.
 
-### Target location classification
+---
 
-Every fleet target is assigned a **location** — `Local`, `Remote`, or `Cloud` — which drives the
-monitor icon and color in both the [terminal monitor](#in-terminal-activity-monitor-tui) (🖥️ bright cyan /
-📡 bright green / ☁️ bright magenta) and the [web monitor](#monitoring). The location is derived
-**synchronously from the target's `Url`** (no DNS lookups, so it never hangs or blocks startup),
-with an optional per-target override via `Targets:*:Location` that always wins:
+## Router API (OpenAPI)
 
-| Location | Classification rule (applied in order) |
-|----------|------------------------------------------|
-| **Local** | Loopback host: `localhost`, `127.0.0.1`, `::1`, `0.0.0.0`, or `::` (unspecified hosts are only reachable from the same host). |
-| **Remote** | LAN / private: IPv4 literals in `10.0.0.0/8`, `172.16.0.0/12`, or `192.168.0.0/16`; IPv6 ULA (`fc00::/7`) and link-local (`fe80::/10`) literals; hostnames ending in `.local` (mDNS); Tailscale addresses ending in `.ts.net`; and single-label hostnames (no dot, e.g. `aiserver`). |
-| **Cloud** | Everything else: public IPv4/IPv6 literals (including CGNAT `100.64.0.0/10` and `169.254.0.0/16`), multi-label public hostnames, and any null / malformed / unparseable `Url` (the deterministic fail-safe default). The **Cloud** pseudo-target is always `Cloud` by definition. |
+The management API is documented as an OpenAPI 3.1 JSON document served at runtime in all environments:
 
-> **Override.** Set `"Location": "remote"` (or `"local"` / `"cloud"`, case-insensitive) on a target
-> when its hostname should be treated differently from its URL implies — e.g. a hostname that
-> resolves to a private IP but should count as `remote`, or a public-looking host that is really
-> a relay. Config binding maps the JSON string to the `TargetLocation` enum automatically.
-
-The location is exposed in the monitor and router APIs (`/monitor/api` fleet rows and
-`GET /api/router/fleet` `targets[]`) as the lowercase wire value `"local"` / `"remote"` /
-`"cloud"`, so both UIs and programmatic consumers stay consistent.
-
-### Dynamic context sizing (MoE only)
-
-When `DynamicContext:Enabled` is `true`, the router sizes the outgoing `options.num_ctx` per request. The system is **MoE-only**: dense models are never bucketed or expanded because a dense KV-cache refill costs 300 s+ — rewriting dense payloads is never worth it.
-
-**MoE — a two-bucket ladder.** A MoE request is sized between exactly two buckets:
-
-1. the node's **pre-configured context** (its Modelfile `num_ctx`) — the *optimal* baseline bucket; and
-2. the model's **native context length** — the single *extensible* bucket, optionally capped across all nodes by an operator `Models:{model}:MaxContextTokens` (e.g. a VRAM-tuned or Q8-lossless ceiling), applied as `min(native, override)`.
-
-If the margin-adjusted requirement (`min(estimatedTokens + ContextFitMarginTokens, clientNumCtx)`) fits the baseline bucket, the baseline is injected; otherwise the extensible bucket is. Stage-1 qualification uses the same extensible limit, so a node pre-configured at 184,320 can still elastically serve a 205k prompt by expanding to its 262,144 native limit (one cheap MoE KV reallocation) instead of failing over. The **Auto-Shrink Manager** then retains the expanded bucket across a cooldown of normal turns (preserving the KV prefix cache) before shrinking back to the pre-configured baseline on a 50%-token drop or idle timeout.
-
-**Dense — clamp-only pass-through.** For a dense model the router rewrites `options.num_ctx` *only* when the client's static value **exceeds** the node's pre-configured context, clamping it **down** to that value (one-time KV reallocation; protects against OOM from static 131,072 requests on a 49,152 node). When the client value is absent or ≤ pre-configured, the payload is left byte-identical. Dense values are never raised, never bucketed, never leased. Set `DynamicContext:DenseClampEnabled` to `false` for pure dense pass-through (no clamping).
-
-Legacy dynamic context profiles (`DynamicContext:Profiles`) and intermediate context stepping (`DynamicContext:BucketStepTokens`) have been retired in favor of the clean two-bucket ladder and dense clamp-only architecture.
-
-### Token estimation overhead recommendations
-
-OllamaRouter estimates prompt token count prior to routing so it can qualify target context capacity (`CMax` / `ContextFitMarginTokens`) without having to download full tokenizer files for every model. Because generic tokenizers (`Tiktoken` or `Heuristic`) differ from the exact vocabulary and chat templates used by targeted models, set `TokenEstimationOverheadFactor` according to your primary model family:
-
-| Model Family | Vocabulary Size | Recommended (`Tiktoken`) | Recommended (`Heuristic`) | Notes |
-| :--- | :---: | :---: | :---: | :--- |
-| **Qwen 3.8** (e.g. `Qwen3.8-27B`) | 248k | **1.09** | **1.11** | Qwen 3.8 expands token embeddings to 248,320. 1.09 is empirically validated for high-context workloads. |
-
-> **Tip.** The monitoring page (`/monitor`) dynamically measures the ratio between raw estimated tokens and Ollama's actual reported prompt tokens for every completed request, providing you with a tailored recommendation for your exact models and prompts.
->
-> If your prompts are predominantly non-English (e.g. French, German, Chinese) or contain heavy code indentation, add an extra `+0.05` margin to the overhead factor to prevent unexpected overflows.
-
-### Inference request recording (optional)
-
-Because the optimal overhead factor depends on your exact models and prompt mix, OllamaRouter can record every inference request so the difference between the **estimated** token count (used for routing) and the **actual** token count (reported by Ollama) can be investigated per request. This recording mode is **disabled by default**.
-
-Enable it in `config/config.json` (or `appsettings.json` factory defaults):
-
-```json
-"Recording": {
-  "Enabled": true
-}
+```text
+GET http://localhost:11434/api/router/openapi.json
 ```
 
-Each recorded request then produces, in the output directory (default `%LOCALAPPDATA%\OllamaRouter\inference-requests\` on Windows):
+It covers 34 `/api/router/*` operations across 11 groups: **Identity & Fleet**, **Hardware Profiling**, **Benchmarking**, **Model Catalog & Cartography**, **Fleet Operations**, **Setup & Configuration**, **API Key Security**, **Session Usage & Savings**, **Session Affinity**, **Admin & Lifecycle**, and **Recommendations**. Config-affecting and admin routes are protected by an API key by default (`Authorization: Bearer <key>` or `X-Api-Key: <key>`); see [API key security](docs/configuration.md#api-key-security).
 
-- one line in `requests.jsonl` with the routing metadata: `timestamp`, `target`, `model`, `endpoint`, `estimatedPromptTokens` (after applying `TokenEstimationOverheadFactor`), `rawPromptTokens` (before the factor), `actualPromptTokens` / `actualResponseTokens` as reported by the Ollama instance, `elapsedMilliseconds`, `statusCode`, `success`, and the name of the payload `file`;
-- a payload file named `&lt;utc-timestamp&gt;_&lt;sequence&gt;_&lt;model&gt;.json` (e.g. `20260925-153012-123_000042_Qwen3.8-27B.json`) containing the **full request body**, pretty-printed and ready to open in an editor. File names begin with a sortable UTC timestamp followed by a per-process sequence, so files list in chronological order and remain unique even for rapid successive requests.
+---
 
-With both numbers and the exact payload of each request, you can tokenize locally with the model's actual tokenizer and pinpoint what drives the gap (chat template overhead, non-Latin scripts, code indentation, …) before tuning `TokenEstimationOverheadFactor`.
+## Requirements & GPU/VRAM detection
 
-The output directory is capped at `Recording:MaxFiles` payload files (default `500`); when the cap is exceeded, the oldest records are deleted and the manifest is rewritten so it only references still-existing payloads. The recorder is best-effort: an I/O failure only produces a log entry and never affects routing.
+- **Runtime:** None for release binaries (self-contained Native AOT). .NET 10 SDK to build from source.
+- **Ollama instances:** One or more reachable Ollama instances (see [Ollama Instance & Mesh Setup](docs/ollama-setup.md)).
+- **VRAM probing:** OllamaRouter detects local free VRAM automatically using the first non-zero probe:
+  1. **NVIDIA** — `nvidia-smi` (Windows / Linux)
+  2. **AMD** — `rocm-smi` (Linux)
+  3. **Intel** — `xpu-smi` or `intel_gpu_top` (Linux)
+  4. **Windows fallback** — WMI `Win32_VideoController.AdapterRAM` (reports total VRAM when `nvidia-smi` is unavailable)
+  5. **macOS Apple Silicon** — `sysctl` (`hw.memsize`, `iogpu.wired_limit_mb`) and `vm_stat` (no extra tools required)
 
-### Token metrics CSV export (optional)
-
-To calibrate the heuristic estimator's model-family coefficients (`WordFactor`, `SymbolFactor`, `NonAsciiFactor`, `CharFloorFactor`, `SafetyMargin`), OllamaRouter can export an empirical training dataset: for each completion request it records the prompt's **structural text metrics** (`Words`, `Symbols`, `NonAscii`, `CharCount`, from `HeuristicTokenEstimator.Analyze`) paired with the **actual token counts** evaluated by Ollama (`prompt_eval_count`/`eval_count` from the native NDJSON final line, or `usage.prompt_tokens`/`usage.completion_tokens` from OpenAI-compatible SSE). This export is **disabled by default** and independent of the full JSON payload recording mode above:
-
-```json
-"Recording": {
-  "TokenMetricsCsv": {
-    "Enabled": true,
-    "MaxFiles": 1000,
-    "GenerateIndividualFiles": true,
-    "AppendConsolidatedFile": true
-  }
-}
-```
-
-Two output modes (both on by default, both one aggregate row per request) write to the output directory (default `%LOCALAPPDATA%\OllamaRouter\token-metrics\` on Windows):
-
-- **Per-request files**: one file per request named `{yyyyMMdd-HHmmss-fff}_{sequence}_{model}_metrics.csv`, containing a header row plus the single data row;
-- **Consolidated dataset**: `token-metrics.csv`, one appended row per request (the header is written once at file creation), ready to load directly in Pandas / Excel / R without merging individual files.
-
-Both files share the fixed RFC 4180 column order (CRLF line endings, quote-escaped fields): `timestamp_utc,request_id,model,target,endpoint,words,symbols,non_ascii,char_count,prior_context_tokens,estimated_prompt_tokens,actual_prompt_tokens,actual_response_tokens,elapsed_ms,status_code,success`. The `actual_*` columns are empty when the captured response tail carried no usage data; `estimated_prompt_tokens` is the raw pre-overhead estimate (estimator + prior context token ids). Only requests that entered the dispatch loop are recorded (pre-dispatch 503 short-circuits are excluded).
-
-Per-request files are capped at `Recording:TokenMetricsCsv:MaxFiles` (default `1000`); the oldest are deleted first (the consolidated file is never pruned). The exporter runs after the response completes, is fail-soft (any I/O failure only produces a log entry), and has zero disk I/O when disabled.
-
-## API key security (configuration endpoints)
-
-nThe router's Setup API can edit persistent configuration (fleet targets, hardware profiles, benchmark results, the full router config). To keep that safe even on a trusted LAN, **config-affecting endpoints require a valid API key by default**. A 401 response carries `WWW-Authenticate: Bearer` plus a JSON `error` body and never echoes key material.
-
-**Default protected routes** (key required, everything else — reads, the monitor UI, `POST /targets`, inference/proxy paths — stays open):
-
-| Method | Route |
-|---|---|
-| `GET`, `PUT` | `/api/router/config` |
-| `POST` | `/api/router/targets` |
-| `PUT`, `DELETE` | `/api/router/targets/{name}` |
-| `PUT` | `/api/router/fleet/hardware/{targetName}` |
-| `POST` | `/api/router/benchmark` |
-| `DELETE` | `/api/router/benchmark/results` |
-| `POST` | `/api/router/recommendations/generate` |
-| `POST` | `/api/router/recommendations/apply` |
-| `GET`, `POST` | `/api/router/api-keys` (key management) |
-| `DELETE` | `/api/router/api-keys/{name}` (key management) |
-| `POST` | `/api/router/api-keys/default/rotate` (key management) |
-| `POST` | `/api/router/targets/{name}/reset-streak` (failure-streak reset — admin action) |
-| `POST` | `/api/router/fleet/reset-streaks` (fleet-wide failure-streak reset — admin action) |
-| `POST` | `/api/router/admin/shutdown` (daemon lifecycle — graceful host stop) |
-
-The monitor availability toggle (`POST /targets`) is **not** protected in default mode (runtime state, not persistent config — the browser flow needs no key). The failure-streak reset endpoints **are** protected: they are admin actions that re-admit failing nodes fleet-wide, but they touch **runtime failure-streak state only** — liveness state, availability toggles and session-affinity leases are untouched, and no config file is written.
-
-**Failure-streak reset** — `POST /api/router/targets/{name}/reset-streak` (key-protected) resets one target's consecutive-failure streak to `0` and clears its circuit-breaker cooldown: `200` with `{"success":true,"target":"...","streak":0,"status":"Closed"}` (the target is immediately routable on the very next routing decision — no restart), `404` for an unknown name (also for `Cloud`), `500` on hosts without the streak service. `POST /api/router/fleet/reset-streaks` (key-protected, no body) does the fleet-wide variant: `200` with `resetCount` and a per-target `previousStreak`/`reset` row for every effective target (plus the Cloud pseudo-target when cloud overflow is enabled); it is idempotent (a second call reports `resetCount: 0`).
-
-**Graceful daemon shutdown** — `POST /api/router/admin/shutdown` (key-protected) returns `202 Accepted` with `{"stopping":true,"processId":...}` and triggers a graceful host stop via `IHostApplicationLifetime.StopApplication()` *after* the response starts flowing: Kestrel stops the listener and drains the in-flight request, so the complete `202` body is always delivered, and the hosted statistics persistence (activity statistics + per-session usage) flushes its in-memory state on `ApplicationStopped`. The daemon also reports its own process telemetry on `GET /api/router/info` (`processId`, `startedAtUtc`, `uptimeSeconds`).
-
-**`ApiSecurity.RequireKeyForAllEndpoints`** (default `false`) extends key enforcement to **every** endpoint (reads, `/monitor*`, proxy paths, runtime actions). Both `ApiSecurity` values are **live**: an edit of `config/config.json` rebinds without a restart.
-
-```json
-"ApiSecurity": {
-  "RequireKeyForAllEndpoints": false,
-  "DefaultKeyRotationHours": 24
-}
-```
-
-### Key files (next to `config/config.json`)
-
-- **`config/default-key.dat`** — the auto-generated **default key** (32 random bytes, base64url, 43 chars). On Windows the file is a **DPAPI-wrapped blob** (unwrapable only by the same Windows user); on Unix the envelope is stored plain with **`0600`** (owner read/write) permissions. On first start the key is generated and its raw value is **logged at INFO** (and again on every rotation) so a local same-user operator can capture it; local same-user automation can also read/unwrap `default-key.dat` directly as the user running the router.
-- **`config/api-keys.json`** — user keys as **hashes only** (name + SHA-256 of the base64url key + optional expiry), also `0600` on Unix. Raw user keys are returned to the caller **exactly once** at creation and never written to disk.
-
-A missing key file is regenerated on startup; a corrupt/unwrappable one is logged and regenerated (fail-open — a DPAPI blob that stops unwrapping after a service-account change follows the same contract).
-
-### Auto-rotation (no grace period)
-
-The default key auto-rotates every `ApiSecurity.DefaultKeyRotationHours` hours (default **24**): the new key is written atomically, logged at INFO, and the **old key stops working immediately** (no grace period). Callers should implement the **re-read-the-key-after-401** pattern: on a 401, re-read `default-key.dat` (or re-fetch the key) and retry once.
-
-`POST /api/router/api-keys/default/rotate` (key-protected) rotates the default key **manually and immediately** with the same semantics; the response returns the new raw key.
-
-### User keys with custom durations
-
-Create additional keys via the key-management endpoints (all key-protected by definition — managing keys requires a valid key):
-
-```bash
-# Create a key valid for 168 hours (168 = hours; omitted "validFor" = no expiry; < 1 = 400)
-curl -X POST http://localhost:11434/api/router/api-keys \
-  -H "Authorization: Bearer <default-or-user-key>" \
-  -H "Content-Type: application/json" \
-  -d '{ "name": "ci", "validFor": 168 }'   # → 201, the raw key is returned once
-
-curl http://localhost:11434/api/router/api-keys \
-  -H "X-Api-Key: <key>"                      # → list (masked: name, createdAt, expiresAt only)
-
-curl -X DELETE http://localhost:11434/api/router/api-keys/ci \
-  -H "Authorization: Bearer <key>"           # → 200 (404 when unknown)
-```
-
-Expired user keys are rejected with 401 (expiry is enforced lazily at validation time). Keys are accepted via **`Authorization: Bearer <key>`** or **`X-Api-Key: <key>`** (the Bearer header wins when both are present).
-
-**Security notes**: the raw default key is logged at INFO on (re)generation by design (local operators capture it from the log; log files live in `logs/` next to the executable); `GET /api/router/config` reports the effective `apiSecurity` section settings but **no key material**; 401 responses and warning logs never contain key material; key comparisons are constant-time.
-
-## Router API documentation (OpenAPI)
-
-The full router management API is documented as an OpenAPI 3.1 JSON document, generated at runtime and served (in ALL environments) at:
-
-```
-GET {bind-address}/api/router/openapi.json
-```
-
-e.g. `http://localhost:11434/api/router/openapi.json`. Point any OpenAPI tooling (Swagger Editor, Redoc, code generators) at that URL. The document covers the 34 `/api/router/*` operations in eleven functional groups:
-
-- **Identity & Fleet** — `/info`, `/fleet`, `/fleet/reset-streaks` (POST, key-protected)
-- **Hardware Profiling** — `/hardware`, `/fleet/hardware` (GET + PUT)
-- **Benchmarking** — `/benchmark`, `/benchmark/results`
-- **Model Catalog & Cartography** — `/models`, `/models/{*modelName}`, `/cartography`
-- **Fleet Operations** — `/vram/reclaim`, `/fleet/unload`, `/context/evaluate`, `/models/{*tail}/preload` (POST catch-all), `/preload/preview`
-- **Setup & Configuration** — `/config`, `/targets` (POST/PUT/DELETE), `/targets/{name}/reset-streak` (POST, key-protected)
-- **API Key Security** — `/api-keys` (GET/POST/DELETE `{name}`), `/api-keys/default/rotate`
-- **Session Usage & Savings** — `/monitor/sessions`, `/monitor/sessions/{*sessionId}`
-- **Session Affinity** — `/sessions/affinity/release` (POST)
-- **Admin & Lifecycle** — `/admin/shutdown` (POST, key-protected graceful host stop)
-- **Recommendations** — `/recommendations` (GET), `/recommendations/generate`, `/recommendations/apply` (POST)
-
-The `RouterApiKey` security scheme (http/bearer/base64url — `Authorization: Bearer <key>` or `X-Api-Key: <key>`) is applied to exactly the default protected route set above; with `ApiSecurity.RequireKeyForAllEndpoints: true` every route (including the document endpoint) requires a key. The document is regenerated per request from the same AOT source-generated DTO records the endpoints use — no drift, and it works in AOT-published builds.
-
-## Dual-Router Mesh (Desktop + Laptop)
-
-OllamaRouter is designed to run as a **symmetrical mesh**: place one router on *each* node and let every router see every physical daemon. Because a router only ever forwards **directly to a physical daemon** (it never lists a peer router as a target), the mesh is loop-free by construction — there is no router→router hop to recurse on.
-
-### Architecture
-
-```
-                      ┌────────────────────┐            ┌────────────────────┐
-   Local clients ────▶│  Desktop Router    │            │  Laptop Router     │ ◀──── Local clients
-                      │   (bind :11434)    │            │   (bind :11434)    │
-                      └─────────┬──────────┘            └─────────┬──────────┘
-                               │  forwards ONLY to physical daemons on :11435
-                               ▼                                  ▼
-                 ┌───────────────────────────────┐  ┌───────────────────────────────┐
-                 │ Desktop daemon :11435         │  │ Laptop daemon :11435          │
-                 │ (OLLAMA_HOST=0.0.0.0:11435)   │  │ (OLLAMA_HOST=0.0.0.0:11435)   │
-                 └───────────────────────────────┘  └───────────────────────────────┘
-```
-
-Both routers run the same `Targets` list (each node's local daemon + the peer's LAN daemon). A request that lands on either router is routed by the full shared scoring engine to the best **daemon**, so a laptop client and a desktop client get identical routing decisions regardless of which router they hit.
-
-### Windows: moving the Ollama daemon to `OLLAMA_HOST=0.0.0.0:11435`
-
-On Windows the Ollama GUI (`ollama app.exe`) binds **11434** automatically at user login, which is exactly the port OllamaRouter wants to bind. Move the daemon to 11435 so the router can take 11434:
-
-1. Open **System environment variables** (not just *User*): `System Properties → Advanced → Environment Variables`.
-2. Set `OLLAMA_HOST` = `0.0.0.0:11435` (a **System** variable, so it applies to the daemon process).
-3. Sign out / sign back in (or restart) and let Ollama relaunch the daemon on the new port.
-
-`OLLAMA_HOST` must bind to `0.0.0.0` (not `127.0.0.1`) so the *peer* router can reach the daemon over the LAN. If a node only ever serves **local** clients through its own router, you can instead bind the *router* to `127.0.0.1:11434` (`BindAddress`) and keep the daemon on `0.0.0.0:11435` for the peer.
-
-### LAN firewall: restrict the daemon to your private subnet
-
-Binding the daemon to `0.0.0.0:11435` exposes it on every interface. Restrict inbound traffic to your private subnet (example for `192.168.1.0/24`):
-
-```powershell
-# Allow the LAN, block everything else, for the Ollama daemon port.
-New-NetFirewallRule -DisplayName "Ollama daemon - LAN" -Direction Inbound -Protocol TCP -LocalPort 11435 -RemoteAddress 192.168.1.0/24 -Action Allow
-New-NetFirewallRule -DisplayName "Ollama daemon - block others" -Direction Inbound -Protocol TCP -LocalPort 11435 -RemoteAddress Any -Action Block
-```
-
-### Router port-availability detection
-
-Before starting `ollama app.exe`, the router now **probes the expected daemon port** (11435, or 11434 as a fallback). If that port is already occupied by a (manually managed) daemon, the router logs a warning and **does not** spawn a second `ollama` process. This makes the `OLLAMA_HOST` manual setup above safe to combine with the auto-launcher — you will never end up with two competing daemons on the same port.
-
-### Per-node `Targets` configuration
-
-> **Loop-free invariant:** a router's `Targets` must **never** list a peer router's `:11434` — only physical daemons on `:11435`. Listing a peer router as a target is the only way to introduce a loop.
-
-Desktop node (`config/config.json`):
-
-```json
-"Targets": [
-  { "Name": "desktop", "Url": "http://127.0.0.1:11435", "SpeedFactor": 2.0 },
-  { "Name": "laptop",  "Url": "http://192.168.1.20:11435" }
-]
-```
-
-Laptop node (`config/config.json`):
-
-```json
-"Targets": [
-  { "Name": "laptop",  "Url": "http://127.0.0.1:11435", "SpeedFactor": 2.0 },
-  { "Name": "desktop", "Url": "http://192.168.1.10:11435" }
-]
-```
-
-(Swap `192.168.1.10` / `192.168.1.20` for each node's real LAN IP. Hardware-hint / `MaxParallel` / `MaxVramMB` / `SpeedFactor` settings apply per target exactly as in the single-router [Configuration](#configuration) section — e.g. a fast local workstation can carry `"SpeedFactor": 2.0` so the router prefers it even when a slower peer holds the model hot, as long as Stage-1 context/hardware gates still qualify it.)
-
-### Validating the mesh
-
-The simulated fleet (two in-process routers + N daemon stubs), the full §4 acceptance matrix, fault injection, the loop-free / exactly-once delivery proofs, and a bounded concurrency smoke all run under the standard `dotnet test` suite. The opt-in **live** mesh validation and the extended high-concurrency soak are documented under [End-to-end tests](#end-to-end-tests).
-
-## Installation
-
-
-### Release binaries
-
-Download the latest bundle for your platform and architecture from the [releases page](../../releases), extract it, and run `ollamarouter-server` (or simply `ollamarouter start`). All three executables in the bundle are **self-contained Native AOT** binaries: no .NET runtime installation is required.
-
-| Platform | Architectures | Bundles |
-|---|---|---|
-| Windows | x64, arm64 | `OllamaRouter-win-x64.zip`, `OllamaRouter-win-arm64.zip` |
-| macOS | Intel x64, Apple Silicon arm64 | `OllamaRouter-osx-x64.tar.gz`, `OllamaRouter-osx-arm64.tar.gz` |
-| Linux | x64, arm64 | `OllamaRouter-linux-x64.tar.gz`, `OllamaRouter-linux-arm64.tar.gz` |
-
-Each bundle contains the three Native AOT executables — `ollamarouter-server` (headless daemon), `ollamarouter` (CLI), and `ollamarouter-app` (Avalonia desktop GUI) — plus `VERSION`, `README.md`, and `LICENSE`.
-
-### Windows local install (`publish.ps1`)
-
-On a Windows development machine, `publish.ps1` builds and installs the three Native AOT executables to `%LOCALAPPDATA%\OllamaRouter` and puts launcher shims on your user PATH:
-
-```powershell
-.\publish.ps1                    # build + install (Release, win-x64)
-.\publish.ps1 -Uninstall         # stop daemon + GUI, remove install dir and PATH entry
-```
-
-### From source
-
-Requires the .NET 10 SDK (and the native AOT toolchain for the target OS). Publish each executable for your runtime identifier:
-
-```bash
-dotnet publish src/OllamaRouter/OllamaRouter.csproj      -c Release -r <rid> -o dist   # ollamarouter-server
-dotnet publish src/OllamaRouter.Cli/OllamaRouter.Cli.csproj -c Release -r <rid> -o dist # ollamarouter
-dotnet publish src/OllamaRouter.App/OllamaRouter.App.csproj -c Release -r <rid> -o dist # ollamarouter-app
-```
-
-## CLI
-
-The `ollamarouter` command is the Native AOT CLI for managing the router daemon and fleet:
-
-| Command | Description |
-|---|---|
-| `ollamarouter start` | Start the daemon in the background. |
-| `ollamarouter stop` | Stop the daemon. |
-| `ollamarouter restart` | Restart the daemon. |
-| `ollamarouter status [--json]` | Show daemon status (`--json` for machine-readable output). |
-| `ollamarouter logs [--follow]` | Show daemon logs (`--follow` to tail). |
-| `ollamarouter monitor [--interval <s>]` | In-terminal activity monitor (TUI), see [In-terminal activity monitor (TUI)](#in-terminal-activity-monitor-tui). |
-| `ollamarouter setup [--wizard] [--wait]` | Open the desktop app's [Setup Wizard](#desktop-app-ollamarouter-app); `--wait` blocks and propagates the wizard exit code. Also (re-)registers the user-scoped [`ollamarouter://`](#custom-uri-protocol-ollamarouter) protocol handler (no admin). |
-| `ollamarouter fleet [--json]` | Show per-target fleet status. |
-| `ollamarouter cartography [--json]` | Show fleet cartography (topology view). |
-| `ollamarouter vram reclaim [--keep-enabled] [--target <name>] [--json]` | Unload models to reclaim VRAM. |
-| `ollamarouter preload <model> [...]` | Preload one or more models onto their targets. |
-| `ollamarouter target list\|add\|remove\|enable\|disable\|reset-streak` | Manage routing targets. |
-| `ollamarouter benchmark run\|status\|clear` | Run, inspect, or clear fleet micro-benchmarks. |
-| `ollamarouter help` | Show usage. |
-
-## Running
-
-After installation, start the router with `ollamarouter start` (the CLI auto-resolves the `ollamarouter-server` daemon binary), or run `ollamarouter-server` directly. From source:
-
-```powershell
-dotnet run --project src\OllamaRouter\OllamaRouter.csproj
-```
-
-By default, the router listens on `http://localhost:11434`, the standard Ollama port, so it can be used as a drop-in replacement for a direct Ollama endpoint in your existing tools and clients. On startup, a link to the [monitoring UI](#monitoring) is printed to the console.
-
-On startup the router ensures the local Ollama is running (Windows and macOS only): on **Windows** it launches `%LOCALAPPDATA%\Programs\Ollama\ollama app.exe`, and on **macOS** it starts `/Applications/Ollama.app` (or `~/Applications/Ollama.app`) in the background with `OLLAMA_HOST` set to the host:port of the first loopback `Targets` entry (falling back to `LocalUrl`). An already-running Ollama is left exactly as is (it must already listen on the expected port — the router probes it and never starts a competing daemon). On other platforms Ollama is expected to be managed by the OS or started manually.
-
-## Desktop app (`ollamarouter-app`)
-
-`ollamarouter-app` is the Avalonia desktop GUI, published as a self-contained **Native AOT** binary. It runs in a **0-VRAM software rendering mode** (software-only swapchains on Win32 and X11), so the app never allocates GPU memory — all VRAM stays available for the LLMs. Launch it with `ollamarouter-app` (`ollamarouter-app.cmd` on Windows).
-
-The app also hosts a guided, four-step **Setup Wizard** — the turnkey initial onboarding for standalone users and the delegated LLM environment-setup step for NightCodeForge. It walks you through getting a local Ollama serving on the router's expected port, wiring up your fleet, measuring it, and applying role-to-model recommendations.
-
-### Launching the wizard
-
-```bash
-ollamarouter setup                # open the wizard (detached)
-ollamarouter setup --wait          # block until the wizard exits, propagating its exit code
-ollamarouter-app --wizard          # open the wizard directly from the app
-```
-
-The wizard is also reachable from any browser or web page via the [`ollamarouter://wizard`](#custom-uri-protocol-ollamarouter) URI (or `ollamarouter://setup`).
-
-`--wizard` is an explicit no-op marker — `setup` always launches the app in wizard mode. The app also **opens the wizard automatically on first run** (when `config/config.json` exists in none of the config roots: `$OLLAMAROUTER_HOME`, then the app directory, then the platform install dir); otherwise the dashboard opens.
-
-**Exit codes (the NightCodeForge handoff contract):**
-
-- `0` — the user clicked **Finish** (setup complete).
-- `1` — the wizard window was closed **without** Finish (abandoned); with `--wait` this propagates to the `ollamarouter setup` exit code.
-
-If the `ollamarouter-app` executable cannot be found in any probed location, `setup` exits `1` and lists the locations it probed; an unknown flag exits `2` with the usage text.
-
-### Custom URI protocol (`ollamarouter://`)
-
-Browser-based tools (such as the NightCodeForge Web UI) can launch the desktop app with a single click through the `ollamarouter://` custom URI scheme:
-
-| URI | Opens |
-|---|---|
-| `ollamarouter://` | the dashboard |
-| `ollamarouter://open` | the dashboard |
-| `ollamarouter://dashboard` | the dashboard |
-| `ollamarouter://dashboard?tab=monitor\|fleet\|cartography\|settings` | the dashboard on the matching tab (unknown tabs fall back to the default Monitor tab) |
-| `ollamarouter://wizard` (or `ollamarouter://setup`) | the 4-step [Setup Wizard](#launching-the-wizard) |
-
-The handler is registered **user-scoped (no administrator/root privileges required)** and is (re-)registered automatically by:
-
-- `ollamarouter setup` (for the app executable it resolves),
-- every `ollamarouter-app` launch (for the running executable), and
-- `publish.ps1` during installation.
-
-`publish.ps1 -Uninstall` removes the registration. Windows stores it under `HKCU:\Software\Classes\ollamarouter`; Linux writes an XDG desktop entry (`~/.local/share/applications/ollamarouter.desktop`, best-effort `xdg-mime` default-handler update). Registration is best-effort everywhere — a failure never blocks the app or the CLI. The `--wizard` flag always wins over a URI host, and a dashboard URI never suppresses the first-run onboarding wizard.
-
-### The four steps
-
-1. **Environment** — detects a local Ollama and what owns `:11434` (a running router, a *raw* Ollama sitting on the router's port — the conflict case — or a free port). The one-click **"Configure Local Ollama for Router"** (Windows + macOS) migrates Ollama off the router's default port to `:11435`, then starts the router daemon on `:11434`:
-   - **Windows**: sets the **User** environment variables `OLLAMA_HOST` (`127.0.0.1:11435`, or `0.0.0.0:11435` with the *Expose on the LAN* option), `OLLAMA_FLASH_ATTENTION=1`, and `OLLAMA_KV_CACHE_TYPE=q8_0`; stops any running `ollama` process; restarts Ollama with an **explicit** environment (so it never inherits a stale `OLLAMA_HOST`) and waits for `:11435`.
-   - **macOS**: writes the same three variables via `launchctl setenv` (so a GUI-launched `Ollama.app` inherits them) and restarts it with `open -g --env OLLAMA_HOST=… -a /Applications/Ollama.app` (or `ollama serve` when only the CLI binary is installed).
-   - **Linux**: one-click is disabled and manual `export OLLAMA_HOST=…` instructions are shown instead.
-2. **Targets** — adds the local node (`http://127.0.0.1:11435`), remote LAN nodes, and OpenAI-compatible providers (OpenRouter / Groq / OpenAI presets with an API key), and toggles the built-in **Cloud** overflow (ollama.com, no key). Every target gets a server-probed liveness check (`testConnectionFirst`) plus live 2 s fleet polling.
-3. **Benchmark** — shows per-node GPU/VRAM (`GET /api/router/fleet/hardware`) and runs micro-benchmarks over all active non-Cloud targets (`POST /api/router/benchmark`), with live 2 s polling showing per-target, per-context-window **tokens/sec** and viability (≥ 20 t/s). The poll stops automatically once every queued target reaches a terminal state.
-4. **Recommendations** — generates (`POST /api/router/recommendations/generate`) and applies (`POST /api/router/recommendations/apply`) the role-to-model matrix: per-role native model, recommended context window, and per-node context ceilings. A `409` (no benchmark data yet) shows a "run the Step 3 micro-benchmark first" hint. The router persists the applied matrix to the **state directory** (`<state>/recommended.json`) — `config/` holds only user configuration.
-
-## Monitoring
-
-OllamaRouter exposes a very lightweight, dependency-free monitoring page at `/monitor` (e.g. `http://localhost:11434/monitor`), backed by a JSON endpoint at `/monitor/api`.
-
-The page shows:
-
-- Whether each instance (**Local**/**Remote**, and **Cloud** when at least one model has a `CloudModel` configured, see [Cloud overflow](#cloud-overflow)) is currently **busy** processing a chat/generate request.
-- An **Enabled** checkbox per instance, to enable/disable each target at runtime. Toggling it immediately changes the routing behavior: a disabled target is completely excluded from routing and will never receive requests (unlike a busy target, which can still queue requests if all eligible targets are busy). The new state is persisted to a dedicated JSON file (`%LOCALAPPDATA%\OllamaRouter\targets.json` on Windows), so it is restored on the next startup. The state file is written on a best-effort ("failsafe") basis: if it cannot be written, the change still takes effect in memory and a warning is logged — `appsettings.json` (factory defaults) is never modified at runtime.
-- The requests currently **in progress**, with target instance, model, estimated input tokens and running time.
-- A history of the most recent completed requests (last 50), with model, estimated vs. actual input tokens, actual output tokens, elapsed time and HTTP status. Failed requests are highlighted.
-- Aggregated **token statistics** per target (and overall total): number of requests, actual input tokens, actual output tokens, and cumulative **GPU time** (`elapsedMs`, milliseconds accumulated from completed successful requests — electricity keeps flowing even when the daemon reports no token usage), both for the **current day** and for the **last 7 days**. Only successful requests with actual token counts are counted toward the request/token counters (elapsed time counts every completed successful request). These statistics are persisted to a dedicated JSON file (`%LOCALAPPDATA%\OllamaRouter\activity-statistics.json` on Windows) so they survive restarts, and are written on a best-effort basis (throttled to at most one write per 30 seconds, on day rollover, and on application shutdown).
-- A **target usage ratio progress bar** visually breaking down the share of tokens processed by each target (**Local**, **Remote**, and **Cloud**) over the **last 7 days**.
-- **Actual savings and cloud overflow cost** based on the **last 7 days**, displayed whenever a token price rate is configured in `Pricing`. Savings are the **actual** savings of serving requests locally and remotely: per non-Cloud target, the token cloud value minus the target's node electricity cost — `electricityCost = (elapsedSeconds / 3600) × (watts / 1000) × ElectricityPricePerKwh` (defaults: `0.20`/kWh and `150` W when unset; the per-target `PowerWatts` override, then `Pricing:DefaultNodePowerWatts`, then the 150 W default resolve the wattage). Cloud targets never consume router-side electricity (their electricity cost is `0`; the Cloud overflow itself is reported separately as `cloudOverflowCost`). Negative savings (electricity exceeding the cloud value) are reported as-is, not clamped. Cached prompt tokens (a subset of the input tokens, reported by Ollama's `prompt_eval_cached_count` / OpenAI-compatible `usage.prompt_tokens_details.cached_tokens`) are valued at the cached rate when `Pricing:CachedPromptPricePerMillion` is configured (otherwise at the regular input rate), so the per-1M cloud value of a request is `(input − cached) × promptPrice + cached × cachedPrice + output × completionPrice`. The electricity cost (`electricityCost` total + `perTargetElectricityCost` per target) is rendered in the savings card and the TUI cost line. If no token price rate is configured, this section is completely hidden (the electricity price alone never surfaces it).
-- A **live token estimation overhead recommendation** card at the bottom of the page, computed from recent requests by comparing raw estimator token counts against the actual prompt tokens reported by Ollama. It displays the overall observed factor, per-model factors, and the exact recommended value to put in `config/config.json` (or `appsettings.json` factory defaults).
-- **Failure-streak observability** (task #95): the per-target fleet rows of `/monitor/api`, `GET /api/router/fleet` and `GET /api/router/cartography` carry `failureStreak` (the target's current consecutive-failure streak count), `circuitState` (`"Closed"` | `"Cooldown"` | `"HalfOpen"` — `"Cooldown"` is the breaker's Open state: the streak is above `MaxConsecutiveFailures` and the cooldown window is still active, so the target is skipped as a routing candidate) and `cooldownRemainingSeconds` (present **only** while in `"Cooldown"`: the seconds left in the `FailureStreakCooldownSeconds` window). Hosts without the streak service degrade to `0` / `"Closed"` / omitted.
-
-The page auto-refreshes every 2 seconds by polling `/monitor/api`. A clickable link to this page is printed to the console when the router starts (see [Running](#running)).
-
-![Monitor screenshot](docs/monitor.png)
-
-### In-terminal activity monitor (TUI)
-
-To monitor traffic without keeping a GPU-accelerated web browser running (which consumes valuable VRAM needed for local LLMs and gaming), OllamaRouter includes a built-in **Terminal UI** that runs directly in the server console.
-
-It displays the same live information as the monitoring page:
-- Instance states (**Local**, **Remote**, **Cloud**: Idle, Busy, Offline, Disabled);
-- An indented failure-streak warning sub-line under any target with an active streak or a non-`Closed` circuit state — e.g. `⚠ Streak 4 · Cooldown 42s` (red while in cooldown), `⚠ Streak 5 · HalfOpen` or `⚠ Streak 2` (yellow) — omitted for clean targets (the 79-column TUI budget is untouched);
-- Token statistics (**Today** and **Last 7 days**: requests, input tokens, output tokens, totals);
-- Target usage ratio breakdown progress bar and legend (last 7 days);
-- Actual savings (cloud value − node electricity cost, including the electricity readout) and cloud overflow costs (when a token price rate is configured);
-- In-progress requests (target, model, estimated input tokens, elapsed time);
-- Recent completed requests with status highlighting.
-
-The terminal UI is completely read-only (actions and token estimation overhead recommendations are omitted) and keeps a direct link to open the full-featured web monitoring page whenever runtime configuration changes or deep model tuning are needed.
-
-It starts automatically when running interactively. If standard output is redirected (e.g. running as a background service or in CI), it automatically falls back to standard log output. You can also explicitly disable it by passing `--no-tui`:
-
-```powershell
-ollamarouter-server --no-tui
-```
-
-### Per-session usage & savings
-
-Client applications that send the public session header (`X-OllamaRouter-Session-Id`) can read the actual price and savings **per session** from two read-only router API endpoints (no API key required in default mode):
-
-- `GET /api/router/monitor/sessions` — the stored sessions, **most-recently-active first**:
-
-  ```json
-  {
-    "currency": "$", "count": 1,
-    "sessions": [{ "sessionId": "sess-85", "requests": 3, "inputTokens": 32, "cachedInputTokens": 20,
-                   "outputTokens": 19, "elapsedMs": 1842.0, "lastSeenAt": "2026-11-09T13:20:11.412Z",
-                   "cloudValue": 0.000011, "electricityCost": 0.000002, "savings": 0.000009,
-                   "actualCloudCost": 0.0, "cost": 0.000002 }]
-  }
-  ```
-
-- `GET /api/router/monitor/sessions/{sessionId}` — one session's totals (same fields, `sessionId` lookup is case-insensitive) plus a `perTarget` breakdown (per-row tokens, `elapsedMs`, `cloudValue`, `electricityCost`, `savings`; configured fleet order, Cloud last, historical since-renamed/removed targets appended after). The `actualCloudCost`/`cost` fields are top-level session fields (same as the list rows), NOT on the `perTarget` rows. Unknown session → `404` with `OllamaErrorResponse` (`"session not found: …"`).
-
-Semantics (mirroring the monitor and the persisted daily statistics, so the figures stay consistent by construction):
-
-- **Counting:** only COMPLETED requests are recorded — failed requests contribute nothing; successful completions with daemon-reported usage add `requests` + `inputTokens` (cached INCLUSIVE, `cachedInputTokens` reported separately as a subset) + `outputTokens` + `elapsedMs`; successful completions WITHOUT usage add `elapsedMs` only (electricity still flows).
-- **Cost math:** the store holds raw counters only; cost figures are computed at READ time from the **currently configured** `Pricing` (cached-token pricing + electricity subtraction, the monitor's exact formulas, 4-decimal rounding, never clamped) — a pricing change re-prices every stored session immediately. `cloudValue` is the all-cloud **baseline** (values ALL tokens — local and cloud — at cloud rates); `actualCloudCost` is the Cloud pseudo-target's **own** token value — the actual money paid to cloud (`0.0` when the Cloud target was never used for the session, distinct from the all-cloud `cloudValue` baseline); `cost = actualCloudCost + electricityCost` is the session's **total actual spend** (cloud spend + local power; e.g. cloud-free ⇒ `cost == electricityCost`, cloud-only ⇒ `cost == actualCloudCost`) — NOT the savings-vs-baseline figure (`cost != savings` in general). The Cloud row carries `electricityCost: 0` and `savings: 0` (no node electricity; its token value is a cost against the all-cloud baseline, not a saving), so session `savings = Σ non-Cloud (cloudValue − electricity)`.
-- **Unconfigured pricing:** when no token price rate is configured, `currency`/`cloudValue`/`electricityCost`/`savings`/`actualCloudCost`/`cost` are omitted from the JSON (token totals are always present) — the same "hidden unless a token price is configured" rule as the monitor's cost card.
-- **Bounds & eviction:** bounded LRU keyed by the public session ID (`OllamaRouter:SessionUsageMaxSessions`, default `1000`, live), best-effort persisted to a dedicated JSON file (`%LOCALAPPDATA%\OllamaRouter\session-usage.json` on Windows — raw counters only, most-recently-active-first) so it survives restarts, and written on a best-effort basis (throttled to at most one write per 30 seconds and on application shutdown). Requests **without** a session ID are never stored; IDs longer than 256 characters are never stored; GETs never refresh recency (eviction is driven by request traffic only).
-
-### Releasing a session's affinity lease (sticky routing)
-
-Clients that tag their requests with the public session header (`X-OllamaRouter-Session-Id`) get sticky routing: the router pins the session to the target that served it (the KV-cache affinity lease, 30-min sliding TTL) so consecutive turns reuse the target's prompt-prefix cache. When the session is **done, was compacted, or its KV cache is no longer needed**, release the lease explicitly instead of waiting for the TTL — the session's next request then routes fresh and re-pins as normal:
-
-```
-curl -X POST -H "X-OllamaRouter-Session-Id: sess-86" \
- http://localhost:11434/api/router/sessions/affinity/release
-# → 200 { "sessionId": "sess-86", "released": true }
-```
-
-- **Idempotent:** ALWAYS `200` with `{ "sessionId": <echo of the trimmed header>, "released": <bool> }` — `released: true` iff a **live** lease was found and removed; `released: false` for unknown session IDs, TTL-expired or already-released sessions, and headers longer than 256 characters (the routing middleware never lets such an ID hold a lease). Clients can fire-and-forget on session end.
-- **400 rule:** a missing/empty/whitespace-only header → `400` `OllamaErrorResponse` ("`X-OllamaRouter-Session-Id header is required`") — the only non-200 response.
-- **Lookup** is case-insensitive (matching the lease store's keying).
-- **Scope:** the session affinity lease ONLY — the per-target/model dynamic-context auto-shrink lease (shared across sessions, with its cooldown/idle hysteresis), the failure-streak state and any per-target state are untouched; in-flight requests are unaffected.
-- **Auth:** no API key required in default mode (like the read-only router routes); covered when `ApiSecurity.RequireKeyForAllEndpoints: true`, like every route.
-
-## Requirements
-
-- Release binaries are self-contained **Native AOT** executables — no .NET runtime is required to run them. The .NET 10 SDK (plus the native AOT compiler toolchain for your OS) is only needed to build from source.
-- Two reachable Ollama instances (local and remote)
-- A GPU VRAM probe tool on the local machine (see “GPU/VRAM detection”); if none is present the probe returns 0, which effectively disables VRAM-gated local routing. To report the free VRAM of the local machine: Windows / Linux: `nvidia-smi` (returns 0 if unavailable); macOS (Apple Silicon): nothing to install — `sysctl` and `vm_stat`
-
-## GPU/VRAM detection
-
-OllamaRouter probes the local GPU's free VRAM through a composite provider that runs vendor-specific CLI tools in a fixed order and uses the **first non-zero result**:
-
-1. **NVIDIA** — `nvidia-smi` (any OS, must be on `PATH`); reports exact free VRAM in MB.
-2. **AMD** — `rocm-smi` (Linux only, ROCm required); reports exact free VRAM (summed across all AMD GPUs).
-3. **Intel** — `xpu-smi` (Linux, Intel GPU Tools) or, as a fallback, `intel_gpu_top` (Linux); reports exact free VRAM.
-4. **Windows non-NVIDIA fallback** — WMI `Win32_VideoController.AdapterRAM` (Windows only). **Degraded: this reports TOTAL VRAM, not free VRAM**, and is only reached when `nvidia-smi` reports 0 (i.e. no usable NVIDIA device).
-5. **macOS Apple Silicon** — `AppleUnifiedMemoryVramProvider` estimates the free VRAM from the machine's unified memory via `sysctl` (`hw.memsize`, `iogpu.wired_limit_mb`) and `vm_stat` — nothing to install. See [GPU memory on macOS](#gpu-memory-on-macos).
-
-Notes:
-
-- AMD and Intel probes are only attempted on Linux; the WMI fallback is only attempted on Windows; the Apple unified-memory estimator is only attempted on macOS. On a machine with no probe tool available at all (e.g. Linux without any of the CLI tools) the probe returns 0.
-- If **all** probes report 0, the composite returns 0, which effectively disables VRAM-gated local routing (requests fall through to the remote target).
-- Each probe result is logged at `Trace` level for diagnostics (e.g. “VRAM probe RocmSmiVramProvider: 1234MB”).
-
-### GPU memory on macOS
-
-Apple Silicon Macs have no dedicated VRAM: the GPU shares the machine's **unified memory**. macOS lets the GPU wire at most `iogpu.wired_limit_mb` megabytes when that sysctl is set (`sudo sysctl iogpu.wired_limit_mb=<MB>`), and otherwise defaults to roughly **2/3 of the total RAM up to 36 GB, 3/4 above that size** — which is exactly the budget `AppleUnifiedMemoryVramProvider` applies when the sysctl is unset. The reported value is `min(remaining GPU wired budget, free + inactive + speculative pages)` from `vm_stat`, so it varies as other applications (and loaded models) use memory: size `MinRequiredVramMB` per Mac (a 24 GB Mac typically reports ≈ 12–14 GB free).
-
-## Project structure
-
-- `Middleware/OllamaRoutingMiddleware.cs` – inspects intercepted requests, emits routing telemetry headers, enforces target pinning, and sets the `X-Ollama-Target` header used by YARP for routing.
-- `Services/RoutingDecisionService.cs` – orchestrates the multi-target routing engine (Stage-1 hardware/context capability filtering, Stage-2 heuristic scoring, and overflow fallback).
-- `Services/CloudRoutingTargetHandler.cs` – overflow target handler relaying to ollama.com cloud models when primary instances are busy or failing.
-- `Services/RoutingContext.cs` – encapsulates request parameters, token estimates, and fleet routing target evaluations.
-- `Services/OllamaModelCatalogClient.cs` – fetches and merges model catalogs (`/api/tags`, `/v1/models`, `/api/ps`) from both instances.
-- `Parsing/OllamaRequestParser.cs` – extracts the prompt, model name, and JSON Schema format from request bodies.
-- `ReverseProxy/OllamaReverseProxyConfig.cs` – builds the YARP routes/clusters in code.
-- `Endpoints/OllamaEndpointsExtensions.cs` – hybrid endpoints (`/api/tags`, `/api/ps`, `/v1/models`) that short-circuit YARP to return merged results including configured cloud models.
-- `Endpoints/MonitorEndpointsExtensions.cs` – lightweight monitoring UI (`/monitor`, `/monitor/api`), target toggles (`POST /targets`), and non-destructive VRAM reclaim (`POST /api/models/unload`, `POST /monitor/reclaim-vram`).
-- `Services/ActivityMonitorService.cs` – in-memory bookkeeping of busy state, in-progress requests and recent request history used by the monitoring UI.
-- `Services/OllamaProcessLauncher.cs` – ensures the local Ollama is running on startup (Windows and macOS only), probing the expected daemon port first so a manually managed daemon is never duplicated.
-- `Services/ActivityStatisticsService.cs` – per-target counters (requests, actual input/output tokens) with current-day and last-7-days aggregation, persisted on a best-effort basis to a dedicated JSON file in the application data folder (`%LOCALAPPDATA%\OllamaRouter\activity-statistics.json` on Windows) and exposed via `/monitor/api`.
-- `Services/TargetAvailabilityService.cs` – in-memory state of the Local/Remote/Cloud enable/disable flags, loaded at startup from and persisted on a best-effort basis to a dedicated JSON state file in the application data folder (`%LOCALAPPDATA%\OllamaRouter\targets.json` on Windows), toggled via `POST /targets`.
-- `Services/InferenceRequestRecorder.cs` – optional, best-effort recorder of inference requests (a `requests.jsonl` metadata manifest plus one pretty-printed payload file per request with the full request body) used to investigate estimated vs actual token counts; disabled by default, records are stored in the application data folder (`%LOCALAPPDATA%\OllamaRouter\inference-requests\` on Windows).
+---
 
 ## Tests
 
-Unit tests are located in `OllamaRouter.Tests` and cover the request parser, the routing decision policy, the model catalog merge logic, the middleware, and the YARP configuration.
+Run the unit and simulated fleet test suite:
 
 ```powershell
 dotnet test
 ```
 
-### End-to-end tests
+Run the opt-in 10 s sustained-concurrency mesh soak:
 
-`OllamaRouter.E2ETests` is a standalone console executable that exercises a **running** OllamaRouter instance (and its underlying local/remote Ollama instances) through both the native Ollama API (using [OllamaSharp](https://github.com/awaescher/OllamaSharp)) and the OpenAI-compatible API (using `Microsoft.Extensions.AI.OpenAI`). It is not a substitute for the unit tests above: it performs real HTTP calls against a live deployment and is meant to be run manually, or as a smoke test after deployment/configuration changes.
+```powershell
+$env:OLLAMAROUTER_MESH_SOAK = "1"
+dotnet test
+```
 
-It checks that:
-- `GET /api/tags` returns a non-empty merged list of models (native Ollama API).
-- `GET /api/ps` returns a valid response (native Ollama API).
-- `POST /api/chat` returns a completion (native Ollama API).
-- `GET /v1/models` returns a non-empty merged list of models (OpenAI-compatible API).
-- `POST /v1/chat/completions` returns a completion (OpenAI-compatible API).
-
-Before running it, make sure OllamaRouter is running (see [Running](#running)) and that both the local and remote Ollama instances are up and have the expected model pulled and aliased (see [Setup Ollama instances](#setup-ollama-instances)).
+Run the live end-to-end smoke test suite (`tests/OllamaRouter.E2ETests`) against a running router and Ollama instances:
 
 ```powershell
 dotnet run --project tests\OllamaRouter.E2ETests\OllamaRouter.E2ETests.csproj
 ```
 
-The executable prints a `PASS`/`FAIL` line per scenario and exits with a non-zero code if any scenario fails, so it can be wired into a CI pipeline or a post-deployment check. It can be configured through the following environment variables:
+<details>
+<summary>E2E environment variables</summary>
 
-| Variable                   | Description                                                        | Default                   |
-|----------------------------|----------------------------------------------------------------------|----------------------------|
-| `OLLAMAROUTER_E2E_URL`     | Base URL of the OllamaRouter instance under test.                    | `http://localhost:11434`  |
-| `OLLAMAROUTER_E2E_MODEL`   | Name of the model aliased on both the local and remote instances.    | `Qwen3.8-27B:latest`      |
-| `OLLAMAROUTER_E2E_MESH`    | Set to `1` to also run the **live dual-router mesh** scenario group (skipped otherwise). | *(unset — skipped)*   |
-| `OLLAMAROUTER_E2E_MESH_URL_B` | Base URL of the **second** router in the mesh (router A is `OLLAMAROUTER_E2E_URL`). | *(required when mesh is on)* |
-| `OLLAMAROUTER_E2E_MESH_TARGETS` | Comma-separated fleet target names for the mesh pin scenarios. | *(optional)*             |
-| `OLLAMAROUTER_E2E_API_KEY` | Router API key (sent as `X-Api-Key`). When set, the cached-token pricing scenario additionally `PUT`s a cached prompt-token rate (snapshot/restore) against the key-protected config endpoint and verifies the monitor cost math; when unset the scenario only exercises the public `/monitor/api` read surface. | *(optional — config manipulation skipped)* |
+| Variable | Description | Default |
+|---|---|---|
+| `OLLAMAROUTER_E2E_URL` | Base URL of the OllamaRouter instance under test. | `http://localhost:11434` |
+| `OLLAMAROUTER_E2E_MODEL` | Model name aliased on the local and remote instances. | `Qwen3.8-27B:latest` |
+| `OLLAMAROUTER_E2E_MESH` | Set to `1` to run the live dual-router mesh scenarios. | *(unset — skipped)* |
+| `OLLAMAROUTER_E2E_MESH_URL_B` | Base URL of the second router in the mesh. | *(required when mesh is on)* |
+| `OLLAMAROUTER_E2E_MESH_TARGETS` | Comma-separated fleet target names for mesh pin scenarios. | *(optional)* |
+| `OLLAMAROUTER_E2E_API_KEY` | Router API key (`X-Api-Key`) for config-mutation scenarios. | *(optional)* |
 
-To validate a real 3-node mesh (two physical routers, two daemons), enable the opt-in mesh group:
+</details>
 
-```powershell
-$env:OLLAMAROUTER_E2E_MESH = "1"
-$env:OLLAMAROUTER_E2E_URL  = "http://127.0.0.1:11434"          # router A (desktop)
-$env:OLLAMAROUTER_E2E_MESH_URL_B = "http://192.168.1.10:11434" # router B (laptop)
-$env:OLLAMAROUTER_E2E_MESH_TARGETS = "desktop,laptop"
-```
-
-The mesh scenarios verify that both routers expose the **same** `/api/tags` union, that `/api/chat` completes from each router within a bounded time (no router→router loop), and that `X-OllamaRouter-Target` pins are honored from each router. When `OLLAMAROUTER_E2E_MESH` is unset (or no second URL is supplied), the mesh group is skipped with a printed notice and the default single-router run is unchanged.
-
-The in-process fleet simulation (two in-process routers + N daemon stubs, loop-free operation, fault injection, and the bounded concurrency smoke) runs under `dotnet test` as part of the standard unit-test suite. An extended high-concurrency soak is available opt-in:
-
-```powershell
-$env:OLLAMAROUTER_MESH_SOAK = "1"   # enables the 10 s sustained-concurrency soak under dotnet test
-dotnet test
-```
+---
 
 ## License
 
