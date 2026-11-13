@@ -107,6 +107,7 @@ public static class OllamaRouterServiceCollectionExtensions
         // resolves it lazily through the service provider so ordering is irrelevant here.
         services.AddSingleton<IPostConfigureOptions<OllamaRouterOptions>>(sp => new TargetApiKeyUnwrapPostProcessor(
             sp.GetService<IKeyProtector>(),
+            sp.GetService<ICredentialStore>(),
             sp.GetService<ILoggerFactory>()?.CreateLogger<TargetApiKeyUnwrapPostProcessor>()));
 
         if (!enableTui)
@@ -250,7 +251,8 @@ public static class OllamaRouterServiceCollectionExtensions
             sp.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>(),
             sp,
             sp.GetService<ILoggerFactory>()?.CreateLogger<RouterConfigPersistence>(),
-            sp.GetService<IKeyProtector>()));
+            sp.GetService<IKeyProtector>(),
+            sp.GetService<ICredentialStore>()));
 
         // API key security (task #50): the at-rest protector is platform-selected at DI time
         // (DPAPI-wrapped default key on Windows; plain + 0600 permissions on Unix; unit tests
@@ -260,6 +262,14 @@ public static class OllamaRouterServiceCollectionExtensions
         // the factory form trips the .NET 10 TryAddEnumerable type-validation, see below).
         services.AddSingleton<IKeyProtector>(_ =>
             OperatingSystem.IsWindows() ? new DpapiKeyProtector() : new PlainKeyProtector());
+        // Task #110: the OS credential store (Windows Credential Manager / macOS Keychain /
+        // Linux Secret Service) via Pmad.KeySharp — the primary at-rest home of the OpenAI
+        // target API keys. Singleton (thread-local native error state — safe from the HTTP
+        // handlers + the options bind path); a bare test host that does not resolve it takes
+        // the v1: IKeyProtector fallback everywhere (defensive GetService in the two SP
+        // factories above).
+        services.AddSingleton<ICredentialStore>(sp => new KeySharpCredentialStore(
+            sp.GetService<ILoggerFactory>()?.CreateLogger<KeySharpCredentialStore>()));
         services.AddSingleton<IApiKeyStore>(sp => new ApiKeyStore(
             sp.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>(),
             sp,

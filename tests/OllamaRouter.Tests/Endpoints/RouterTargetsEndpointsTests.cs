@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -7,6 +8,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using OllamaRouter.Configuration;
 using OllamaRouter.Endpoints.RouterApi.Targets;
 using OllamaRouter.Middleware;
 using OllamaRouter.Options;
@@ -533,5 +535,233 @@ public class RouterTargetsEndpointsTests
             Assert.Equal(HttpStatusCode.Unauthorized, fleetUnauthorized.StatusCode);
             Assert.Equal("Bearer", fleetUnauthorized.Headers.WwwAuthenticate?.FirstOrDefault()?.Scheme);
         }
+    }
+}
+
+/// <summary>
+/// Task #110 (D1): the Setup-API target mutations (<c>POST/PUT/DELETE /api/router/targets[/{name}]</c>)
+/// ride the single write path <c>IRouterConfigPersistence.PersistTargetsAsync</c>, so the OS-keyring
+/// synchronization (store / clear / delete of the credential) is asserted here against a host that
+/// registers an explicit <see cref="IRouterConfigPersistence"/> (plain protector) + a fake
+/// <see cref="ICredentialStore"/> — NO auth middleware (handler-level test), NO real keyring.
+/// </summary>
+public class RouterTargetsKeyringEndpointsTests
+{
+    private sealed class KeyringHarness : IAsyncDisposable
+    {
+        public KeyringHarness(
+            WebApplication app,
+            HttpClient client,
+            TestOptionsMonitor<OllamaRouterOptions> options,
+            FakeCredentialStore store,
+            string contentRoot)
+        {
+            App = app;
+            Client = client;
+            Options = options;
+            Store = store;
+            ContentRoot = contentRoot;
+        }
+
+        public WebApplication App { get; }
+
+        public HttpClient Client { get; }
+
+        public TestOptionsMonitor<OllamaRouterOptions> Options { get; }
+
+        public FakeCredentialStore Store { get; }
+
+        public string ContentRoot { get; }
+
+        public string ConfigPath => Path.Combine(ContentRoot, "config", "config.json");
+
+        public Task<HttpResponseMessage> PutAsync(string path, string body) => Client.SendAsync(
+            new HttpRequestMessage(HttpMethod.Put, path) { Content = new StringContent(body, Encoding.UTF8, "application/json") });
+
+        public Task<HttpResponseMessage> PostAsync(string path, string body) => Client.SendAsync(
+            new HttpRequestMessage(HttpMethod.Post, path) { Content = new StringContent(body, Encoding.UTF8, "application/json") });
+
+        public Task<HttpResponseMessage> DeleteAsync(string path) =>
+            Client.SendAsync(new HttpRequestMessage(HttpMethod.Delete, path));
+
+        public async ValueTask DisposeAsync()
+        {
+            try
+            {
+                await App.StopAsync();
+                await App.DisposeAsync();
+            }
+            finally
+            {
+                try
+                {
+                    if (Directory.Exists(ContentRoot))
+                    {
+                        Directory.Delete(ContentRoot, recursive: true);
+                    }
+                }
+                catch
+                {
+                    // Temp cleanup must never mask the test outcome.
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Minimal host (mirrors <see cref="RouterConfigEndpointsTests"/>): temp content root +
+    /// <see cref="TestOptionsMonitor{TOptions}"/> + explicit <see cref="IRouterConfigPersistence"/>
+    /// (PlainKeyProtector + the fake store) + <c>MapRouterTargetsEndpoints</c> only — no auth
+    /// middleware, no liveness/catalog services (OpenAI targets use the synthetic catalog;
+    /// <c>testConnectionFirst: false</c> skips the probe).
+    /// </summary>
+    private static async Task<KeyringHarness> CreateKeyringHarnessAsync(
+        FakeCredentialStore store,
+        OllamaRouterOptions? initialOptions = null,
+        string? seedConfigJson = null)
+    {
+        var contentRoot = Path.Combine(Path.GetTempPath(), $"ollamarouter-keyring-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(contentRoot);
+        if (seedConfigJson is not null)
+        {
+            Directory.CreateDirectory(Path.Combine(contentRoot, "config"));
+            await File.WriteAllTextAsync(Path.Combine(contentRoot, "config", "config.json"), seedConfigJson);
+        }
+
+        var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+        {
+            Args = [],
+            ContentRootPath = contentRoot
+        });
+        builder.WebHost.UseUrls("http://127.0.0.1:0");
+        builder.Logging.ClearProviders();
+
+        var optionsMonitor = new TestOptionsMonitor<OllamaRouterOptions>(initialOptions ?? new OllamaRouterOptions());
+        builder.Services.AddSingleton<IOptionsMonitor<OllamaRouterOptions>>(optionsMonitor);
+        builder.Services.AddSingleton<ICredentialStore>(store);
+        builder.Services.AddSingleton<IRouterConfigPersistence>(sp => new RouterConfigPersistence(
+            sp.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>(),
+            sp,
+            null,
+            new PlainKeyProtector(),
+            store));
+
+        var app = builder.Build();
+        app.MapRouterTargetsEndpoints();
+        await app.StartAsync();
+
+        var client = new HttpClient { BaseAddress = new Uri(app.Urls.First()), Timeout = TimeSpan.FromSeconds(15) };
+        return new KeyringHarness(app, client, optionsMonitor, store, contentRoot);
+    }
+
+    private static JsonArray ReadTargetsNode(string configPath)
+    {
+        var root = (JsonObject)JsonNode.Parse(File.ReadAllText(configPath))!;
+        return (JsonArray)root["OllamaRouter"]!["Targets"]!;
+    }
+
+    private static OllamaTargetOptions GroqOptions(string? apiKey) => new()
+    {
+        Name = "groq",
+        Url = "https://api.groq.com/openai/v1",
+        Type = TargetType.OpenAI,
+        Provider = "groq",
+        ApiKey = apiKey
+    };
+
+    [Fact]
+    public async Task DeleteTarget_RemovesCredentialFromKeyring()
+    {
+        var store = new FakeCredentialStore { IsAvailable = true };
+        store.Seed(ICredentialStore.PackageId, ICredentialStore.OpenAiService, "groq", "sk-groq");
+        // config.json already carries the target with its keyring marker (the on-disk
+        // existingByName source of the delete plan) and the in-memory options hold it live.
+        await using var harness = await CreateKeyringHarnessAsync(
+            store,
+            new OllamaRouterOptions { Targets = [GroqOptions("sk-groq")] },
+            seedConfigJson: """
+            {
+              "OllamaRouter": {
+                "Targets": [
+                  { "Name": "groq", "Url": "https://api.groq.com/openai/v1", "Type": "OpenAI", "ApiKey": "keyring:groq" }
+                ]
+              }
+            }
+            """);
+
+        using var response = await harness.DeleteAsync("/api/router/targets/groq");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        // The credential was removed from the (fake) OS keyring...
+        Assert.Contains(store.DeleteCalls, c => c is (ICredentialStore.PackageId, ICredentialStore.OpenAiService, "groq"));
+        Assert.Null(store.GetPassword(ICredentialStore.PackageId, ICredentialStore.OpenAiService, "groq"));
+
+        // ...and the target is gone from config.json.
+        Assert.Empty(ReadTargetsNode(harness.ConfigPath).AsEnumerable());
+    }
+
+    [Fact]
+    public async Task UpdateTarget_ClearsKey_DeletesCredential()
+    {
+        var store = new FakeCredentialStore { IsAvailable = true };
+        await using var harness = await CreateKeyringHarnessAsync(
+            store,
+            new OllamaRouterOptions { Targets = [GroqOptions("sk-old")] });
+
+        using var response = await harness.PutAsync("/api/router/targets/groq", "{\"apiKey\": \"\"}");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        // The cleared key removes the file node AND deletes the keyring entry.
+        Assert.Single(store.DeleteCalls);
+        Assert.Equal((ICredentialStore.PackageId, ICredentialStore.OpenAiService, "groq"), store.DeleteCalls[0]);
+        var targetNode = (JsonObject)ReadTargetsNode(harness.ConfigPath)[0]!;
+        Assert.Null(targetNode["ApiKey"]);
+    }
+
+    [Fact]
+    public async Task UpdateTarget_SetsKey_WritesKeyringAndMarker()
+    {
+        var store = new FakeCredentialStore { IsAvailable = true };
+        await using var harness = await CreateKeyringHarnessAsync(
+            store,
+            new OllamaRouterOptions { Targets = [GroqOptions(null)] });
+
+        using var response = await harness.PutAsync("/api/router/targets/groq", "{\"apiKey\": \"sk-new\"}");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        // The plaintext went to the (fake) keyring; the file holds ONLY the marker.
+        Assert.Single(store.SetCalls);
+        Assert.Equal((ICredentialStore.PackageId, ICredentialStore.OpenAiService, "groq", "sk-new"), store.SetCalls[0]);
+        var fileContent = File.ReadAllText(harness.ConfigPath);
+        var targetNode = (JsonObject)ReadTargetsNode(harness.ConfigPath)[0]!;
+        Assert.Equal("keyring:groq", targetNode["ApiKey"]!.GetValue<string>());
+        Assert.DoesNotContain("sk-new", fileContent);
+    }
+
+    [Fact]
+    public async Task AddTarget_OpenAiWithKey_StoresCredential()
+    {
+        var store = new FakeCredentialStore { IsAvailable = true };
+        await using var harness = await CreateKeyringHarnessAsync(store, new OllamaRouterOptions());
+
+        using var response = await harness.PostAsync("/api/router/targets", """
+            {
+              "name": "groq",
+              "url": "https://api.groq.com/openai/v1",
+              "type": "openai",
+              "apiKey": "sk-new",
+              "maxParallel": 2,
+              "testConnectionFirst": false
+            }
+            """);
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+
+        // The credential was stored in the (fake) keyring and the file keeps only the marker.
+        Assert.Contains(store.SetCalls, c => c is (ICredentialStore.PackageId, ICredentialStore.OpenAiService, "groq", "sk-new"));
+        var fileContent = File.ReadAllText(harness.ConfigPath);
+        var targetNode = (JsonObject)ReadTargetsNode(harness.ConfigPath)[0]!;
+        Assert.Equal("groq", targetNode["Name"]!.GetValue<string>());
+        Assert.Equal("keyring:groq", targetNode["ApiKey"]!.GetValue<string>());
+        Assert.DoesNotContain("sk-new", fileContent);
     }
 }

@@ -17,6 +17,16 @@
     <DebugType>embedded</DebugType>
   </PropertyGroup>
 
+  <!-- Task #110: the ONE new AOT warning introduced by the Pmad.KeySharp reference — ILC flags
+       KeySharp.Glue.GetLibrarySearchPaths' use of Assembly.Location (IL3000, which would be
+       empty in a single-file app). The canonical publish is NOT single-file (the natives sit
+       next to the binary) and no code in this repo reads Assembly.Location, so the warning is
+       inert; it is suppressed (AOT publishes only) to keep the AOT pass clean of package-
+       attributable warnings. -->
+  <PropertyGroup Condition="'$(PublishAot)' == 'true'">
+    <NoWarn>$(NoWarn);IL3000</NoWarn>
+  </PropertyGroup>
+
   <ItemGroup>
     <PackageReference Include="Microsoft.Bcl.Memory" Version="10.0.12" />
     <!-- Runtime OpenAPI document for the /api/router/ management API (task #51): the .NET 10
@@ -31,6 +41,12 @@
     <PackageReference Include="Microsoft.Extensions.AI.Abstractions" Version="10.9.0" />
     <PackageReference Include="Microsoft.ML.Tokenizers" Version="2.0.0" />
     <PackageReference Include="Microsoft.ML.Tokenizers.Data.Cl100kBase" Version="2.0.0" />
+    <!-- Task #110: cross-platform OS keyring access (Windows Credential Manager / macOS Keychain /
+         Linux Secret Service) for OpenAI target API keys. Pinned to 0.1.0: net10.0 TFM, zero
+         managed dependencies (adds nothing to the dependency graph), dynamic NativeLibrary
+         loading (no unsafe / no reflection) - NativeAOT-safe with the existing publish
+         properties; the bundled skeychain natives ride the single-file self-extract path. -->
+    <PackageReference Include="Pmad.KeySharp" Version="0.1.0" />
     <PackageReference Include="Pmad.AI" Version="0.0.4" />
     <PackageReference Include="Yarp.ReverseProxy" Version="2.3.0" />
     <PackageReference Include="Serilog.AspNetCore" Version="10.0.0" />
