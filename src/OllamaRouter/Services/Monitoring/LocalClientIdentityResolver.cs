@@ -51,7 +51,9 @@ public sealed class LocalClientIdentityResolver : ILocalClientIdentityResolver
     // --- Windows GetExtendedTcpTable (iphlpapi.dll) constants ---
     private const uint AF_INET = 2;
     private const uint AF_INET6 = 23;
-    private const uint TCP_TABLE_OWNER_PID_CONNECTIONS = 3;
+    // TCP_TABLE_CLASS (iphlpapi.h): BASIC_LISTENER=0, BASIC_CONNECTIONS=1, BASIC_ALL=2,
+    // OWNER_PID_LISTENER=3, OWNER_PID_CONNECTIONS=4, OWNER_PID_ALL=5.
+    private const uint TCP_TABLE_OWNER_PID_CONNECTIONS = 4;
     private const uint NO_ERROR = 0;
 
     // The two-call sizing pattern: the first (empty-buffer) call returns this code and the
@@ -208,12 +210,10 @@ public sealed class LocalClientIdentityResolver : ILocalClientIdentityResolver
             // connection: normalize before family selection (the kernel may publish the row
             // in EITHER table — AF_INET sockets live in the v4 table, IPv4-mapped AF_INET6
             // sockets live in the v6 table in ::ffff:a.b.c.d form — so both are searched).
-            bool wasV4Mapped = false;
             if (remoteIp.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6
                 && IsIPv4MappedPrefix(remoteIp.GetAddressBytes().AsSpan()))
             {
                 remoteIp = remoteIp.MapToIPv4();
-                wasV4Mapped = true;
             }
 
             if (OperatingSystem.IsWindows())
@@ -222,10 +222,10 @@ public sealed class LocalClientIdentityResolver : ILocalClientIdentityResolver
                     ? AF_INET6
                     : AF_INET;
                 var pid = WindowsGetOwningPid(remoteIp, remotePort, localPort, ipVersion);
-                // An IPv4 client on the v6 stack (IPv4-mapped) may be published in the
-                // AF_INET6 table in ::ffff:a.b.c.d form — fall back to it when the v4
-                // table has no matching row.
-                if (pid is null && ipVersion == AF_INET && wasV4Mapped)
+                // An IPv4 client on a dual-mode v6 socket (IPv4-mapped) may be published in the
+                // AF_INET6 table in ::ffff:a.b.c.d form even when the listener saw an AF_INET
+                // address — fall back to AF_INET6 when the v4 table has no matching row.
+                if (pid is null && ipVersion == AF_INET)
                 {
                     pid = WindowsGetOwningPid(remoteIp, remotePort, localPort, AF_INET6);
                 }
@@ -274,19 +274,32 @@ public sealed class LocalClientIdentityResolver : ILocalClientIdentityResolver
     {
         // Classic two-call pattern: the first call with an EMPTY buffer must come back with
         // ERROR_INSUFFICIENT_BUFFER (122), which reports the exact buffer size required in
-        // tableSize; only the second, sized call may return NO_ERROR. (NO_ERROR on the first
-        // call would mean the whole table fit in zero bytes — impossible — so any other
-        // return degrades to null.)
+        // tableSize; only a subsequent sized call may return NO_ERROR. Retry up to 3 times in
+        // case concurrent socket creation grows the table between the sizing call and the read.
         var tableSize = (uint)0;
-        var result = GetExtendedTcpTable(Array.Empty<byte>(), ref tableSize, true, ipVersion, TCP_TABLE_OWNER_PID_CONNECTIONS, 0);
+        var result = GetExtendedTcpTable(null, ref tableSize, false, ipVersion, TCP_TABLE_OWNER_PID_CONNECTIONS, 0);
         if (result != ERROR_INSUFFICIENT_BUFFER || tableSize < 4)
         {
             return null;
         }
 
-        var buffer = new byte[tableSize];
-        result = GetExtendedTcpTable(buffer, ref tableSize, true, ipVersion, TCP_TABLE_OWNER_PID_CONNECTIONS, 0);
-        if (result != NO_ERROR)
+        byte[]? buffer = null;
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            buffer = new byte[tableSize];
+            result = GetExtendedTcpTable(buffer, ref tableSize, false, ipVersion, TCP_TABLE_OWNER_PID_CONNECTIONS, 0);
+            if (result == NO_ERROR)
+            {
+                break;
+            }
+
+            if (result != ERROR_INSUFFICIENT_BUFFER || tableSize < 4)
+            {
+                return null;
+            }
+        }
+
+        if (result != NO_ERROR || buffer is null)
         {
             return null;
         }
@@ -355,8 +368,8 @@ public sealed class LocalClientIdentityResolver : ILocalClientIdentityResolver
                 }
 
                 var addressBytes = ipVersion == AF_INET6
-                    ? table.AsSpan(offset, 16).ToArray()
-                    : table.AsSpan(offset + 4, 4).ToArray();
+                    ? table.AsSpan(offset, 16)
+                    : table.AsSpan(offset + 4, 4);
                 if (!AddressMatchesTarget(addressBytes, targetAddress))
                 {
                     continue;
@@ -374,34 +387,24 @@ public sealed class LocalClientIdentityResolver : ILocalClientIdentityResolver
         return null;
     }
 
-    // 16-byte equality with the IPv4-mapped IPv6 form (::ffff:a.b.c.d) accepted for an IPv4
-    // target address (Windows may surface v4 endpoints in the AF_INET6 table).
-    private static bool AddressMatchesTarget(byte[] rowAddress, byte[] targetAddress)
+    // 4-byte or 16-byte equality with the IPv4-mapped IPv6 form (::ffff:a.b.c.d) accepted in
+    // either direction (Windows may surface v4 endpoints in the AF_INET6 table or caller may
+    // pass an IPv4-mapped IPAddress).
+    private static bool AddressMatchesTarget(ReadOnlySpan<byte> rowAddress, ReadOnlySpan<byte> targetAddress)
     {
-        if (rowAddress.Length == 4 && targetAddress.Length == 4)
+        if (rowAddress.Length == targetAddress.Length)
         {
             return rowAddress.SequenceEqual(targetAddress);
         }
 
-        if (rowAddress.Length == 16)
+        if (rowAddress.Length == 16 && targetAddress.Length == 4)
         {
-            if (targetAddress.Length == 16)
-            {
-                return rowAddress.SequenceEqual(targetAddress);
-            }
+            return IsIPv4MappedPrefix(rowAddress) && rowAddress.Slice(12, 4).SequenceEqual(targetAddress);
+        }
 
-            if (targetAddress.Length == 4)
-            {
-                // ::ffff:a.b.c.d — ten zero bytes, then the 0xFF 0xFF prefix, then the IPv4 octets.
-                var mapped = new byte[16];
-                mapped[10] = 0xFF;
-                mapped[11] = 0xFF;
-                mapped[12] = targetAddress[0];
-                mapped[13] = targetAddress[1];
-                mapped[14] = targetAddress[2];
-                mapped[15] = targetAddress[3];
-                return rowAddress.SequenceEqual(mapped);
-            }
+        if (rowAddress.Length == 4 && targetAddress.Length == 16)
+        {
+            return IsIPv4MappedPrefix(targetAddress) && targetAddress.Slice(12, 4).SequenceEqual(rowAddress);
         }
 
         return false;

@@ -497,6 +497,18 @@ public class LocalClientIdentityResolverTests
     }
 
     [Fact]
+    public void WindowsTableParse_Ipv4Row_MatchesIpv4MappedTarget()
+    {
+        // When MatchOwningPidInTable is invoked directly with an IPv4-mapped IPv6 address
+        // (::ffff:127.0.0.1) against an AF_INET table, it must match the 4-byte IPv4 row.
+        var table = NewTable(V4RowSize, 1);
+        WriteV4Row(table, 0, state: 5, localPort: 49152, remotePort: RouterPort, pid: 4321);
+
+        Assert.Equal(4321, LocalClientIdentityResolver.MatchOwningPidInTable(
+            table, IPAddress.Loopback.MapToIPv4().MapToIPv6(), 49152, RouterPort, AfInet));
+    }
+
+    [Fact]
     public void WindowsTableParse_NonEstablishedRows_ReturnsNull()
     {
         // CLOSED(1), LISTEN(2), SYN_SENT(3), FIN_WAIT1(6) and TIME_WAIT(11) with exact ports
