@@ -83,6 +83,8 @@ public static partial class MonitorEndpointsExtensions
                 disableTarget ?? false, catalogClient, targetAvailability, options,
                 serviceProvider.GetService<IContextAutoShrinkManager>(), cancellationToken));
 
+        app.MapGet("/monitor", () => Results.Content(ReadMonitorPageHtml(), "text/html"));
+
         return app;
     }
 
@@ -155,5 +157,14 @@ public static partial class MonitorEndpointsExtensions
             {
                 ["Local"] = false
             });
+    }
+
+    private static string ReadMonitorPageHtml()
+    {
+        var resourceName = "OllamaRouter.Endpoints.monitor.html";
+        using var stream = typeof(MonitorEndpointsExtensions).Assembly.GetManifestResourceStream(resourceName)
+            ?? throw new InvalidOperationException($"Embedded resource '{resourceName}' was not found.");
+        using var reader = new StreamReader(stream, System.Text.Encoding.UTF8);
+        return reader.ReadToEnd();
     }
 }

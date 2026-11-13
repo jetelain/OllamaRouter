@@ -1,3 +1,4 @@
+using System.Runtime.Versioning;
 using Microsoft.Win32;
 using ProcessStartInfo = System.Diagnostics.ProcessStartInfo;
 
@@ -238,6 +239,7 @@ public static class ProtocolRegistrationService
         StartupNotify=true
         """;
 
+    [SupportedOSPlatform("windows")]
     private static void RegisterWindows(string exe)
     {
         var plan = CreateWindowsPlan(exe);

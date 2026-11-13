@@ -46,4 +46,8 @@
          transitively (only DpapiKeyProtector consumes it). -->
     <ProjectReference Include="..\OllamaRouter.Client\OllamaRouter.Client.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- Monitor page served verbatim by GET /monitor (OllamaRouter.Endpoints.monitor.html). -->
+    <EmbeddedResource Include="Endpoints\monitor.html" />
+  </ItemGroup>
 </Project>
