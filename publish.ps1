@@ -274,20 +274,12 @@ $exeSuffix = if ($Runtime -match 'win') { ".exe" } else { "" }
 foreach ($binaryName in @("ollamarouter-server", "ollamarouter", "ollamarouter-app")) {
     $publishedBinary = Join-Path $InstallDir "$binaryName$exeSuffix"
     if (-not (Test-Path $publishedBinary)) {
-        throw "Published binary not found in $InstallDir: $publishedBinary"
+        throw "Published binary not found in $InstallDir : $publishedBinary"
     }
 }
 Set-Content -Path (Join-Path $InstallDir "VERSION") -Value "$version`n"
 
-# 6a. Upgrade cleanup: remove legacy single-binary artifacts (idempotent)
-foreach ($legacyName in @("OllamaRouter.exe", "OllamaRouter", "ollamarouter-web.cmd")) {
-    $legacyPath = Join-Path $InstallDir $legacyName
-    if (Test-Path $legacyPath) {
-        Remove-Item -Path $legacyPath -Force -ErrorAction SilentlyContinue
-    }
-}
-
-# 6b. Register the ollamarouter:// protocol handler (user-scoped, NO elevation required; best effort, non-fatal)
+# 7. Register the ollamarouter:// protocol handler (user-scoped, NO elevation required; best effort, non-fatal)
 $protocolRegistered = $false
 if ($Runtime -match 'win') {
     try {
@@ -309,7 +301,7 @@ if ($Runtime -match 'win') {
     }
 }
 
-# 7. Configure runtime directories in appsettings.Production.json
+# 8. Configure runtime directories in appsettings.Production.json
 Write-Host "`nConfiguring runtime directories in appsettings.Production.json..." -ForegroundColor Yellow
 
 $stateDirPath = $StateDir.Replace('\', '/')

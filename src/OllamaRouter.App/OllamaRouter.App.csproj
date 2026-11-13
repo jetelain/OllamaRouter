@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -12,7 +12,6 @@
          because bindings are compiled by default, XAML is source-generated at build time, and all JSON flows
          through the source-generated OllamaRouterClientJsonContext, so no TrimmerRootDescriptor/RootDescriptor is required. -->
     <PublishAot>true</PublishAot>
-    <InvariantGlobalization>true</InvariantGlobalization>
     <ServerGarbageCollection>false</ServerGarbageCollection>
     <IsAotCompatible>true</IsAotCompatible>
   </PropertyGroup>
