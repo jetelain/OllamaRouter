@@ -332,6 +332,7 @@ public sealed class OllamaRouterDaemonLauncherTests : IDisposable
         Assert.Equal(installDir, psi.WorkingDirectory);
         Assert.False(psi.UseShellExecute);
         Assert.True(psi.CreateNoWindow);
+        Assert.True(psi.RedirectStandardInput); // task #109: all three std streams redirected
         Assert.True(psi.RedirectStandardOutput);
         Assert.True(psi.RedirectStandardError);
 

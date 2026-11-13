@@ -13,7 +13,15 @@ namespace OllamaRouter.Client.Process;
 /// daemon port, auto-starts a DETACHED headless user process and gracefully stops it.
 /// <para>
 /// The client stays an AOT leaf library: only BCL APIs are used (<see cref="System.Net.Http"/>,
-/// <see cref="System.Diagnostics.Process"/>) — no reflection, no new packages.
+/// <see cref="System.Diagnostics.Process"/>, primitive-typed kernel32 P/Invoke via
+/// <see cref="WindowsProcessLauncher"/>) — no reflection, no new packages.
+/// </para>
+/// <para>
+/// Detached-launch contract (tasks #99/#109): no shell, no window, ALL THREE standard
+/// streams redirected (the daemon never reads stdin, so its stdin pipe is closed
+/// immediately); on Windows the parent's std-handle inheritance is suppressed around
+/// <c>Process.Start</c> so the caller's redirected pipes are not leaked into the
+/// long-lived daemon (the grandparent caller sees EOF on CLI exit).
 /// </para>
 /// <para>
 /// Probe classification: <c>200</c> + parseable router identity payload (or a 401 after the
@@ -254,6 +262,10 @@ public sealed class OllamaRouterDaemonLauncher : IOllamaRouterDaemonLauncher
             WorkingDirectory = Path.GetDirectoryName(executablePath),
             UseShellExecute = false,
             CreateNoWindow = true,
+            RedirectStandardInput = true, // the daemon never reads stdin (task #109): it gets
+            // its own pipe whose write end is closed immediately; it also guarantees that,
+            // while the parent's std-handle inherit flags are cleared on Windows, STARTUPINFO
+            // references only freshly created inheritable pipes (no ERROR_ACCESS_DENIED).
             RedirectStandardOutput = true,
             RedirectStandardError = true,
         };
@@ -322,14 +334,39 @@ public sealed class OllamaRouterDaemonLauncher : IOllamaRouterDaemonLauncher
         }
     }
 
-    /// <summary>The default starter: real <see cref="System.Diagnostics.Process.Start(ProcessStartInfo)"/> + drained pipes.</summary>
+    /// <summary>
+    /// The default starter: real <see cref="System.Diagnostics.Process.Start(ProcessStartInfo)"/> +
+    /// drained pipes. On Windows the parent's std-handle inheritance is suppressed strictly
+    /// around <c>Process.Start</c> (task #109) and the daemon's stdin pipe is closed
+    /// immediately after start (immediate stdin EOF; the launcher holds no input pipe for
+    /// the daemon's lifetime).
+    /// </summary>
     private static RouterDaemonProcess DefaultProcessStarter(ProcessStartInfo startInfo)
     {
         var process = new ProcessType { StartInfo = startInfo };
-        if (!process.Start())
+        try
+        {
+            using var noStdHandleInheritance = WindowsProcessLauncher.SuppressStandardHandleInheritance();
+            if (!process.Start())
+            {
+                throw new RouterDaemonException($"Failed to start the daemon executable '{startInfo.FileName}'.");
+            }
+        }
+        catch
         {
             process.Dispose();
-            throw new RouterDaemonException($"Failed to start the daemon executable '{startInfo.FileName}'.");
+            throw;
+        }
+
+        // The daemon never reads stdin: close our write end so it sees EOF immediately and we
+        // do not hold an open input pipe for the daemon's lifetime (task #109).
+        try
+        {
+            process.StandardInput.Close();
+        }
+        catch (Exception)
+        {
+            // Best-effort: a start that failed before pipes existed still reached this path.
         }
 
         // Redirected-but-discarded streams: a fully detached child with NO console window,
