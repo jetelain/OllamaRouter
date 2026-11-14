@@ -15,6 +15,7 @@ using OllamaRouter.Services.ContextSizing;
 using OllamaRouter.Services.Monitoring;
 using OllamaRouter.Services.Routing;
 using OllamaRouter.Tests.TestHelpers;
+using OllamaSharp.Models.Exceptions;
 using Yarp.ReverseProxy.Forwarder;
 
 namespace OllamaRouter.Tests.Middleware;
@@ -654,8 +655,11 @@ public class DualPathRoutingMiddlewareTests
             { "model": "llama3", "stream": true, "messages": [ { "role": "user", "content": "hi" } ] }
             """);
         var errorClient = new FakeChatClient(new List<ChatResponseUpdate>(),
-            failure: new OllamaRouter.Services.Clients.OllamaHttpException(
-                "Ollama endpoint error (HTTP 400): unknown model", System.Net.HttpStatusCode.BadRequest, null));
+            // Task #111: the Ollama client now throws the native OllamaSharp OllamaException
+            // (no status property — only ever thrown for daemon HTTP 400): the middleware maps
+            // it to a 400 upstream error.
+            failure: new OllamaException(
+                "Ollama endpoint error (HTTP 400): unknown model"));
 
         var forwarder = new Mock<IHttpForwarder>();
         var streak = new Mock<ITargetFailureStreakService>();
@@ -672,6 +676,82 @@ public class DualPathRoutingMiddlewareTests
         Assert.Contains("\"message\"", body, StringComparison.Ordinal);
         Assert.Contains("\"type\"", body, StringComparison.Ordinal);
         streak.Verify(s => s.RecordFailure(It.IsAny<RoutingTarget>()), Times.Never);
+    }
+
+    [Theory]
+    [InlineData(System.Net.HttpStatusCode.NotFound, 404, "model 'nope' not found")]
+    [InlineData(System.Net.HttpStatusCode.Unauthorized, 401, "bad api key")]
+    [InlineData(System.Net.HttpStatusCode.Conflict, 409, "model 'x' is busy")]
+    [InlineData(System.Net.HttpStatusCode.ServiceUnavailable, 503, "daemon overloaded")]
+    public async Task Converter_OllamaDaemonHttpErrorWithStatus_TerminalWithProtocolShapedErrorBody_NoStreak(
+        System.Net.HttpStatusCode daemonStatus, int expectedClientStatus, string daemonError)
+    {
+        // Task #111: daemon 401/404/409/5xx arrive as HttpRequestException WITH a StatusCode
+        // (RouterOllamaApiClient restores the body snippet): the status split in the middleware
+        // must classify them as upstream HTTP errors (terminal, committed-equivalent) — NOT as
+        // transport failures (which would rewind, strike the streak, and fail over).
+        var context = BuildContext("/api/chat", """
+            { "model": "nope", "stream": true, "messages": [ { "role": "user", "content": "hi" } ] }
+            """);
+        var errorClient = new FakeChatClient(new List<ChatResponseUpdate>(),
+            failure: new HttpRequestException(
+                $"Ollama endpoint error (HTTP {(int)daemonStatus}): {daemonError}", null, daemonStatus));
+
+        var forwarder = new Mock<IHttpForwarder>();
+        var streak = new Mock<ITargetFailureStreakService>();
+        var sut = BuildSut(_ => Task.CompletedTask, HeterogeneousFleetOptions(), new RoutingTarget(OpenRouter),
+            new FakeTargetChatClientProvider(new Dictionary<string, IChatClient> { [OpenRouter] = errorClient }),
+            forwarder, streak, out _);
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal(expectedClientStatus, context.Response.StatusCode);
+        var body = ReadBody(context);
+        Assert.Contains("\"error\"", body, StringComparison.Ordinal);
+        Assert.Contains($"(HTTP {(int)daemonStatus})", body, StringComparison.Ordinal);
+        // The source-gen context's default encoder escapes single quotes as \u0027.
+        Assert.Contains(daemonError.Replace("'", "\\u0027"), body, StringComparison.Ordinal);
+
+        // NO streak (the daemon ANSWERED) and NO failover.
+        streak.Verify(s => s.RecordFailure(It.IsAny<RoutingTarget>()), Times.Never);
+        forwarder.Verify(f => f.SendAsync(
+            It.IsAny<HttpContext>(), It.IsAny<string>(), It.IsAny<HttpMessageInvoker>(),
+            It.IsAny<ForwarderRequestConfig>(), It.IsAny<HttpTransformer>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task Converter_NullStatusHttpRequestException_TransportFailure_FailsOver_RecordsStreak()
+    {
+        // Task #111: a status-less HttpRequestException (transport fault — including the
+        // router-side image-fetch failures the adapter deliberately strips to null status) must
+        // still take the uncommitted failover path: rewind + streak + liveness strike.
+        var context = BuildContext("/api/chat", """
+            { "model": "openai/gpt-4o", "stream": true, "messages": [ { "role": "user", "content": "hi" } ] }
+            """);
+        var deadClient = new FakeChatClient(new List<ChatResponseUpdate>(),
+            failure: new HttpRequestException("connect: connection refused", null, null));
+
+        var forwarder = new Mock<IHttpForwarder>();
+        SetupForwarderServing(forwarder, async (c, _, _) =>
+        {
+            c.Response.ContentType = "application/x-ndjson";
+            await c.Response.WriteAsync("{\"model\":\"llama3\",\"message\":{\"role\":\"assistant\",\"content\":\"rescued2\"},\"done\":true}\n");
+        });
+
+        var streak = new Mock<ITargetFailureStreakService>();
+        streak.Setup(s => s.ShouldSkip(It.IsAny<RoutingTarget>(), It.IsAny<int>())).Returns(false);
+        var liveness = new Mock<ITargetLivenessService>();
+        var sut = BuildSut(_ => Task.CompletedTask, HeterogeneousFleetOptions(), new RoutingTarget(OpenRouter),
+            new FakeTargetChatClientProvider(new Dictionary<string, IChatClient> { [OpenRouter] = deadClient }),
+            forwarder, streak, out var builder);
+
+        await sut.InvokeAsync(context);
+
+        Assert.Equal(200, context.Response.StatusCode);
+        Assert.Contains("rescued2", ReadBody(context), StringComparison.Ordinal);
+        streak.Verify(s => s.RecordFailure(new RoutingTarget(OpenRouter)), Times.Once);
+        builder.Liveness.Verify(l => l.MarkHardFailureAsync(new RoutingTarget(OpenRouter)), Times.Once);
     }
 
     [Fact]

@@ -165,9 +165,6 @@ namespace OllamaRouter.Serialization;
  [JsonSerializable(typeof(OpenAiPromptTokensDetailsDto))]
  [JsonSerializable(typeof(OpenAiErrorResponseDto))]
  [JsonSerializable(typeof(OpenAiErrorDetailDto))]
- // Outbound Ollama IChatClient wire DTOs (task #61: the router's own /api/chat client).
- [JsonSerializable(typeof(OllamaChatRequestDto))]
- [JsonSerializable(typeof(OllamaChatStreamChunkDto))]
  // API key store file format (config/api-keys.json — hashes only; internal, same assembly).
  [JsonSerializable(typeof(OllamaRouter.Security.ApiKeyFile))]
  // Per-session usage & savings router API DTOs (task #85).

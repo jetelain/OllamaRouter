@@ -176,72 +176,10 @@ public sealed class OpenAiResponseFormatDto
 }
 
 // ------------------------------------------------------------------
-//  Outbound Ollama wire DTOs for the router's own Ollama IChatClient (task #61).
-//  Serialized exclusively through the source-generated contexts (Native AOT safe).
-//  OllamaChatMessageDto (inbound above) is REUSED for the outbound "messages" entries — the
-//  wire shape is identical in both directions (role/content/images/tool_calls/tool_name).
+//  (task #111) The outbound Ollama wire DTOs (OllamaChatRequestDto /
+//  OllamaChatStreamChunkDto) were deleted with the hand-rolled OllamaChatClient: outbound
+//  /api/chat bodies and NDJSON frames are now (de)serialized natively by OllamaSharp 5.5.2
+//  through OllamaRouter.Serialization.OllamaSharpWireContext. The inbound DTOs below
+//  (OllamaChatMessageDto / OllamaToolCallDto / OllamaToolCallFunctionDto) remain in use by
+//  the inbound OllamaChatRequestParser.
 // ------------------------------------------------------------------
-
-/// <summary>
-/// Outbound body of a router-originated <c>POST {base}/api/chat</c> call (task #61).
-/// </summary>
-public sealed class OllamaChatRequestDto
-{
-    [JsonPropertyName("model")]
-    public string? Model { get; set; }
-
-    [JsonPropertyName("messages")]
-    public List<OllamaChatMessageDto>? Messages { get; set; }
-
-    [JsonPropertyName("stream")]
-    public bool Stream { get; set; }
-
-    /// <summary>Generation options (temperature, top_p, top_k, num_predict, seed, stop, num_ctx, ...). Omitted when nothing is set.</summary>
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    [JsonPropertyName("options")]
-    public Dictionary<string, JsonElement>? Options { get; set; }
-
-    /// <summary>OpenAI-style function tools (Ollama /api/chat supports the same schema). Omitted when no tools are requested.</summary>
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    [JsonPropertyName("tools")]
-    public List<OpenAiRequestToolDto>? Tools { get; set; }
-
-    /// <summary>"required" or a specific function name. Omitted (the default, auto) when not set.</summary>
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    [JsonPropertyName("tool_choice")]
-    public string? ToolChoice { get; set; }
-}
-
-/// <summary>
-/// One NDJSON frame of an Ollama <c>/api/chat</c> response — a streaming chunk (done:false)
-/// or the single non-streaming response object (done:true). <see cref="Message"/>
-/// reuses the inbound <see cref="OllamaChatMessageDto"/> (identical wire shape).
-/// </summary>
-public sealed class OllamaChatStreamChunkDto
-{
-    [JsonPropertyName("model")]
-    public string? Model { get; set; }
-
-    [JsonPropertyName("message")]
-    public OllamaChatMessageDto? Message { get; set; }
-
-    [JsonPropertyName("done")]
-    public bool Done { get; set; }
-
-    /// <summary>"stop" / "length" (present on the terminal frame).</summary>
-    [JsonPropertyName("done_reason")]
-    public string? DoneReason { get; set; }
-
-    [JsonPropertyName("prompt_eval_count")]
-    public int? PromptEvalCount { get; set; }
-
-    /// <summary>Cached prompt tokens (a subset of <see cref="PromptEvalCount"/>, absent ⇒ none cached).</summary>
-    [JsonPropertyName("prompt_eval_cached_count")]
-    public int? PromptEvalCachedCount { get; set; }
-
-    [JsonPropertyName("eval_count")]
-    public int? EvalCount { get; set; }
-
-    [JsonPropertyName("total_duration")]
-    public long? TotalDuration { get; set; }
-}

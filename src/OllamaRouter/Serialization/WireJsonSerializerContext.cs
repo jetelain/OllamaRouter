@@ -22,7 +22,6 @@ namespace OllamaRouter.Serialization;
 [JsonSerializable(typeof(bool))]
 [JsonSerializable(typeof(List<OpenAiContentPartDto>))]
 [JsonSerializable(typeof(OpenAiChatCompletionRequestDto))]
-[JsonSerializable(typeof(OllamaChatRequestDto))]
 public partial class WireJsonSerializerContext : JsonSerializerContext
 {
 }

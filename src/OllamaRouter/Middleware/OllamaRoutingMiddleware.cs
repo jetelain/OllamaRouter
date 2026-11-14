@@ -23,6 +23,7 @@ using OllamaRouter.Services.Monitoring;
 using OllamaRouter.Services.Recommendations;
 using OllamaRouter.Services.Routing;
 using OllamaRouter.Transforms;
+using OllamaSharp.Models.Exceptions;
 using Yarp.ReverseProxy.Forwarder;
 
 namespace OllamaRouter.Middleware;
@@ -2183,9 +2184,18 @@ public sealed class OllamaRoutingMiddleware(
             context.Features.Set<IForwarderErrorFeature>(new ConverterForwarderErrorFeature(ForwarderError.RequestCanceled, null));
             return ConverterOutcome.ClientAborted;
         }
-        catch (Exception ex) when (ex is OpenAiHttpException or OllamaHttpException)
+        // Upstream-HTTP filter: OpenAiHttpException (the OpenAI client wraps ALL of its failures
+        // in this type — a raw status-less HttpRequestException from that side therefore never
+        // reaches the split below) plus the OllamaSharp OllamaException family. In OllamaSharp
+        // 5.5.2 OllamaException/ModelDoesNotSupportToolsException are only ever thrown for daemon
+        // HTTP 400 (the status is implicit — the type carries none), so classify them as 400.
+        // Terminal committed-equivalent: protocol-shaped error envelope with ex.Message (body
+        // snippet preserved by RouterOllamaApiClient), NO streak, NO failover.
+        catch (Exception ex) when (ex is OpenAiHttpException or OllamaException)
         {
-            var upstreamStatus = (ex as OpenAiHttpException)?.StatusCode ?? (ex as OllamaHttpException)?.StatusCode;
+            // (a status-less OpenAiHttpException is transport-level and falls through to the
+            // mid-stream/transport tail below, exactly as before).
+            var upstreamStatus = ex is OpenAiHttpException openAiEx ? openAiEx.StatusCode : (HttpStatusCode?)HttpStatusCode.BadRequest;
             if (upstreamStatus is not null && !IsResponseCommitted(context))
             {
                 // Upstream HTTP error (404 model-not-found, 401, 429, …): the provider ANSWERED —
@@ -2211,6 +2221,20 @@ public sealed class OllamaRoutingMiddleware(
         }
         catch (Exception ex) when (ex is HttpRequestException or IOException)
         {
+            // Split (task #111): an HttpRequestException WITH a StatusCode is a real upstream
+            // HTTP error — the Ollama daemons' 401/404/409/5xx path (surfaced with the body
+            // snippet by RouterOllamaApiClient's SendToOllamaAsync override) — committed-equivalent
+            // terminal, no streak, no failover. A status-less HttpRequestException (transport
+            // failure: connect/DNS/read, or a router-side image-fetch failure deliberately
+            // stripped to null status) or a bare IOException is the uncommitted failover path —
+            // unchanged semantics.
+            if ((ex as HttpRequestException)?.StatusCode is { } httpStatus && !IsResponseCommitted(context))
+            {
+                context.Response.StatusCode = (int)httpStatus;
+                await WriteProtocolShapedErrorBodyAsync(context, protocol, ex.Message);
+                return ConverterOutcome.UpstreamHttpError;
+            }
+
             if (IsResponseCommitted(context))
             {
                 context.Features.Set<IForwarderErrorFeature>(new ConverterForwarderErrorFeature(ForwarderError.ResponseBodyDestination, ex));

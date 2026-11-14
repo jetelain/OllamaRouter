@@ -23,8 +23,18 @@
        next to the binary) and no code in this repo reads Assembly.Location, so the warning is
        inert; it is suppressed (AOT publishes only) to keep the AOT pass clean of package-
        attributable warnings. -->
+  <!-- Task #111: IL2104/IL3053 are the per-ASSEMBLY singlewarn summaries ILC emits when a
+       package's internals carry trim/AOT analysis warnings (Serilog's IL2104 predates this
+       change). The OllamaSharp 5.5.2 roots are all generic System.Text.Json calls INSIDE the
+       package assembly (JsonSerializer.Serialize/Deserialize/SerializeToElement overloads
+       marked RequiresDynamicCode/RequiresUnreferencedCode) — its IL unconditionally calls the
+       options-based overloads, so the consumer cannot prove them source-generated statically.
+       At RUNTIME they are reflection-free: every OllamaApiClient construction passes the
+       source-generated OllamaSharpWireContext (AOT context mode), runtime-verified against the
+       full chat surface. The summaries are therefore inert; suppressed (AOT publishes only)
+       alongside the IL3000 precedent above. -->
   <PropertyGroup Condition="'$(PublishAot)' == 'true'">
-    <NoWarn>$(NoWarn);IL3000</NoWarn>
+    <NoWarn>$(NoWarn);IL3000;IL2104;IL3053</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
@@ -38,7 +48,16 @@
          Pinned to 10.9.0, the exact version already in the transitive closure via
          Pmad.AI 0.0.1 -> Microsoft.Extensions.AI 10.9.0: this direct reference adds zero
          new packages to the dependency graph. -->
-    <PackageReference Include="Microsoft.Extensions.AI.Abstractions" Version="10.9.0" />
+         <PackageReference Include="Microsoft.Extensions.AI.Abstractions" Version="10.9.0" />
+         <!-- Task #111: native Ollama IChatClient binding for the converter dispatch path. Pinned to
+         5.5.2 (latest at adoption): it carries the request-side thinking-preservation fix
+         (TextReasoningContent -> message.thinking) and the opt-in AOT surface — a CONSUMER-defined
+         JsonSerializerContext accepted by the OllamaApiClient(HttpClient, ...) constructor (the
+         package's own generated context is internal). Native AOT: every construction in the server
+         passes the source-generated OllamaSharpWireContext (Serialization/OllamaSharpWireContext.cs).
+         NuGet graph: depends on Microsoft.Extensions.AI(.Abstractions) 10.8.0, unified up to the
+         10.9.0 already resolved via Pmad.AI 0.0.4 — adds exactly one package, no downgrades. -->
+    <PackageReference Include="OllamaSharp" Version="5.5.2" />
     <PackageReference Include="Microsoft.ML.Tokenizers" Version="2.0.0" />
     <PackageReference Include="Microsoft.ML.Tokenizers.Data.Cl100kBase" Version="2.0.0" />
     <!-- Task #110: cross-platform OS keyring access (Windows Credential Manager / macOS Keychain /

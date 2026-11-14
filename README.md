@@ -139,6 +139,16 @@ See [Dynamic context sizing](docs/configuration.md#dynamic-context-sizing-moe-on
 
 OllamaRouter can run as a **symmetrical, loop-free mesh** (e.g. one router on a desktop and one on a laptop), where each router forwards directly to physical Ollama daemons on `:11435` and never to a peer router. See [Dual-Router Mesh setup](docs/ollama-setup.md#dual-router-mesh-desktop--laptop).
 
+### Converter dispatch limitations
+
+Cross-protocol requests (`X-OllamaRouter-Dispatch-Mode: converter`) translate through the canonical Microsoft.Extensions.AI representation and dispatch to the target with the native **OllamaSharp 5.5.2** `IChatClient` binding (Ollama targets) or the router's `OpenAiHttpChatClient` (OpenAI targets). The Ollama dispatch path is deliberately **functionally narrowed** (maintainer-approved, task #111):
+
+- **Ollama-specific request options are dropped** — `ChatOptions.AdditionalProperties` values (`num_ctx`, `repeat_penalty`, `keep_alive`, …) are never forwarded onto the Ollama wire; only standard options are mapped (temperature, top_p, top_k, stop, max tokens / `num_predict`, seed, frequency / presence penalties, tools, structured-output format, reasoning → `think`).
+- **`tool_choice` / tool-call constraints are dropped** — the 5.5.2 binding cannot express `tool_choice`. Function tools still round-trip: schemas go out, `tool_calls` come back (Ollama conveys no server-side call id, so a synthetic one is assigned on read, mirroring the inbound parser).
+- **Thinking / reasoning is preserved in both directions** at the canonical level (request `TextReasoningContent` → `message.thinking`, `Reasoning` → `think`; response `thinking` → `TextReasoningContent`), but the converted **wire** rendering in converted *streams* still omits reasoning (v1 encoder limitation in both protocols).
+- **Cached prompt tokens are not surfaced** — `prompt_eval_cached_count` / `cached_tokens` are absent from converted Ollama-target responses; token usage itself is always present (0/0 when the daemon omits it).
+- **`image_url` links are router-fetched** — client-supplied image URLs (OpenAI `image_url` parts, image or inferred media type) are resolved by the router before dispatch: **http/https only**, hard cap **25 MiB**, **30 s** timeout. This means the router performs outbound fetches of client-influenced URLs (SSRF surface — run it behind your firewall policy); a fetch failure is classified as a transport failure and fails over to the next candidate rather than erroring the client.
+
 ---
 
 ## Monitoring & session analytics

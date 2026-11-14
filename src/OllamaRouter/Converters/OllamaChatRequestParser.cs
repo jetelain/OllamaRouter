@@ -185,9 +185,12 @@ public sealed class OllamaChatRequestParser : IChatRequestConverter
             chatOptions.Seed = seed.GetInt64();
         }
 
-        // The ENTIRE options dictionary is passed through so downstream dispatch can recover
-        // non-canonical fields (num_ctx, repeat_penalty, ...). stream/keep_alive/format/template
-        // are recognized-but-ignored there.
+        // The ENTIRE options dictionary is stored so the canonical options survive the parse.
+        // NOTE (task #111): the Ollama converter-dispatch path (OllamaChatClient) applies a
+        // functional narrowing — these additional properties (num_ctx, repeat_penalty, ...)
+        // are NO LONGER restored onto the outbound Ollama wire for Ollama targets; they are
+        // retained here for diagnostics and for OpenAI targets, which ignore them natively.
+        // stream/keep_alive/format/template are recognized-but-ignored on the dispatch path.
         if (chatOptions.AdditionalProperties is null)
         {
             // ChatOptions starts with a null AdditionalProperties; materialize it lazily.
