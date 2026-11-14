@@ -657,7 +657,7 @@ public class OllamaChatClientTests
         ]);
 
         var ex = await Assert.ThrowsAsync<HttpRequestException>(() => client.GetStreamingResponseAsync(
-            [user], new ChatOptions { ModelId = "m" }).ToListAsync());
+            [user], new ChatOptions { ModelId = "m" }).ToListAsync().AsTask());
 
         // A scheme violation is NOT an upstream response: null status ⇒ transport failure ⇒
         // failover (and the daemon was never contacted).
@@ -684,7 +684,7 @@ public class OllamaChatClientTests
         ]);
 
         var ex = await Assert.ThrowsAsync<HttpRequestException>(() => client.GetStreamingResponseAsync(
-            [user], new ChatOptions { ModelId = "m" }).ToListAsync());
+            [user], new ChatOptions { ModelId = "m" }).ToListAsync().AsTask());
 
         Assert.Null(ex.StatusCode); // deliberately stripped — not an upstream-daemon 404
         Assert.Empty(daemonHandler.RequestPaths);
@@ -708,7 +708,7 @@ public class OllamaChatClientTests
         ]);
 
         var ex = await Assert.ThrowsAsync<HttpRequestException>(() => client.GetStreamingResponseAsync(
-            [user], new ChatOptions { ModelId = "m" }).ToListAsync());
+            [user], new ChatOptions { ModelId = "m" }).ToListAsync().AsTask());
 
         Assert.Null(ex.StatusCode);
         Assert.Empty(daemonHandler.RequestPaths);
@@ -728,7 +728,7 @@ public class OllamaChatClientTests
         ]);
 
         var ex = await Assert.ThrowsAsync<HttpRequestException>(() => client.GetStreamingResponseAsync(
-            [user], new ChatOptions { ModelId = "m" }).ToListAsync());
+            [user], new ChatOptions { ModelId = "m" }).ToListAsync().AsTask());
 
         Assert.Null(ex.StatusCode);
         Assert.Empty(daemonHandler.RequestPaths);
@@ -753,7 +753,7 @@ public class OllamaChatClientTests
         ]);
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => client.GetStreamingResponseAsync(
-            [user], new ChatOptions { ModelId = "m" }, cts.Token).ToListAsync());
+            [user], new ChatOptions { ModelId = "m" }, cts.Token).ToListAsync().AsTask());
     }
 
     // ------------------------------------------------------------------
@@ -851,7 +851,7 @@ public class OllamaChatClientTests
 
         using var client = CreateClient(handler);
         var ex = await Assert.ThrowsAsync<OllamaException>(() => client.GetStreamingResponseAsync(
-            [new ChatMessage(ChatRole.User, "hi")], new ChatOptions { ModelId = "ghost" }).ToListAsync());
+            [new ChatMessage(ChatRole.User, "hi")], new ChatOptions { ModelId = "ghost" }).ToListAsync().AsTask());
 
         Assert.Equal("Ollama endpoint error (HTTP 400): model 'ghost' not found", ex.Message);
     }
@@ -863,7 +863,7 @@ public class OllamaChatClientTests
 
         using var client = CreateClient(handler);
         await Assert.ThrowsAsync<ModelDoesNotSupportToolsException>(() => client.GetStreamingResponseAsync(
-            [new ChatMessage(ChatRole.User, "hi")], new ChatOptions { ModelId = "tiny" }).ToListAsync());
+            [new ChatMessage(ChatRole.User, "hi")], new ChatOptions { ModelId = "tiny" }).ToListAsync().AsTask());
     }
 
     [Fact]
@@ -873,7 +873,7 @@ public class OllamaChatClientTests
 
         using var client = CreateClient(handler);
         var ex = await Assert.ThrowsAsync<OllamaException>(() => client.GetStreamingResponseAsync(
-            [new ChatMessage(ChatRole.User, "hi")], new ChatOptions { ModelId = "m" }).ToListAsync());
+            [new ChatMessage(ChatRole.User, "hi")], new ChatOptions { ModelId = "m" }).ToListAsync().AsTask());
 
         Assert.Contains("<html>bad gateway</html>", ex.Message, StringComparison.Ordinal);
     }
@@ -885,7 +885,7 @@ public class OllamaChatClientTests
 
         using var client = CreateClient(handler);
         var ex = await Assert.ThrowsAsync<HttpRequestException>(() => client.GetStreamingResponseAsync(
-            [new ChatMessage(ChatRole.User, "hi")], new ChatOptions { ModelId = "nope" }).ToListAsync());
+            [new ChatMessage(ChatRole.User, "hi")], new ChatOptions { ModelId = "nope" }).ToListAsync().AsTask());
 
         // The body snippet IS surfaced (stock 5.5.2 loses it — the subclass restores parity).
         Assert.Equal(HttpStatusCode.NotFound, ex.StatusCode);

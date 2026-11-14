@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.ClientModel;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipelines;
@@ -2184,18 +2185,28 @@ public sealed class OllamaRoutingMiddleware(
             context.Features.Set<IForwarderErrorFeature>(new ConverterForwarderErrorFeature(ForwarderError.RequestCanceled, null));
             return ConverterOutcome.ClientAborted;
         }
-        // Upstream-HTTP filter: OpenAiHttpException (the OpenAI client wraps ALL of its failures
-        // in this type — a raw status-less HttpRequestException from that side therefore never
-        // reaches the split below) plus the OllamaSharp OllamaException family. In OllamaSharp
-        // 5.5.2 OllamaException/ModelDoesNotSupportToolsException are only ever thrown for daemon
-        // HTTP 400 (the status is implicit — the type carries none), so classify them as 400.
-        // Terminal committed-equivalent: protocol-shaped error envelope with ex.Message (body
-        // snippet preserved by RouterOllamaApiClient), NO streak, NO failover.
-        catch (Exception ex) when (ex is OpenAiHttpException or OllamaException)
+        // Upstream-HTTP filter: the native OpenAI client's ClientResultException (task #112: it
+        // wraps ALL of that client's failures — non-2xx before the first byte carries Status =
+        // HTTP code + the full body on GetRawResponse(); a transport failure carries Status == 0
+        // with a null raw response, the exact analogue of the deleted OpenAiHttpException's
+        // status-less "endpoint unreachable" case) plus the OllamaSharp OllamaException family.
+        // In OllamaSharp 5.5.2 OllamaException/ModelDoesNotSupportToolsException are only ever
+        // thrown for daemon HTTP 400 (the status is implicit — the type carries none), so
+        // classify them as 400. Terminal committed-equivalent: protocol-shaped error envelope in
+        // the legacy message formats (detail = error.message or ≤200-char raw body snippet), NO
+        // streak, NO failover.
+        catch (Exception ex) when (ex is ClientResultException or OllamaException)
         {
-            // (a status-less OpenAiHttpException is transport-level and falls through to the
-            // mid-stream/transport tail below, exactly as before).
-            var upstreamStatus = ex is OpenAiHttpException openAiEx ? openAiEx.StatusCode : (HttpStatusCode?)HttpStatusCode.BadRequest;
+            // (a Status == 0 ClientResultException is transport-level and falls through to the
+            // mid-stream/transport tail below, exactly as the status-less OpenAiHttpException did;
+            // an OllamaException is classified as 400 — mirroring the old non-OpenAiHttpException
+            // branch, since the daemon always answers 400 for the OllamaSharp error family).
+            var upstreamStatus = ex switch
+            {
+                ClientResultException cre when cre.Status > 0 => (HttpStatusCode?)(HttpStatusCode)(int)cre.Status,
+                OllamaException => (HttpStatusCode?)HttpStatusCode.BadRequest,
+                _ => null,
+            };
             if (upstreamStatus is not null && !IsResponseCommitted(context))
             {
                 // Upstream HTTP error (404 model-not-found, 401, 429, …): the provider ANSWERED —
@@ -2203,12 +2214,13 @@ public sealed class OllamaRoutingMiddleware(
                 // daemon" rule. Terminal with the upstream status + a protocol-shaped error body;
                 // NO streak, NO liveness strike (transport was reliable).
                 context.Response.StatusCode = (int)upstreamStatus.Value;
-                await WriteProtocolShapedErrorBodyAsync(context, protocol, ex.Message);
+                var message = ex is ClientResultException cre2 ? ComposeOpenAiErrorMessage(cre2, upstreamStatus.Value) : ex.Message;
+                await WriteProtocolShapedErrorBodyAsync(context, protocol, message);
                 return ConverterOutcome.UpstreamHttpError;
             }
 
-            // Same exception type but no status (transport-level, e.g. connection refused for
-            // an OpenAiHttpException) or bytes already committed (mid-stream break).
+            // Same exception type but no status (transport-level, e.g. connection refused for a
+            // ClientResultException) or bytes already committed (mid-stream break).
             if (IsResponseCommitted(context))
             {
                 context.Features.Set<IForwarderErrorFeature>(new ConverterForwarderErrorFeature(ForwarderError.ResponseBodyDestination, ex));
@@ -2259,6 +2271,46 @@ public sealed class OllamaRoutingMiddleware(
             logger.LogError(ex, "Unexpected converter failure to {Target} before the first byte; failing over.", targetOptions.Name);
             return ConverterOutcome.TransportFailure;
         }
+    }
+
+    // Composes the user-facing message for a native OpenAI-client upstream error (task #112)
+    // in the EXACT legacy OpenAiHttpException formats (byte-equivalent — the 401 key-locked
+    // detail surfaced to App/CLI remote mode depends on it): status-specific prefix +
+    // (error.message when parseable, else a ≤200-char raw body snippet) + error.type for the
+    // generic 4xx/5xx case. Parsed via the source-generated context (AOT-safe).
+    private static string ComposeOpenAiErrorMessage(ClientResultException exception, HttpStatusCode status)
+    {
+        const int ErrorBodySnippetLength = 200;
+
+        var rawBody = exception.GetRawResponse()?.Content?.ToString() ?? string.Empty;
+        string? payloadMessage = null;
+        string? errorType = null;
+        try
+        {
+            var errorDto = JsonSerializer.Deserialize(rawBody, OllamaRouterJsonSerializerContext.Default.OpenAiErrorResponseDto);
+            payloadMessage = errorDto?.Error?.Message;
+            errorType = errorDto?.Error?.Type;
+        }
+        catch (JsonException)
+        {
+            // Unparseable/empty error body: fall back to the raw snippet below.
+        }
+
+        var statusCode = (int)status;
+        var detail = !string.IsNullOrWhiteSpace(payloadMessage)
+            ? payloadMessage!
+            : (rawBody.Length > ErrorBodySnippetLength ? rawBody[..ErrorBodySnippetLength] : rawBody);
+
+        return status switch
+        {
+            HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden
+                => $"OpenAI-compatible endpoint authentication failed (HTTP {statusCode}): {detail}",
+            HttpStatusCode.TooManyRequests
+                => $"OpenAI-compatible endpoint rate limited (HTTP {statusCode}): {detail}",
+            HttpStatusCode.ServiceUnavailable
+                => $"OpenAI-compatible endpoint unavailable/overloaded (HTTP {statusCode}): {detail}",
+            _ => $"OpenAI-compatible endpoint error (HTTP {statusCode}, type={errorType ?? "unknown"}): {detail}",
+        };
     }
 
     /// <summary>

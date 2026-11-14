@@ -45,10 +45,9 @@
          OllamaRouterJsonSerializerContext. -->
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.14" />
     <!-- Canonical protocol contract for the bidirectional Ollama/OpenAI translators (task #59).
-         Pinned to 10.9.0, the exact version already in the transitive closure via
-         Pmad.AI 0.0.1 -> Microsoft.Extensions.AI 10.9.0: this direct reference adds zero
-         new packages to the dependency graph. -->
-         <PackageReference Include="Microsoft.Extensions.AI.Abstractions" Version="10.9.0" />
+         Task #112: bumped 10.9.0 -> 10.10.0 — required by Microsoft.Extensions.AI.OpenAI 10.10.0;
+         unifies the Pmad.AI 10.9.0 / OllamaSharp 10.8.0 transitives UPWARD (zero downgrades). -->
+          <PackageReference Include="Microsoft.Extensions.AI.Abstractions" Version="10.10.0" />
          <!-- Task #111: native Ollama IChatClient binding for the converter dispatch path. Pinned to
          5.5.2 (latest at adoption): it carries the request-side thinking-preservation fix
          (TextReasoningContent -> message.thinking) and the opt-in AOT surface — a CONSUMER-defined
@@ -58,6 +57,18 @@
          NuGet graph: depends on Microsoft.Extensions.AI(.Abstractions) 10.8.0, unified up to the
          10.9.0 already resolved via Pmad.AI 0.0.4 — adds exactly one package, no downgrades. -->
     <PackageReference Include="OllamaSharp" Version="5.5.2" />
+    <!-- Task #112: native OpenAI IChatClient binding for the converter dispatch path. Pinned to
+         10.10.0, the exact version already referenced by tests/OllamaRouter.E2ETests. NuGet graph
+         (net10.0): Microsoft.Extensions.AI.Abstractions 10.10.0 + OpenAI 2.13.0 ->
+         System.ClientModel 1.14.0; the Pmad.AI 10.9.0 / OllamaSharp 10.8.0 M.E.AI transitives
+         unify UP to 10.10.0 (no downgrades). The OpenAI SDK stack serializes its wire bodies
+         through System.ClientModel's BinaryData source-generated model (no reflection), so the
+         surface is NativeAOT-safe; server code uses the SDK types directly (factory: OpenAIClient /
+         OpenAIClientOptions / ApiKeyCredential / HttpClientPipelineTransport / ClientRetryPolicy,
+         middleware: ClientResultException), hence the direct references below. -->
+    <PackageReference Include="Microsoft.Extensions.AI.OpenAI" Version="10.10.0" />
+    <PackageReference Include="OpenAI" Version="2.13.0" />
+    <PackageReference Include="System.ClientModel" Version="1.14.0" />
     <PackageReference Include="Microsoft.ML.Tokenizers" Version="2.0.0" />
     <PackageReference Include="Microsoft.ML.Tokenizers.Data.Cl100kBase" Version="2.0.0" />
     <!-- Task #110: cross-platform OS keyring access (Windows Credential Manager / macOS Keychain /

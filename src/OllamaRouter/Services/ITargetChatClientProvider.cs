@@ -7,8 +7,8 @@ namespace OllamaRouter.Services;
 /// Resolves the dispatch <see cref="IChatClient"/> for a fleet target by name (task #61).
 /// The converter path of the completion dispatch loop needs a client for BOTH protocols:
 /// Ollama targets serving OpenAI-protocol clients (the <see cref="Clients.OllamaChatClient"/>)
-/// and OpenAI targets serving Ollama-protocol clients (the task #60
-/// <see cref="Clients.OpenAiHttpChatClient"/>).
+/// and OpenAI targets serving Ollama-protocol clients (the task #60 / #112
+/// <see cref="Clients.OpenAiChatClient"/> native-client adapter).
 /// <para>
 /// The provider resolves the LIVE <c>OllamaTargetOptions</c> snapshot per call (case-insensitive
 /// name match) and delegates to the pooled per-endpoint factories, so a Setup-API

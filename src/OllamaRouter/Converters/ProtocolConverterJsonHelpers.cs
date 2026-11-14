@@ -1,3 +1,4 @@
+using System.Collections;
 using System.Text.Json;
 using Microsoft.Extensions.AI;
 
@@ -86,6 +87,75 @@ internal static class ProtocolConverterJsonHelpers
         }
 
         return builder.ToString();
+    }
+
+    /// <summary>
+    /// Explicit, allocation-conscious JSON value walker supporting the value shapes the canonical
+    /// layer can actually carry (the <see cref="JsonToValue(JsonElement)"/> output rules):
+    /// string / long / int / double / bool / JsonElement / Dictionary / list / null.
+    /// Unrecognized shapes degrade to <c>null</c> rather than throwing mid-request. (Task #112:
+    /// moved here from the deleted <c>OpenAiHttpChatClient</c>; the sole surviving consumer is the
+    /// Ollama client's tool-result stringification.)
+    /// </summary>
+    public static void WriteJson(Utf8JsonWriter writer, object? value)
+    {
+        switch (value)
+        {
+            case null:
+                writer.WriteNullValue();
+                break;
+
+            case string s:
+                writer.WriteStringValue(s);
+                break;
+
+            case long l:
+                writer.WriteNumberValue(l);
+                break;
+
+            case int i:
+                writer.WriteNumberValue(i);
+                break;
+
+            case double d:
+                writer.WriteNumberValue(d);
+                break;
+
+            case bool b:
+                writer.WriteBooleanValue(b);
+                break;
+
+            case JsonElement element:
+                element.WriteTo(writer);
+                break;
+
+            case IDictionary<string, object?> dictionary:
+                writer.WriteStartObject();
+                foreach (var pair in dictionary)
+                {
+                    writer.WritePropertyName(pair.Key);
+                    WriteJson(writer, pair.Value);
+                }
+
+                writer.WriteEndObject();
+                break;
+
+            case IEnumerable enumerable:
+                // Catches IList<object?> and any non-string enumerable of values
+                // (string is handled above; JsonElement implements IEnumerable but is too).
+                writer.WriteStartArray();
+                foreach (var item in enumerable)
+                {
+                    WriteJson(writer, item);
+                }
+
+                writer.WriteEndArray();
+                break;
+
+            default:
+                writer.WriteNullValue();
+                break;
+        }
     }
 
     private static object? JsonToValue(JsonElement element) => element.ValueKind switch

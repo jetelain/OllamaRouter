@@ -3,6 +3,7 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.AI;
+using OllamaRouter.Converters;
 using OllamaSharp;
 
 namespace OllamaRouter.Services.Clients;
@@ -397,8 +398,9 @@ public sealed class OllamaChatClient : IChatClient, IDisposable
         using var stream = new MemoryStream();
         using (var writer = new Utf8JsonWriter(stream))
         {
-            // Shared AOT-safe JSON value walker (no reflection, no dynamic).
-            OpenAiHttpChatClient.WriteJson(writer, value);
+            // Shared AOT-safe JSON value walker (no reflection, no dynamic) — task #112: now
+            // lives in ProtocolConverterJsonHelpers (moved with the deleted OpenAiHttpChatClient).
+            ProtocolConverterJsonHelpers.WriteJson(writer, value);
         }
 
         return Encoding.UTF8.GetString(stream.ToArray());

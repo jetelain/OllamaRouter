@@ -10,7 +10,8 @@ namespace OllamaRouter.Tests.Services;
 /// <summary>
 /// Task #61: <see cref="TargetChatClientProvider"/> — live per-name resolution of a target's
 /// <see cref="IChatClient"/> (Ollama → pooled <c>OllamaChatClient</c>, OpenAI → pooled
-/// <c>OpenAiHttpChatClient</c>, OsNative → no client) plus the options-change RECONCILIATION
+/// <c>OpenAiChatClient</c> native-client adapter (task #112), OsNative → no client) plus the
+/// options-change RECONCILIATION
 /// that drops the pooled clients of removed/reconfigured targets (no connection-pool leaks).
 /// </summary>
 public class TargetChatClientProviderTests

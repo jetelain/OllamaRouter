@@ -138,31 +138,9 @@ namespace OllamaRouter.Serialization;
 [JsonSerializable(typeof(OpenAiToolCallFunctionDto))]
 [JsonSerializable(typeof(OpenAiResponseFormatDto))]
 [JsonSerializable(typeof(Dictionary<string, JsonElement>))]
- // Outbound OpenAI-compatible client DTOs (task #60) + element serialization targets used by the
- // OpenAiHttpChatClient request builder (plain strings / stop-sequence arrays / content-part arrays).
- [JsonSerializable(typeof(string))]
- [JsonSerializable(typeof(List<string>))]
- [JsonSerializable(typeof(List<OpenAiContentPartDto>))]
- [JsonSerializable(typeof(OpenAiChatCompletionRequestDto))]
- [JsonSerializable(typeof(OpenAiRequestMessageDto))]
- [JsonSerializable(typeof(OpenAiContentPartDto))]
- [JsonSerializable(typeof(OpenAiImageUrlDto))]
- [JsonSerializable(typeof(OpenAiRequestToolCallDto))]
- [JsonSerializable(typeof(OpenAiRequestToolCallFunctionDto))]
- [JsonSerializable(typeof(OpenAiRequestToolDto))]
- [JsonSerializable(typeof(OpenAiRequestToolFunctionDto))]
- [JsonSerializable(typeof(OpenAiStreamOptionsDto))]
- [JsonSerializable(typeof(OpenAiChatCompletionResponseDto))]
- [JsonSerializable(typeof(OpenAiResponseChoiceDto))]
- [JsonSerializable(typeof(OpenAiResponseMessageDto))]
- [JsonSerializable(typeof(OpenAiResponseToolCallDto))]
- [JsonSerializable(typeof(OpenAiResponseToolCallFunctionDto))]
- [JsonSerializable(typeof(OpenAiStreamChunkDto))]
- [JsonSerializable(typeof(OpenAiStreamChunkChoiceDto))]
- [JsonSerializable(typeof(OpenAiStreamChunkDeltaDto))]
- [JsonSerializable(typeof(OpenAiUsageDto))]
- [JsonSerializable(typeof(OpenAiCompletionTokensDetailsDto))]
- [JsonSerializable(typeof(OpenAiPromptTokensDetailsDto))]
+// Outbound OpenAI-compatible client DTOs (task #60; task #112: the request/response DTOs and
+// their element targets were deleted with the hand-rolled OpenAiHttpChatClient — only the
+// error envelope survives, consumed by the routing middleware's error surfacing).
  [JsonSerializable(typeof(OpenAiErrorResponseDto))]
  [JsonSerializable(typeof(OpenAiErrorDetailDto))]
  // API key store file format (config/api-keys.json, version 2: per-key 16-byte salt + salted SHA-256 hash; internal, same assembly).

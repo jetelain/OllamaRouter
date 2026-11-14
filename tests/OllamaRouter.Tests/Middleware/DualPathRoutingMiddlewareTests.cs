@@ -1,6 +1,8 @@
 using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.ClientModel;
+using System.ClientModel.Primitives;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Caching.Memory;
@@ -578,8 +580,13 @@ public class DualPathRoutingMiddlewareTests
         var context = BuildContext("/api/chat", """
             { "model": "openai/gpt-4o", "stream": true, "messages": [ { "role": "user", "content": "hi" } ] }
             """);
-        // The OpenAI target's client dies BEFORE the first byte (connection refused).
-        var deadClient = new FakeChatClient(new List<ChatResponseUpdate>(), failure: new HttpRequestException("connection refused"));
+        // The OpenAI target's client dies BEFORE the first byte (connection refused): task #112 —
+        // the native client surfaces this as a Status == 0 ClientResultException (null raw
+        // response), the exact analogue of the deleted status-less OpenAiHttpException.
+        var deadClient = new FakeChatClient(new List<ChatResponseUpdate>(), failure: new ClientResultException(
+            "Failed to reach the OpenAI-compatible endpoint: connection refused",
+            response: null,
+            innerException: new HttpRequestException("connection refused")));
 
         var forwarder = new Mock<IHttpForwarder>();
         int forwardAttempts = 0;
@@ -620,9 +627,15 @@ public class DualPathRoutingMiddlewareTests
             { "model": "nope", "stream": true, "messages": [ { "role": "user", "content": "hi" } ] }
             """);
         var errorClient = new FakeChatClient(new List<ChatResponseUpdate>(),
-            failure: new OllamaRouter.Services.Clients.OpenAiHttpException(
-                "OpenAI endpoint error (HTTP 404): model 'nope' not found",
-                System.Net.HttpStatusCode.NotFound, "invalid_request_error", "model_not_found"));
+            // Task #112: the native OpenAI client wraps upstream HTTP errors in a
+            // ClientResultException (Status = HTTP code + body on GetRawResponse()); the
+            // middleware composes the legacy message format from it.
+            failure: new ClientResultException(
+                "HTTP 404 (type: invalid_request_error)\n\nmodel 'nope' not found",
+                new FakePipelineResponse(
+                    System.Net.HttpStatusCode.NotFound,
+                    """{"error":{"message":"model 'nope' not found","type":"invalid_request_error","param":null,"code":"model_not_found"}}"""),
+                innerException: null));
 
         var forwarder = new Mock<IHttpForwarder>();
         var streak = new Mock<ITargetFailureStreakService>();
@@ -637,7 +650,10 @@ public class DualPathRoutingMiddlewareTests
         Assert.Equal("application/x-ndjson", context.Response.ContentType);
         var body = ReadBody(context);
         Assert.Contains("\"error\"", body, StringComparison.Ordinal);
-        Assert.Contains("(HTTP 404)", body, StringComparison.Ordinal);
+        // Task #112: the middleware composes the legacy message format from the native
+        // ClientResultException (status + error.type + error.message) — 404 is the generic
+        // "endpoint error (HTTP {s}, type={t})" branch.
+        Assert.Contains("(HTTP 404, type=invalid_request_error)", body, StringComparison.Ordinal);
         Assert.Contains("not found", body, StringComparison.Ordinal);
 
         // NO streak (the provider answered — transport was reliable) and NO failover.
@@ -1058,6 +1074,68 @@ public class DualPathRoutingMiddlewareTests
     // ------------------------------------------------------------------
     //  Helpers
     // ------------------------------------------------------------------
+
+    /// <summary>
+    /// Test-local <see cref="System.ClientModel.Primitives.PipelineResponse"/> fake carrying the
+    /// upstream status + raw error body (task #112: the middleware composes the legacy
+    /// OpenAI-client error message from exactly these two members).
+    /// </summary>
+    private sealed class FakePipelineResponse : System.ClientModel.Primitives.PipelineResponse
+    {
+        private readonly int _status;
+        private readonly MemoryStream _content;
+
+        public FakePipelineResponse(System.Net.HttpStatusCode status, string body)
+        {
+            _status = (int)status;
+            _content = new MemoryStream(Encoding.UTF8.GetBytes(body));
+        }
+
+        public override int Status => _status;
+
+        public override string ReasonPhrase => "Fake";
+
+        protected override System.ClientModel.Primitives.PipelineResponseHeaders HeadersCore => new FakePipelineResponseHeaders();
+
+        public override Stream? ContentStream
+        {
+            get => _content;
+            set => throw new NotSupportedException();
+        }
+
+        public override BinaryData Content => BinaryData.FromBytes(_content.ToArray());
+
+        public override BinaryData BufferContent(CancellationToken cancellationToken) => Content;
+
+        public override ValueTask<BinaryData> BufferContentAsync(CancellationToken cancellationToken)
+            => new(Content);
+
+        public override bool IsError => _status is >= 400 and < 600;
+
+        public override void Dispose()
+        {
+            _content.Dispose();
+        }
+    }
+
+    /// <summary>Empty test-local header bag for <see cref="FakePipelineResponse"/>.</summary>
+    private sealed class FakePipelineResponseHeaders : System.ClientModel.Primitives.PipelineResponseHeaders
+    {
+        public override bool TryGetValue(string header, out string? value)
+        {
+            value = null;
+            return false;
+        }
+
+        public override bool TryGetValues(string header, out IEnumerable<string> values)
+        {
+            values = Enumerable.Empty<string>();
+            return false;
+        }
+
+        public override IEnumerator<KeyValuePair<string, string>> GetEnumerator()
+            => Enumerable.Empty<KeyValuePair<string, string>>().GetEnumerator();
+    }
 
     private static string ReadBody(HttpContext context)
     {
