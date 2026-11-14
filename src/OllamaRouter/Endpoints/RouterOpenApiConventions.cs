@@ -159,7 +159,7 @@ internal static class RouterOpenApiDocumentTransformer
                     "key is auto-generated in config/default-key.dat (DPAPI-wrapped on Windows, " +
                     "file mode 0600 on Unix) and auto-rotated every ApiSecurity.DefaultKeyRotationHours " +
                     "(default 24 h) with NO grace period — re-read the key after a 401. User keys " +
-                    "persist only as SHA-256 hashes in config/api-keys.json. 401 responses carry " +
+                    "persist only as salted SHA-256 hashes (unique 16-byte salt + SHA256(salt ‖ key)) in config/api-keys.json. 401 responses carry " +
                     "'WWW-Authenticate: Bearer' plus the OllamaErrorResponse JSON body. The " +
                     "requirement is derived from the production ApiSecurityPolicy default set " +
                     "(config-affecting routes + key management); ApiSecurity.RequireKeyForAllEndpoints=true " +
@@ -508,7 +508,7 @@ internal static class RouterOpenApiDocumentTransformer
                     "NUMBER OF HOURS (e.g. 168 = 7 days; omitted/null = no expiry; < 1 → 400).",
                 responses:
                 [
-                    ("201", typeof(ApiKeyCreatedResponse), "Created: the raw base64url key is returned EXACTLY ONCE (only its SHA-256 hash is persisted in config/api-keys.json)."),
+                    ("201", typeof(ApiKeyCreatedResponse), "Created: the raw base64url key is returned EXACTLY ONCE (only its salted SHA-256 hash — unique 16-byte random salt + SHA256(salt ‖ key) — is persisted in config/api-keys.json)."),
                     ("400", typeof(OllamaErrorResponse), "invalid name or validFor < 1"),
                     ("409", typeof(OllamaErrorResponse), "an API key named '{name}' already exists"),
                     ("500", typeof(OllamaErrorResponse), "persistence failure or missing key store")

@@ -23,7 +23,8 @@ public sealed record ApiKeyInfo(string Name, DateTimeOffset CreatedAt, DateTimeO
 
 /// <summary>
 /// Outcome of a successful user key creation (task #50). The <see cref="Key"/> is the raw
-/// base64url key returned to the operator EXACTLY ONCE — only its SHA-256 hash is persisted.
+/// base64url key returned to the operator EXACTLY ONCE — only its salted SHA-256 hash
+/// (unique 16-byte random salt + <c>SHA256(salt ‖ key)</c>) is persisted.
 /// </summary>
 public sealed record ApiKeyCreated(string Name, string Key, DateTimeOffset CreatedAt, DateTimeOffset? ExpiresAt);
 
@@ -57,15 +58,21 @@ public sealed record ApiKeyCreateResult(bool Success, ApiKeyCreated? Created, st
 /// The API key store (task #50): owns the two key files next to <c>config/config.json</c> —
 /// <c>config/default-key.dat</c> (the auto-generated default key, wrapped by
 /// <see cref="IKeyProtector"/>: DPAPI on Windows, plain + <c>0600</c> on Unix) and
-/// <c>config/api-keys.json</c> (user keys as SHA-256 hashes + timestamps only; raw user keys
-/// never touch disk).
+/// <c>config/api-keys.json</c> (format version 2: user keys as a unique 16-byte random salt +
+/// salted SHA-256 hash (<c>SHA256(salt ‖ key)</c>) + timestamps only; raw user keys never touch
+/// disk).
 /// <para>
 /// Load semantics (lazy, once-only, on the first store operation): a MISSING
 /// <c>default-key.dat</c> is generated + persisted + logged at INFO (raw key, by design); a
 /// PRESENT but corrupt / unwrappable / malformed file is logged, regenerated and re-persisted
 /// (fail-open — startup is never bricked). A missing <c>api-keys.json</c> is an empty user-key
 /// store (the file is created only on the first user-key mutation); a corrupt one is treated as
-/// empty with an error log. All file writes are atomic (same-directory temp file +
+/// empty with an error log. A file whose <c>version</c> is missing or ≠ 2 (a legacy v1 file with
+/// unsalted hashes) — or a version-2 file with ANY malformed entry (missing/invalid/wrong-length
+/// salt, missing/invalid hash, blank name) — is treated as an EMPTY store with a prominent
+/// invalidation WARNING (all pre-existing user keys must be recreated via
+/// <c>POST /api/router/api-keys</c>); the file is re-written as format version 2 on the next
+/// mutation. All file writes are atomic (same-directory temp file +
 /// <see cref="File.Move(string, string, bool)"/>) with <c>0600</c> Unix permissions.
 /// </para>
 /// <para>
@@ -107,8 +114,9 @@ public interface IApiKeyStore
     /// <summary>
     /// Creates a user API key: validates <paramref name="name"/> (non-empty, ≤ 64 chars, no
     /// whitespace / <c>/</c> / <c>\</c> / <c>:</c> / control chars, case-insensitively unique)
-    /// and <paramref name="validForHours"/> (null = no expiry, else ≥ 1); generates the key,
-    /// persists only its SHA-256 hash (+ timestamps, atomic, <c>0600</c> on Unix) and returns
+    /// and <paramref name="validForHours"/> (null = no expiry, else ≥ 1); generates the key and
+    /// a fresh 16-byte random salt, persists only the salted SHA-256 hash
+    /// (<c>SHA256(salt ‖ key)</c>) + salt (+ timestamps, atomic, <c>0600</c> on Unix) and returns
     /// the raw key ONCE. Never throws (failures are reported via <see cref="ApiKeyCreateResult"/>).
     /// </summary>
     Task<ApiKeyCreateResult> CreateUserKeyAsync(string name, int? validForHours);
@@ -130,8 +138,8 @@ public interface IApiKeyStore
 public sealed class ApiKeyStore : IApiKeyStore
 {
 
-    /// <summary>One persisted user key: the SHA-256 hash bytes (never the raw key) + timestamps.</summary>
-    private sealed record StoredUserKey(string Name, byte[] Hash, DateTimeOffset CreatedAt, DateTimeOffset? ExpiresAt);
+    /// <summary>One persisted user key: the 16-byte salt + the salted SHA-256 hash bytes (SHA256(salt ‖ key); never the raw key) + timestamps.</summary>
+    private sealed record StoredUserKey(string Name, byte[] Salt, byte[] Hash, DateTimeOffset CreatedAt, DateTimeOffset? ExpiresAt);
 
     private readonly IOptionsMonitor<OllamaRouterOptions> _options;
     private readonly IKeyProtector _keyProtector;
@@ -266,11 +274,12 @@ public sealed class ApiKeyStore : IApiKeyStore
             }
 
             var key = ApiKeyCrypto.GenerateKey();
+            var salt = ApiKeyCrypto.GenerateSalt();
             var createdAt = DateTimeOffset.UtcNow;
             DateTimeOffset? expiresAt = validForHours is { } validFor ? createdAt.AddHours(validFor) : null;
             var updated = new List<StoredUserKey>(_userKeys.Count + 1);
             updated.AddRange(_userKeys);
-            updated.Add(new StoredUserKey(name, ApiKeyCrypto.HashKey(key), createdAt, expiresAt));
+            updated.Add(new StoredUserKey(name, salt, ApiKeyCrypto.HashKey(key, salt), createdAt, expiresAt));
             _userKeys = updated;
 
             await PersistUserKeysAsync().ConfigureAwait(false);
@@ -360,10 +369,13 @@ public sealed class ApiKeyStore : IApiKeyStore
             return true;
         }
 
-        var presentedHash = ApiKeyCrypto.HashKey(presentedKey);
         var now = DateTimeOffset.UtcNow;
         foreach (var key in _userKeys)
         {
+            // Each stored user key carries its OWN unique salt: re-hash the presented key with
+            // that salt (SHA256(salt ‖ key)) before the constant-time comparison — the salted
+            // hash differs per key even for identical raw values.
+            var presentedHash = ApiKeyCrypto.HashKey(presentedKey, key.Salt);
             if (CryptographicOperations.FixedTimeEquals(presentedHash, key.Hash))
             {
                 // Lazily enforced expiry: a matched key is rejected once its expiry has passed.
@@ -521,9 +533,23 @@ public sealed class ApiKeyStore : IApiKeyStore
     }
 
     /// <summary>
-    /// Loads the user key hash store. A MISSING file means an empty store (the file is created
-    /// only on the first mutation); a CORRUPT file is treated as an empty store with an error
-    /// log (fail-open, never throws).
+    /// Loads the user key hash store (fail-open, never throws). Load validation matrix:
+    /// <list type="bullet">
+    /// <item>A MISSING file means an empty store (the file is created only on the first mutation).</item>
+    /// <item>An UNPARSEABLE (corrupt) file is treated as an empty store with an error log.</item>
+    /// <item>A file whose <c>version</c> property is MISSING or ≠ 2 (a legacy v1 file with
+    /// unsalted hashes, or a pre-#50 hand-written file) is treated as an EMPTY store with a
+    /// prominent INVALIDATION WARNING: every pre-existing user key is invalid because unsalted
+    /// hashes cannot be verified against the salted format — the operator must recreate keys
+    /// via <c>POST /api/router/api-keys</c>; the file is re-written as v2 on the next mutation.</item>
+    /// <item>A <c>version == 2</c> file with ANY malformed entry (blank name; salt missing,
+    /// not valid base64, or decoding to ≠ <see cref="ApiKeyCrypto.SaltByteLength"/> bytes; hash
+    /// missing or not valid base64) is — by deliberate design — also treated as an EMPTY store
+    /// with the SAME prominent invalidation WARNING (a half-trusted file invalidates everything
+    /// rather than silently keeping some keys). It never throws per-entry.</item>
+    /// <item>A <c>version == 2</c> file whose entries are all well-formed is loaded (per-key
+    /// salt + hash + timestamps; an unparseable <c>createdAt</c> defaults to now).</item>
+    /// </list>
     /// </summary>
     private void LoadUserKeys()
     {
@@ -536,14 +562,63 @@ public sealed class ApiKeyStore : IApiKeyStore
         {
             var text = File.ReadAllText(UserKeysFilePath);
             using var document = JsonDocument.Parse(text);
-            var list = new List<StoredUserKey>();
-            foreach (var entry in document.RootElement.GetProperty("keys").EnumerateArray())
+            var root = document.RootElement;
+            // Missing "version" counts as legacy v1 (a pre-#50 hand-written file has none).
+            if (root.ValueKind != JsonValueKind.Object ||
+                !root.TryGetProperty("version", out var version) ||
+                version.ValueKind != JsonValueKind.Number ||
+                version.GetInt32() != SupportedUserKeysFileVersion)
             {
-                var name = entry.GetProperty("name").GetString();
-                var hashB64 = entry.GetProperty("hash").GetString();
-                if (string.IsNullOrWhiteSpace(name) || hashB64 is null)
+                LogUserKeysInvalidated("legacy format (version != 2)");
+                return;
+            }
+
+            var list = new List<StoredUserKey>();
+            var malformed = false;
+            foreach (var entry in root.GetProperty("keys").EnumerateArray())
+            {
+                // TryGetProperty everywhere: a MISSING property is malformed (not an exception),
+                // so rule D1 (empty store + prominent invalidation warning) applies uniformly.
+                string? name = null;
+                string? saltB64 = null;
+                string? hashB64 = null;
+                if (entry.ValueKind == JsonValueKind.Object)
                 {
-                    continue;
+                    if (entry.TryGetProperty("name", out var nameElement))
+                    {
+                        name = nameElement.GetString();
+                    }
+
+                    if (entry.TryGetProperty("salt", out var saltElement))
+                    {
+                        saltB64 = saltElement.GetString();
+                    }
+
+                    if (entry.TryGetProperty("hash", out var hashElement))
+                    {
+                        hashB64 = hashElement.GetString();
+                    }
+                }
+                byte[]? salt = null;
+                byte[]? hash = null;
+                if (saltB64 is not null)
+                {
+                    salt = TryDecodeBase64(saltB64);
+                }
+
+                if (hashB64 is not null)
+                {
+                    hash = TryDecodeBase64(hashB64);
+                }
+
+                if (string.IsNullOrWhiteSpace(name) ||
+                    salt is null || salt.Length != ApiKeyCrypto.SaltByteLength ||
+                    hash is null)
+                {
+                    // ANY malformed entry invalidates the WHOLE store (documented design rule);
+                    // a partial load would silently trust a half-trusted file.
+                    malformed = true;
+                    break;
                 }
 
                 DateTimeOffset? createdAt = null;
@@ -564,7 +639,13 @@ public sealed class ApiKeyStore : IApiKeyStore
                     expiresAt = parsedExpires;
                 }
 
-                list.Add(new StoredUserKey(name, Convert.FromBase64String(hashB64), createdAt ?? DateTimeOffset.UtcNow, expiresAt));
+                list.Add(new StoredUserKey(name, salt, hash, createdAt ?? DateTimeOffset.UtcNow, expiresAt));
+            }
+
+            if (malformed)
+            {
+                LogUserKeysInvalidated("one or more entries are malformed (missing/invalid salt or hash, blank name)");
+                return;
             }
 
             _userKeys = list;
@@ -576,6 +657,42 @@ public sealed class ApiKeyStore : IApiKeyStore
                 UserKeysFilePath, ex.Message);
             _userKeys = Array.Empty<StoredUserKey>();
         }
+    }
+
+    /// <summary>The user-key file format version this build reads and writes (salted format).</summary>
+    private const int SupportedUserKeysFileVersion = 2;
+
+    /// <summary>Attempts a standard-base64 decode, returning null (never throwing) on invalid input.</summary>
+    private static byte[]? TryDecodeBase64(string base64)
+    {
+        try
+        {
+            return Convert.FromBase64String(base64);
+        }
+        catch (FormatException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Prominent invalidation notice for a legacy/malformed user-key file: the store is loaded
+    /// EMPTY (fail-open) and every pre-existing user key must be recreated. The file is
+    /// re-written as v2 on the next mutation.
+    /// </summary>
+    private void LogUserKeysInvalidated(string reason)
+    {
+        _logger?.LogWarning(
+            "*** ALL PRE-EXISTING USER API KEYS HAVE BEEN INVALIDATED (config file {Path}: {Reason}). " +
+            "After the upgrade to salted SHA-256 hashing, every user key stored before the upgrade " +
+            "is no longer valid and MUST BE RECREATED via POST /api/router/api-keys (only the default " +
+            "key still works). The user key file will be re-written as format version 2 after the " +
+            "first key mutation. ***",
+            UserKeysFilePath, reason);
+        _logger?.LogWarning(
+            "User API key store loaded EMPTY because {Path} was rejected ({Reason}); fail-open — startup is never bricked.",
+            UserKeysFilePath, reason);
+        _userKeys = Array.Empty<StoredUserKey>();
     }
 
     // ------------------------------------------------------------------
@@ -608,18 +725,21 @@ public sealed class ApiKeyStore : IApiKeyStore
     }
 
     /// <summary>
-    /// Persists the user key store as pretty-printed <c>{"version":1,"keys":[...]}</c>: name +
-    /// base64(SHA-256 hash) + createdAt + expiresAt (null = no expiry). Raw user keys NEVER
-    /// touch the file. Atomic write + <c>0600</c> on Unix.
+    /// Persists the user key store as pretty-printed <c>{"version":2,"keys":[...]}</c>: name +
+    /// base64(16-byte random salt) + base64(salted SHA-256 hash = SHA256(salt ‖ key)) +
+    /// createdAt + expiresAt (null = no expiry). Raw user keys NEVER touch the file.
+    /// Atomic write + <c>0600</c> on Unix.
     /// </summary>
     private async Task PersistUserKeysAsync()
     {
-        // Source-gen serialized file format (hashes only — raw keys never touch the file; no
-        // reflection, NativeAOT-safe): version + masked entries, expiresAt null = no expiry.
+        // Source-gen serialized file format (v2: per-key salt + salted hash — raw keys never
+        // touch the file; no reflection, NativeAOT-safe): version + masked entries, expiresAt
+        // null = no expiry.
         var file = new ApiKeyFile(
-            1,
+            SupportedUserKeysFileVersion,
             _userKeys.Select(k => new ApiKeyFileEntry(
                 k.Name,
+                Convert.ToBase64String(k.Salt),
                 Convert.ToBase64String(k.Hash),
                 k.CreatedAt.ToString("O"),
                 k.ExpiresAt is { } exp ? exp.ToString("O") : null))
@@ -703,14 +823,16 @@ public sealed class ApiKeyStore : IApiKeyStore
 }
 
 /// <summary>
-/// Wire format row of <c>config/api-keys.json</c> (task #50): hashes ONLY (SHA-256 of the
-/// base64url key, base64-encoded) + timestamps; lower-case property names to match the
-/// documented format; <c>expiresAt</c> JSON null = no expiry. Raw user keys NEVER touch this
-/// file. AOT-safe source-gen serialization (registered in
+/// Wire format row of <c>config/api-keys.json</c> format version 2 (task #50/#113): the
+/// unique 16-byte base64-encoded random <c>salt</c> + the base64-encoded salted SHA-256
+/// hash (<c>SHA256(salt ‖ UTF8(base64url key))</c>, salt first) + timestamps; lower-case
+/// property names to match the documented format; <c>expiresAt</c> JSON null = no expiry.
+/// Raw user keys NEVER touch this file. AOT-safe source-gen serialization (registered in
 /// <see cref="Serialization.OllamaRouterJsonSerializerContext"/>).
 /// </summary>
 public sealed record ApiKeyFileEntry(
     [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("salt")] string Salt,
     [property: JsonPropertyName("hash")] string Hash,
     [property: JsonPropertyName("createdAt")] string CreatedAt,
     [property: JsonPropertyName("expiresAt")] string? ExpiresAt);

@@ -360,6 +360,9 @@ public class ApiKeyAuthMiddlewareTests
         // BEFORE the host starts, so the store's lazy load picks them up.
         var pastKey = ApiKeyCrypto.GenerateKey();
         var futureKey = ApiKeyCrypto.GenerateKey();
+        // Format v2: every entry needs its own 16-byte random salt (hash = SHA256(salt ‖ key)).
+        var pastSalt = ApiKeyCrypto.GenerateSalt();
+        var futureSalt = ApiKeyCrypto.GenerateSalt();
         await using var host = await Host.StartAsync(root =>
         {
             var configDir = Path.Combine(root, "config");
@@ -369,21 +372,23 @@ public class ApiKeyAuthMiddlewareTests
                 new JsonObject
                 {
                     ["name"] = "past",
-                    ["hash"] = Convert.ToBase64String(ApiKeyCrypto.HashKey(pastKey)),
+                    ["salt"] = Convert.ToBase64String(pastSalt),
+                    ["hash"] = Convert.ToBase64String(ApiKeyCrypto.HashKey(pastKey, pastSalt)),
                     ["createdAt"] = DateTimeOffset.UtcNow.AddDays(-2).ToString("O"),
                     ["expiresAt"] = DateTimeOffset.UtcNow.AddMinutes(-1).ToString("O")
                 },
                 new JsonObject
                 {
                     ["name"] = "future",
-                    ["hash"] = Convert.ToBase64String(ApiKeyCrypto.HashKey(futureKey)),
+                    ["salt"] = Convert.ToBase64String(futureSalt),
+                    ["hash"] = Convert.ToBase64String(ApiKeyCrypto.HashKey(futureKey, futureSalt)),
                     ["createdAt"] = DateTimeOffset.UtcNow.AddHours(-1).ToString("O"),
                     ["expiresAt"] = DateTimeOffset.UtcNow.AddDays(1).ToString("O")
                 }
             };
             File.WriteAllText(
                 Path.Combine(configDir, "api-keys.json"),
-                new JsonObject { ["version"] = 1, ["keys"] = keys }.ToJsonString());
+                new JsonObject { ["version"] = 2, ["keys"] = keys }.ToJsonString());
         });
 
         var (past, _, _) = await SendAsync(host.Client, Request("GET", "/api/router/config", null, pastKey));

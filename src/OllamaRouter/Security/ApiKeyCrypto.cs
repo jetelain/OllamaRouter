@@ -9,6 +9,11 @@ namespace OllamaRouter.Security;
 /// as base64url (43 chars, no padding) — the exact same format for the auto-generated default
 /// key and every operator-created user key.
 /// <para>
+/// User keys are persisted as a per-key 16-byte random salt + <c>SHA256(salt ‖ key)</c>
+/// (see <see cref="HashKey"/> / <see cref="GenerateSalt"/>) — the salted hash is the ONLY
+/// persistence form of a user key.
+/// </para>
+/// <para>
 /// Validation is FAST-REJECT + constant-time: <see cref="IsValidApiKeyFormat"/> cheaply
 /// rejects structurally invalid keys, and the store compares candidate keys with
 /// <see cref="CryptographicOperations.FixedTimeEquals"/> only (never <c>string.Equals</c> or
@@ -75,11 +80,35 @@ public static class ApiKeyCrypto
     }
 
     /// <summary>
-    /// Computes the SHA-256 hash (bytes) of a raw base64url key value (UTF-8 encoded). This is
-    /// the ONLY form of a user key ever persisted to <c>config/api-keys.json</c> — the raw key
-    /// is returned to the operator exactly once at creation and never written to disk.
+    /// Salt length in bytes for user-key hashing: every user key gets a unique cryptographically
+    /// random 16-byte (128-bit) salt stored alongside its hash in <c>config/api-keys.json</c>
+    /// (format version 2).
     /// </summary>
-    public static byte[] HashKey(string key) => SHA256.HashData(Encoding.UTF8.GetBytes(key));
+    public const int SaltByteLength = 16;
+
+    /// <summary>
+    /// Generates a fresh random salt of <see cref="SaltByteLength"/> (16) bytes using a
+    /// cryptographically secure RNG. The API accepts any salt length, but the store ALWAYS
+    /// salts with this (16-byte) length.
+    /// </summary>
+    public static byte[] GenerateSalt() => RandomNumberGenerator.GetBytes(SaltByteLength);
+
+    /// <summary>
+    /// Computes the SALTED SHA-256 hash (bytes) of a raw base64url key value: <c>
+    /// SHA256(salt ‖ UTF8(key))</c> — the 16-byte salt FIRST, then the UTF-8 key bytes,
+    /// hashed in a single allocation. This is the ONLY form of a user key ever persisted to
+    /// <c>config/api-keys.json</c> (unsalted hashes are not permitted) — the raw key is
+    /// returned to the operator exactly once at creation and never written to disk. Unique
+    /// per-key salts defeat dictionary and rainbow-table attacks.
+    /// </summary>
+    public static byte[] HashKey(string key, ReadOnlySpan<byte> salt)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        var buffer = new byte[salt.Length + Encoding.UTF8.GetByteCount(key)];
+        salt.CopyTo(buffer);
+        Encoding.UTF8.GetBytes(key, buffer.AsSpan(salt.Length));
+        return SHA256.HashData(buffer.AsSpan());
+    }
 
     /// <summary>
     /// Encodes bytes as base64url (RFC 4648 §5, no padding): standard base64 with

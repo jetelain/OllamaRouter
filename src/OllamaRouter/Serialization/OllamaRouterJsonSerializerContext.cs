@@ -165,7 +165,7 @@ namespace OllamaRouter.Serialization;
  [JsonSerializable(typeof(OpenAiPromptTokensDetailsDto))]
  [JsonSerializable(typeof(OpenAiErrorResponseDto))]
  [JsonSerializable(typeof(OpenAiErrorDetailDto))]
- // API key store file format (config/api-keys.json — hashes only; internal, same assembly).
+ // API key store file format (config/api-keys.json, version 2: per-key 16-byte salt + salted SHA-256 hash; internal, same assembly).
  [JsonSerializable(typeof(OllamaRouter.Security.ApiKeyFile))]
  // Per-session usage & savings router API DTOs (task #85).
  [JsonSerializable(typeof(RouterSessionUsageListResponse))]

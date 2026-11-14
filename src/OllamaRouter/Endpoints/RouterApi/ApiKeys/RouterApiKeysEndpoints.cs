@@ -50,7 +50,8 @@ public static class RouterApiKeysEndpoints
             .WithSummary("Create a user API key (protected: API key required).")
             .WithDescription("Body: { name, validFor? } where validFor is an INTEGER NUMBER OF HOURS (e.g. 168 = 7 days; "
                 + "omitted/null = no expiry; < 1 → 400). The raw base64url key is returned to the caller EXACTLY ONCE in the 201 "
-                + "response — only its SHA-256 hash is persisted (config/api-keys.json, 0600 on Unix). 400 invalid name/validFor; "
+                + "response — only its salted SHA-256 hash (unique 16-byte random salt + SHA256(salt ‖ key)) is persisted " +
+                "(config/api-keys.json, 0600 on Unix). 400 invalid name/validFor; "
                 + "409 duplicate name (case-insensitive); 500 persistence failure or missing key store. Key management is "
                 + "protected by the API-key middleware BY DEFINITION.");
         app.MapDelete("/api/router/api-keys/{name}", DeleteApiKeyHandler)
@@ -84,7 +85,8 @@ public static class RouterApiKeysEndpoints
     /// Handler of <c>POST /api/router/api-keys</c> (task #50): creates a user API key. Body:
     /// <c>{ name, validFor? }</c> where <c>validFor</c> is an INTEGER NUMBER OF HOURS
     /// (e.g. 168 = 7 days; omitted/null = no expiry; &lt; 1 → 400). The raw base64url key is
-    /// returned to the caller EXACTLY ONCE in the 201 response — only its SHA-256 hash is
+    /// returned to the caller EXACTLY ONCE in the 201 response — only its salted SHA-256 hash
+    /// (a unique 16-byte random salt + SHA256(salt ‖ key)) is
     /// persisted (config/api-keys.json, 0600 on Unix). Status matrix: 201 created / 400 invalid
     /// name or validFor / 409 duplicate name (case-insensitive) / 500 persistence failure or
     /// missing key store.

@@ -243,9 +243,9 @@ Runtime availability toggles (`POST /targets`), reads, `/monitor`, and inference
 ### Key files (next to `config/config.json`)
 
 - **`config/default-key.dat`** — auto-generated default key (32 random bytes, base64url, 43 chars). On Windows it is a **DPAPI-wrapped blob** (unwrapable only by the same Windows user); on Unix it is stored plain with `0600` permissions. On first start and on every rotation, the raw key is **logged at INFO**.
-- **`config/api-keys.json`** — user keys stored as **hashes only** (name + SHA-256 + optional expiry), `0600` on Unix. Raw user keys are returned once at creation and never written to disk.
+- **`config/api-keys.json`** — user keys stored as a **unique 16-byte random salt + salted SHA-256 hash** per key (name + base64 `salt` + base64 `hash` = `SHA256(salt ‖ key)` + optional expiry), format `"version": 2`, `0600` on Unix. Raw user keys are returned once at creation and never written to disk.
 
-Missing or corrupt key files are regenerated on startup (fail-open).
+Missing or corrupt key files are regenerated on startup (fail-open). **Breaking change (upgrade from format v1):** upgrading from the old unsalted-hash format invalidates **ALL** pre-existing user keys — the store is loaded EMPTY with a prominent warning in the logs (the old unsalted hashes cannot be verified against the salted format). Recreate your keys via `POST /api/router/api-keys`; after the first key mutation the file is re-written as format version 2. The default key is unaffected.
 
 ### Auto-rotation & user keys
 

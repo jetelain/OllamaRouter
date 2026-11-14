@@ -3,9 +3,10 @@ using OllamaRouter.Security;
 namespace OllamaRouter.Tests.Security;
 
 /// <summary>
-/// Unit tests for the API key crypto helpers (task #50): key generation format (32 bytes /
+/// Unit tests for the API key crypto helpers (task #50/#113): key generation format (32 bytes /
 /// 43-char base64url / uniqueness), the format pre-filter (wrong length, non-base64url chars,
-/// embedded padding / spaces) and the SHA-256 key hashing.
+/// embedded padding / spaces) and the SALTED SHA-256 key hashing (deterministic per salt,
+/// salt-first ordering, salt uniqueness, GenerateSalt length/uniqueness).
 /// </summary>
 public class ApiKeyCryptoTests
 {
@@ -94,12 +95,75 @@ public class ApiKeyCryptoTests
     }
 
     [Fact]
-    public void HashKey_IsSha256OfUtf8Key_AndDeterministic()
+    public void HashKey_IsSaltedSha256_SaltFirst_ThenUtf8Key_AndDeterministic()
     {
         var key = ApiKeyCrypto.GenerateKey();
-        var expected = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(key));
-        Assert.Equal(expected, ApiKeyCrypto.HashKey(key));
-        Assert.Equal(expected, ApiKeyCrypto.HashKey(key));
-        Assert.NotEqual(expected, ApiKeyCrypto.HashKey(ApiKeyCrypto.GenerateKey()));
+        var salt = ApiKeyCrypto.GenerateSalt();
+
+        // Deterministic: same key + same salt ⇒ identical hash (twice).
+        var hash1 = ApiKeyCrypto.HashKey(key, salt);
+        Assert.Equal(hash1, ApiKeyCrypto.HashKey(key, salt));
+
+        // Independently computed expected value: SHA256(salt ‖ UTF8(key)), salt FIRST.
+        var expected = System.Security.Cryptography.SHA256.HashData(
+            [.. salt, .. System.Text.Encoding.UTF8.GetBytes(key)]);
+        Assert.Equal(expected, hash1);
+        Assert.Equal(32, hash1.Length);
+
+        // A different raw key with the SAME salt yields a different hash.
+        Assert.NotEqual(hash1, ApiKeyCrypto.HashKey(ApiKeyCrypto.GenerateKey(), salt));
+    }
+
+    [Fact]
+    public void HashKey_DifferentSalt_DifferentHash_ForTheSameRawKey()
+    {
+        var key = ApiKeyCrypto.GenerateKey();
+        var saltA = ApiKeyCrypto.GenerateSalt();
+        var saltB = ApiKeyCrypto.GenerateSalt();
+        Assert.NotEqual(saltA, saltB);
+
+        // Same raw key, two different salts ⇒ different stored hashes (no cross-key collisions
+        // are possible by construction).
+        Assert.NotEqual(ApiKeyCrypto.HashKey(key, saltA), ApiKeyCrypto.HashKey(key, saltB));
+    }
+
+    [Fact]
+    public void HashKey_IsSaltFirst_Ordering_NotKeyFirst()
+    {
+        var key = ApiKeyCrypto.GenerateKey();
+        var salt = ApiKeyCrypto.GenerateSalt();
+
+        // Ordering matters: SHA256(salt ‖ key) ≠ SHA256(key ‖ salt) for a 16-byte salt.
+        var keyFirst = System.Security.Cryptography.SHA256.HashData(
+            [.. System.Text.Encoding.UTF8.GetBytes(key), .. salt]);
+        Assert.NotEqual(keyFirst, ApiKeyCrypto.HashKey(key, salt));
+
+        // The API accepts ANY salt length (the store always uses 16 bytes):
+        // an empty salt degenerates to plain SHA256(UTF8(key)).
+        Assert.Equal(
+            System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(key)),
+            ApiKeyCrypto.HashKey(key, System.Array.Empty<byte>()));
+
+        // A short (non-standard) salt still works: SHA256(shortSalt ‖ UTF8(key)).
+        var shortSalt = new byte[] { 1, 2, 3 };
+        Assert.Equal(
+            System.Security.Cryptography.SHA256.HashData([1, 2, 3, .. System.Text.Encoding.UTF8.GetBytes(key)]),
+            ApiKeyCrypto.HashKey(key, shortSalt));
+    }
+
+    [Fact]
+    public void GenerateSalt_ReturnsSixteenBytes_AndIsUniqueAcrossDraws()
+    {
+        var salt = ApiKeyCrypto.GenerateSalt();
+        Assert.Equal(ApiKeyCrypto.SaltByteLength, salt.Length);
+        Assert.Equal(16, ApiKeyCrypto.SaltByteLength);
+
+        var seen = new HashSet<string>();
+        for (var i = 0; i < 200; i++)
+        {
+            var s = ApiKeyCrypto.GenerateSalt();
+            Assert.Equal(16, s.Length);
+            Assert.True(seen.Add(Convert.ToBase64String(s)), $"salt collision at iteration {i}");
+        }
     }
 }

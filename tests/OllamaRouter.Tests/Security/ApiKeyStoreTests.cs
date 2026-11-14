@@ -4,6 +4,7 @@ using System.Text.Json.Nodes;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Logging;
 using OllamaRouter.Options;
 using OllamaRouter.Security;
 using OllamaRouter.Tests.TestHelpers;
@@ -121,7 +122,8 @@ public class ApiKeyStoreTests : IAsyncLifetime
         string contentRoot,
         IKeyProtector protector,
         OllamaRouterOptions options,
-        out ServiceProvider provider)
+        out ServiceProvider? provider,
+        ILogger<ApiKeyStore>? logger = null)
     {
         var monitor = new TestOptionsMonitor<OllamaRouterOptions>(options);
         provider = BuildProvider(contentRoot, monitor);
@@ -129,7 +131,43 @@ public class ApiKeyStoreTests : IAsyncLifetime
             provider.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>(),
             provider,
             protector,
-            null);
+            logger);
+    }
+
+    /// <summary>
+    /// Capturing <see cref="ILogger{TCategoryName}"/> (pattern: DynamicContextSizingTests.TestLogger):
+    /// records the rendered log messages so tests can assert the prominent invalidation warning.
+    /// </summary>
+    private sealed class CapturingLogger : ILogger<ApiKeyStore>
+    {
+        private readonly List<string> _messages = [];
+
+        public List<string> Messages => _messages;
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            lock (_messages)
+            {
+                _messages.Add(formatter(state, exception));
+            }
+        }
+
+        public bool AnyWarningContains(params string[] fragments)
+        {
+            lock (_messages)
+            {
+                return _messages.Any(m => fragments.All(f => m.Contains(f, StringComparison.OrdinalIgnoreCase)));
+            }
+        }
     }
 
     private static string DefaultKeyPath(string contentRoot) => Path.Combine(contentRoot, "config", "default-key.dat");
@@ -149,7 +187,7 @@ public class ApiKeyStoreTests : IAsyncLifetime
         File.WriteAllBytes(path, protector.Protect(System.Text.Encoding.UTF8.GetBytes(envelope.ToJsonString())));
     }
 
-    /// <summary>Seeds the user key hash store with the given (name, rawKey, expiresAt) entries.</summary>
+    /// <summary>Seeds the (format v2) user key salt+hash store with the given (name, rawKey, expiresAt) entries — each entry gets a FRESH random 16-byte salt.</summary>
     private static void SeedUserKeys(
         string contentRoot,
         params (string Name, string RawKey, DateTimeOffset? ExpiresAt)[] entries)
@@ -159,12 +197,35 @@ public class ApiKeyStoreTests : IAsyncLifetime
         var keys = new JsonArray();
         foreach (var (name, rawKey, expiresAt) in entries)
         {
+            var salt = ApiKeyCrypto.GenerateSalt();
             keys.Add(new JsonObject
             {
                 ["name"] = name,
-                ["hash"] = Convert.ToBase64String(ApiKeyCrypto.HashKey(rawKey)),
+                ["salt"] = Convert.ToBase64String(salt),
+                ["hash"] = Convert.ToBase64String(ApiKeyCrypto.HashKey(rawKey, salt)),
                 ["createdAt"] = DateTimeOffset.UtcNow.AddHours(-2).ToString("O"),
                 ["expiresAt"] = expiresAt is { } e ? e.ToString("O") : null
+            });
+        }
+
+        File.WriteAllText(path, new JsonObject { ["version"] = 2, ["keys"] = keys }.ToJsonString());
+    }
+
+    /// <summary>Seeds a LEGACY format-v1 file (unsalted hash, no per-entry salt) to exercise the v2 upgrade path.</summary>
+    private static void SeedLegacyV1UserKeys(string contentRoot, (string Name, string RawKey)[] entries)
+    {
+        var path = UserKeysPath(contentRoot);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var keys = new JsonArray();
+        foreach (var (name, rawKey) in entries)
+        {
+            keys.Add(new JsonObject
+            {
+                ["name"] = name,
+                ["hash"] = Convert.ToBase64String(
+                    System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(rawKey))),
+                ["createdAt"] = DateTimeOffset.UtcNow.AddHours(-2).ToString("O"),
+                ["expiresAt"] = null
             });
         }
 
@@ -300,11 +361,149 @@ public class ApiKeyStoreTests : IAsyncLifetime
         var entry = ((JsonArray)root["keys"]!)![0]! as JsonObject;
         Assert.NotNull(entry);
         Assert.Equal("worker", entry!["name"]!.GetValue<string>());
+        // v2: the salt is persisted (16 bytes, standard base64) and the hash is the SALTED
+        // SHA-256 — verified independently from the file content.
+        var storedSalt = Convert.FromBase64String(entry!["salt"]!.GetValue<string>()!);
+        Assert.Equal(ApiKeyCrypto.SaltByteLength, storedSalt.Length);
         var storedHash = Convert.FromBase64String(entry!["hash"]!.GetValue<string>()!);
-        Assert.Equal(ApiKeyCrypto.HashKey(result.Created.Key), storedHash);
-        Assert.Equal(4, entry.Count);
+        Assert.Equal(
+            System.Security.Cryptography.SHA256.HashData([.. storedSalt, .. System.Text.Encoding.UTF8.GetBytes(result.Created.Key)]),
+            storedHash);
+        Assert.Equal(5, entry.Count);
 
         Assert.True(store.ValidateKey(result.Created.Key), "a fresh user key must validate");
+    }
+
+    [Fact]
+    public async Task CreateUserKey_TwoKeys_NeverShareASalt()
+    {
+        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), out _);
+        var first = await store.CreateUserKeyAsync("a", null);
+        var second = await store.CreateUserKeyAsync("b", null);
+        Assert.True(first.Success && second.Success);
+
+        var fileText = File.ReadAllText(UserKeysPath(_contentRoot));
+        var root = (JsonObject)JsonNode.Parse(fileText)!;
+        var keys = (JsonArray)root["keys"]!;
+        var saltA = Convert.FromBase64String(keys![0]!["salt"]!.GetValue<string>()!);
+        var saltB = Convert.FromBase64String(keys[1]["salt"]!.GetValue<string>()!);
+        Assert.Equal(ApiKeyCrypto.SaltByteLength, saltA.Length);
+        Assert.Equal(ApiKeyCrypto.SaltByteLength, saltB.Length);
+        Assert.False(
+            System.Linq.Enumerable.SequenceEqual(saltA, saltB),
+            "two keys must never share a salt (unique per-key random salt)");
+
+        // Even the SAME raw value hashed with the two salts yields different stored hashes.
+        var rawKey = first.Created!.Key;
+        Assert.NotEqual(ApiKeyCrypto.HashKey(rawKey, saltA), ApiKeyCrypto.HashKey(rawKey, saltB));
+    }
+
+    [Fact]
+    public async Task V1File_EmptyStore_ProminentInvalidationWarning_V2RewrittenOnNextMutation()
+    {
+        var legacyKey = ApiKeyCrypto.GenerateKey();
+        SeedLegacyV1UserKeys(_contentRoot, [("legacy", legacyKey)]);
+        var logger = new CapturingLogger();
+        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), provider: out _, logger: logger);
+
+        Assert.Empty(store.GetUserKeys());
+        Assert.False(store.ValidateKey(legacyKey), "legacy unsalted-hash keys must no longer validate");
+        Assert.True(
+            logger.AnyWarningContains("invalidat", "POST /api/router/api-keys"),
+            "the prominent invalidation warning must be logged (with the recreate pointer)");
+
+        // Next mutation re-writes the file as v2 with ONLY the new entry.
+        var result = await store.CreateUserKeyAsync("fresh", null);
+        Assert.True(result.Success);
+        var fileText = File.ReadAllText(UserKeysPath(_contentRoot));
+        var root = (JsonObject)JsonNode.Parse(fileText)!;
+        Assert.Equal(2, root["version"]!.GetValue<int>());
+        var keys = (JsonArray)root["keys"]!;
+        var entry = Assert.Single(keys)! as JsonObject;
+        Assert.Equal("fresh", entry!["name"]!.GetValue<string>());
+        Assert.NotNull(entry["salt"]);
+        Assert.DoesNotContain("legacy", fileText, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void V2File_MissingSalt_EmptyStore_WithWarning()
+    {
+        // Rule D1: a v2 file with ANY malformed entry (here: missing "salt") invalidates the
+        // WHOLE store — no per-entry skip.
+        var path = UserKeysPath(_contentRoot);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var keys = new JsonArray
+        {
+            new JsonObject
+            {
+                ["name"] = "ok",
+                ["hash"] = Convert.ToBase64String(ApiKeyCrypto.HashKey(ApiKeyCrypto.GenerateKey(), ApiKeyCrypto.GenerateSalt())),
+                ["createdAt"] = DateTimeOffset.UtcNow.AddHours(-1).ToString("O"),
+                ["expiresAt"] = null
+            },
+            new JsonObject
+            {
+                ["name"] = "no-salt",
+                ["hash"] = Convert.ToBase64String(ApiKeyCrypto.HashKey(ApiKeyCrypto.GenerateKey(), ApiKeyCrypto.GenerateSalt())),
+                ["createdAt"] = DateTimeOffset.UtcNow.AddHours(-1).ToString("O"),
+                ["expiresAt"] = null
+            }
+        };
+        File.WriteAllText(path, new JsonObject { ["version"] = 2, ["keys"] = keys }.ToJsonString());
+
+        var logger = new CapturingLogger();
+        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), provider: out _, logger: logger);
+        Assert.Empty(store.GetUserKeys());
+        Assert.True(logger.AnyWarningContains("invalidat"), "the invalidation warning must be logged (rule D1: missing salt)");
+    }
+
+    [Fact]
+    public void V2File_WrongLengthSalt_EmptyStore_WithWarning()
+    {
+        // An 8-byte salt (≠ 16) is malformed → whole store empty + warning, no exception.
+        var path = UserKeysPath(_contentRoot);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var keys = new JsonArray
+        {
+            new JsonObject
+            {
+                ["name"] = "short-salt",
+                ["salt"] = Convert.ToBase64String(new byte[8]),
+                ["hash"] = Convert.ToBase64String(ApiKeyCrypto.HashKey(ApiKeyCrypto.GenerateKey(), new byte[8])),
+                ["createdAt"] = DateTimeOffset.UtcNow.AddHours(-1).ToString("O"),
+                ["expiresAt"] = null
+            }
+        };
+        File.WriteAllText(path, new JsonObject { ["version"] = 2, ["keys"] = keys }.ToJsonString());
+
+        var logger = new CapturingLogger();
+        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), provider: out _, logger: logger);
+        Assert.Empty(store.GetUserKeys());
+        Assert.True(logger.AnyWarningContains("invalidat"), "the invalidation warning must be logged (rule D1: 8-byte salt)");
+    }
+
+    [Fact]
+    public void V2File_NonBase64Salt_EmptyStore_WithWarning()
+    {
+        var path = UserKeysPath(_contentRoot);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var keys = new JsonArray
+        {
+            new JsonObject
+            {
+                ["name"] = "bad-salt",
+                ["salt"] = "not!valid;base64!!!",
+                ["hash"] = Convert.ToBase64String(ApiKeyCrypto.HashKey(ApiKeyCrypto.GenerateKey(), ApiKeyCrypto.GenerateSalt())),
+                ["createdAt"] = DateTimeOffset.UtcNow.AddHours(-1).ToString("O"),
+                ["expiresAt"] = null
+            }
+        };
+        File.WriteAllText(path, new JsonObject { ["version"] = 2, ["keys"] = keys }.ToJsonString());
+
+        var logger = new CapturingLogger();
+        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), provider: out _, logger: logger);
+        Assert.Empty(store.GetUserKeys());
+        Assert.True(logger.AnyWarningContains("invalidat"), "the invalidation warning must be logged (rule D1: non-base64 salt)");
     }
 
     [Fact]
