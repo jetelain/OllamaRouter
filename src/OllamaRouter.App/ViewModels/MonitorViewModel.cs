@@ -178,6 +178,13 @@ public sealed class MonitorUsageRatioItem
     public long Tokens { get; init; }
     public int Requests { get; init; }
     public string FormattedSummary => $"{Views.HumanReadableFormatters.FormatTokens(Tokens)} ({Percentage:0.#}%)";
+
+    /// <summary>
+    /// Hover tooltip for a usage-ratio bar segment, matching the web monitor:
+    /// <c>{Name}: {pct:0.#}% ({formatted tokens} tokens, {requests} req)</c>.
+    /// </summary>
+    public string FormattedTooltip =>
+        $"{Name}: {Percentage:0.#}% ({Views.HumanReadableFormatters.FormatTokens(Tokens)} tokens, {Requests} req)";
 }
 
 public sealed class MonitorTargetSavingsItem
@@ -228,6 +235,14 @@ public sealed partial class MonitorViewModel : RouterTabViewModel
     /// <summary>Summary text for the usage ratio progress bar (e.g. "9.7M tokens").</summary>
     [ObservableProperty]
     private string _usageRatioSummary = "0 tokens";
+
+    /// <summary>
+    /// Whether there is any token activity in the last 7 days (task #114): gates the
+    /// segmented usage-ratio bar and its legend — at zero activity the panel shows the
+    /// "No token activity in the last 7 days" empty state instead. False before the first poll.
+    /// </summary>
+    [ObservableProperty]
+    private bool _hasUsageActivity;
 
     /// <summary>Whether cost &amp; savings data is available.</summary>
     [ObservableProperty]
@@ -362,6 +377,7 @@ public sealed partial class MonitorViewModel : RouterTabViewModel
             UsageRatioSummary = totalTokens > 0
                 ? $"{Views.HumanReadableFormatters.FormatTokens(totalTokens)} tokens"
                 : "0 tokens";
+            HasUsageActivity = totalTokens > 0;
 
             foreach (var e in nonTotalEntries)
             {

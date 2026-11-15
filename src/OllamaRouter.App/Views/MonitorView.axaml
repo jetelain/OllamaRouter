@@ -2,6 +2,7 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:views="using:OllamaRouter.App.Views"
              xmlns:vm="using:OllamaRouter.App.ViewModels"
+             xmlns:converters="using:OllamaRouter.App.Converters"
              x:Class="OllamaRouter.App.Views.MonitorView"
              x:DataType="vm:MonitorViewModel">
   <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto">
@@ -130,8 +131,33 @@
               <TextBlock Grid.Column="1" Text="{Binding UsageRatioSummary}" FontSize="12" Foreground="{DynamicResource SemiColorText2}"/>
             </Grid>
 
+            <!-- Segmented 7-day usage ratio bar (web-monitor parity): one colored segment per target, width ∝ token share -->
+            <Grid Height="18">
+              <Border Background="#181818" CornerRadius="6" IsVisible="{Binding HasUsageActivity}">
+                <ItemsControl ItemsSource="{Binding UsageRatios}" Margin="1">
+                  <ItemsControl.ItemsPanel>
+                    <ItemsPanelTemplate>
+                      <views:ProportionalPanel HorizontalAlignment="Stretch" VerticalAlignment="Stretch"/>
+                    </ItemsPanelTemplate>
+                  </ItemsControl.ItemsPanel>
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate x:DataType="vm:MonitorUsageRatioItem">
+                      <Border Background="{Binding Location, Converter={x:Static views:TargetBrushConverter.Instance}}"
+                              CornerRadius="2" Margin="0,0,2,0"
+                              views:ProportionalPanel.Weight="{Binding Percentage}"
+                              ToolTip.Tip="{Binding FormattedTooltip}"/>
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+              </Border>
+              <TextBlock Text="No token activity in the last 7 days"
+                         FontSize="11" FontStyle="Italic" Foreground="#666666"
+                         HorizontalAlignment="Center" VerticalAlignment="Center"
+                         IsVisible="{Binding HasUsageActivity, Converter={x:Static converters:BoolNegateConverter.Instance}}"/>
+            </Grid>
+
             <!-- Usage Legend with color dots -->
-            <ItemsControl ItemsSource="{Binding UsageRatios}">
+            <ItemsControl ItemsSource="{Binding UsageRatios}" IsVisible="{Binding HasUsageActivity}">
               <ItemsControl.ItemsPanel>
                 <ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate>
               </ItemsControl.ItemsPanel>
@@ -141,12 +167,13 @@
                     <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
                       <Ellipse Width="10" Height="10" Fill="{Binding Location, Converter={x:Static views:TargetBrushConverter.Instance}}" VerticalAlignment="Center"/>
                       <TextBlock Text="{Binding Name, Converter={x:Static views:TargetEmojiConverter.Instance}}"
-                                 FontFamily="Segoe UI Emoji, Apple Color Emoji" VerticalAlignment="Center"/>
+                                 FontSize="12" FontFamily="Segoe UI Emoji, Apple Color Emoji" VerticalAlignment="Center"/>
                       <TextBlock Text="{Binding Name, Converter={x:Static views:TargetNameConverter.Instance}}"
+                                 FontSize="12"
                                  Foreground="{Binding Location, Converter={x:Static views:TargetBrushConverter.Instance}}"
                                  FontWeight="SemiBold" VerticalAlignment="Center"/>
                       <TextBlock Text="{Binding FormattedSummary, StringFormat=': {0}'}"
-                                 Foreground="{DynamicResource SemiColorText1}" VerticalAlignment="Center"/>
+                                 FontSize="12" Foreground="{DynamicResource SemiColorText1}" VerticalAlignment="Center"/>
                     </StackPanel>
                   </Border>
                 </DataTemplate>

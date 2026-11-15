@@ -178,6 +178,53 @@ public sealed class MonitorViewModelTests : IAsyncLifetime
         Assert.Equal(2, _viewModel.FleetRows.Count);
     }
 
+    [Fact]
+    public async Task RefreshAsync_With7DayActivity_SetsHasUsageActivity_AndNonZeroSummary()
+    {
+        _client.MonitorState = BuildMonitorState();
+
+        await _viewModel.RefreshAsync();
+
+        Assert.True(_viewModel.HasUsageActivity);
+        Assert.NotEqual("0 tokens", _viewModel.UsageRatioSummary);
+    }
+
+    [Fact]
+    public async Task RefreshAsync_WithZero7DayActivity_ClearsHasUsageActivity_AndShowsZeroSummary()
+    {
+        _client.MonitorState = BuildMonitorState();
+        await _viewModel.RefreshAsync();
+        Assert.True(_viewModel.HasUsageActivity);
+
+        _client.MonitorState = new MonitorStateResponse(
+            true,
+            [new MonitorFleetTargetItem("Local", true, "Online", 0, "-", "local", "http://127.0.0.1:11434/")],
+            new MonitorStatisticsStatus(new Dictionary<string, ActivityStatisticsTotals>(), new Dictionary<string, ActivityStatisticsTotals>()),
+            [],
+            [],
+            null);
+
+        await _viewModel.RefreshAsync();
+
+        Assert.False(_viewModel.HasUsageActivity);
+        Assert.Equal("0 tokens", _viewModel.UsageRatioSummary);
+    }
+
+    [Fact]
+    public async Task RefreshAsync_UsageRatios_OrderAndPercentages_MatchTheTokenShares()
+    {
+        _client.MonitorState = BuildMonitorState();
+
+        await _viewModel.RefreshAsync();
+
+        // BuildMonitorState: Local = 12000 in + 3000 out = 15000 tokens, only non-total entry.
+        var ratio = Assert.Single(_viewModel.UsageRatios);
+        Assert.Equal("Local", ratio.Name);
+        Assert.Equal(100.0, ratio.Percentage, 10);
+        Assert.Equal(15000, ratio.Tokens);
+        Assert.Equal(41, ratio.Requests);
+    }
+
     /// <inheritdoc />
     public Task InitializeAsync() => Task.CompletedTask;
 
