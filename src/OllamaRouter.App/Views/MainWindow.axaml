@@ -48,8 +48,8 @@
           <!-- Right: Controls & Instance selector -->
           <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
             <Button Content="Refresh" Command="{Binding RefreshStatusCommand}"/>
-            <Button Content="Start" Classes="Primary" Command="{Binding StartDaemonCommand}" IsVisible="{Binding IsLocalMode}"/>
-            <Button Content="Stop" Classes="Danger" Command="{Binding StopDaemonCommand}" IsVisible="{Binding IsLocalMode}"/>
+            <Button Content="Start" Classes="Primary" Command="{Binding StartDaemonCommand}" IsVisible="{Binding ShowStartButton}"/>
+            <Button Content="Stop" Classes="Danger" Command="{Binding StopDaemonCommand}" IsVisible="{Binding ShowStopButton}"/>
             <Button Content="Restart" Classes="Warning" Command="{Binding RestartDaemonCommand}" IsVisible="{Binding IsLocalMode}"/>
             <Button Content="🌐 Select Instance..." Click="OnSelectInstanceClick"/>
           </StackPanel>

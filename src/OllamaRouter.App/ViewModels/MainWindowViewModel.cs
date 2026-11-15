@@ -77,8 +77,34 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
     [ObservableProperty]
     private bool _isBusy;
 
+    /// <summary>Whether the local router daemon is currently running (drives the
+    /// Start/Stop button visibility in the header control cluster).</summary>
+    [ObservableProperty]
+    private bool _isDaemonRunning;
+
     /// <summary>Whether the active profile is Local (daemon management enabled).</summary>
     public bool IsLocalMode => _connection.Profile.Mode == RouterConnectionMode.Local;
+
+    /// <summary>Header cluster: the Start button is visible only in local mode while the
+    /// daemon is NOT running.</summary>
+    public bool ShowStartButton => IsLocalMode && !IsDaemonRunning;
+
+    /// <summary>Header cluster: the Stop button is visible only in local mode while the
+    /// daemon IS running.</summary>
+    public bool ShowStopButton => IsLocalMode && IsDaemonRunning;
+
+    /// <summary>
+    /// Raised by the source-generated <c>OnIsDaemonRunningChanged</c> hook and by
+    /// <c>IsLocalModeChanged()</c> (connection switches) — the two inputs of the derived
+    /// visibility flags.
+    /// </summary>
+    private void RaiseButtonVisibility()
+    {
+        OnPropertyChanged(nameof(ShowStartButton));
+        OnPropertyChanged(nameof(ShowStopButton));
+    }
+
+    partial void OnIsDaemonRunningChanged(bool value) => RaiseButtonVisibility();
 
     /// <summary>The connection base URL (bind address) of the active profile.</summary>
     public string BaseUrl => _connection.Profile.BaseUrl.ToString();
@@ -310,6 +336,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
             {
                 StatusText = "Disconnected";
                 StatusDetail = ex.Message;
+                IsDaemonRunning = false;
                 RaiseCommandAvailability();
             }
         }
@@ -338,6 +365,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
         {
             StatusText = "Disconnected";
             StatusDetail = ex.Message;
+            IsDaemonRunning = false;
             RaiseCommandAvailability();
         }
     }
@@ -350,6 +378,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
         {
             var info = await _connection.Client.GetInfoAsync(ct).ConfigureAwait(false);
             IsPortConflict = false;
+            IsDaemonRunning = false;
             StatusText = "Remote";
             StatusDetail = BuildRemoteDetail(info);
             RaiseCommandAvailability();
@@ -358,6 +387,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
             ex.Status == System.Net.HttpStatusCode.Unauthorized)
         {
             IsPortConflict = false;
+            IsDaemonRunning = false;
             StatusText = "Remote";
             StatusDetail =
                 "The router is key-locked and rejected the configured key — enter a valid API " +
@@ -367,6 +397,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
         catch (Exception ex)
         {
             IsPortConflict = false;
+            IsDaemonRunning = false;
             StatusText = "Disconnected";
             StatusDetail = ex.Message;
             RaiseCommandAvailability();
@@ -379,11 +410,13 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
         {
             case RouterDaemonState.Running:
                 IsPortConflict = false;
+                IsDaemonRunning = true;
                 StatusText = "Running";
                 StatusDetail = BuildLocalDetail(status.Info);
                 break;
             case RouterDaemonState.Stopped:
                 IsPortConflict = false;
+                IsDaemonRunning = false;
                 StatusText = "Stopped";
                 StatusDetail = string.IsNullOrWhiteSpace(status.Detail)
                     ? $"The daemon is not running at {BaseUrl}."
@@ -400,6 +433,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
     private void ApplyForeignPortStatus(RouterDaemonStatus status)
     {
         IsPortConflict = true;
+        IsDaemonRunning = false;
         StatusText = "Port Conflict";
         var detail = string.IsNullOrWhiteSpace(status.Detail) ? "port occupied" : status.Detail;
         StatusDetail =
@@ -412,6 +446,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
     private void ApplyStoppedStatus(string message)
     {
         IsPortConflict = false;
+        IsDaemonRunning = false;
         StatusText = "Stopped";
         StatusDetail = message;
         RaiseCommandAvailability();
@@ -486,7 +521,11 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
 
     private bool CanStartDaemon() => IsLocalMode && !IsPortConflict && !IsBusy;
 
-    private void IsLocalModeChanged() => RaiseCommandAvailability();
+    private void IsLocalModeChanged()
+    {
+        RaiseCommandAvailability();
+        RaiseButtonVisibility();
+    }
 
     private void RaiseCommandAvailability()
     {
@@ -559,6 +598,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
         IsLocalModeChanged();
         StatusText = "Connecting\u2026";
         StatusDetail = string.Empty;
+        IsDaemonRunning = false;
         RaiseCommandAvailability();
         _ = RefreshStatusAsync(CancellationToken.None);
     }

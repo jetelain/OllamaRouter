@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Net;
 using OllamaRouter.App.Connection;
 using OllamaRouter.App.ViewModels;
@@ -204,6 +205,154 @@ public sealed class MainWindowViewModelTests : IAsyncLifetime
         });
 
         Assert.Equal("Running", viewModel.StatusText);
+    }
+
+    // -- Task #118: Start/Stop button visibility matrix ----------------------
+
+    [Fact]
+    public async Task RunningDaemon_StartHidden_StopVisible()
+    {
+        var viewModel = CreateViewModel();
+        _launcher.Status = FakeDaemonLauncher.RunningStatus();
+
+        // Initial ("Connecting…") local state: Start visible, Stop hidden.
+        Assert.False(viewModel.IsDaemonRunning);
+        Assert.True(viewModel.ShowStartButton);
+        Assert.False(viewModel.ShowStopButton);
+
+        await viewModel.StartAsync();
+
+        Assert.Equal("Running", viewModel.StatusText);
+        Assert.True(viewModel.IsDaemonRunning);
+        Assert.False(viewModel.ShowStartButton);
+        Assert.True(viewModel.ShowStopButton);
+    }
+
+    [Fact]
+    public async Task StopDaemon_TogglesVisibilityImmediately()
+    {
+        var viewModel = CreateViewModel();
+        _launcher.Status = FakeDaemonLauncher.RunningStatus();
+        await viewModel.StartAsync();
+
+        await viewModel.StopDaemonCommand.ExecuteAsync(null);
+
+        Assert.Equal("Stopped", viewModel.StatusText);
+        Assert.False(viewModel.IsDaemonRunning);
+        Assert.True(viewModel.ShowStartButton);
+        Assert.False(viewModel.ShowStopButton);
+    }
+
+    [Fact]
+    public async Task StartDaemon_TogglesVisibilityBack()
+    {
+        var viewModel = CreateViewModel();
+        _launcher.Status = FakeDaemonLauncher.RunningStatus();
+        await viewModel.StartAsync();
+        await viewModel.StopDaemonCommand.ExecuteAsync(null);
+        Assert.True(viewModel.ShowStartButton);
+        Assert.False(viewModel.ShowStopButton);
+
+        await viewModel.StartDaemonCommand.ExecuteAsync(null);
+
+        Assert.Equal("Running", viewModel.StatusText);
+        Assert.False(viewModel.ShowStartButton);
+        Assert.True(viewModel.ShowStopButton);
+    }
+
+    [Fact]
+    public async Task RestartDaemon_KeepsRunningVisibility()
+    {
+        var viewModel = CreateViewModel();
+        _launcher.Status = FakeDaemonLauncher.RunningStatus();
+        await viewModel.StartAsync();
+
+        await viewModel.RestartDaemonCommand.ExecuteAsync(null);
+
+        Assert.Equal("Running", viewModel.StatusText);
+        Assert.True(viewModel.IsDaemonRunning);
+        Assert.False(viewModel.ShowStartButton);
+        Assert.True(viewModel.ShowStopButton);
+    }
+
+    [Fact]
+    public async Task PortConflict_StartVisible_StopHidden()
+    {
+        var viewModel = CreateViewModel();
+        _launcher.Status = new RouterDaemonStatus(
+            RouterDaemonState.PortOccupiedByOtherService, null, null);
+
+        await viewModel.StartAsync();
+
+        Assert.Equal("Port Conflict", viewModel.StatusText);
+        Assert.False(viewModel.IsDaemonRunning);
+        Assert.True(viewModel.ShowStartButton);
+        Assert.False(viewModel.ShowStopButton);
+    }
+
+    [Fact]
+    public async Task StartFailure_SurfacesStoppedVisibility()
+    {
+        var viewModel = CreateViewModel();
+        _launcher.Status = new RouterDaemonStatus(RouterDaemonState.Stopped, null, null);
+        _launcher.StartException = new RouterDaemonStartTimeoutException(
+            TimeSpan.FromSeconds(5), "ollamarouter");
+
+        await viewModel.StartAsync();
+
+        Assert.Equal("Stopped", viewModel.StatusText);
+        Assert.False(viewModel.IsDaemonRunning);
+        Assert.True(viewModel.ShowStartButton);
+        Assert.False(viewModel.ShowStopButton);
+    }
+
+    [Fact]
+    public async Task RemoteMode_BothDaemonButtonsHidden()
+    {
+        var viewModel = CreateViewModel();
+        _launcher.Status = FakeDaemonLauncher.RunningStatus();
+        await viewModel.StartAsync();
+        Assert.True(viewModel.ShowStopButton);
+
+        await _harness.Service.SwitchConnectionAsync(new RouterConnectionProfile(
+            RouterConnectionMode.Remote, new Uri("http://192.168.1.50:11434/"), "key"));
+        _client.InfoResponse = FakeDaemonLauncher.RunningStatus().Info!;
+        await viewModel.RefreshStatusCommand.ExecuteAsync(null);
+
+        Assert.Equal("Remote", viewModel.StatusText);
+        Assert.False(viewModel.IsDaemonRunning);
+        Assert.False(viewModel.ShowStartButton);
+        Assert.False(viewModel.ShowStopButton);
+    }
+
+    [Fact]
+    public async Task VisibilityFlags_RaisePropertyChanged_OnTransition()
+    {
+        var viewModel = CreateViewModel();
+        _launcher.Status = FakeDaemonLauncher.RunningStatus();
+
+        var notifications = new List<string>();
+        viewModel.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName is nameof(MainWindowViewModel.ShowStartButton) or
+                nameof(MainWindowViewModel.ShowStopButton))
+            {
+                notifications.Add(e.PropertyName);
+            }
+        };
+
+        // Running → Stopped → Running cycle (the connection-switch reset is also covered
+        // because IsDaemonRunning only CHANGES on each applied state).
+        await viewModel.StartAsync();
+        await viewModel.StopDaemonCommand.ExecuteAsync(null);
+        await viewModel.StartDaemonCommand.ExecuteAsync(null);
+
+        Assert.Contains(nameof(MainWindowViewModel.ShowStartButton), notifications);
+        Assert.Contains(nameof(MainWindowViewModel.ShowStopButton), notifications);
+        // The flags are complements, so every transition of IsDaemonRunning (start,
+        // stop, start) flips BOTH of them.
+        Assert.Equal(3, notifications.Count(n => n == nameof(MainWindowViewModel.ShowStartButton)));
+        Assert.Equal(3, notifications.Count(n => n == nameof(MainWindowViewModel.ShowStopButton)));
     }
 
     private MainWindowViewModel CreateViewModel()
