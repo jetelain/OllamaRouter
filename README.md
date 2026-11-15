@@ -196,7 +196,7 @@ On first run (or via `ollamarouter setup` / `ollamarouter-app --wizard` / `ollam
 3. **Benchmark** — inspects fleet GPU/VRAM and runs micro-benchmarks across all active nodes.
 4. **Recommendations** — generates and applies the role-to-model matrix and per-node context ceilings.
 
-`ollamarouter setup --wait` propagates exit code `0` on Finish or `1` if abandoned. The `ollamarouter://` URI scheme (`ollamarouter://dashboard?tab=monitor|fleet|cartography|settings`, `ollamarouter://wizard`) is registered user-scoped (no admin required) by `ollamarouter setup`, `ollamarouter-app`, and `publish.ps1`.
+`ollamarouter setup --wait` propagates exit code `0` on Finish or `1` if abandoned. The `ollamarouter://` URI scheme (`ollamarouter://dashboard?tab=monitor|sessions|fleet|cartography|settings`, `ollamarouter://wizard`) is registered user-scoped (no admin required) by `ollamarouter setup`, `ollamarouter-app`, and `publish.ps1`.
 
 ---
 

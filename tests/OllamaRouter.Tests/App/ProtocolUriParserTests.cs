@@ -78,7 +78,7 @@ public class ProtocolUriParserTests
     {
         var options = ProtocolUriParser.Parse(["OLLAMAROUTER://SETUP?TAB=SETTINGS"]);
         Assert.True(options.Wizard);
-        Assert.Equal(3, options.InitialTabIndex);
+        Assert.Equal(4, options.InitialTabIndex);
     }
 
     [Fact]
@@ -127,13 +127,15 @@ public class ProtocolUriParserTests
 
     [Theory]
     [InlineData("monitor", 0)]
-    [InlineData("fleet", 1)]
-    [InlineData("cartography", 2)]
-    [InlineData("settings", 3)]
+    [InlineData("sessions", 1)]
+    [InlineData("fleet", 2)]
+    [InlineData("cartography", 3)]
+    [InlineData("settings", 4)]
     [InlineData("MONITOR", 0)]
-    [InlineData("Fleet", 1)]
-    [InlineData("CARTOGRAPHY", 2)]
-    [InlineData("SETTINGS", 3)]
+    [InlineData("Sessions", 1)]
+    [InlineData("Fleet", 2)]
+    [InlineData("CARTOGRAPHY", 3)]
+    [InlineData("SETTINGS", 4)]
     public void Parse_TabQuery_MapsToTabIndex(string tab, int expectedIndex)
     {
         var options = ProtocolUriParser.Parse([$"ollamarouter://open?tab={tab}"]);
@@ -146,7 +148,7 @@ public class ProtocolUriParserTests
     {
         var options = ProtocolUriParser.Parse(["ollamarouter://?tab=fleet"]);
         Assert.False(options.Wizard);
-        Assert.Equal(1, options.InitialTabIndex);
+        Assert.Equal(2, options.InitialTabIndex);
     }
 
     [Theory]
@@ -164,21 +166,21 @@ public class ProtocolUriParserTests
     public void Parse_TabKeyIsCaseInsensitive()
     {
         var options = ProtocolUriParser.Parse(["ollamarouter://open?Tab=Cartography"]);
-        Assert.Equal(2, options.InitialTabIndex);
+        Assert.Equal(3, options.InitialTabIndex);
     }
 
     [Fact]
     public void Parse_PercentEncodedTabValue_IsDecoded()
     {
         var options = ProtocolUriParser.Parse(["ollamarouter://open?tab=sett%69ngs"]); // "settings"
-        Assert.Equal(3, options.InitialTabIndex);
+        Assert.Equal(4, options.InitialTabIndex);
     }
 
     [Fact]
     public void Parse_MultipleTabPairs_FirstWins()
     {
         var options = ProtocolUriParser.Parse(["ollamarouter://open?tab=fleet&tab=settings"]);
-        Assert.Equal(1, options.InitialTabIndex);
+        Assert.Equal(2, options.InitialTabIndex);
     }
 
     [Fact]
@@ -186,7 +188,7 @@ public class ProtocolUriParserTests
     {
         var options = ProtocolUriParser.Parse(["ollamarouter://wizard?tab=fleet"]);
         Assert.True(options.Wizard);
-        Assert.Equal(1, options.InitialTabIndex);
+        Assert.Equal(2, options.InitialTabIndex);
     }
 
     // ------------------------------------------------------------------
@@ -220,7 +222,7 @@ public class ProtocolUriParserTests
     {
         var options = ProtocolUriParser.Parse(["--wizard", "ollamarouter://open?tab=settings"]);
         Assert.True(options.Wizard);
-        Assert.Equal(3, options.InitialTabIndex);
+        Assert.Equal(4, options.InitialTabIndex);
     }
 
     [Fact]

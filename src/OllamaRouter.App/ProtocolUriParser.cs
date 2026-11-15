@@ -13,10 +13,10 @@ internal sealed record AppLaunchOptions
     public required bool Wizard { get; init; }
 
     /// <summary>
-    /// The initial dashboard tab index (0 = Monitor, 1 = Fleet, 2 = Cartography, 3 = Settings —
-    /// the <c>MainWindow.axaml</c> <c>TabItem</c> order), or null ⇒ the app default (0). Surfaces
-    /// the <c>?tab=</c> query of the first <c>ollamarouter://</c> URI argument; the app ignores it
-    /// in wizard mode.
+    /// The initial dashboard tab index (0 = Monitor, 1 = Agents &amp; Sessions, 2 = Fleet,
+    /// 3 = Cartography, 4 = Settings — the <c>MainWindow.axaml</c> <c>TabItem</c> order), or null
+    /// ⇒ the app default (0). Surfaces the <c>?tab=</c> query of the first
+    /// <c>ollamarouter://</c> URI argument; the app ignores it in wizard mode.
     /// </summary>
     public int? InitialTabIndex { get; init; }
 }
@@ -42,8 +42,8 @@ internal sealed record AppLaunchOptions
 /// <item>
 /// The <c>?tab=</c> query of that URI: the FIRST <c>tab=</c> pair wins (key
 /// case-insensitive, value percent-decoded and compared case-insensitively):
-/// <c>monitor</c>⇒0, <c>fleet</c>⇒1, <c>cartography</c>⇒2, <c>settings</c>⇒3;
-/// unknown/missing/empty ⇒ null. Surfaced regardless of mode.
+/// <c>monitor</c>⇒0, <c>sessions</c>⇒1, <c>fleet</c>⇒2, <c>cartography</c>⇒3,
+/// <c>settings</c>⇒4; unknown/missing/empty ⇒ null. Surfaced regardless of mode.
 /// </item>
 /// <item>
 /// No args / null ⇒ dashboard, no tab.
@@ -124,9 +124,10 @@ internal static class ProtocolUriParser
             int? index = value.ToLowerInvariant() switch
             {
                 "monitor" => 0,
-                "fleet" => 1,
-                "cartography" => 2,
-                "settings" => 3,
+                "sessions" => 1,
+                "fleet" => 2,
+                "cartography" => 3,
+                "settings" => 4,
                 _ => null,
             };
             return index; // the first tab= pair wins

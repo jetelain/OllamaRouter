@@ -87,6 +87,14 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
     /// <summary>The <c>POST /api/router/vram/reclaim</c> response (default: nothing unloaded).</summary>
     public RouterVramReclaimResponse ReclaimResponse { get; set; } = new(true, 0, [], null);
 
+    /// <summary>The <c>GET /api/router/monitor/sessions</c> response (empty store by default).</summary>
+    public RouterSessionUsageListResponse SessionsResponse { get; set; } = new(null, 0, []);
+
+    /// <summary>The <c>GET /api/router/monitor/sessions/{sessionId}</c> detail store (an unknown
+    /// session id ⇒ 404 <see cref="OllamaRouterApiException"/>, mirroring the wire).</summary>
+    public Dictionary<string, RouterSessionUsageDetailResponse> SessionDetails { get; } =
+        new(StringComparer.OrdinalIgnoreCase);
+
     /// <summary>The <c>GET /api/router/preload/preview</c> +
     /// <c>POST .../preload</c> response (default: no selection).</summary>
     public RouterModelPreloadResponse PreloadResponse { get; set; } = new("model", null, 900, null, null, null, null, null, [], null);
@@ -452,13 +460,25 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
         NotImplemented<RouterBenchmarkClearedResponse>(nameof(ClearBenchmarkResultsAsync));
 
     /// <inheritdoc />
-    public Task<RouterSessionUsageListResponse> GetSessionsAsync(CancellationToken ct = default) =>
-        NotImplemented<RouterSessionUsageListResponse>(nameof(GetSessionsAsync));
+    public Task<RouterSessionUsageListResponse> GetSessionsAsync(CancellationToken ct = default)
+    {
+        Log(nameof(GetSessionsAsync));
+        return Task.FromResult(SessionsResponse);
+    }
 
     /// <inheritdoc />
     public Task<RouterSessionUsageDetailResponse> GetSessionDetailAsync(
-        string sessionId, CancellationToken ct = default) =>
-        NotImplemented<RouterSessionUsageDetailResponse>(nameof(GetSessionDetailAsync));
+        string sessionId, CancellationToken ct = default)
+    {
+        Log(nameof(GetSessionDetailAsync));
+        if (!SessionDetails.TryGetValue(sessionId, out var detail))
+        {
+            throw new OllamaRouterApiException(
+                HttpStatusCode.NotFound, $"session not found: {sessionId}");
+        }
+
+        return Task.FromResult(detail);
+    }
 
     /// <inheritdoc />
     public Task<RouterSessionAffinityReleaseResponse> ReleaseSessionAffinityAsync(

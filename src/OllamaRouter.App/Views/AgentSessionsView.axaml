@@ -1,0 +1,169 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:views="using:OllamaRouter.App.Views"
+             xmlns:vm="using:OllamaRouter.App.ViewModels"
+             xmlns:converters="using:OllamaRouter.App.Converters"
+             xmlns:dialogs="using:OllamaRouter.App.Views.Dialogs"
+             x:Class="OllamaRouter.App.Views.AgentSessionsView"
+             x:DataType="vm:AgentSessionsViewModel">
+  <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto">
+    <StackPanel Spacing="16" Margin="12,12,12,48">
+      <TextBlock Text="{Binding LastError}" Foreground="#FF7B7B" TextWrapping="Wrap" IsVisible="{Binding IsErrorVisible}"/>
+
+      <!-- 1. SUMMARY: fleet-wide aggregates over the listed sessions -->
+      <Border Theme="{DynamicResource CardBorder}" Padding="14">
+        <StackPanel Spacing="10">
+          <Grid ColumnDefinitions="*,auto">
+            <TextBlock Grid.Column="0" Text="Agents &amp; Sessions" FontWeight="Bold" FontSize="16" VerticalAlignment="Center"/>
+            <Button Grid.Column="1" Content="Refresh" Command="{Binding RefreshCommand}"/>
+          </Grid>
+
+          <Grid ColumnDefinitions="110,110,150,140,160,160" ColumnSpacing="16">
+            <StackPanel Grid.Column="0" Spacing="2">
+              <TextBlock Text="SESSIONS" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+              <TextBlock Text="{Binding Summary.Sessions}" FontSize="20" FontWeight="Bold"/>
+            </StackPanel>
+            <StackPanel Grid.Column="1" Spacing="2">
+              <TextBlock Text="REQUESTS" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+              <TextBlock Text="{Binding Summary.Requests}" FontSize="20" FontWeight="Bold"/>
+            </StackPanel>
+            <StackPanel Grid.Column="2" Spacing="2">
+              <TextBlock Text="TOTAL TOKENS (IN + OUT)" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+              <TextBlock Text="{Binding Summary.FormattedTotalTokens}" FontSize="20" FontWeight="Bold"/>
+            </StackPanel>
+            <StackPanel Grid.Column="3" Spacing="2">
+              <TextBlock Text="GPU TIME" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+              <TextBlock Text="{Binding Summary.FormattedElapsed}" FontSize="20" FontWeight="Bold"/>
+            </StackPanel>
+            <StackPanel Grid.Column="4" Spacing="2">
+              <TextBlock Text="EST. COST (ALL-CLOUD VALUE)" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+              <TextBlock Text="{Binding Summary.FormattedTotalCloudValue}" FontSize="20" FontWeight="Bold"/>
+            </StackPanel>
+            <StackPanel Grid.Column="5" Spacing="2">
+              <TextBlock Text="ACTUAL COST" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+              <TextBlock Text="{Binding Summary.FormattedTotalCost}" FontSize="20" FontWeight="Bold"/>
+            </StackPanel>
+          </Grid>
+          <TextBlock Text="Costs are computed by the router at read time from the configured Pricing rates (per-million prompt / completion / cached tokens)."
+                     Foreground="{DynamicResource SemiColorText2}" FontSize="11" Margin="0,4,0,0"/>
+        </StackPanel>
+      </Border>
+
+      <!-- 2. SESSIONS TABLE (one row per agent session, most-recently-active first) -->
+      <Border Theme="{DynamicResource CardBorder}" Padding="14">
+        <StackPanel Spacing="10">
+          <Grid ColumnDefinitions="220,70,90,90,90,100,140,100,110" Margin="0,0,0,4">
+            <TextBlock Grid.Column="0" Text="AGENT / SESSION ID" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="1" Text="REQUESTS" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="2" Text="PROMPT (IN)" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="3" Text="CACHED" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="4" Text="RESPONSE" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="5" Text="GPU TIME" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="6" Text="LAST SEEN" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="7" Text="EST. COST" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="8" Text="COST" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+          </Grid>
+
+          <ListBox ItemsSource="{Binding Sessions}"
+                   SelectedItem="{Binding SelectedRow, Mode=TwoWay}">
+            <ListBox.ItemTemplate>
+              <DataTemplate>
+                <Grid ColumnDefinitions="220,70,90,90,90,100,140,100,110" Margin="0,2">
+                  <TextBlock Grid.Column="0" Text="{Binding AgentId}" FontWeight="SemiBold"
+                             TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding AgentId}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="1" Text="{Binding Requests}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="2" Text="{Binding InputTokens, Converter={x:Static views:TokenCountConverter.Instance}}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="3" Text="{Binding CachedInputTokens, Converter={x:Static views:TokenCountConverter.Instance}}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="4" Text="{Binding OutputTokens, Converter={x:Static views:TokenCountConverter.Instance}}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="5" Text="{Binding ElapsedMs, Converter={x:Static views:DurationMsConverter.Instance}}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="6" Text="{Binding LastSeenAt, StringFormat='{}{0:yyyy-MM-dd HH:mm:ss}'}" Foreground="{DynamicResource SemiColorText2}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="7" Text="{Binding FormattedCloudValue}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="8" Text="{Binding FormattedCost}" VerticalAlignment="Center"/>
+                </Grid>
+              </DataTemplate>
+            </ListBox.ItemTemplate>
+          </ListBox>
+
+          <TextBlock Text="No agent sessions recorded yet. Sessions are tracked per X-OllamaRouter-Session-Id (or X-OllamaRouter-Agent-Id) request header — completed requests with a session/agent ID appear here."
+                     FontSize="11" FontStyle="Italic" Foreground="#666666"
+                     IsVisible="{Binding HasSessions, Converter={x:Static converters:BoolNegateConverter.Instance}}"/>
+        </StackPanel>
+      </Border>
+
+      <!-- 3. SESSION DETAIL (per-target breakdown of the selected session) -->
+      <Border Theme="{DynamicResource CardBorder}" Padding="14"
+              IsVisible="{Binding SelectedRow, Converter={x:Static dialogs:NotNullToBoolConverter.Instance}}">
+        <StackPanel Spacing="10">
+          <StackPanel Orientation="Horizontal" Spacing="10">
+            <TextBlock Text="Session Detail" FontWeight="Bold" FontSize="16" VerticalAlignment="Center"/>
+            <TextBlock Text="{Binding SelectedRow.AgentId}" FontSize="14" VerticalAlignment="Center"
+                       TextTrimming="CharacterEllipsis" MaxWidth="420" ToolTip.Tip="{Binding SelectedRow.AgentId}"/>
+          </StackPanel>
+
+          <!-- Session-level figures -->
+          <Grid ColumnDefinitions="110,90,90,90,100,140,100,110,110" Margin="0,0,0,4">
+            <TextBlock Grid.Column="0" Text="REQUESTS" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="1" Text="PROMPT (IN)" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="2" Text="CACHED" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="3" Text="RESPONSE" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="4" Text="GPU TIME" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="5" Text="LAST SEEN" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="6" Text="EST. COST" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="7" Text="COST" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="8" Text="SAVINGS" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+          </Grid>
+          <Grid ColumnDefinitions="110,90,90,90,100,140,100,110,110" Margin="0,0,0,6">
+            <TextBlock Grid.Column="0" Text="{Binding SelectedRow.Requests}" VerticalAlignment="Center"/>
+            <TextBlock Grid.Column="1" Text="{Binding SelectedRow.InputTokens, Converter={x:Static views:TokenCountConverter.Instance}}" VerticalAlignment="Center"/>
+            <TextBlock Grid.Column="2" Text="{Binding SelectedRow.CachedInputTokens, Converter={x:Static views:TokenCountConverter.Instance}}" VerticalAlignment="Center"/>
+            <TextBlock Grid.Column="3" Text="{Binding SelectedRow.OutputTokens, Converter={x:Static views:TokenCountConverter.Instance}}" VerticalAlignment="Center"/>
+            <TextBlock Grid.Column="4" Text="{Binding SelectedRow.ElapsedMs, Converter={x:Static views:DurationMsConverter.Instance}}" VerticalAlignment="Center"/>
+            <TextBlock Grid.Column="5" Text="{Binding SelectedRow.LastSeenAt, StringFormat='{}{0:yyyy-MM-dd HH:mm:ss}'}" Foreground="{DynamicResource SemiColorText2}" VerticalAlignment="Center"/>
+            <TextBlock Grid.Column="6" Text="{Binding SelectedRow.FormattedCloudValue}" VerticalAlignment="Center"/>
+            <TextBlock Grid.Column="7" Text="{Binding SelectedRow.FormattedCost}" VerticalAlignment="Center"/>
+            <TextBlock Grid.Column="8" Text="{Binding SelectedRow.FormattedSavings}" VerticalAlignment="Center"/>
+          </Grid>
+
+          <TextBlock Text="{Binding SelectedDetailError}" Foreground="#FF7B7B" TextWrapping="Wrap"
+                     IsVisible="{Binding SelectedDetailError, Converter={x:Static dialogs:NotNullToBoolConverter.Instance}}"/>
+
+          <!-- Per-target breakdown (fleet order, Cloud last) -->
+          <Grid ColumnDefinitions="140,70,90,90,90,100,110,110,110" Margin="0,4,0,0">
+            <TextBlock Grid.Column="0" Text="TARGET" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="1" Text="REQ" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="2" Text="IN" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="3" Text="CACHED" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="4" Text="OUT" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="5" Text="GPU TIME" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="6" Text="EST. COST" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="7" Text="ELECTRICITY" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="8" Text="SAVINGS" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+          </Grid>
+          <ItemsControl ItemsSource="{Binding SelectedTargetRows}">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate>
+                <Grid ColumnDefinitions="140,70,90,90,90,100,110,110,110" Margin="0,3">
+                  <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                    <TextBlock Text="{Binding Target, Converter={x:Static views:TargetEmojiConverter.Instance}}"
+                               FontFamily="Segoe UI Emoji, Apple Color Emoji" VerticalAlignment="Center"/>
+                    <TextBlock Text="{Binding Target, Converter={x:Static views:TargetNameConverter.Instance}}"
+                               Foreground="{Binding Target, Converter={x:Static views:TargetBrushConverter.Instance}}"
+                               FontWeight="SemiBold" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+                  </StackPanel>
+                  <TextBlock Grid.Column="1" Text="{Binding Requests}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="2" Text="{Binding InputTokens, Converter={x:Static views:TokenCountConverter.Instance}}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="3" Text="{Binding CachedInputTokens, Converter={x:Static views:TokenCountConverter.Instance}}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="4" Text="{Binding OutputTokens, Converter={x:Static views:TokenCountConverter.Instance}}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="5" Text="{Binding ElapsedMs, Converter={x:Static views:DurationMsConverter.Instance}}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="6" Text="{Binding FormattedCloudValue}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="7" Text="{Binding FormattedElectricity}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="8" Text="{Binding FormattedSavings}" VerticalAlignment="Center"/>
+                </Grid>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+        </StackPanel>
+      </Border>
+    </StackPanel>
+  </ScrollViewer>
+</UserControl>

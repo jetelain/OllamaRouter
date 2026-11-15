@@ -365,6 +365,7 @@ public sealed class MainWindowViewModelTests : IAsyncLifetime
         _viewModel = new MainWindowViewModel(
             connection,
             new MonitorViewModel(() => _client, GatedDelay),
+            new AgentSessionsViewModel(() => _client, GatedDelay),
             new FleetTargetsViewModel(() => _client, GatedDelay),
             new CartographyViewModel(() => _client, GatedDelay),
             new SettingsViewModel(() => _client, GatedDelay));

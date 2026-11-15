@@ -25,13 +25,15 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
     private bool _disposed;
 
     /// <summary>
-    /// Creates the main view model over the composition-root connection service and the four
-    /// tab view models, opening on <paramref name="initialTabIndex"/> (0 = Monitor, 1 = Fleet,
-    /// 2 = Cartography, 3 = Settings — the <c>MainWindow.axaml</c> <c>TabItem</c> order; default 0).
+    /// Creates the main view model over the composition-root connection service and the five
+    /// tab view models, opening on <paramref name="initialTabIndex"/> (0 = Monitor, 1 = Agents
+    /// &amp; Sessions, 2 = Fleet, 3 = Cartography, 4 = Settings — the <c>MainWindow.axaml</c>
+    /// <c>TabItem</c> order; default 0).
     /// </summary>
     public MainWindowViewModel(
         IAppConnectionService connection,
         MonitorViewModel monitor,
+        AgentSessionsViewModel sessions,
         FleetTargetsViewModel fleet,
         CartographyViewModel cartography,
         SettingsViewModel settings,
@@ -39,6 +41,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
     {
         _connection = connection ?? throw new ArgumentNullException(nameof(connection));
         MonitorTab = monitor ?? throw new ArgumentNullException(nameof(monitor));
+        SessionsTab = sessions ?? throw new ArgumentNullException(nameof(sessions));
         FleetTab = fleet ?? throw new ArgumentNullException(nameof(fleet));
         CartographyTab = cartography ?? throw new ArgumentNullException(nameof(cartography));
         SettingsTab = settings ?? throw new ArgumentNullException(nameof(settings));
@@ -48,6 +51,9 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
 
     /// <summary>The Monitor &amp; Savings tab.</summary>
     public MonitorViewModel MonitorTab { get; }
+
+    /// <summary>The Agents &amp; Sessions tab (task #124: per-agent token usage &amp; cost).</summary>
+    public AgentSessionsViewModel SessionsTab { get; }
 
     /// <summary>The Fleet &amp; Cloud Targets tab.</summary>
     public FleetTargetsViewModel FleetTab { get; }
@@ -281,10 +287,11 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
             }
 
             var monitorTask = MonitorTab.StartPollingAsync(ct);
+            var sessionsTask = SessionsTab.StartPollingAsync(ct);
             var fleetTask = FleetTab.StartPollingAsync(ct);
             var cartographyTask = CartographyTab.StartPollingAsync(ct);
             var settingsTask = SettingsTab.RefreshAsync(ct);
-            await Task.WhenAll(monitorTask, fleetTask, cartographyTask, settingsTask).ConfigureAwait(false);
+            await Task.WhenAll(monitorTask, sessionsTask, fleetTask, cartographyTask, settingsTask).ConfigureAwait(false);
         }
         finally
         {
@@ -305,6 +312,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
         _connection.ConnectionChanged -= OnConnectionChanged;
         _commandGate.Dispose();
         await MonitorTab.DisposeAsync().ConfigureAwait(false);
+        await SessionsTab.DisposeAsync().ConfigureAwait(false);
         await FleetTab.DisposeAsync().ConfigureAwait(false);
         await CartographyTab.DisposeAsync().ConfigureAwait(false);
         await SettingsTab.DisposeAsync().ConfigureAwait(false);

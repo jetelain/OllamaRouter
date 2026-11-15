@@ -12,6 +12,9 @@
     <DataTemplate DataType="vm:MonitorViewModel">
       <views:MonitorView/>
     </DataTemplate>
+    <DataTemplate DataType="vm:AgentSessionsViewModel">
+      <views:AgentSessionsView/>
+    </DataTemplate>
     <DataTemplate DataType="vm:FleetTargetsViewModel">
       <views:FleetTargetsView/>
     </DataTemplate>
@@ -67,6 +70,7 @@
                 HorizontalContentAlignment="Stretch"
                 VerticalContentAlignment="Stretch">
       <TabItem Header="Monitor &amp; Savings" Content="{Binding MonitorTab}"/>
+      <TabItem Header="Agents &amp; Sessions" Content="{Binding SessionsTab}"/>
       <TabItem Header="Fleet &amp; Cloud Targets" Content="{Binding FleetTab}"/>
       <TabItem Header="Model Cartography" Content="{Binding CartographyTab}"/>
       <TabItem Header="Settings &amp; API Keys" Content="{Binding SettingsTab}"/>
