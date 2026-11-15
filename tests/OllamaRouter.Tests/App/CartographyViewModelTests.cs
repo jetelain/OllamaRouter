@@ -8,9 +8,10 @@ namespace OllamaRouter.Tests.App;
 
 /// <summary>
 /// <see cref="CartographyViewModel"/> / <see cref="PreloadDialogViewModel"/> tests
-/// (task #102, spec §7): the model × target matrix cells (present / capable / ceiling /
-/// resident footprint / veto reason), the loaded-process flattening, and the
-/// preview-then-preload sequence with the exact request payloads.
+/// (task #102, spec §7; task #119): the model × target matrix cells (present / capable /
+/// ceiling / veto reason, no Cloud column, no resident / in-flight tokens), the
+/// loaded-process flattening, and the preview-then-preload sequence with the exact request
+/// payloads.
 /// </summary>
 public sealed class CartographyViewModelTests : IAsyncLifetime
 {
@@ -59,15 +60,14 @@ public sealed class CartographyViewModelTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task RefreshAsync_BuildsTheMatrix_WithCellStatesAndFootprint()
+    public async Task RefreshAsync_BuildsTheMatrix_WithCellStates()
     {
         _client.CartographyResponse = BuildCartography();
 
         await _viewModel.RefreshAsync();
 
-        Assert.Equal(2, _viewModel.Nodes.Count);
-        Assert.Equal("Local", _viewModel.Nodes[0].Name);
-        Assert.Equal("Cloud", _viewModel.Nodes[1].Name); // Cloud pseudo-target last
+        var localNode = Assert.Single(_viewModel.Nodes);
+        Assert.Equal("Local", localNode.Name); // the Cloud pseudo-target is dropped
         Assert.Equal(2, _viewModel.Models.Count);
 
         var llama = _viewModel.Models[0];
@@ -75,22 +75,69 @@ public sealed class CartographyViewModelTests : IAsyncLifetime
         Assert.Equal("llama", llama.Architecture);
         Assert.Equal(4096, llama.RecommendedContextWindow);
         Assert.True(llama.CloudOverflowAvailable);
-        Assert.Equal(2, llama.Cells.Count);
 
-        var localCell = Assert.Single(llama.Cells, c => c.Target == "Local");
+        var localCell = Assert.Single(llama.Cells);
+        Assert.Equal("Local", localCell.Target);
         Assert.True(localCell.Present);
         Assert.True(localCell.Capable);
-        Assert.True(localCell.IsResident);
         Assert.Equal(8192, localCell.ContextCeiling);
-        Assert.Equal(1, localCell.InFlightRequests);
         Assert.Null(localCell.VetoReason);
-        Assert.NotNull(localCell.LoadedSizeHuman); // the resident footprint in humanized bytes
         Assert.Equal("Q4_K_M", localCell.Quantization);
-        Assert.Contains("resident", localCell.Summary);
+        Assert.Equal("capable · Q4_K_M", localCell.Summary);
+        AssertNoFootprintTokens(localCell.Summary);
+    }
 
-        var cloudCell = Assert.Single(llama.Cells, c => c.Target == "Cloud");
-        Assert.False(cloudCell.Present);
-        Assert.Equal("not present", cloudCell.Summary);
+    [Fact]
+    public async Task RefreshAsync_DropsTheCloudPseudoTarget_ColumnsAndCellsStayInSync()
+    {
+        var response = BuildCartography();
+        var local = response.Nodes[0];
+        var remote = new CartographyNodeRow(
+            "Remote", "remote", true, "Online", false, "8k", 0, 0,
+            [], "http://remote:11434/", null,
+            new CartographyNodeHardware(true, "A100", "NVIDIA", 32768, 65536));
+        var cloud = response.Nodes[1];
+        Assert.Equal("Cloud", cloud.Name);
+
+        var models = response.Models.Select(model => new CartographyModelRow(
+            model.Name, model.Architecture, model.WeightSizeBytes, model.NativeContextWindow,
+            model.RecommendedContextWindow, model.CloudOverflowAvailable,
+            [
+                .. model.Deployments,
+                new CartographyDeploymentRow("Remote", true, true, 16384, true, 3, null, 1L * 1024 * 1024, "Q8_0"),
+            ],
+            model.RecommendedContextWindow * 1000, model.Quantization)).ToArray();
+
+        _client.CartographyResponse = new RouterCartographyResponse(
+            [local, remote, cloud], models, response.LoadedModels);
+
+        await _viewModel.RefreshAsync();
+
+        Assert.Equal(["Local", "Remote"], _viewModel.Nodes.Select(n => n.Name).ToArray());
+        Assert.DoesNotContain(_viewModel.Nodes, n => string.Equals(n.Name, "Cloud", StringComparison.OrdinalIgnoreCase));
+
+        var remoteCell = _viewModel.Models[0].Cells.First(c => c.Target == "Remote");
+        Assert.Equal("Q8_0", remoteCell.Quantization);
+        Assert.Equal("capable · Q8_0", remoteCell.Summary); // capable flag + quant only
+
+        foreach (var model in _viewModel.Models)
+        {
+            Assert.Equal(2, model.Cells.Count);
+            Assert.DoesNotContain(model.Cells, c => c.Target == "Cloud");
+
+            foreach (var cell in model.Cells)
+            {
+                AssertNoFootprintTokens(cell.Summary);
+                if (cell.Quantization is not null)
+                {
+                    Assert.Contains(cell.Quantization, cell.Summary);
+                }
+                if (cell.Capable)
+                {
+                    Assert.Contains("capable", cell.Summary);
+                }
+            }
+        }
     }
 
     [Fact]
@@ -101,11 +148,13 @@ public sealed class CartographyViewModelTests : IAsyncLifetime
         await _viewModel.RefreshAsync();
 
         var qwen = _viewModel.Models[1];
-        var vetoed = Assert.Single(qwen.Cells, c => c.Target == "Local");
+        var vetoed = Assert.Single(qwen.Cells);
+        Assert.Equal("Local", vetoed.Target);
         Assert.True(vetoed.Present);
         Assert.False(vetoed.Capable);
         Assert.Equal("vram too small for qwen2:72b", vetoed.VetoReason);
         Assert.Contains("vram too small", vetoed.Summary);
+        AssertNoFootprintTokens(vetoed.Summary);
 
         var process = Assert.Single(_viewModel.LoadedProcesses);
         Assert.Equal("llama3:8b", process.Name);
@@ -113,6 +162,13 @@ public sealed class CartographyViewModelTests : IAsyncLifetime
         Assert.Equal(5L * 1024 * 1024, process.SizeVramBytes);
         Assert.Equal("Online", process.Liveness);
         Assert.False(process.Stale);
+    }
+
+    private static void AssertNoFootprintTokens(string summary)
+    {
+        var lowered = summary.ToLowerInvariant();
+        Assert.DoesNotContain("in flight", lowered);
+        Assert.DoesNotContain("resident", lowered);
     }
 
     [Fact]

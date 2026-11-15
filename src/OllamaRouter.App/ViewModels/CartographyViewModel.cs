@@ -15,13 +15,12 @@ public sealed record CartographyCellRow(
     bool Present,
     bool Capable,
     int ContextCeiling,
-    bool IsResident,
-    int InFlightRequests,
     string? VetoReason,
-    string? LoadedSizeHuman,
     string? Quantization)
 {
-    /// <summary>The single-line state summary used for the cell tooltip / sub-text.</summary>
+    /// <summary>The single-line state summary used for the cell tooltip / sub-text: the
+    /// capable/present status (or the veto reason, when not capable) plus the
+    /// quantization (when known), joined with " · ".</summary>
     public string Summary
     {
         get
@@ -30,10 +29,6 @@ public sealed record CartographyCellRow(
             if (VetoReason is not null)
             {
                 parts.Add(VetoReason);
-            }
-            else if (IsResident)
-            {
-                parts.Add(LoadedSizeHuman is null ? "resident" : $"resident ({LoadedSizeHuman})");
             }
             else if (Capable)
             {
@@ -46,11 +41,6 @@ public sealed record CartographyCellRow(
             else
             {
                 parts.Add("not present");
-            }
-
-            if (InFlightRequests > 0)
-            {
-                parts.Add($"{InFlightRequests} in flight");
             }
 
             if (Quantization is not null)
@@ -102,7 +92,7 @@ public sealed partial class CartographyModelRowVm
     /// <summary>The catalog-sourced quantization (when known).</summary>
     public string? Quantization => Wire.Quantization;
 
-    /// <summary>The one deployment cell per fleet node (node order; Cloud never deployed).</summary>
+    /// <summary>The one deployment cell per fleet node (node order).</summary>
     public IReadOnlyList<CartographyCellRow> Cells { get; }
 
     private static IReadOnlyList<CartographyCellRow> BuildCells(
@@ -118,10 +108,7 @@ public sealed partial class CartographyModelRowVm
                 deployment?.Present ?? false,
                 deployment?.Capable ?? false,
                 deployment?.ContextCeiling ?? 0,
-                deployment?.IsResident ?? false,
-                deployment?.InFlightRequests ?? 0,
                 deployment?.VetoReason,
-                deployment?.LoadedSizeVramBytes is { } bytes ? VramBytes.FormatBytes(bytes) : null,
                 deployment?.Quantization));
         }
 
@@ -167,6 +154,10 @@ public sealed partial class CartographyViewModel : RouterTabViewModel
     /// <summary>The Cartography tab polling interval (spec §4).</summary>
     internal static readonly TimeSpan CartographyInterval = TimeSpan.FromSeconds(5);
 
+    /// <summary>The wire name of the Cloud pseudo-target the server appends to the
+    /// cartography nodes (<c>RoutingTarget.Cloud.Value</c>); excluded from the matrix.</summary>
+    internal const string CloudPseudoTargetName = "Cloud";
+
     public CartographyViewModel(
         Func<IOllamaRouterApiClient> clientAccessor,
         Func<TimeSpan, CancellationToken, Task>? pollDelay = null)
@@ -178,7 +169,7 @@ public sealed partial class CartographyViewModel : RouterTabViewModel
     protected override TimeSpan PollInterval => CartographyInterval;
 
     /// <summary>The fleet node rows (matrix column order = node order, Cloud pseudo-target
-    /// last when present).</summary>
+    /// excluded).</summary>
     public ObservableCollection<CartographyNodeRow> Nodes { get; } = [];
 
     /// <summary>The model rows with their deployment cells (matrix rows).</summary>
@@ -211,10 +202,16 @@ public sealed partial class CartographyViewModel : RouterTabViewModel
     {
         var response = await ClientAccessor().GetCartographyAsync(ct).ConfigureAwait(false);
 
+        // The server appends the Cloud pseudo-target as the last node row; it carries no
+        // per-model deployment information, so the matrix keeps only the real fleet targets.
+        var matrixNodes = response.Nodes
+            .Where(node => !string.Equals(node.Name, CloudPseudoTargetName, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
         await RunOnUiAsync(() =>
         {
             Nodes.Clear();
-            foreach (var node in response.Nodes)
+            foreach (var node in matrixNodes)
             {
                 Nodes.Add(node);
             }
@@ -222,7 +219,7 @@ public sealed partial class CartographyViewModel : RouterTabViewModel
             Models.Clear();
             foreach (var model in response.Models)
             {
-                Models.Add(new CartographyModelRowVm(model, response.Nodes));
+                Models.Add(new CartographyModelRowVm(model, matrixNodes));
             }
 
             LoadedProcesses.Clear();
