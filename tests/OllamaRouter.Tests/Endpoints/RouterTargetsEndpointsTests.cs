@@ -17,6 +17,7 @@ using OllamaRouter.Serialization;
 using OllamaRouter.Services.Monitoring;
 using OllamaRouter.Services.Routing;
 using OllamaRouter.Tests.TestHelpers;
+using Pmad.LocalApi.Security;
 
 namespace OllamaRouter.Tests.Endpoints;
 
@@ -207,9 +208,11 @@ public class RouterTargetsEndpointsTests
             builder.Services.AddSingleton<IOptionsMonitor<OllamaRouterOptions>>(optionsMonitor);
 
             // The REAL key store on the temp content root (config/default-key.dat is generated
-            // there; PlainKeyProtector keeps the envelope plain on any OS — no DPAPI).
+            // there; PlainKeyProtector keeps the envelope plain on any OS — no DPAPI). Task
+            // #115: the package store takes the explicit config directory
+            // (<ContentRootPath>/config, the same path the production DI resolves).
             builder.Services.AddSingleton<IApiKeyStore>(sp =>
-                new ApiKeyStore(optionsMonitor, sp, new PlainKeyProtector()));
+                new ApiKeyStore(Path.Combine(root, "config"), new PlainKeyProtector()));
 
             // The REAL streak service (the same singleton lifetime production uses via
             // AddSingleton in AddOllamaRouterCore) — omitted entirely on the degraded host.

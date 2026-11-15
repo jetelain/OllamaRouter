@@ -1,4 +1,4 @@
-using OllamaRouter.Security;
+using Pmad.LocalApi.Security;
 
 namespace OllamaRouter.Tests.Security;
 

@@ -2,6 +2,7 @@ using System.Runtime.Versioning;
 using System.Security.Cryptography;
 using OllamaRouter.Client;
 using OllamaRouter.Security;
+using Pmad.LocalApi.Security;
 
 namespace OllamaRouter.Tests.Client;
 
@@ -59,7 +60,7 @@ public sealed class DefaultKeyReaderTests : IDisposable
         var key = MakeKey("default-key-1");
         WriteEnvelope(configDir, key, new PlainKeyProtector());
 
-        var reader = new DefaultKeyReader(configDir, new PlainKeyProtector());
+        var reader = OllamaRouterDefaultKeyReader.Create(configDir, new PlainKeyProtector());
 
         Assert.Equal(key, reader.ReadDefaultKey());
     }
@@ -72,7 +73,7 @@ public sealed class DefaultKeyReaderTests : IDisposable
         var key = MakeKey("default-key-2");
         WriteEnvelope(configDir, key, protector);
 
-        var reader = new DefaultKeyReader(configDir, protector);
+        var reader = OllamaRouterDefaultKeyReader.Create(configDir, protector);
 
         Assert.Equal(key, reader.ReadDefaultKey());
     }
@@ -80,7 +81,7 @@ public sealed class DefaultKeyReaderTests : IDisposable
     [Fact]
     public void MissingFile_ReturnsNull()
     {
-        var reader = new DefaultKeyReader(Path.Combine(_tempRoot, "does-not-exist"), new PlainKeyProtector());
+        var reader = OllamaRouterDefaultKeyReader.Create(Path.Combine(_tempRoot, "does-not-exist"), new PlainKeyProtector());
 
         Assert.Null(reader.ReadDefaultKey());
     }
@@ -92,7 +93,7 @@ public sealed class DefaultKeyReaderTests : IDisposable
         Directory.CreateDirectory(configDir);
         File.WriteAllBytes(Path.Combine(configDir, "default-key.dat"), new byte[] { 0x00, 0x01, 0x02, 0xFF });
 
-        var reader = new DefaultKeyReader(configDir, new PlainKeyProtector());
+        var reader = OllamaRouterDefaultKeyReader.Create(configDir, new PlainKeyProtector());
 
         Assert.Null(reader.ReadDefaultKey());
     }
@@ -105,7 +106,7 @@ public sealed class DefaultKeyReaderTests : IDisposable
         File.WriteAllText(Path.Combine(configDir, "default-key.dat"),
             $"{{\"generatedAt\":\"{GeneratedAt:O}\"}}");
 
-        var reader = new DefaultKeyReader(configDir, new PlainKeyProtector());
+        var reader = OllamaRouterDefaultKeyReader.Create(configDir, new PlainKeyProtector());
 
         Assert.Null(reader.ReadDefaultKey());
     }
@@ -120,7 +121,7 @@ public sealed class DefaultKeyReaderTests : IDisposable
         File.WriteAllText(Path.Combine(configDir, "default-key.dat"),
             $"{{\"key\":\"{key}\",\"generatedAt\":\"{GeneratedAt:O}\"}}");
 
-        var reader = new DefaultKeyReader(configDir, new PlainKeyProtector());
+        var reader = OllamaRouterDefaultKeyReader.Create(configDir, new PlainKeyProtector());
 
         Assert.Null(reader.ReadDefaultKey());
     }
@@ -132,7 +133,7 @@ public sealed class DefaultKeyReaderTests : IDisposable
         Directory.CreateDirectory(configDir);
         File.WriteAllBytes(Path.Combine(configDir, "default-key.dat"), new byte[] { 1, 2, 3 });
 
-        var reader = new DefaultKeyReader(configDir, new ThrowingProtector());
+        var reader = OllamaRouterDefaultKeyReader.Create(configDir, new ThrowingProtector());
 
         Assert.Null(reader.ReadDefaultKey());
     }
@@ -148,7 +149,7 @@ public sealed class DefaultKeyReaderTests : IDisposable
         Directory.CreateDirectory(Path.Combine(homeDir, "config"));
         WriteEnvelope(homeDir, homeKey, new PlainKeyProtector());
 
-        var reader = new DefaultKeyReader(explicitDir, new PlainKeyProtector(),
+        var reader = OllamaRouterDefaultKeyReader.Create(explicitDir, new PlainKeyProtector(),
             name => name == "OLLAMAROUTER_HOME" ? homeDir : null);
 
         Assert.Equal(explicitKey, reader.ReadDefaultKey());
@@ -162,7 +163,7 @@ public sealed class DefaultKeyReaderTests : IDisposable
         var homeKey = MakeKey("home-key");
         WriteEnvelope(Path.Combine(homeDir, "config"), homeKey, new PlainKeyProtector());
 
-        var reader = new DefaultKeyReader(null, new PlainKeyProtector(),
+        var reader = OllamaRouterDefaultKeyReader.Create(null, new PlainKeyProtector(),
             name => name == "OLLAMAROUTER_HOME" ? homeDir : null);
 
         Assert.Equal(homeKey, reader.ReadDefaultKey());
@@ -172,7 +173,7 @@ public sealed class DefaultKeyReaderTests : IDisposable
     [Fact]
     public void NoCandidatesExist_KeyFilePathIsFirstInPriorityOrder()
     {
-        var reader = new DefaultKeyReader(null, new PlainKeyProtector(), _ => null);
+        var reader = OllamaRouterDefaultKeyReader.Create(null, new PlainKeyProtector(), _ => null);
 
         // No explicit dir, no env var → the platform default is reported.
         Assert.EndsWith(Path.Combine("default-key.dat"), reader.KeyFilePath);
@@ -199,7 +200,7 @@ public sealed class DefaultKeyReaderTests : IDisposable
             }
 
             Environment.SetEnvironmentVariable("HOME", homeDir);
-            var reader = new DefaultKeyReader(null, new PlainKeyProtector(), _ => null);
+            var reader = OllamaRouterDefaultKeyReader.Create(null, new PlainKeyProtector(), _ => null);
             Assert.Equal(key, reader.ReadDefaultKey());
         }
         finally
@@ -224,7 +225,7 @@ public sealed class DefaultKeyReaderTests : IDisposable
         WriteEnvelope(configDir, key, protector);
         try
         {
-            var reader = new DefaultKeyReader(configDir, protector);
+            var reader = OllamaRouterDefaultKeyReader.Create(configDir, protector);
             Assert.Equal(key, await Task.Run(reader.ReadDefaultKey));
         }
         finally
@@ -241,7 +242,7 @@ public sealed class DefaultKeyReaderTests : IDisposable
         var second = MakeKey("second-key");
         WriteEnvelope(configDir, first, new PlainKeyProtector());
 
-        var reader = new DefaultKeyReader(configDir, new PlainKeyProtector());
+        var reader = OllamaRouterDefaultKeyReader.Create(configDir, new PlainKeyProtector());
         Assert.Equal(first, reader.ReadDefaultKey());
 
         // Simulate a default-key rotation on disk: the next read must observe the new key.
@@ -252,7 +253,7 @@ public sealed class DefaultKeyReaderTests : IDisposable
     [Fact]
     public void CreateDefault_DoesNotThrowAndResolvesAPath()
     {
-        var reader = DefaultKeyReader.CreateDefault();
+        var reader = OllamaRouterDefaultKeyReader.Create();
 
         Assert.False(string.IsNullOrWhiteSpace(reader.KeyFilePath));
         // Must not throw whether or not the local default-key file exists.

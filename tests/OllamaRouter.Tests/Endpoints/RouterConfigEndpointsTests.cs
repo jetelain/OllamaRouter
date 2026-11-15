@@ -21,6 +21,7 @@ using OllamaRouter.Tests.TestHelpers;
 using OllamaRouter.Services.Catalog;
 using OllamaRouter.Services.Monitoring;
 using OllamaRouter.Services.Routing;
+using Pmad.LocalApi.Security;
 
 namespace OllamaRouter.Tests.Endpoints;
 

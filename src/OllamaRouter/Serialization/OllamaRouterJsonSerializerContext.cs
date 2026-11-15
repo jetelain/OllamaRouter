@@ -143,8 +143,8 @@ namespace OllamaRouter.Serialization;
 // error envelope survives, consumed by the routing middleware's error surfacing).
  [JsonSerializable(typeof(OpenAiErrorResponseDto))]
  [JsonSerializable(typeof(OpenAiErrorDetailDto))]
- // API key store file format (config/api-keys.json, version 2: per-key 16-byte salt + salted SHA-256 hash; internal, same assembly).
- [JsonSerializable(typeof(OllamaRouter.Security.ApiKeyFile))]
+ // Task #115: config/api-keys.json is now serialized by Pmad.LocalApi.Security's internal
+ // source-generated LocalApiSecurityJsonContext (same WriteIndented = true output).
  // Per-session usage & savings router API DTOs (task #85).
  [JsonSerializable(typeof(RouterSessionUsageListResponse))]
  [JsonSerializable(typeof(RouterSessionUsageItem))]

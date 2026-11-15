@@ -22,6 +22,7 @@ using OllamaRouter.Endpoints.RouterApi.Vram;
 using OllamaRouter.Security;
 using OllamaRouter.Services.Hardware;
 using OllamaRouter.Services.Recommendations;
+using Pmad.LocalApi.Security;
 
 namespace OllamaRouter.Tests.Client;
 
@@ -618,10 +619,10 @@ public sealed class OllamaRouterDaemonLauncherTests : IDisposable
         return installDir;
     }
 
-    private DefaultKeyReader KeyReader()
+    private IDefaultKeyReader KeyReader()
     {
         Directory.CreateDirectory(_configDir);
-        return new DefaultKeyReader(_configDir, new PlainKeyProtector(), _ => null);
+        return OllamaRouterDefaultKeyReader.Create(_configDir, new PlainKeyProtector(), _ => null);
     }
 
     private void WriteKeyFile(string key)

@@ -67,7 +67,7 @@ public sealed class CliContext
         System.Net.Http.HttpClient? httpClient = null)
     {
         var url = baseUrl ?? ResolveBaseUrl();
-        var keyReader = DefaultKeyReader.CreateDefault();
+        var keyReader = OllamaRouterDefaultKeyReader.Create();
         var resolvedClient = client ?? new OllamaRouterApiClient(url, keyReader: keyReader, httpClient: httpClient);
         var resolvedLauncher = launcher ?? new OllamaRouterDaemonLauncher(
             url, keyReader: keyReader, httpClient: httpClient);

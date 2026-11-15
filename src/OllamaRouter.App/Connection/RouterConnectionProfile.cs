@@ -18,7 +18,7 @@ public enum RouterConnectionMode
 /// One connection profile (task #102): the mode, the base URL and the (explicit) API key.
 /// <para>
 /// Invariant: LOCAL profiles carry <c>BaseUrl = OllamaRouterDaemonLauncher.DefaultBaseUrl</c>
-/// and <c>ApiKey = null</c> (the client falls back to the <see cref="OllamaRouter.Security.IDefaultKeyReader"/>
+/// and <c>ApiKey = null</c> (the client falls back to the <see cref="Pmad.LocalApi.Security.IDefaultKeyReader"/>
 /// re-read per request — transparent default-key rotation). REMOTE profiles carry the user
 /// URL + explicit key; the key lives in PROCESS MEMORY FOR THE SESSION ONLY (never persisted
 /// to disk).

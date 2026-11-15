@@ -7,6 +7,7 @@ using OllamaRouter.Configuration;
 using OllamaRouter.Options;
 using OllamaRouter.Security;
 using OllamaRouter.Tests.TestHelpers;
+using Pmad.LocalApi.Security;
 
 namespace OllamaRouter.Tests.Configuration;
 

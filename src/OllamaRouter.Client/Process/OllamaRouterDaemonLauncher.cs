@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using System.Net;
 using OllamaRouter.Endpoints.RouterApi.Info;
-using OllamaRouter.Security;
+using Pmad.LocalApi.Security;
 
 // The namespace OllamaRouter.Client.Process hides System.Diagnostics.Process inside this file.
 using ProcessType = System.Diagnostics.Process;

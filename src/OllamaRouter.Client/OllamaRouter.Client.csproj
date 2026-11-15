@@ -7,16 +7,22 @@
     <RootNamespace>OllamaRouter.Client</RootNamespace>
     <Description>
       Shared OllamaRouter client SDK (task #98): the /api/router/* + /monitor/api wire DTOs,
-      the local default-key reader (IKeyProtector / DefaultKeyReader) and the strongly-typed
-      management/monitoring HTTP client. Leaf library: no ASP.NET Core, no YARP, no
-      Microsoft.Extensions.* — AOT/trim-safe for CLI and desktop (Avalonia) consumers.
+      the local default-key reader factory (OllamaRouterDefaultKeyReader over
+      Pmad.LocalApi.Security) and the strongly-typed management/monitoring HTTP client.
+      Leaf SDK: no ASP.NET Core, no YARP; only Pmad.LocalApi.Security (transitively
+      Microsoft.Extensions.Logging.Abstractions) — AOT/trim-safe for CLI and desktop
+      (Avalonia) consumers.
     </Description>
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- DPAPI for DpapiKeyProtector (Windows at-rest protection of default-key.dat).
-         P/Invoke-based, NativeAOT-safe; the only package reference of this library. -->
-    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+    <!-- Task #115: shared local API-key security primitives (IKeyProtector / PlainKeyProtector /
+         DpapiKeyProtector, SecretFilePermissions, IDefaultKeyReader / DefaultKeyReader) — the
+         in-tree copies of the client SDK and the server were replaced by this package. net10.0,
+         IsTrimmable / Native AOT-safe (source-generated JSON, DPAPI behind an IsWindows guard);
+         transitively adds only Microsoft.Extensions.Logging.Abstractions +
+         System.Security.Cryptography.ProtectedData 10.0.5. -->
+    <PackageReference Include="Pmad.LocalApi.Security" Version="0.1.0" />
   </ItemGroup>
 
   <ItemGroup>

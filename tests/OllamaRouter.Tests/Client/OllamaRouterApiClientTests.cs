@@ -23,6 +23,7 @@ using OllamaRouter.Security;
 using OllamaRouter.Services.Benchmarking;
 using OllamaRouter.Services.Hardware;
 using OllamaRouter.Services.Recommendations;
+using Pmad.LocalApi.Security;
 
 namespace OllamaRouter.Tests.Client;
 
@@ -36,7 +37,7 @@ namespace OllamaRouter.Tests.Client;
 /// and a table-driven round-trip of ALL 28 route-table methods against the source-generated
 /// <see cref="OllamaRouterClientJsonContext"/>.
 /// Self-contained: a fake <see cref="HttpMessageHandler"/> captures method/path/body/headers and
-/// serves canned responses; a temp-dir <see cref="DefaultKeyReader"/> with
+/// serves canned responses; a temp-dir <c>OllamaRouterDefaultKeyReader</c> with
 /// <see cref="PlainKeyProtector"/> (identity protect) keeps the key-rotation tests off real DPAPI.
 /// </summary>
 public sealed class OllamaRouterApiClientTests : IDisposable
@@ -1148,7 +1149,7 @@ public sealed class OllamaRouterApiClientTests : IDisposable
         File.WriteAllText(Path.Combine(_configDir, "default-key.dat"), envelope);
     }
 
-    private DefaultKeyReader KeyReader() => new(_configDir, new PlainKeyProtector(), _ => null);
+    private IDefaultKeyReader KeyReader() => OllamaRouterDefaultKeyReader.Create(_configDir, new PlainKeyProtector(), _ => null);
 
     private static OllamaRouterApiClient CreateClient(
         FakeHttpMessageHandler handler, string? apiKey = null, IDefaultKeyReader? keyReader = null) =>

@@ -23,6 +23,7 @@ using OllamaRouter.Options;
 using OllamaRouter.Security;
 using OllamaRouter.Services.Hardware;
 using OllamaRouter.Serialization;
+using Pmad.LocalApi.Security;
 
 namespace OllamaRouter.Tests.Endpoints;
 

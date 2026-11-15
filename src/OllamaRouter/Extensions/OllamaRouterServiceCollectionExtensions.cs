@@ -22,6 +22,7 @@ using OllamaRouter.Services.Preload;
 using OllamaRouter.Services.Process;
 using OllamaRouter.Services.Routing;
 using OllamaRouter.Services.Benchmarking;
+using Pmad.LocalApi.Security;
 using OllamaRouter.Services.Clients;
 using OllamaRouter.Services.Hardware;
 using OllamaRouter.Services.Recommendations;
@@ -254,14 +255,16 @@ public static class OllamaRouterServiceCollectionExtensions
             sp.GetService<IKeyProtector>(),
             sp.GetService<ICredentialStore>()));
 
-        // API key security (task #50): the at-rest protector is platform-selected at DI time
-        // (DPAPI-wrapped default key on Windows; plain + 0600 permissions on Unix; unit tests
-        // inject a fake protector so real DPAPI is never touched), the key store owns
-        // config/default-key.dat + config/api-keys.json (lazy load, atomic writes) and the
-        // rotation service auto-rotates the stale default key (class-based AddHostedService —
-        // the factory form trips the .NET 10 TryAddEnumerable type-validation, see below).
-        services.AddSingleton<IKeyProtector>(_ =>
-            OperatingSystem.IsWindows() ? new DpapiKeyProtector() : new PlainKeyProtector());
+        // API key security (task #50; task #115: the primitives now come from
+        // Pmad.LocalApi.Security): the at-rest protector is platform-selected at DI time via
+        // KeyProtectorFactory.CreatePlatformDefault() (DPAPI-wrapped default key on Windows;
+        // plain + 0600 permissions on Unix; unit tests inject a fake protector so real DPAPI is
+        // never touched), the key store owns config/default-key.dat + config/api-keys.json
+        // (lazy load, atomic writes) under the host's <ContentRoot>/config directory (same
+        // fallback as RouterConfigPersistence) and the rotation service auto-rotates the stale
+        // default key (class-based AddHostedService — the factory form trips the .NET 10
+        // TryAddEnumerable type-validation, see below).
+        services.AddSingleton<IKeyProtector>(_ => KeyProtectorFactory.CreatePlatformDefault());
         // Task #110: the OS credential store (Windows Credential Manager / macOS Keychain /
         // Linux Secret Service) via Pmad.KeySharp — the primary at-rest home of the OpenAI
         // target API keys. Singleton (thread-local native error state — safe from the HTTP
@@ -270,11 +273,17 @@ public static class OllamaRouterServiceCollectionExtensions
         // factories above).
         services.AddSingleton<ICredentialStore>(sp => new KeySharpCredentialStore(
             sp.GetService<ILoggerFactory>()?.CreateLogger<KeySharpCredentialStore>()));
-        services.AddSingleton<IApiKeyStore>(sp => new ApiKeyStore(
-            sp.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>(),
-            sp,
-            sp.GetRequiredService<IKeyProtector>(),
-            sp.GetService<ILoggerFactory>()?.CreateLogger<ApiKeyStore>()));
+        services.AddSingleton<IApiKeyStore>(sp =>
+        {
+            var environment = sp.GetService<IHostEnvironment>();
+            var contentRoot = string.IsNullOrWhiteSpace(environment?.ContentRootPath)
+                ? AppContext.BaseDirectory
+                : environment.ContentRootPath;
+            return new ApiKeyStore(
+                Path.Combine(contentRoot, "config"),
+                sp.GetRequiredService<IKeyProtector>(),
+                sp.GetService<ILoggerFactory>()?.CreateLogger<ApiKeyStore>());
+        });
         services.AddHostedService<DefaultKeyRotationHostedService>();
 
         // Effective fleet targets plus the Cloud pseudo-target; used by the availability and statistics

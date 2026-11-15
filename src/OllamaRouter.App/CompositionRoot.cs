@@ -13,7 +13,7 @@ namespace OllamaRouter.App;
 /// The single composition (wiring) point of the desktop application (task #102, spec §2):
 /// <list type="number">
 /// <item>
-/// <c>IDefaultKeyReader keyReader = DefaultKeyReader.CreateDefault();</c>
+/// <c>IDefaultKeyReader keyReader = OllamaRouterDefaultKeyReader.Create();</c>
 /// </item>
 /// <item>
 /// <c>IAppConnectionService connection = new AppConnectionService(keyReader);</c> (default
@@ -33,10 +33,10 @@ namespace OllamaRouter.App;
 /// </summary>
 internal static class CompositionRoot
 {
-    /// <summary>Builds the connection service with the production <c>DefaultKeyReader</c>
+    /// <summary>Builds the connection service with the production <c>OllamaRouterDefaultKeyReader</c>
     /// (the default profile is Local).</summary>
     public static IAppConnectionService CreateConnectionService() =>
-        new AppConnectionService(DefaultKeyReader.CreateDefault());
+        new AppConnectionService(OllamaRouterDefaultKeyReader.Create());
 
     /// <summary>
     /// Builds the main window with its full view-model tree, opening on

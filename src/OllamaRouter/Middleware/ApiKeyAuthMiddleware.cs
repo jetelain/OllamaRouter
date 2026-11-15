@@ -5,6 +5,7 @@ using Microsoft.Extensions.Options;
 using OllamaRouter.Options;
 using OllamaRouter.Security;
 using OllamaRouter.Serialization;
+using Pmad.LocalApi.Security;
 
 namespace OllamaRouter.Middleware;
 
@@ -19,17 +20,19 @@ namespace OllamaRouter.Middleware;
 /// endpoints AND proxy paths).
 /// </para>
 /// <para>
-/// Key extraction: an <c>Authorization: Bearer &lt;key&gt;</c> header (scheme case-insensitive)
-/// takes precedence, else the <c>X-Api-Key: &lt;key&gt;</c> header (value trimmed). On failure
-/// the request is short-circuited with <c>401 Unauthorized</c> + <c>WWW-Authenticate: Bearer</c>
-/// + a JSON <c>OllamaErrorResponse</c> body (source-gen serialization, no MVC allocation,
-/// NativeAOT-safe); the warning log carries NO key material (only method/path/remote IP).
+/// Key extraction: delegated to <see cref="ApiKeyHeaderParser.ExtractKey"/> (task #115 —
+/// Pmad.LocalApi.Security): an <c>Authorization: Bearer &lt;key&gt;</c> header (scheme
+/// case-insensitive, whitespace after the scheme required) takes precedence over the
+/// <c>X-Api-Key: &lt;key&gt;</c> header; the value is trimmed and control characters rejected.
+/// On failure the request is short-circuited with <c>401 Unauthorized</c> +
+/// <c>WWW-Authenticate: Bearer</c> + a JSON <c>OllamaErrorResponse</c> body (source-gen
+/// serialization, no MVC allocation, NativeAOT-safe); the warning log carries NO key
+/// material (only method/path/remote IP).
 /// </para>
 /// </summary>
 public sealed class ApiKeyAuthMiddleware
 {
     private const string XApiKeyHeader = "X-Api-Key";
-    private const string BearerSchemePrefix = "Bearer ";
 
     private readonly RequestDelegate _next;
     private readonly IOptionsMonitor<OllamaRouterOptions> _options;
@@ -70,7 +73,9 @@ public sealed class ApiKeyAuthMiddleware
             return;
         }
 
-        var presentedKey = ExtractKey(request);
+        var presentedKey = ApiKeyHeaderParser.ExtractKey(
+            request.Headers.Authorization.ToString(),
+            request.Headers.TryGetValue(XApiKeyHeader, out var xApiKey) ? xApiKey.ToString() : null);
         if (presentedKey is not null && _keyStore.ValidateKey(presentedKey))
         {
             await _next(context).ConfigureAwait(false);
@@ -81,29 +86,6 @@ public sealed class ApiKeyAuthMiddleware
             "Rejected {Method} {Path} from {RemoteIp}: missing or invalid API key.",
             request.Method, request.Path, context.Connection.RemoteIpAddress);
         await WriteUnauthorizedAsync(context).ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// Extracts the presented key: <c>Authorization</c> with the Bearer scheme (case-insensitive)
-    /// wins, else the <c>X-Api-Key</c> header; the value is trimmed. Returns null when neither
-    /// header carries a usable value.
-    /// </summary>
-    private static string? ExtractKey(HttpRequest request)
-    {
-        var authorization = request.Headers.Authorization.ToString();
-        if (authorization.StartsWith(BearerSchemePrefix, StringComparison.OrdinalIgnoreCase))
-        {
-            var key = authorization[BearerSchemePrefix.Length..].Trim();
-            return key.Length > 0 ? key : null;
-        }
-
-        if (request.Headers.TryGetValue(XApiKeyHeader, out var xApiKey))
-        {
-            var key = xApiKey.ToString().Trim();
-            return key.Length > 0 ? key : null;
-        }
-
-        return null;
     }
 
     /// <summary>

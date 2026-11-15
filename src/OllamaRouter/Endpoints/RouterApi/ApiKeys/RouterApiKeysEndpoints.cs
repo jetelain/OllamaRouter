@@ -1,8 +1,8 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.DependencyInjection;
 using OllamaRouter.Middleware;
-using OllamaRouter.Security;
 using OllamaRouter.Serialization;
+using Pmad.LocalApi.Security;
 using System.Text.Json;
 
 namespace OllamaRouter.Endpoints.RouterApi.ApiKeys;
@@ -67,7 +67,7 @@ public static class RouterApiKeysEndpoints
             .WithSummary("Rotate the default API key immediately (protected: API key required).")
             .WithDescription("Manually rotates the default key IMMEDIATELY (ignores the elapsed interval — same semantics as an "
                 + "auto-rotation tick): the previous default key is dead instantly (no grace period) and the new raw base64url "
-                + "key is returned exactly once (it is also logged at INFO by the store). 500 when the key store is unavailable. "
+                + "key is returned exactly once in the 200 response. 500 when the key store is unavailable. "
                 + "Key management is protected by the API-key middleware BY DEFINITION.");
         return app;
     }
@@ -170,7 +170,7 @@ public static class RouterApiKeysEndpoints
     /// Handler of <c>POST /api/router/api-keys/default/rotate</c> (task #50): manually rotates
     /// the default key IMMEDIATELY (ignores the elapsed interval — same semantics as an
     /// auto-rotation tick): the previous default key is dead instantly (no grace period) and
-    /// the new raw key is returned exactly once (it is also logged at INFO by the store).
+    /// the new raw key is returned exactly once in the 200 response.
     /// </summary>
     private static async Task<IResult> RotateDefaultApiKeyHandler(
         IServiceProvider serviceProvider,

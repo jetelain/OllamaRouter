@@ -1,13 +1,12 @@
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using OllamaRouter.Options;
-using OllamaRouter.Security;
 using OllamaRouter.Tests.TestHelpers;
+using Pmad.LocalApi.Security;
 
 namespace OllamaRouter.Tests.Security;
 
@@ -20,32 +19,6 @@ namespace OllamaRouter.Tests.Security;
 /// </summary>
 public class ApiKeyStoreTests : IAsyncLifetime
 {
-    private sealed class FakeHostEnvironment : IHostEnvironment
-    {
-        public FakeHostEnvironment(string contentRootPath) => ContentRootPath = contentRootPath;
-
-        public string ApplicationName { get; set; } = "ApiKeyStoreTests";
-
-        // The store only reads ContentRootPath; a throw-on-use file provider is sufficient.
-        public Microsoft.Extensions.FileProviders.IFileProvider ContentRootFileProvider { get; set; } = new EmptyFileProvider();
-
-        public string ContentRootPath { get; set; }
-
-        public string EnvironmentName { get; set; } = "Testing";
-    }
-
-    private sealed class EmptyFileProvider : Microsoft.Extensions.FileProviders.IFileProvider
-    {
-        public Microsoft.Extensions.FileProviders.IDirectoryContents GetDirectoryContents(string path)
-            => throw new NotSupportedException();
-
-        public Microsoft.Extensions.FileProviders.IFileInfo GetFileInfo(string subpath)
-            => throw new NotSupportedException();
-
-        public Microsoft.Extensions.Primitives.IChangeToken Watch(string filter)
-            => throw new NotSupportedException();
-    }
-
     /// <summary>
     /// Recording stand-in for the platform protector: prefixes the wrapped bytes with "ENC" so
     /// tests can assert the file is NOT plaintext and can seed/validate wrapped envelopes. Real
@@ -110,29 +83,8 @@ public class ApiKeyStoreTests : IAsyncLifetime
     //  Helpers
     // ------------------------------------------------------------------
 
-    private static ServiceProvider BuildProvider(string contentRoot, TestOptionsMonitor<OllamaRouterOptions> monitor)
-    {
-        var services = new ServiceCollection();
-        services.AddSingleton<IHostEnvironment>(new FakeHostEnvironment(contentRoot));
-        services.AddSingleton<IOptionsMonitor<OllamaRouterOptions>>(monitor);
-        return services.BuildServiceProvider();
-    }
-
-    private static ApiKeyStore CreateStore(
-        string contentRoot,
-        IKeyProtector protector,
-        OllamaRouterOptions options,
-        out ServiceProvider? provider,
-        ILogger<ApiKeyStore>? logger = null)
-    {
-        var monitor = new TestOptionsMonitor<OllamaRouterOptions>(options);
-        provider = BuildProvider(contentRoot, monitor);
-        return new ApiKeyStore(
-            provider.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>(),
-            provider,
-            protector,
-            logger);
-    }
+    private static ApiKeyStore CreateStore(string contentRoot, IKeyProtector protector, ILogger<ApiKeyStore>? logger = null)
+        => new(Path.Combine(contentRoot, "config"), protector, logger);
 
     /// <summary>
     /// Capturing <see cref="ILogger{TCategoryName}"/> (pattern: DynamicContextSizingTests.TestLogger):
@@ -239,8 +191,7 @@ public class ApiKeyStoreTests : IAsyncLifetime
     [Fact]
     public void FirstStart_CreatesDefaultKeyFile_RoundTripsKeyAndGeneratedAt()
     {
-        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), out var provider);
-        provider.Dispose();
+        var store = CreateStore(_contentRoot, new PlainKeyProtector());
         var key = store.GetDefaultKey();
 
         Assert.True(ApiKeyCrypto.IsValidApiKeyFormat(key));
@@ -261,7 +212,7 @@ public class ApiKeyStoreTests : IAsyncLifetime
     public void FirstStart_WithEncryptingProtector_FileBytesAreNotPlaintext()
     {
         var protector = new FakeKeyProtector();
-        var store = CreateStore(_contentRoot, protector, new OllamaRouterOptions(), out _);
+        var store = CreateStore(_contentRoot, protector);
         var key = store.GetDefaultKey();
 
         var raw = File.ReadAllBytes(DefaultKeyPath(_contentRoot));
@@ -292,7 +243,7 @@ public class ApiKeyStoreTests : IAsyncLifetime
         // Unwrappable garbage → regenerate.
         File.WriteAllBytes(DefaultKeyPath(_contentRoot), [0x00, 0x01, 0x02, 0x03]);
 
-        var store = CreateStore(_contentRoot, protector, new OllamaRouterOptions(), out _);
+        var store = CreateStore(_contentRoot, protector);
         var key = store.GetDefaultKey();
         Assert.True(ApiKeyCrypto.IsValidApiKeyFormat(key));
         Assert.True(store.ValidateKey(key));
@@ -310,7 +261,7 @@ public class ApiKeyStoreTests : IAsyncLifetime
             DefaultKeyPath(_contentRoot),
             protector.Protect(System.Text.Encoding.UTF8.GetBytes(badEnvelope.ToJsonString())));
 
-        var store = CreateStore(_contentRoot, protector, new OllamaRouterOptions(), out _);
+        var store = CreateStore(_contentRoot, protector);
         var key = store.GetDefaultKey();
         Assert.True(ApiKeyCrypto.IsValidApiKeyFormat(key));
         Assert.True(store.ValidateKey(key));
@@ -323,7 +274,7 @@ public class ApiKeyStoreTests : IAsyncLifetime
         var known = ApiKeyCrypto.GenerateKey();
         SeedDefaultKey(_contentRoot, protector, known, DateTimeOffset.UtcNow.AddMinutes(-5));
 
-        var store = CreateStore(_contentRoot, protector, new OllamaRouterOptions(), out _);
+        var store = CreateStore(_contentRoot, protector);
         Assert.Equal(known, store.GetDefaultKey());
         Assert.True(protector.UnprotectCalls >= 1, "the seeded file must be unwrapped through the protector on load");
         Assert.True(store.ValidateKey(known));
@@ -340,7 +291,7 @@ public class ApiKeyStoreTests : IAsyncLifetime
     [Fact]
     public async Task CreateUserKey_PersistsHashOnly_NeverTheRawKey()
     {
-        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), out _);
+        var store = CreateStore(_contentRoot, new PlainKeyProtector());
         _ = store.GetDefaultKey(); // force init
 
         var result = await store.CreateUserKeyAsync("worker", 168);
@@ -377,7 +328,7 @@ public class ApiKeyStoreTests : IAsyncLifetime
     [Fact]
     public async Task CreateUserKey_TwoKeys_NeverShareASalt()
     {
-        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), out _);
+        var store = CreateStore(_contentRoot, new PlainKeyProtector());
         var first = await store.CreateUserKeyAsync("a", null);
         var second = await store.CreateUserKeyAsync("b", null);
         Assert.True(first.Success && second.Success);
@@ -404,13 +355,13 @@ public class ApiKeyStoreTests : IAsyncLifetime
         var legacyKey = ApiKeyCrypto.GenerateKey();
         SeedLegacyV1UserKeys(_contentRoot, [("legacy", legacyKey)]);
         var logger = new CapturingLogger();
-        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), provider: out _, logger: logger);
+        var store = CreateStore(_contentRoot, new PlainKeyProtector(), logger);
 
         Assert.Empty(store.GetUserKeys());
         Assert.False(store.ValidateKey(legacyKey), "legacy unsalted-hash keys must no longer validate");
         Assert.True(
-            logger.AnyWarningContains("invalidat", "POST /api/router/api-keys"),
-            "the prominent invalidation warning must be logged (with the recreate pointer)");
+            logger.AnyWarningContains("loaded EMPTY", "was rejected"),
+            "the prominent invalidation warning must be logged (fail-open, store rejected)");
 
         // Next mutation re-writes the file as v2 with ONLY the new entry.
         var result = await store.CreateUserKeyAsync("fresh", null);
@@ -452,9 +403,9 @@ public class ApiKeyStoreTests : IAsyncLifetime
         File.WriteAllText(path, new JsonObject { ["version"] = 2, ["keys"] = keys }.ToJsonString());
 
         var logger = new CapturingLogger();
-        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), provider: out _, logger: logger);
+        var store = CreateStore(_contentRoot, new PlainKeyProtector(), logger);
         Assert.Empty(store.GetUserKeys());
-        Assert.True(logger.AnyWarningContains("invalidat"), "the invalidation warning must be logged (rule D1: missing salt)");
+        Assert.True(logger.AnyWarningContains("loaded EMPTY", "was rejected"), "the invalidation warning must be logged (rule D1: missing salt)");
     }
 
     [Fact]
@@ -477,9 +428,9 @@ public class ApiKeyStoreTests : IAsyncLifetime
         File.WriteAllText(path, new JsonObject { ["version"] = 2, ["keys"] = keys }.ToJsonString());
 
         var logger = new CapturingLogger();
-        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), provider: out _, logger: logger);
+        var store = CreateStore(_contentRoot, new PlainKeyProtector(), logger);
         Assert.Empty(store.GetUserKeys());
-        Assert.True(logger.AnyWarningContains("invalidat"), "the invalidation warning must be logged (rule D1: 8-byte salt)");
+        Assert.True(logger.AnyWarningContains("loaded EMPTY", "was rejected"), "the invalidation warning must be logged (rule D1: 8-byte salt)");
     }
 
     [Fact]
@@ -501,15 +452,15 @@ public class ApiKeyStoreTests : IAsyncLifetime
         File.WriteAllText(path, new JsonObject { ["version"] = 2, ["keys"] = keys }.ToJsonString());
 
         var logger = new CapturingLogger();
-        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), provider: out _, logger: logger);
+        var store = CreateStore(_contentRoot, new PlainKeyProtector(), logger);
         Assert.Empty(store.GetUserKeys());
-        Assert.True(logger.AnyWarningContains("invalidat"), "the invalidation warning must be logged (rule D1: non-base64 salt)");
+        Assert.True(logger.AnyWarningContains("loaded EMPTY", "was rejected"), "the invalidation warning must be logged (rule D1: non-base64 salt)");
     }
 
     [Fact]
     public async Task CreateUserKey_NoExpiry_ExpiresAtIsNull_AndKeyNeverExpires()
     {
-        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), out _);
+        var store = CreateStore(_contentRoot, new PlainKeyProtector());
         var result = await store.CreateUserKeyAsync("forever", null);
         Assert.True(result.Success);
         Assert.Null(result.Created!.ExpiresAt);
@@ -521,7 +472,7 @@ public class ApiKeyStoreTests : IAsyncLifetime
     [Fact]
     public async Task CreateUserKey_DuplicateName_ReturnsDuplicate()
     {
-        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), out _);
+        var store = CreateStore(_contentRoot, new PlainKeyProtector());
         var first = await store.CreateUserKeyAsync("dup", null);
         Assert.True(first.Success);
 
@@ -542,7 +493,7 @@ public class ApiKeyStoreTests : IAsyncLifetime
     [InlineData("tab\tname")]
     public async Task CreateUserKey_InvalidName_ReturnsInvalidInput(string? name)
     {
-        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), out _);
+        var store = CreateStore(_contentRoot, new PlainKeyProtector());
         var result = await store.CreateUserKeyAsync(name!, null);
         Assert.False(result.Success);
         Assert.Equal(ApiKeyCreateFailure.InvalidInput, result.Failure);
@@ -551,7 +502,7 @@ public class ApiKeyStoreTests : IAsyncLifetime
     [Fact]
     public async Task CreateUserKey_NameTooLong_ReturnsInvalidInput()
     {
-        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), out _);
+        var store = CreateStore(_contentRoot, new PlainKeyProtector());
         var result = await store.CreateUserKeyAsync(new string('a', 65), null);
         Assert.False(result.Success);
         Assert.Equal(ApiKeyCreateFailure.InvalidInput, result.Failure);
@@ -563,7 +514,7 @@ public class ApiKeyStoreTests : IAsyncLifetime
     [InlineData(-100)]
     public async Task CreateUserKey_ValidForBelowOne_ReturnsInvalidInput(int validFor)
     {
-        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), out _);
+        var store = CreateStore(_contentRoot, new PlainKeyProtector());
         var result = await store.CreateUserKeyAsync("hours", validFor);
         Assert.False(result.Success);
         Assert.Equal(ApiKeyCreateFailure.InvalidInput, result.Failure);
@@ -572,7 +523,7 @@ public class ApiKeyStoreTests : IAsyncLifetime
     [Fact]
     public async Task DeleteUserKey_RemovesIt_AndUnknownNameReturnsFalse()
     {
-        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), out _);
+        var store = CreateStore(_contentRoot, new PlainKeyProtector());
         var created = (await store.CreateUserKeyAsync("gone", null)).Created!;
 
         Assert.True(await store.DeleteUserKeyAsync("GONE"));
@@ -588,7 +539,7 @@ public class ApiKeyStoreTests : IAsyncLifetime
     {
         var rawKey = ApiKeyCrypto.GenerateKey();
         SeedUserKeys(_contentRoot, ("masked", rawKey, null));
-        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), out _);
+        var store = CreateStore(_contentRoot, new PlainKeyProtector());
 
         var list = store.GetUserKeys();
         var info = Assert.Single(list);
@@ -609,7 +560,7 @@ public class ApiKeyStoreTests : IAsyncLifetime
             ("future", future, DateTimeOffset.UtcNow.AddHours(2)),
             ("none", none, null));
 
-        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), out _);
+        var store = CreateStore(_contentRoot, new PlainKeyProtector());
         Assert.False(store.ValidateKey(past), "an expired user key must be rejected");
         Assert.True(store.ValidateKey(future), "a non-expired user key must validate");
         Assert.True(store.ValidateKey(none), "a key without expiry must validate");
@@ -620,7 +571,7 @@ public class ApiKeyStoreTests : IAsyncLifetime
     {
         Directory.CreateDirectory(Path.GetDirectoryName(UserKeysPath(_contentRoot))!);
         File.WriteAllText(UserKeysPath(_contentRoot), "{{{ not json");
-        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), out _);
+        var store = CreateStore(_contentRoot, new PlainKeyProtector());
         Assert.Empty(store.GetUserKeys());
         Assert.True(ApiKeyCrypto.IsValidApiKeyFormat(store.GetDefaultKey()));
     }
@@ -628,7 +579,7 @@ public class ApiKeyStoreTests : IAsyncLifetime
     [Fact]
     public void UserKeysFile_IsCreatedOnlyOnFirstMutation()
     {
-        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), out _);
+        var store = CreateStore(_contentRoot, new PlainKeyProtector());
         _ = store.GetDefaultKey();
         _ = store.GetUserKeys();
         Assert.False(File.Exists(UserKeysPath(_contentRoot)), "no user keys yet: the file must not exist");
@@ -645,8 +596,8 @@ public class ApiKeyStoreTests : IAsyncLifetime
         var known = ApiKeyCrypto.GenerateKey();
         SeedDefaultKey(_contentRoot, protector, known, DateTimeOffset.UtcNow.AddMinutes(-5));
 
-        var store = CreateStore(_contentRoot, protector, new OllamaRouterOptions(), out _);
-        Assert.False(await store.RotateDefaultKeyIfStaleAsync(), "a fresh key (24h interval) must not rotate");
+        var store = CreateStore(_contentRoot, protector);
+        Assert.False(await store.RotateDefaultKeyIfStaleAsync(TimeSpan.FromHours(24)), "a fresh key (24h interval) must not rotate");
         Assert.Equal(known, store.GetDefaultKey());
         Assert.True(store.ValidateKey(known));
     }
@@ -658,9 +609,9 @@ public class ApiKeyStoreTests : IAsyncLifetime
         var oldKey = ApiKeyCrypto.GenerateKey();
         SeedDefaultKey(_contentRoot, protector, oldKey, DateTimeOffset.UtcNow.AddHours(-25)); // 25h > 24h default
 
-        var store = CreateStore(_contentRoot, protector, new OllamaRouterOptions(), out _);
+        var store = CreateStore(_contentRoot, protector);
         Assert.False(store.ValidateKey("nonsense"), "sanity");
-        Assert.True(await store.RotateDefaultKeyIfStaleAsync(), "a 25h-old key must rotate at the 24h default");
+        Assert.True(await store.RotateDefaultKeyIfStaleAsync(TimeSpan.FromHours(24)), "a 25h-old key must rotate at the 24h default");
 
         var newKey = store.GetDefaultKey();
         Assert.NotEqual(oldKey, newKey);
@@ -678,22 +629,42 @@ public class ApiKeyStoreTests : IAsyncLifetime
         var known = ApiKeyCrypto.GenerateKey();
         SeedDefaultKey(_contentRoot, protector, known, DateTimeOffset.UtcNow.AddHours(-2));
 
-        var options = new OllamaRouterOptions(); // 24h default
-        var store = CreateStore(_contentRoot, protector, options, out var provider);
-        Assert.False(await store.RotateDefaultKeyIfStaleAsync(), "2h old at a 24h interval: no rotation");
+        // Task #115: the store no longer holds the options monitor — the caller computes the
+        // live interval from the monitor on every check, exactly like
+        // DefaultKeyRotationHostedService.TickAsync does.
+        var monitor = new TestOptionsMonitor<OllamaRouterOptions>(new OllamaRouterOptions()); // 24h default
+        var store = CreateStore(_contentRoot, protector);
+        Assert.False(
+            await store.RotateDefaultKeyIfStaleAsync(TimeSpan.FromHours(monitor.CurrentValue.ApiSecurity.DefaultKeyRotationHours)),
+            "2h old at a 24h interval: no rotation");
         Assert.Equal(known, store.GetDefaultKey());
 
         // LIVE rebind: the monitor now reports a 1h interval → the 2h-old key is stale.
-        var rebinned = new OllamaRouterOptions { ApiSecurity = new ApiSecurityOptions { DefaultKeyRotationHours = 1 } };
-        ((TestOptionsMonitor<OllamaRouterOptions>)provider.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>()).SetValue(rebinned);
-        Assert.True(await store.RotateDefaultKeyIfStaleAsync(), "after the live rebind to 1h, the stale key must rotate");
+        monitor.SetValue(new OllamaRouterOptions { ApiSecurity = new ApiSecurityOptions { DefaultKeyRotationHours = 1 } });
+        Assert.True(
+            await store.RotateDefaultKeyIfStaleAsync(TimeSpan.FromHours(monitor.CurrentValue.ApiSecurity.DefaultKeyRotationHours)),
+            "after the live rebind to 1h, the stale key must rotate");
         Assert.NotEqual(known, store.GetDefaultKey());
+    }
+
+    [Fact]
+    public void RotationHostedService_Constructs_WithStore_LiveMonitor_AndLogger()
+    {
+        // Task #115: the hosted service now takes the live IOptionsMonitor itself (the store no
+        // longer holds it); the 5-minute tick loop itself stays untested, as before.
+        var monitor = new TestOptionsMonitor<OllamaRouterOptions>(new OllamaRouterOptions());
+        var service = new OllamaRouter.Security.DefaultKeyRotationHostedService(
+            CreateStore(_contentRoot, new PlainKeyProtector()),
+            monitor,
+            NullLogger<OllamaRouter.Security.DefaultKeyRotationHostedService>.Instance);
+        Assert.NotNull(service);
+        service.Dispose();
     }
 
     [Fact]
     public async Task RotateDefaultKeyAsync_AlwaysRotates_ManualSemantics()
     {
-        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), out _);
+        var store = CreateStore(_contentRoot, new PlainKeyProtector());
         var first = store.GetDefaultKey();
         Assert.True(ApiKeyCrypto.IsValidApiKeyFormat(first));
 
@@ -708,7 +679,7 @@ public class ApiKeyStoreTests : IAsyncLifetime
     [Fact]
     public async Task RotateDefaultKeyAsync_InvalidatesNothingElse_UserKeysSurvive()
     {
-        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), out _);
+        var store = CreateStore(_contentRoot, new PlainKeyProtector());
         var user = (await store.CreateUserKeyAsync("survivor", null)).Created!;
         await store.RotateDefaultKeyAsync();
         Assert.True(store.ValidateKey(user.Key), "a default-key rotation must not touch user keys");
@@ -726,7 +697,7 @@ public class ApiKeyStoreTests : IAsyncLifetime
             return; // 0600 is a Unix-only concern; no-op on Windows by design.
         }
 
-        var store = CreateStore(_contentRoot, new PlainKeyProtector(), new OllamaRouterOptions(), out _);
+        var store = CreateStore(_contentRoot, new PlainKeyProtector());
         _ = store.GetDefaultKey();
         var created = (await store.CreateUserKeyAsync("perm", null)).Created!;
         _ = created;

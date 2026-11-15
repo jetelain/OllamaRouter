@@ -2,6 +2,7 @@ using OllamaRouter.App.Connection;
 using OllamaRouter.Client;
 using OllamaRouter.Client.Process;
 using OllamaRouter.Security;
+using Pmad.LocalApi.Security;
 
 namespace OllamaRouter.Tests.App;
 

@@ -9,6 +9,7 @@ using Microsoft.Extensions.Options;
 using OllamaRouter.Endpoints.RouterApi.Config;
 using OllamaRouter.Options;
 using OllamaRouter.Security;
+using Pmad.LocalApi.Security;
 
 namespace OllamaRouter.Configuration;
 

@@ -1,5 +1,8 @@
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using OllamaRouter.Options;
+using Pmad.LocalApi.Security;
 
 namespace OllamaRouter.Security;
 
@@ -11,6 +14,12 @@ namespace OllamaRouter.Security;
 /// <c>generatedAt</c> has elapsed that interval (no grace period — the old key stops working
 /// immediately; callers re-read the key after a 401). A failing tick NEVER stops the loop or
 /// the host (every tick is swallowed + logged); <see cref="StopAsync"/> cancels the loop.
+/// <para>
+/// Task #115: the store (Pmad.LocalApi.Security) no longer owns the options — this service
+/// re-reads the LIVE <c>ApiSecurity.DefaultKeyRotationHours</c> option on every tick and
+/// computes <c>TimeSpan.FromHours(...)</c> passed to
+/// <see cref="IApiKeyStore.RotateDefaultKeyIfStaleAsync(TimeSpan)"/>.
+/// </para>
 /// </summary>
 public sealed class DefaultKeyRotationHostedService : IHostedService, IDisposable
 {
@@ -21,16 +30,22 @@ public sealed class DefaultKeyRotationHostedService : IHostedService, IDisposabl
     public static readonly TimeSpan CheckInterval = TimeSpan.FromMinutes(5);
 
     private readonly IApiKeyStore _keyStore;
+    private readonly IOptionsMonitor<OllamaRouterOptions> _options;
     private readonly ILogger<DefaultKeyRotationHostedService> _logger;
     private readonly CancellationTokenSource _stop = new();
     private Task? _runTask;
 
     /// <summary>Creates the rotation service.</summary>
     /// <param name="keyStore">The API key store (rotation semantics live there).</param>
+    /// <param name="options">The live options monitor (supplies the rotation interval).</param>
     /// <param name="logger">The logger.</param>
-    public DefaultKeyRotationHostedService(IApiKeyStore keyStore, ILogger<DefaultKeyRotationHostedService> logger)
+    public DefaultKeyRotationHostedService(
+        IApiKeyStore keyStore,
+        IOptionsMonitor<OllamaRouterOptions> options,
+        ILogger<DefaultKeyRotationHostedService> logger)
     {
         _keyStore = keyStore ?? throw new ArgumentNullException(nameof(keyStore));
+        _options = options ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
@@ -86,7 +101,8 @@ public sealed class DefaultKeyRotationHostedService : IHostedService, IDisposabl
     {
         try
         {
-            if (await _keyStore.RotateDefaultKeyIfStaleAsync().ConfigureAwait(false))
+            var maxAge = TimeSpan.FromHours(_options.CurrentValue.ApiSecurity.DefaultKeyRotationHours);
+            if (await _keyStore.RotateDefaultKeyIfStaleAsync(maxAge).ConfigureAwait(false))
             {
                 _logger.LogInformation(
                     "Default API key auto-rotation ({Phase}): the previous key no longer works (no grace period).",

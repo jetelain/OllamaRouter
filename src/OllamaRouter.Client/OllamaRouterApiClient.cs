@@ -19,7 +19,7 @@ using OllamaRouter.Endpoints.RouterApi.Sessions;
 using OllamaRouter.Endpoints.RouterApi.Targets;
 using OllamaRouter.Endpoints.RouterApi.Vram;
 using OllamaRouter.Middleware;
-using OllamaRouter.Security;
+using Pmad.LocalApi.Security;
 using OllamaRouter.Services.Hardware;
 using OllamaRouter.Services.Recommendations;
 

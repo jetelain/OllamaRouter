@@ -77,6 +77,15 @@
          loading (no unsafe / no reflection) - NativeAOT-safe with the existing publish
          properties; the bundled skeychain natives ride the single-file self-extract path. -->
     <PackageReference Include="Pmad.KeySharp" Version="0.1.0" />
+    <!-- Task #115: the shared local API-key security primitives (server-side IApiKeyStore /
+         ApiKeyStore, IKeyProtector, ApiKeyHeaderParser, ApiKeyCrypto, SecretFilePermissions) —
+         the in-tree src/OllamaRouter/Security/ApiKeyStore.cs + ApiKeyCrypto.cs were replaced by
+         this package, shared with the client SDK. Native AOT-safe: net10.0, IsTrimmable, the
+         api-keys.json path rides the package's internal source-generated
+         LocalApiSecurityJsonContext, and DpapiKeyProtector is gated behind
+         OperatingSystem.IsWindows() inside KeyProtectorFactory (no new suppressions needed).
+         Also flows transitively via the OllamaRouter.Client project reference below. -->
+    <PackageReference Include="Pmad.LocalApi.Security" Version="0.1.0" />
     <PackageReference Include="Pmad.AI" Version="0.0.4" />
     <PackageReference Include="Yarp.ReverseProxy" Version="2.3.0" />
     <PackageReference Include="Serilog.AspNetCore" Version="10.0.0" />
@@ -87,9 +96,10 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Shared client SDK (task #98): wire DTOs + IKeyProtector/SecretFilePermissions moved
-         out of the server; System.Security.Cryptography.ProtectedData now flows here
-         transitively (only DpapiKeyProtector consumes it). -->
+    <!-- Shared client SDK (task #98; task #115): wire DTOs + the OllamaRouterDefaultKeyReader
+         default-key factory moved out of the server; Pmad.LocalApi.Security (IKeyProtector /
+         SecretFilePermissions and all API-key security primitives) now flows here
+         transitively. -->
     <ProjectReference Include="..\OllamaRouter.Client\OllamaRouter.Client.csproj" />
   </ItemGroup>
   <ItemGroup>
