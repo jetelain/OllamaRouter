@@ -68,4 +68,57 @@ public sealed class MonitorUsageRatioTests
 
         Assert.Equal("B: 1.2% (1.3k tokens, 7 req)", item.FormattedTooltip);
     }
+
+    // ── task #117: BuildUsageRatioLegendRows (legend wraps to ≤3 items per row) ──
+
+    private static MonitorUsageRatioItem Item(string name) => new() { Name = name, Location = "local" };
+
+    [Fact]
+    public void BuildUsageRatioLegendRows_UpToThreeItems_SingleRowPreservingOrder()
+    {
+        foreach (var count in new[] { 1, 2, 3 })
+        {
+            var items = Enumerable.Range(0, count).Select(i => Item($"T{i}")).ToList();
+            var rows = MonitorViewModel.BuildUsageRatioLegendRows(items);
+
+            Assert.Single(rows);
+            Assert.Equal(items, rows[0]);
+        }
+    }
+
+    [Theory]
+    [InlineData(4, 3, 1)]
+    [InlineData(5, 3, 2)]
+    [InlineData(6, 3, 3)]
+    [InlineData(7, 3, 3, 1)]
+    public void BuildUsageRatioLegendRows_MoreThanThreeItems_ChunksIntoConsecutiveRows(
+        int count, params int[] expectedSizes)
+    {
+        var items = Enumerable.Range(0, count).Select(i => Item($"T{i}")).ToList();
+        var rows = MonitorViewModel.BuildUsageRatioLegendRows(items);
+
+        Assert.Equal(expectedSizes, rows.Select(r => r.Count));
+        Assert.Equal(items, rows.SelectMany(r => r));
+    }
+
+    [Fact]
+    public void BuildUsageRatioLegendRows_EmptyInput_ReturnsNoRows()
+    {
+        Assert.Empty(MonitorViewModel.BuildUsageRatioLegendRows(Array.Empty<MonitorUsageRatioItem>()));
+    }
+
+    [Fact]
+    public void BuildUsageRatioLegendRows_NullInput_ReturnsNoRows()
+    {
+        Assert.Empty(MonitorViewModel.BuildUsageRatioLegendRows(null));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void BuildUsageRatioLegendRows_InvalidItemsPerRow_Throws(int itemsPerRow)
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            MonitorViewModel.BuildUsageRatioLegendRows([Item("A")], itemsPerRow));
+    }
 }

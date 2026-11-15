@@ -120,9 +120,9 @@
           <Grid ColumnDefinitions="240,140,120,90,90,80,100" Margin="0,0,0,4">
             <TextBlock Grid.Column="0" Text="MODEL" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
             <TextBlock Grid.Column="1" Text="TARGET" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
-            <TextBlock Grid.Column="2" Text="VRAM SIZE" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="2" Text="VRAM SIZE" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold" TextAlignment="Right"/>
             <TextBlock Grid.Column="3" Text="QUANT" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
-            <TextBlock Grid.Column="4" Text="CONTEXT" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="4" Text="CONTEXT" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold" TextAlignment="Right"/>
             <TextBlock Grid.Column="5" Text="LIVENESS" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
             <TextBlock Grid.Column="6" Text="STATUS" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
           </Grid>
@@ -138,9 +138,9 @@
                                Foreground="{Binding Target, Converter={x:Static local:TargetBrushConverter.Instance}}"
                                FontWeight="SemiBold" VerticalAlignment="Center"/>
                   </StackPanel>
-                  <TextBlock Grid.Column="2" Text="{Binding SizeVramBytes, Converter={x:Static local:ByteSizeConverter.Instance}}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="2" Text="{Binding SizeVramBytes, Converter={x:Static local:ByteSizeConverter.Instance}}" VerticalAlignment="Center" TextAlignment="Right"/>
                   <TextBlock Grid.Column="3" Text="{Binding Quantization}" Foreground="{DynamicResource SemiColorText2}" VerticalAlignment="Center"/>
-                  <TextBlock Grid.Column="4" Text="{Binding ContextLength, Converter={x:Static local:ContextSizeConverter.Instance}}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="4" Text="{Binding ContextLength, Converter={x:Static local:ContextSizeConverter.Instance}}" VerticalAlignment="Center" TextAlignment="Right"/>
                   <TextBlock Grid.Column="5" Text="{Binding Liveness}" Foreground="{DynamicResource SemiColorText2}" VerticalAlignment="Center"/>
                   <TextBlock Grid.Column="6" Text="{Binding Stale, StringFormat='stale: {0}'}" Foreground="{DynamicResource SemiColorText2}" VerticalAlignment="Center"/>
                 </Grid>

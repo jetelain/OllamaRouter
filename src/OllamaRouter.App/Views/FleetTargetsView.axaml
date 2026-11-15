@@ -48,7 +48,7 @@
                     <TextBlock Text="{Binding ApiKeyConfigured, StringFormat='key: {0}'}" Foreground="{DynamicResource SemiColorText2}"/>
                   </StackPanel>
                   <TextBlock Grid.Column="4" Text="{Binding ResidentModels.Count}"
-                             ToolTip.Tip="Resident models" VerticalAlignment="Center"/>
+                             ToolTip.Tip="Resident models" VerticalAlignment="Center" TextAlignment="Right"/>
                   <StackPanel Grid.Column="5" Orientation="Horizontal" Spacing="6">
                     <Button Content="Edit" Click="OnEditTargetClick" Tag="{Binding}"/>
                     <Button Content="Delete" Classes="Danger" Click="OnDeleteTargetClick" Tag="{Binding}"/>

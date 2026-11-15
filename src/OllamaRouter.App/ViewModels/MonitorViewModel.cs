@@ -34,7 +34,18 @@ public sealed record MonitorRecentRequestRow(
     int? CachedInputTokens,
     double ElapsedMs,
     int? StatusCode,
-    bool Success);
+    bool Success)
+{
+    /// <summary>True when the request failed (non-2xx / unsuccessful) — the UI renders the
+    /// STATUS text in red for these rows.</summary>
+    public bool IsFailure => !Success;
+}
+
+/// <summary>
+/// One column of the Monitor tab's Recent Requests table (task #117). Single source of truth
+/// for the column contract: the XAML grids mirror this order exactly, and the tests pin it.
+/// </summary>
+public sealed record MonitorRecentRequestColumn(string Key, string Header, bool IsNumeric);
 
 /// <summary>
 /// One 7-day per-target statistics row (wire:
@@ -232,6 +243,57 @@ public sealed partial class MonitorViewModel : RouterTabViewModel
     /// <summary>Usage ratio segments for the 7-day breakdown.</summary>
     public ObservableCollection<MonitorUsageRatioItem> UsageRatios { get; } = [];
 
+    /// <summary>
+    /// The Recent Requests table column contract (task #117): 8 columns in render order,
+    /// TIMESTAMP, TARGET, MODEL, PROMPT, CACHED, RESPONSE, ELAPSED, STATUS (no RESULT column).
+    /// CACHED sits immediately after PROMPT because it is the cached subset of prompt tokens.
+    /// </summary>
+    public static IReadOnlyList<MonitorRecentRequestColumn> RecentRequestColumns { get; } =
+    [
+        new MonitorRecentRequestColumn("timestamp", "TIMESTAMP", false),
+        new MonitorRecentRequestColumn("target", "TARGET", false),
+        new MonitorRecentRequestColumn("model", "MODEL", false),
+        new MonitorRecentRequestColumn("prompt", "PROMPT", true),
+        new MonitorRecentRequestColumn("cached", "CACHED", true),
+        new MonitorRecentRequestColumn("response", "RESPONSE", true),
+        new MonitorRecentRequestColumn("elapsed", "ELAPSED", true),
+        new MonitorRecentRequestColumn("status", "STATUS", true),
+    ];
+
+    /// <summary>
+    /// Splits the flat usage-ratio legend items into rows of at most <paramref name="itemsPerRow"/>
+    /// items (task #117) so the legend wraps deterministically within the panel width (the page
+    /// ScrollViewer measures content with infinite width, so a WrapPanel would never wrap).
+    /// Consecutive order-preserving chunks: n≤3 → 1 row, n=4 → [3,1], n=5 → [3,2], n=6 → [3,3],
+    /// n=7 → [3,3,1]; null/empty input → an empty row list. The fixed per-row cap bounds the
+    /// legend's natural width, so it can never drive horizontal overflow.
+    /// </summary>
+    public static IReadOnlyList<IReadOnlyList<MonitorUsageRatioItem>> BuildUsageRatioLegendRows(
+        IReadOnlyList<MonitorUsageRatioItem> items, int itemsPerRow = 3)
+    {
+        if (itemsPerRow < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(itemsPerRow), "itemsPerRow must be >= 1.");
+        }
+
+        if (items is null || items.Count == 0)
+        {
+            return [];
+        }
+
+        var rows = new List<IReadOnlyList<MonitorUsageRatioItem>>(
+            (items.Count + itemsPerRow - 1) / itemsPerRow);
+        for (var start = 0; start < items.Count; start += itemsPerRow)
+        {
+            rows.Add(items
+                .Skip(start)
+                .Take(itemsPerRow)
+                .ToArray());
+        }
+
+        return rows;
+    }
+
     /// <summary>Summary text for the usage ratio progress bar (e.g. "9.7M tokens").</summary>
     [ObservableProperty]
     private string _usageRatioSummary = "0 tokens";
@@ -243,6 +305,15 @@ public sealed partial class MonitorViewModel : RouterTabViewModel
     /// </summary>
     [ObservableProperty]
     private bool _hasUsageActivity;
+
+    /// <summary>
+    /// The usage-ratio legend items split into rows of ≤3 (task #117, see
+    /// <see cref="BuildUsageRatioLegendRows"/>): the legend renders one horizontal row per entry,
+    /// breaking onto a second line within the panel width when more than 3 targets exist.
+    /// Rebuilt together with <see cref="UsageRatios"/> on every refresh.
+    /// </summary>
+    [ObservableProperty]
+    private IReadOnlyList<IReadOnlyList<MonitorUsageRatioItem>> _usageRatioLegendRows = [];
 
     /// <summary>Whether cost &amp; savings data is available.</summary>
     [ObservableProperty]
@@ -391,6 +462,10 @@ public sealed partial class MonitorViewModel : RouterTabViewModel
                     Requests = e.Requests
                 });
             }
+
+            // Legend wrapping (task #117): chunk the flat legend into ≤3 items per row so it
+            // breaks onto a second line within the panel width instead of one unbounded row.
+            UsageRatioLegendRows = BuildUsageRatioLegendRows(UsageRatios);
 
             // Savings & cost
             HasCost = state.Cost != null;
