@@ -14,7 +14,7 @@ namespace OllamaRouter.Services.ModelUninstall;
 /// <see cref="RouterApiSharedHelpers.GetFleetModelNamesAsync"/> enumeration (unknown →
 /// "model not found: {model}"), (2) the effective-target roster check per requested name
 /// (case-insensitive; first unknown → "target not found: {name}", ZERO daemon calls).
-/// Execution is ONE fail-soft <c>POST {target}/api/delete</c> per selected target IN REQUEST
+/// Execution is ONE fail-soft <c>DELETE {target}/api/delete</c> per selected target IN REQUEST
 /// ORDER (case-insensitive duplicate names collapse onto the same canonical target); a
 /// daemon 404 ("model not found") or an unreachable daemon surfaces as that target's row
 /// only — the remaining targets are always processed.
@@ -86,7 +86,7 @@ public sealed class ModelUninstallService : IModelUninstallService
             selected.Add((match, requested));
         }
 
-        // ---- 3. Execution: ONE fail-soft POST /api/delete per selected target, request order ----
+        // ---- 3. Execution: ONE fail-soft DELETE /api/delete per selected target, request order ----
         var rows = new List<ModelUninstallTargetOutcome>(selected.Count);
         foreach (var (target, _) in selected)
         {

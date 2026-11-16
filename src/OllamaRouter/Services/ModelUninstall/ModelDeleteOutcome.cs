@@ -1,7 +1,7 @@
 namespace OllamaRouter.Services.ModelUninstall;
 
 /// <summary>
-/// The fail-soft result of one daemon-level <c>POST /api/delete</c> call
+/// The fail-soft result of one daemon-level <c>DELETE /api/delete</c> call
 /// (<see cref="IOllamaModelCatalogClient.DeleteModelAsync"/> in
 /// <c>OllamaRouter.Services.Catalog</c>): <see cref="Deleted"/> true on a 2xx delete,
 /// false otherwise with a bounded <see cref="Error"/> text (non-2xx → "http {status}"

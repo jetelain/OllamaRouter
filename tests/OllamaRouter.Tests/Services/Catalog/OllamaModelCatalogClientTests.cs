@@ -820,10 +820,25 @@ public class OllamaModelCatalogClientTests
 
         Assert.True(outcome.Deleted);
         Assert.Null(outcome.Error);
-        Assert.Equal(HttpMethod.Post, handler.LastRequest?.Method);
+        Assert.Equal(HttpMethod.Delete, handler.LastRequest?.Method);
         Assert.Equal("http://127.0.0.1:11435/api/delete", handler.LastRequest?.RequestUri?.ToString());
+        Assert.Equal("application/json", handler.LastRequest?.Content?.Headers.ContentType?.MediaType);
         var body = System.Text.Json.Nodes.JsonNode.Parse(handler.LastRequestBody!)!.AsObject()!;
         Assert.Equal("llama3:8b", body["model"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task DeleteModelAsync_405Rejected_SurfacesHttpStatusOnly()
+    {
+        // The exact field-reported shape: a router-port or reverse-proxy target that rejects the
+        // method on /api/delete returns a bare 405 without a JSON body.
+        var (sut, handler) = CreateSut(_ => new HttpResponseMessage(HttpStatusCode.MethodNotAllowed));
+
+        var outcome = await sut.DeleteModelAsync("http://127.0.0.1:11435", "Qwen3.6-27B:latest");
+
+        Assert.False(outcome.Deleted);
+        Assert.Equal("http 405", outcome.Error);
+        Assert.Equal(HttpMethod.Delete, handler.LastRequest?.Method);
     }
 
     [Fact]

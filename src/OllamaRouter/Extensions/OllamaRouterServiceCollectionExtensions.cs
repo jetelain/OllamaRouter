@@ -434,7 +434,7 @@ public static class OllamaRouterServiceCollectionExtensions
 
         // Model uninstall (task #126, report item #7): the destructive counterpart of the
         // model pre-load — validates the fleet model + target roster BEFORE any daemon call,
-        // then issues ONE fail-soft POST {target}/api/delete per selected target (request
+        // then issues ONE fail-soft DELETE {target}/api/delete per selected target (request
         // order) via the 4 s catalog client. All enrichment dependencies are
         // nullable-tolerant so minimal test hosts keep working (defensive, like every other
         // endpoint in this graph).

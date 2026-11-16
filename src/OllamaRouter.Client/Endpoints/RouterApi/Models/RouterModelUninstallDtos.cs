@@ -14,7 +14,7 @@ public sealed record RouterModelUninstallRequest(
 
 /// <summary>
 /// One per-target row of the uninstall response: the CANONICAL configured target name,
-/// whether the daemon's <c>POST /api/delete</c> succeeded and the fail-soft error text
+/// whether the daemon's <c>DELETE /api/delete</c> succeeded and the fail-soft error text
 /// (the daemon's 404 "model not found" / an unreachable daemon) when it did not. Partial
 /// failures are still a 200 — the failing rows simply carry <c>success:false</c>.
 /// </summary>

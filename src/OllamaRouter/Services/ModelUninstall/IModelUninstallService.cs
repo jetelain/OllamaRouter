@@ -3,7 +3,7 @@ namespace OllamaRouter.Services.ModelUninstall;
 /// <summary>
 /// The per-target result of a model uninstall (task #126): the CANONICAL configured
 /// target name (echoed even when the request used a different casing), whether the
-/// daemon's <c>POST /api/delete</c> succeeded, and the fail-soft error text (the daemon's
+/// daemon's <c>DELETE /api/delete</c> succeeded, and the fail-soft error text (the daemon's
 /// 404 "model not found" / an unreachable daemon) when it did not.
 /// </summary>
 public sealed record ModelUninstallTargetOutcome(string Target, bool Success, string? Error = null);
@@ -24,7 +24,7 @@ public sealed record ModelUninstallResult(
 /// the destructive counterpart of the model pre-load (task #44). Validation is a pure
 /// fleet-state check (shared <c>RouterApiSharedHelpers</c> fleet-name enumeration + the
 /// effective-target roster) BEFORE any daemon is touched; execution is ONE fail-soft
-/// <c>POST {target}/api/delete</c> per selected target (in request order, duplicates
+/// <c>DELETE {target}/api/delete</c> per selected target (in request order, duplicates
 /// collapsed case-insensitively) via the raw-HttpClient catalog client — no routing
 /// middleware, no lease mutation. After a successful delete the model disappears from the
 /// daemon's /api/tags and /api/ps, so the digest-keyed capability cache and the 2 s

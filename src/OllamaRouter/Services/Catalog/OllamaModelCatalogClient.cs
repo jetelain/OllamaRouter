@@ -225,7 +225,14 @@ public sealed class OllamaModelCatalogClient(HttpClient httpClient, IHttpClientF
         {
             var payload = new JsonObject { ["model"] = modelName };
             using var content = new StringContent(payload.ToJsonString(), Encoding.UTF8, "application/json");
-            var response = await httpClient.PostAsync(BuildUrl(baseUrl, "/api/delete"), content, cancellationToken).ConfigureAwait(false);
+            // DELETE is the universally-accepted verb: bare Ollama daemons accept both POST and
+            // DELETE on /api/delete, while OllamaRouter's own pinned-management middleware only
+            // forwards DELETE to a daemon — so router-port or proxied targets no longer 405.
+            using var request = new HttpRequestMessage(HttpMethod.Delete, BuildUrl(baseUrl, "/api/delete"))
+            {
+                Content = content
+            };
+            var response = await httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
             if (response.IsSuccessStatusCode)
             {
                 return new ModelDeleteOutcome(true);

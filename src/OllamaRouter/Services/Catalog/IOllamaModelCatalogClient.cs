@@ -91,8 +91,10 @@ public interface IOllamaModelCatalogClient
     Task<IReadOnlyList<string>> StopRunningModelsAsync(string? baseUrl, CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Deletes a model from the specified instance via <c>POST {base}/api/delete</c> with a
+    /// Deletes a model from the specified instance via <c>DELETE {base}/api/delete</c> with a
     /// <c>{"model": "..."}</c> body (task #126 — the model cartography uninstall action).
+    /// DELETE is the verb OllamaRouter's own pinned-management middleware forwards to a daemon
+    /// (daemons accept both POST and DELETE), so bare daemons and router-port targets alike work.
     /// Fail-soft like <see cref="UnloadModelAsync"/> / <see cref="PreloadModelAsync"/>: never
     /// throws; blank url/model → (false, "no target url or model name"), 2xx → (true, null),
     /// non-2xx → (false, "http {status}" + the bounded daemon <c>error</c> property when the

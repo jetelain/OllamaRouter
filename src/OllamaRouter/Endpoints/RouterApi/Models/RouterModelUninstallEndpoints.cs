@@ -11,7 +11,7 @@ namespace OllamaRouter.Endpoints.RouterApi.Models;
 /// The model uninstall endpoint of the OllamaRouter programmatic management API (task
 /// #126, report item #7): <c>POST /api/router/models/uninstall</c> permanently deletes a
 /// model from one or more fleet nodes — the destructive counterpart of the model pre-load
-/// (task #44). The router issues ONE fail-soft <c>POST {target}/api/delete</c> per selected
+/// (task #44). The router issues ONE fail-soft <c>DELETE {target}/api/delete</c> per selected
 /// target daemon directly (never through the routing middleware / YARP); a failing target
 /// (daemon 404 "model not found", unreachable node) never aborts the remaining ones. After
 /// a successful delete the model disappears from the daemon's /api/tags and /api/ps, so the
@@ -41,7 +41,7 @@ public static class RouterModelUninstallEndpoints
             .WithTags("Fleet Operations")
             .WithSummary("Router-owned model uninstall (permanent delete) on the selected fleet targets.")
             .WithDescription("DESTRUCTIVE + PERSISTENT: permanently deletes the model files of the given model from the "
-                + "selected fleet nodes (POST {target}/api/delete per target daemon, request order, fail-soft per target — "
+                + "selected fleet nodes (DELETE {target}/api/delete per target daemon, request order, fail-soft per target — "
                 + "a failing target never aborts the others; the loaded instance on the daemon is removed as well, and the "
                 + "router's /api/ps tracker + digest-keyed capability cache pick up the deletion within their refresh "
                 + "windows). API-key-protected in default mode (Authorization: Bearer or X-Api-Key). Request body (REQUIRED): "
