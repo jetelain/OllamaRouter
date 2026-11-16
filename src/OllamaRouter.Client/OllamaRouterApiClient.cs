@@ -90,6 +90,18 @@ public interface IOllamaRouterApiClient
         string modelName, RouterModelPreloadRequest? request = null, CancellationToken ct = default);
 
     /// <summary>
+    /// <c>POST /api/router/models/uninstall</c> (task #126): permanently deletes the model from
+    /// the selected fleet targets (body-only contract: <c>{ model, targets[] }</c>).
+    /// Key-protected in default mode (the <see cref="IDefaultKeyReader"/> / explicit key handles
+    /// the 401). Returns the per-target execution report IN REQUEST ORDER (fail-soft: a failing
+    /// target never aborts the others — its row carries <c>success:false</c> + the daemon's
+    /// error text). 400 (invalid body) / 404 (unknown model or target — checked before ANY
+    /// daemon call) surface as <see cref="OllamaRouterApiException"/>.
+    /// </summary>
+    Task<RouterModelUninstallResponse> UninstallModelAsync(
+        string model, IReadOnlyList<string> targets, CancellationToken ct = default);
+
+    /// <summary>
     /// <c>GET /api/router/preload/preview</c>: the side-effect-free preload selection (query
     /// parameters <c>model</c> / <c>keepAliveSeconds</c> / <c>contextIntentTokens</c> / <c>target</c>).
     /// </summary>
@@ -397,6 +409,17 @@ public sealed class OllamaRouterApiClient : IOllamaRouterApiClient, IDisposable
             request,
             OllamaRouterClientJsonContext.Default.RouterModelPreloadRequest,
             OllamaRouterClientJsonContext.Default.RouterModelPreloadResponse,
+            ct);
+
+    /// <inheritdoc />
+    public Task<RouterModelUninstallResponse> UninstallModelAsync(
+        string model, IReadOnlyList<string> targets, CancellationToken ct = default) =>
+        SendWithBodyAsync(
+            HttpMethod.Post,
+            "api/router/models/uninstall",
+            new RouterModelUninstallRequest(model, targets),
+            OllamaRouterClientJsonContext.Default.RouterModelUninstallRequest,
+            OllamaRouterClientJsonContext.Default.RouterModelUninstallResponse,
             ct);
 
     /// <inheritdoc />

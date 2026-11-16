@@ -18,6 +18,7 @@ using OllamaRouter.Services.Catalog;
 using OllamaRouter.Services;
 using OllamaRouter.Services.ContextSizing;
 using OllamaRouter.Services.Monitoring;
+using OllamaRouter.Services.ModelUninstall;
 using OllamaRouter.Services.Preload;
 using OllamaRouter.Services.Process;
 using OllamaRouter.Services.Routing;
@@ -406,6 +407,20 @@ public static class OllamaRouterServiceCollectionExtensions
             sp.GetService<ITargetExecutionTracker>(),
             sp.GetService<IFleetHardwareService>(),
             sp.GetRequiredService<ILogger<ModelPreloadService>>()));
+
+        // Model uninstall (task #126, report item #7): the destructive counterpart of the
+        // model pre-load — validates the fleet model + target roster BEFORE any daemon call,
+        // then issues ONE fail-soft POST {target}/api/delete per selected target (request
+        // order) via the 4 s catalog client. All enrichment dependencies are
+        // nullable-tolerant so minimal test hosts keep working (defensive, like every other
+        // endpoint in this graph).
+        services.AddSingleton<IModelUninstallService>(sp => new ModelUninstallService(
+            sp.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>(),
+            sp.GetRequiredService<IOllamaModelCatalogClient>(),
+            sp.GetService<IModelCatalogCacheService>(),
+            sp.GetService<IFleetAggregationService>(),
+            sp.GetService<ITargetAvailabilityService>(),
+            sp.GetRequiredService<ILogger<ModelUninstallService>>()));
 
         // Micro-benchmark engine (task #28): the candidate catalog is code-defined in v1
         // (a config.json binding hook is out of scope), the "Benchmark" client carries no

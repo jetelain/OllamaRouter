@@ -266,6 +266,58 @@ public sealed class CartographyViewModelTests : IAsyncLifetime
         Assert.Empty(_client.PreviewCalls);
     }
 
+    [Fact]
+    public async Task UninstallDialog_SourcesExactlyThePresentTargets_NoCloudNoAbsentTargets()
+    {
+        // Extend the fixture: llama3:8b is present on Local AND a Remote node (Remote gets a
+        // capable deployment); qwen2:72b is present on Local but vetoed (present = uninstallable);
+        // a third model (mistral:7b) is absent everywhere (its row must not offer uninstall).
+        var response = BuildCartography();
+        var remote = new CartographyNodeRow(
+            "Remote", "remote", true, "Online", false, "8k", 0, 0,
+            [], "http://remote:11434/", null,
+            new CartographyNodeHardware(true, "A100", "NVIDIA", 32768, 65536));
+        var models = response.Models.Select(model => new CartographyModelRow(
+            model.Name, model.Architecture, model.WeightSizeBytes, model.NativeContextWindow,
+            model.RecommendedContextWindow, model.CloudOverflowAvailable,
+            [
+                .. model.Deployments,
+                model.Name == "llama3:8b"
+                    ? new CartographyDeploymentRow("Remote", true, true, 16384, true, 3, null, 1L * 1024 * 1024, "Q8_0")
+                    : new CartographyDeploymentRow("Remote", false, false, 0, false, 0, null, null, null),
+            ],
+            model.RecommendedContextWindow * 1000, model.Quantization)).ToArray();
+        models = [
+            .. models,
+            new CartographyModelRow(
+                "mistral:7b", "llama", 4L * 1024 * 1024 * 1024, 8192, 8192, false,
+                [new CartographyDeploymentRow("Local", false, true, 8192, true, 0, null, null, null)],
+                7_000_000_000, null),
+        ];
+        _client.CartographyResponse = new RouterCartographyResponse(
+            [.. response.Nodes.Where(n => n.Name != "Cloud"), remote], models, response.LoadedModels);
+
+        await _viewModel.RefreshAsync();
+
+        // AC1: the button flag mirrors presence.
+        var llama = _viewModel.Models.First(m => m.Name == "llama3:8b");
+        var qwen = _viewModel.Models.First(m => m.Name == "qwen2:72b");
+        var mistral = _viewModel.Models.First(m => m.Name == "mistral:7b");
+        Assert.True(llama.HasPresentTargets);
+        Assert.True(qwen.HasPresentTargets); // present-but-vetoed still carries the files
+        Assert.False(mistral.HasPresentTargets); // absent everywhere → button hidden
+
+        // AC2: the dialog lists EXACTLY the present targets of the row (matrix order).
+        var dialog = _viewModel.CreateUninstallDialog(llama);
+        Assert.Equal("llama3:8b", dialog.ModelName);
+        Assert.Equal(["Local", "Remote"], dialog.Targets.Select(t => t.Target).ToArray());
+        Assert.DoesNotContain(dialog.Targets, t => t.Target == "Cloud");
+        Assert.All(dialog.Targets, t => Assert.True(t.IsSelected)); // pre-checked
+
+        var absentDialog = Assert.Throws<ArgumentException>(() => _viewModel.CreateUninstallDialog(mistral));
+        Assert.NotNull(absentDialog); // the button hides this row in practice (defensive guard)
+    }
+
     /// <inheritdoc />
     public Task InitializeAsync() => Task.CompletedTask;
 

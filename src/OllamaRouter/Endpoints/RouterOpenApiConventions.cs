@@ -29,11 +29,11 @@ namespace OllamaRouter.Endpoints;
 /// <c>HttpJsonOptions</c>) and is served at exactly <c>GET /api/router/openapi.json</c>
 /// (document name <see cref="DocumentName"/> + the <c>{documentName}</c> route parameter).
 /// <para>
-/// Scope: the 34 <c>/api/router/*</c> management operations ONLY (monitor, Ollama-compatible
+/// Scope: the 35 <c>/api/router/*</c> management operations ONLY (monitor, Ollama-compatible
 /// hybrid and YARP routes are excluded via <see cref="OpenApiOptions.ShouldInclude"/>, and the
 /// document endpoint's own template route is dropped). The security requirement is derived by
 /// calling the production <see cref="ApiSecurityPolicy.IsProtectedRoute"/> on each route
-/// template, so the document can never drift from the enforced set (17 protected operations
+/// template, so the document can never drift from the enforced set (18 protected operations
 /// in default mode; <c>ApiSecurity.RequireKeyForAllEndpoints: true</c> protects every route).
 /// </para>
 /// <para>
@@ -236,7 +236,7 @@ internal static class RouterOpenApiDocumentTransformer
         }
 
         // Security: derived from the PRODUCTION policy called with the route template (the
-        // single- and two-segment logic match their templates; exactly 17 of the 34 operations
+        // single- and two-segment logic match their templates; exactly 18 of the 35 operations
         // match). A 401 response is documented on exactly those operations.
         if (ApiSecurityPolicy.IsProtectedRoute(method, path))
         {
@@ -414,6 +414,26 @@ internal static class RouterOpenApiDocumentTransformer
                     ("400", typeof(OllamaErrorResponse), "Invalid preload path (missing /preload suffix), keepAliveSeconds or contextIntentTokens validation."),
                     ("404", typeof(OllamaErrorResponse), "model or pinned target unknown."),
                     ("503", typeof(OllamaErrorResponse), "no capable target available for the requested context (candidates carry the skip reasons).")
+                ]),
+
+            ["POST /api/router/models/uninstall"] = new(requestBodyType: typeof(RouterModelUninstallRequest),
+                requestRequired: true,
+                requestDescription:
+                    "Required: 'model' (non-blank model name, no URI escaping needed — namespaced " +
+                    "names with slashes travel verbatim in the JSON body) and 'targets' (a " +
+                    "non-empty array with at least one non-blank target name; target names are " +
+                    "matched case-insensitively against the configured effective targets, the " +
+                    "canonical configured names are echoed in the response, and the Cloud " +
+                    "pseudo-target is never a valid target — no OllamaTargetOptions → 404). An " +
+                    "absent/empty/malformed JSON body, a blank 'model' or an empty/blank " +
+                    "'targets' list → 400. DESTRUCTIVE + PERSISTENT (key-protected in default " +
+                    "mode): the model files are permanently deleted from the selected nodes.",
+                responses:
+                [
+                    ("200", typeof(RouterModelUninstallResponse), "Per-target execution report IN REQUEST ORDER (fail-soft: a single target's daemon 404 'model not found' or an unreachable daemon is 200 with that row's success:false + error — it never aborts the remaining targets)."),
+                    ("400", typeof(OllamaErrorResponse), "Absent/empty/malformed JSON body, blank 'model' or empty/blank 'targets' list."),
+                    ("404", typeof(OllamaErrorResponse), "model not found: {model} (fleet-wide check) / target not found: {name} (checked BEFORE any daemon delete call — zero deletes issued)."),
+                    ("503", typeof(OllamaErrorResponse), "model uninstall service is not available (minimal hosts without the registered service).")
                 ]),
 
             ["GET /api/router/preload/preview"] = new(typeof(RouterModelPreloadResponse),

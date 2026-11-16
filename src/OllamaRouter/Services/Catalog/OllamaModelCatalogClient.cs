@@ -4,6 +4,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Nodes;
 using OllamaRouter.Options;
+using OllamaRouter.Services.ModelUninstall;
 using OllamaRouter.Services.Preload;
 
 namespace OllamaRouter.Services.Catalog;
@@ -171,6 +172,73 @@ public sealed class OllamaModelCatalogClient(HttpClient httpClient, IHttpClientF
         catch
         {
             return false;
+        }
+    }
+
+    /// <summary>
+    /// The bounded (16 KiB) best-effort extraction of the daemon's <c>error</c> property from
+    /// a non-2xx response body (the /api/delete 404 "model not found" text; null when the
+    /// body is absent, too large to matter, not JSON, or lacks the property).
+    /// </summary>
+    private static async Task<string?> ExtractBoundedErrorAsync(HttpContent? content, CancellationToken cancellationToken)
+    {
+        const int MaxErrorBodyBytes = 16 * 1024;
+        try
+        {
+            if (content is null)
+            {
+                return null;
+            }
+
+            using var stream = new MemoryStream();
+            var source = await content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            var buffer = new byte[4096];
+            int read;
+            while ((read = await source.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) > 0
+                   && stream.Length < MaxErrorBodyBytes)
+            {
+                stream.Write(buffer, 0, (int)Math.Min(read, MaxErrorBodyBytes - stream.Length));
+            }
+
+            if (stream.Length == 0)
+            {
+                return null;
+            }
+
+            var json = JsonNode.Parse(stream.ToArray());
+            return json?["error"]?.ToString();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public async Task<ModelDeleteOutcome> DeleteModelAsync(string? baseUrl, string modelName, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(baseUrl) || string.IsNullOrWhiteSpace(modelName))
+        {
+            return new ModelDeleteOutcome(false, "no target url or model name");
+        }
+
+        try
+        {
+            var payload = new JsonObject { ["model"] = modelName };
+            using var content = new StringContent(payload.ToJsonString(), Encoding.UTF8, "application/json");
+            var response = await httpClient.PostAsync(BuildUrl(baseUrl, "/api/delete"), content, cancellationToken).ConfigureAwait(false);
+            if (response.IsSuccessStatusCode)
+            {
+                return new ModelDeleteOutcome(true);
+            }
+
+            var error = await ExtractBoundedErrorAsync(response.Content, cancellationToken).ConfigureAwait(false);
+            return new ModelDeleteOutcome(false, string.IsNullOrEmpty(error)
+                ? $"http {(int)response.StatusCode}"
+                : $"http {(int)response.StatusCode}: {error}");
+        }
+        catch (Exception ex)
+        {
+            return new ModelDeleteOutcome(false, ex.Message);
         }
     }
 

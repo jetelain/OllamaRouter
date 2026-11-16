@@ -95,6 +95,11 @@ public sealed partial class CartographyModelRowVm
     /// <summary>The one deployment cell per fleet node (node order).</summary>
     public IReadOnlyList<CartographyCellRow> Cells { get; }
 
+    /// <summary>Whether the model is present on at least one fleet target (drives the
+    /// row-level Uninstall button's visibility — task #126; Cloud can never be present: the
+    /// matrix cells are per effective target only, the Cloud pseudo-target is dropped).</summary>
+    public bool HasPresentTargets => Cells.Any(c => c.Present);
+
     private static IReadOnlyList<CartographyCellRow> BuildCells(
         CartographyModelRow wire, IReadOnlyList<CartographyNodeRow> nodes)
     {
@@ -146,8 +151,10 @@ internal static class VramBytes
 /// <summary>
 /// The Model Cartography &amp; Preload tab view model (task #102, spec §5.3): the model ×
 /// target deployment matrix (5 s poll from <c>GET /api/router/cartography</c>), the loaded-
-/// process list and the per-model preload action (the dialog is presented by the view; the
-/// <see cref="PreloadDialogViewModel"/> owns the preview-then-preload logic).
+/// process list, the per-model preload action (the dialog is presented by the view; the
+/// <see cref="PreloadDialogViewModel"/> owns the preview-then-preload logic) and the per-
+/// model uninstall action (task #126; the <see cref="UninstallDialogViewModel"/> owns the
+/// target selection + per-target results).
 /// </summary>
 public sealed partial class CartographyViewModel : RouterTabViewModel
 {
@@ -234,4 +241,13 @@ public sealed partial class CartographyViewModel : RouterTabViewModel
     /// dialog window).</summary>
     public PreloadDialogViewModel CreatePreloadDialog(string modelName) =>
         new(modelName, ClientAccessor);
+
+    /// <summary>Creates the uninstall dialog view model for a model row (task #126): the
+    /// dialog lists EXACTLY the targets where the model is present (pre-checked); the view
+    /// shows the dialog window and confirms the destructive action.</summary>
+    public UninstallDialogViewModel CreateUninstallDialog(CartographyModelRowVm row) =>
+        new(
+            row.Name,
+            row.Cells.Where(c => c.Present).Select(c => c.Target).ToList(),
+            ClientAccessor);
 }

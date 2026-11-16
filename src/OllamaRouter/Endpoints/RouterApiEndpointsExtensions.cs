@@ -32,16 +32,21 @@ namespace OllamaRouter.Endpoints;
 /// <see cref="RouterApi.Recommendations.RouterRecommendationEndpoints"/>)
 /// in the exact original registration order, which global route matching depends on
 /// (in particular the catch-all <c>/api/router/models/{*modelName}</c> vs
-/// <c>POST /api/router/models/{*tail}</c> pair and the position of the
+/// <c>POST /api/router/models/{*tail}</c> pair — the task-#126 LITERAL
+/// <c>POST /api/router/models/uninstall</c> route outranks both by route scoring, so it
+/// coexists with them regardless of registration position — and the position of the
 /// <c>POST /api/router/fleet/unload</c> alias).
 /// </summary>
 public static class RouterApiEndpointsExtensions
 {
     /// <summary>
-    /// Maps the full OllamaRouter management API: the 32 endpoints of the 15 per-area
+    /// Maps the full OllamaRouter management API: the 35 operations of the 15 per-area
     /// endpoint groups, registered in the original order (the admin & lifecycle and the
     /// role-recommendation areas are appended last — append-last preserves the global
-    /// route-matching order documented in the class summary).
+    /// route-matching order documented in the class summary; the literal
+    /// <c>POST /api/router/models/uninstall</c> route (task #126) outranks the
+    /// <c>models</c> catch-alls by route scoring, so its registration position after the
+    /// preload group is documentation, not correctness).
     /// </summary>
     public static WebApplication MapOllamaRouterApiEndpoints(this WebApplication app)
     {
@@ -53,6 +58,7 @@ public static class RouterApiEndpointsExtensions
         app.MapRouterVramEndpoints();
         app.MapRouterContextEndpoints();
         app.MapRouterPreloadEndpoints();
+        app.MapRouterModelUninstallEndpoints();
         app.MapRouterConfigEndpoints();
         app.MapRouterTargetsEndpoints();
         app.MapRouterApiKeysEndpoints();

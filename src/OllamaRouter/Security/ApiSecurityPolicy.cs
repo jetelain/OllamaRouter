@@ -18,7 +18,10 @@ namespace OllamaRouter.Security;
 /// state fleet-wide and re-admit failing nodes, so they are admin actions like the shutdown,
 /// not browser runtime toggles) and the daemon lifecycle endpoint
 /// <c>POST /api/router/admin/shutdown</c> (task #99: stopping the
-/// host is config-lifetime-affecting and must never be reachable keyless).
+/// host is config-lifetime-affecting and must never be reachable keyless), plus the model
+/// uninstall action (task #126: <c>POST /api/router/models/uninstall</c> — DESTRUCTIVE AND
+/// PERSISTENT, like the target-DELETE admin actions: it removes multi-GB model files from
+/// fleet node disks permanently, so it must never be reachable keyless).
 /// </para>
 /// <para>
 /// Explicitly NOT in the default set: <c>POST /targets</c> (monitor availability toggle —
@@ -27,7 +30,8 @@ namespace OllamaRouter.Security;
 /// <c>/api/tags|ps|show</c>, <c>/v1/models</c>, <c>/monitor*</c>), the runtime actions
 /// (<c>/api/router/vram/reclaim</c>, <c>/api/router/fleet/unload</c>,
 /// <c>/api/router/context/evaluate</c>, preload, <c>/monitor/reclaim-vram</c>,
-/// <c>/api/models/unload</c>), the YARP proxy paths and unknown paths.
+/// <c>/api/models/unload</c> — unload/preload are re-provisionable runtime state; model
+/// UNINSTALL deletes the files permanently and IS protected), the YARP proxy paths and unknown paths.
 /// </para>
 /// </summary>
 public static class ApiSecurityPolicy
@@ -90,6 +94,14 @@ public static class ApiSecurityPolicy
         if (string.Equals(path, "/api/router/admin/shutdown", StringComparison.OrdinalIgnoreCase))
         {
             // POST only (task #99): the graceful daemon shutdown is lifecycle-affecting.
+            return method == "POST";
+        }
+
+        // Model uninstall (task #126): DESTRUCTIVE + PERSISTENT — permanently deletes model
+        // files from fleet node disks (grouped with the target-DELETE admin actions).
+        // POST only, literal route (the /api/router/models catch-alls stay open).
+        if (string.Equals(path, "/api/router/models/uninstall", StringComparison.OrdinalIgnoreCase))
+        {
             return method == "POST";
         }
 

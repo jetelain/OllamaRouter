@@ -11,6 +11,7 @@ using OllamaRouter.Options;
 using OllamaRouter.Services.Catalog;
 using OllamaRouter.Services.ContextSizing;
 using OllamaRouter.Services.Monitoring;
+using OllamaRouter.Services.ModelUninstall;
 using OllamaRouter.Services.Preload;
 using OllamaRouter.Services.Routing;
 
@@ -63,6 +64,8 @@ public class TargetExecutionTrackerTests : IDisposable
         public Task<bool> UnloadModelAsync(string? baseUrl, string modelName, CancellationToken cancellationToken = default) => Task.FromResult(false);
         public Task<PreloadOutcome> PreloadModelAsync(string? baseUrl, string modelName, int keepAliveSeconds, int? numCtx, CancellationToken cancellationToken = default)
             => Task.FromResult(new PreloadOutcome(false, "not supported by test double"));
+        public Task<ModelDeleteOutcome> DeleteModelAsync(string? baseUrl, string modelName, CancellationToken cancellationToken = default)
+            => Task.FromResult(new ModelDeleteOutcome(false, "not supported by test double"));
         public Task<IReadOnlyList<string>> StopRunningModelsAsync(string? baseUrl, CancellationToken cancellationToken = default) => Task.FromResult<IReadOnlyList<string>>([]);
     }
 

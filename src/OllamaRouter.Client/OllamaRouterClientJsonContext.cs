@@ -76,6 +76,10 @@ namespace OllamaRouter.Client;
 [JsonSerializable(typeof(RouterModelPreloadRequest))]
 [JsonSerializable(typeof(RouterModelPreloadCandidate))]
 [JsonSerializable(typeof(RouterModelPreloadResponse))]
+// Model uninstall (task #126): POST /api/router/models/uninstall wire DTOs.
+[JsonSerializable(typeof(RouterModelUninstallRequest))]
+[JsonSerializable(typeof(RouterModelUninstallResponse))]
+[JsonSerializable(typeof(RouterModelUninstallTargetResult))]
 [JsonSerializable(typeof(RouterVramReclaimRequest))]
 [JsonSerializable(typeof(RouterVramReclaimTargetResult))]
 [JsonSerializable(typeof(RouterVramReclaimResponse))]

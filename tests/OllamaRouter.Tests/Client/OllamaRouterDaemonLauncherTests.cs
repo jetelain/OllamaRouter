@@ -742,6 +742,8 @@ public sealed class OllamaRouterDaemonLauncherTests : IDisposable
         public Task<RouterModelDetailResponse> GetModelDetailAsync(string modelName, CancellationToken ct = default) => Unavailable<RouterModelDetailResponse>();
         public Task<RouterModelPreloadResponse> PreloadModelAsync(string modelName, RouterModelPreloadRequest? request = null, CancellationToken ct = default)
             => Unavailable<RouterModelPreloadResponse>();
+        public Task<RouterModelUninstallResponse> UninstallModelAsync(string model, IReadOnlyList<string> targets, CancellationToken ct = default)
+            => Unavailable<RouterModelUninstallResponse>();
         public Task<RouterModelPreloadResponse> PreviewPreloadAsync(string model, int? keepAliveSeconds = null, int? contextIntentTokens = null, string? target = null, CancellationToken ct = default)
             => Unavailable<RouterModelPreloadResponse>();
         public Task<RouterVramReclaimResponse> ReclaimVramAsync(RouterVramReclaimRequest? request = null, CancellationToken ct = default)

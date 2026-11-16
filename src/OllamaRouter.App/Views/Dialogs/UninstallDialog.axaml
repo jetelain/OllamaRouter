@@ -1,0 +1,42 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="using:OllamaRouter.App.Views.Dialogs"
+        xmlns:vm="using:OllamaRouter.App.ViewModels"
+        x:Class="OllamaRouter.App.Views.Dialogs.UninstallDialog"
+        x:DataType="vm:UninstallDialogViewModel"
+        Title="Uninstall Model"
+        Width="560" Height="440"
+        WindowStartupLocation="CenterOwner">
+  <DockPanel Margin="8">
+    <StackPanel DockPanel.Dock="Top" Spacing="6">
+      <TextBlock Text="{Binding ModelName}" FontWeight="Bold" FontSize="16"/>
+      <TextBlock Text="This permanently deletes the model files on the selected nodes. This cannot be undone."
+                 Foreground="#FF7B7B" TextWrapping="Wrap"/>
+      <ScrollViewer MaxHeight="200" VerticalScrollBarVisibility="Auto">
+        <ItemsControl ItemsSource="{Binding Targets}">
+          <ItemsControl.ItemTemplate>
+            <DataTemplate>
+              <Grid ColumnDefinitions="auto,140,*" ColumnSpacing="8" Margin="0,1">
+                <CheckBox Grid.Column="0" IsChecked="{Binding IsSelected}" VerticalAlignment="Center"/>
+                <TextBlock Grid.Column="1" Text="{Binding Target}" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                  <TextBlock Text="deleted" Foreground="#22C55E" VerticalAlignment="Center"
+                             IsVisible="{Binding Succeeded, Converter={x:Static local:SuccessVisibilityConverter.SuccessInstance}}"/>
+                  <TextBlock Text="{Binding ResultText}" Foreground="#FF7B7B" TextTrimming="CharacterEllipsis"
+                             VerticalAlignment="Center"
+                             IsVisible="{Binding Succeeded, Converter={x:Static local:SuccessVisibilityConverter.FailureInstance}}"/>
+                </StackPanel>
+              </Grid>
+            </DataTemplate>
+          </ItemsControl.ItemTemplate>
+        </ItemsControl>
+      </ScrollViewer>
+      <TextBlock Text="{Binding ErrorMessage}" Foreground="#FF7B7B" TextWrapping="Wrap"/>
+      <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
+        <Button Content="Uninstall" Classes="Primary" Click="OnUninstallClick"/>
+        <Button Content="Cancel" Click="OnCancelClick"/>
+        <Button Content="Close" IsVisible="{Binding HasResults}" Click="OnCancelClick"/>
+      </StackPanel>
+    </StackPanel>
+  </DockPanel>
+</Window>

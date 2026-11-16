@@ -200,6 +200,8 @@ public class ApiKeyAuthMiddlewareTests
     // Task #95: the failure-streak reset admin actions (key-protected in default mode).
     [InlineData("POST", "/api/router/targets/Dummy/reset-streak", null)]
     [InlineData("POST", "/api/router/fleet/reset-streaks", null)]
+    // Task #126: the destructive model uninstall (key-protected in default mode).
+    [InlineData("POST", "/api/router/models/uninstall", """{ "model": "x", "targets": ["Dummy"] }""")]
     public async Task ProtectedRoute_WithoutKey_Returns401_WithWwwAuthenticateAndJsonError(string method, string path, string? body)
     {
         await using var host = await Host.StartAsync();
@@ -273,6 +275,28 @@ public class ApiKeyAuthMiddlewareTests
             host.Client, Request("PUT", "/api/router/config", """{"resilience": { "maxConsecutiveFailures": 4 }}""", key));
         Assert.Equal(200, put);
         Assert.Equal(4, host.Options.MaxConsecutiveFailures);
+    }
+
+    [Fact]
+    public async Task ModelUninstall_DefaultMode_401Keyless_AndTheDefaultKeyPassesThrough()
+    {
+        // AC9 (task #126): the destructive uninstall route is key-protected in default mode;
+        // with the default key the middleware passes the request to the handler (which then
+        // runs its own 400/404 contract — for this unknown model/target pair: 404, NEVER 401).
+        await using var host = await Host.StartAsync();
+        const string body = """{ "model": "x", "targets": ["Dummy"] }""";
+
+        var (keyless, _, _) = await SendAsync(host.Client, Request("POST", "/api/router/models/uninstall", body));
+        Assert.Equal(401, keyless);
+
+        var (bearer, _, bearerJson) = await SendAsync(
+            host.Client, Request("POST", "/api/router/models/uninstall", body, host.Keys.GetDefaultKey()));
+        Assert.NotEqual(401, bearer);
+        Assert.NotNull(bearerJson);
+
+        var (xApiKey, _, _) = await SendAsync(
+            host.Client, Request("POST", "/api/router/models/uninstall", body, host.Keys.GetDefaultKey(), useXApiKeyHeader: true));
+        Assert.NotEqual(401, xApiKey);
     }
 
     // ------------------------------------------------------------------

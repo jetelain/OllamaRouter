@@ -4,6 +4,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Moq;
 using OllamaRouter.Options;
 using OllamaRouter.Services.Catalog;
+using OllamaRouter.Services.ModelUninstall;
 
 namespace OllamaRouter.Tests.Services.Catalog;
 
@@ -800,6 +801,89 @@ public class OllamaModelCatalogClientTests
 
         Assert.False(succeeded);
         Assert.Null(data);
+        Assert.Null(handler.LastRequest);
+    }
+
+    // ------------------------------------------------------------------
+    //  DeleteModelAsync (task #126)
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task DeleteModelAsync_Success_200DeletedTrue()
+    {
+        var (sut, handler) = CreateSut(_ => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent("""{ "status": "success" }""", Encoding.UTF8, "application/json")
+        });
+
+        var outcome = await sut.DeleteModelAsync("http://127.0.0.1:11435", "llama3:8b");
+
+        Assert.True(outcome.Deleted);
+        Assert.Null(outcome.Error);
+        Assert.Equal(HttpMethod.Post, handler.LastRequest?.Method);
+        Assert.Equal("http://127.0.0.1:11435/api/delete", handler.LastRequest?.RequestUri?.ToString());
+        var body = System.Text.Json.Nodes.JsonNode.Parse(handler.LastRequestBody!)!.AsObject()!;
+        Assert.Equal("llama3:8b", body["model"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task DeleteModelAsync_404UnknownModel_FailSoftWithErrorText()
+    {
+        var (sut, _) = CreateSut(_ => new HttpResponseMessage(HttpStatusCode.NotFound)
+        {
+            Content = new StringContent(
+                """{ "error": "model 'llama3:8b' not found" }""", Encoding.UTF8, "application/json")
+        });
+
+        var outcome = await sut.DeleteModelAsync("http://127.0.0.1:11435", "llama3:8b");
+
+        Assert.False(outcome.Deleted);
+        Assert.Equal("http 404: model 'llama3:8b' not found", outcome.Error);
+    }
+
+    [Fact]
+    public async Task DeleteModelAsync_500WithoutErrorProperty_SurfacesHttpStatusOnly()
+    {
+        var (sut, _) = CreateSut(_ => new HttpResponseMessage(HttpStatusCode.InternalServerError));
+
+        var outcome = await sut.DeleteModelAsync("http://127.0.0.1:11435", "llama3:8b");
+
+        Assert.False(outcome.Deleted);
+        Assert.Equal("http 500", outcome.Error);
+    }
+
+    [Fact]
+    public async Task DeleteModelAsync_TransportException_FailSoftWithMessage()
+    {
+        var (sut, _) = CreateSut(_ => throw new HttpRequestException("connection refused"));
+
+        var outcome = await sut.DeleteModelAsync("http://127.0.0.1:11435", "llama3:8b");
+
+        Assert.False(outcome.Deleted);
+        Assert.Equal("connection refused", outcome.Error);
+    }
+
+    [Fact]
+    public async Task DeleteModelAsync_BlankBaseUrl_NoHttpCall()
+    {
+        var (sut, handler) = CreateSut(_ => throw new InvalidOperationException("must not be called"));
+
+        var outcome = await sut.DeleteModelAsync("  ", "llama3:8b");
+
+        Assert.False(outcome.Deleted);
+        Assert.Equal("no target url or model name", outcome.Error);
+        Assert.Null(handler.LastRequest);
+    }
+
+    [Fact]
+    public async Task DeleteModelAsync_BlankModelName_NoHttpCall()
+    {
+        var (sut, handler) = CreateSut(_ => throw new InvalidOperationException("must not be called"));
+
+        var outcome = await sut.DeleteModelAsync("http://127.0.0.1:11435", "");
+
+        Assert.False(outcome.Deleted);
+        Assert.Equal("no target url or model name", outcome.Error);
         Assert.Null(handler.LastRequest);
     }
 }

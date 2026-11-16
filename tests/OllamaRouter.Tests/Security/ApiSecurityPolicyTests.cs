@@ -31,6 +31,10 @@ public class ApiSecurityPolicyTests
     // Task #95: the failure-streak reset admin actions (key-protected in default mode).
     [InlineData("POST", "/api/router/fleet/reset-streaks")]
     [InlineData("POST", "/api/router/targets/{name}/reset-streak")]
+    // Task #126: the destructive model uninstall (deletes model files from node disks).
+    [InlineData("POST", "/api/router/models/uninstall")]
+    [InlineData("POST", "/api/router/models/uninstall/")] // trailing slash (endpoint-routing semantics)
+    [InlineData("post", "/Api/Router/Models/UNINSTALL")] // case-insensitive path + method
     public void IsProtectedRoute_DefaultSet_IncludesConfigAffectingRoutes(string method, string path)
     {
         Assert.True(ApiSecurityPolicy.IsProtectedRoute(method, path), $"{method} {path} must be protected");
@@ -98,6 +102,9 @@ public class ApiSecurityPolicyTests
     [InlineData("GET", "/api/router/benchmark/results")]
     [InlineData("GET", "/api/router/preload/preview")]
     [InlineData("POST", "/api/router/models/llama3/preload")]
+    [InlineData("GET", "/api/router/models/uninstall")] // wrong method on the #126 uninstall route
+    [InlineData("DELETE", "/api/router/models/uninstall")] // wrong method on the #126 uninstall route
+    [InlineData("POST", "/api/router/models/llama3%2Funinstall")]
     [InlineData("POST", "/api/router/vram/reclaim")]
     [InlineData("POST", "/api/router/fleet/unload")]
     [InlineData("POST", "/api/router/context/evaluate")]

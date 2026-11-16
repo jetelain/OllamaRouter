@@ -50,13 +50,16 @@
               <DataTemplate>
                 <Border Margin="0,0,0,8" Padding="10" Theme="{DynamicResource CardBorder}">
                   <Grid ColumnDefinitions="320,*">
-                    <!-- Left column: Model Metadata & Preload button -->
+                    <!-- Left column: Model Metadata & Preload/Uninstall buttons -->
                     <StackPanel Grid.Column="0" Spacing="6" Margin="0,0,12,0" VerticalAlignment="Center">
-                      <Grid ColumnDefinitions="*,auto">
+                      <Grid ColumnDefinitions="*,auto,auto">
                         <TextBlock Grid.Column="0" Text="{Binding Name}" FontWeight="Bold" FontSize="14"
                                    TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
                         <Button Grid.Column="1" Content="Preload" Classes="Primary" Click="OnPreloadClick"
-                                Tag="{Binding}" Padding="8,2" FontSize="11" VerticalAlignment="Center"/>
+                                Tag="{Binding}" Padding="8,2" FontSize="11" Margin="8,0,0,0" VerticalAlignment="Center"/>
+                        <Button Grid.Column="2" Content="Uninstall" Click="OnUninstallClick"
+                                IsVisible="{Binding HasPresentTargets}" Padding="8,2" FontSize="11"
+                                Margin="8,0,0,0" VerticalAlignment="Center"/>
                       </Grid>
 
                       <WrapPanel>

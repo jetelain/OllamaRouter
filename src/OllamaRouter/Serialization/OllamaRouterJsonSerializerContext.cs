@@ -66,6 +66,11 @@ namespace OllamaRouter.Serialization;
 [JsonSerializable(typeof(RouterModelPreloadRequest))]
 [JsonSerializable(typeof(RouterModelPreloadResponse))]
 [JsonSerializable(typeof(RouterModelPreloadCandidate))]
+// Model uninstall (task #126): POST /api/router/models/uninstall request/response DTOs
+// (shared wire contract with the client SDK, camelCase).
+[JsonSerializable(typeof(RouterModelUninstallRequest))]
+[JsonSerializable(typeof(RouterModelUninstallResponse))]
+[JsonSerializable(typeof(RouterModelUninstallTargetResult))]
 [JsonSerializable(typeof(RouterVramReclaimTargetResult))]
 [JsonSerializable(typeof(Dictionary<string, HardwareProfileState>))]
 [JsonSerializable(typeof(NodeHardwareProfile))]

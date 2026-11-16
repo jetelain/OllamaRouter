@@ -232,6 +232,21 @@ public sealed class OllamaRouterApiClientTests : IDisposable
     }
 
     [Fact]
+    public async Task UninstallModelAsync_404UnknownModel_SurfacesOllamaRouterApiException()
+    {
+        var handler = new FakeHttpMessageHandler(_ => JsonResponse(HttpStatusCode.NotFound,
+            """{"error":"model not found: nope"}"""));
+        using var client = CreateClient(handler);
+
+        var exception = await Assert.ThrowsAsync<OllamaRouterApiException>(() =>
+            client.UninstallModelAsync("nope", ["Desktop"]));
+
+        Assert.Equal(HttpStatusCode.NotFound, exception.Status);
+        Assert.Equal("model not found: nope", exception.Error);
+        Assert.Equal("/api/router/models/uninstall", Assert.Single(handler.Requests).PathAndQuery);
+    }
+
+    [Fact]
     public async Task Non2xx_NonJsonBody_RawTextTruncatedTo512Chars()
     {
         var raw = "upstream gateway failure: " + new string('x', 700);
@@ -420,6 +435,7 @@ public sealed class OllamaRouterApiClientTests : IDisposable
     [InlineData("GetModelsAsync")]
     [InlineData("GetModelDetailAsync")]
     [InlineData("PreloadModelAsync")]
+    [InlineData("UninstallModelAsync")]
     [InlineData("PreviewPreloadAsync")]
     [InlineData("ReclaimVramAsync")]
     [InlineData("GetConfigAsync")]
@@ -603,6 +619,21 @@ public sealed class OllamaRouterApiClientTests : IDisposable
                 Assert.Equal("Desktop", r.SelectedTarget);
                 Assert.True(r.LoadAccepted);
                 Assert.Single(r.Candidates);
+            }),
+
+        ["UninstallModelAsync"] = new(
+            "POST", "/api/router/models/uninstall",
+            """{"model":"org/model:tag","targets":["Desktop","Server"]}""",
+            null, HttpStatusCode.OK, UninstallJson,
+            async client => await client.UninstallModelAsync("org/model:tag", ["Desktop", "Server"]),
+            result =>
+            {
+                var r = (RouterModelUninstallResponse)result!;
+                Assert.Equal("org/model:tag", r.Model);
+                Assert.Equal(2, r.Targets.Count);
+                Assert.True(r.Targets[0].Success);
+                Assert.False(r.Targets[1].Success);
+                Assert.Equal("model 'org/model:tag' not found", r.Targets[1].Error);
             }),
 
         ["PreviewPreloadAsync"] = new(
@@ -1008,6 +1039,13 @@ public sealed class OllamaRouterApiClientTests : IDisposable
          "candidates":[{"target":"Desktop","eligible":false,"inFlightRequests":2,"isResident":true,
           "contextCeiling":8192,"serverClass":false,"busy":true,"skipReason":"busy"}],
          "reason":"preview-only"}
+        """;
+
+    private const string UninstallJson = """
+        {"model":"org/model:tag",
+         "targets":[{"target":"Desktop","success":true},
+          {"target":"Server","success":false,"error":"model 'org/model:tag' not found"}],
+         "message":null}
         """;
 
     private const string VramReclaimJson = """

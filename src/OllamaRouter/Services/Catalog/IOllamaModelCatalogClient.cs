@@ -1,5 +1,6 @@
 using System.Text.Json.Nodes;
 using OllamaRouter.Options;
+using OllamaRouter.Services.ModelUninstall;
 using OllamaRouter.Services.Preload;
 
 namespace OllamaRouter.Services.Catalog;
@@ -88,6 +89,21 @@ public interface IOllamaModelCatalogClient
     /// Returns the list of model names that were unloaded.
     /// </summary>
     Task<IReadOnlyList<string>> StopRunningModelsAsync(string? baseUrl, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Deletes a model from the specified instance via <c>POST {base}/api/delete</c> with a
+    /// <c>{"model": "..."}</c> body (task #126 — the model cartography uninstall action).
+    /// Fail-soft like <see cref="UnloadModelAsync"/> / <see cref="PreloadModelAsync"/>: never
+    /// throws; blank url/model → (false, "no target url or model name"), 2xx → (true, null),
+    /// non-2xx → (false, "http {status}" + the bounded daemon <c>error</c> property when the
+    /// body carries one — the 404 "model not found" case), transport exception → (false, ex.Message).
+    /// The call rides the injected 4 s catalog client (a delete is fast — no dedicated timeout
+    /// client, unlike the preload load). After a successful delete the model disappears from
+    /// the daemon's /api/tags and /api/ps, so the digest-keyed capability cache and the
+    /// /api/ps execution tracker invalidate naturally.
+    /// See <c>POST /api/router/models/uninstall</c> (task #126).
+    /// </summary>
+    Task<ModelDeleteOutcome> DeleteModelAsync(string? baseUrl, string modelName, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Fetches a JSON array endpoint of a single instance with an explicit per-target time

@@ -100,6 +100,14 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
     public RouterModelPreloadResponse PreloadResponse { get; set; } = new("model", null, 900, null, null, null, null, null, [], null);
 
     /// <summary>Scripted add-target failure (400/409/422 → <see cref="OllamaRouterApiException"/>).</summary>
+    public (HttpStatusCode Status, string Error)? UninstallError { get; set; }
+
+    /// <summary>If set, uninstall calls await this before responding (busy-guard scripting).</summary>
+    public Task? UninstallBlock { get; set; }
+
+    public RouterModelUninstallResponse UninstallResponse { get; set; } =
+        new("model", []);
+
     public (HttpStatusCode Status, string Error)? AddTargetError { get; set; }
 
     /// <summary>Scripted <c>PUT /api/router/config</c> failure.</summary>
@@ -145,6 +153,9 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
 
     /// <summary>Every preload PRELOAD call (model, request).</summary>
     public List<(string Model, RouterModelPreloadRequest? Request)> PreloadCalls { get; } = [];
+
+    /// <summary>Every uninstall call (model, targets in request order; task #126).</summary>
+    public List<(string Model, IReadOnlyList<string> Targets)> UninstallCalls { get; } = [];
 
     /// <summary>Every VRAM-reclaim request, in call order.</summary>
     public List<RouterVramReclaimRequest?> ReclaimCalls { get; } = [];
@@ -269,6 +280,35 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
     }
 
     /// <inheritdoc />
+    public async Task<RouterModelUninstallResponse> UninstallModelAsync(
+        string model, IReadOnlyList<string> targets, CancellationToken ct = default)
+    {
+        Log(nameof(UninstallModelAsync));
+        UninstallCalls.Add((model, targets));
+
+        if (UninstallBlock is { } blockTask)
+        {
+            await blockTask;
+        }
+
+        if (UninstallError is { } scripted)
+        {
+            UninstallError = null;
+            throw new OllamaRouterApiException(scripted.Status, scripted.Error);
+        }
+
+        // A scripted response is served as-is; the default (no script) derives one per-target
+        // failure row per requested target (fail-soft 200 shape).
+        var response = UninstallResponse;
+        if (response.Targets.Count == 0)
+        {
+            response = new RouterModelUninstallResponse(model,
+                targets.Select(t => new RouterModelUninstallTargetResult(t, false, "not found")).ToList());
+        }
+
+        return response;
+    }
+
     public Task<RouterModelPreloadResponse> PreviewPreloadAsync(
         string model, int? keepAliveSeconds, int? contextIntentTokens,
         string? target, CancellationToken ct = default)
