@@ -740,6 +740,8 @@ public sealed class OllamaRouterDaemonLauncherTests : IDisposable
         public Task<RouterCartographyResponse> GetCartographyAsync(CancellationToken ct = default) => Unavailable<RouterCartographyResponse>();
         public Task<RouterModelsResponse> GetModelsAsync(CancellationToken ct = default) => Unavailable<RouterModelsResponse>();
         public Task<RouterModelDetailResponse> GetModelDetailAsync(string modelName, CancellationToken ct = default) => Unavailable<RouterModelDetailResponse>();
+        public Task<OllamaRouterModelPullResult> PullModelAsync(string model, string? target = null, int? aliasContext = null, IProgress<OllamaRouterModelPullProgress>? progress = null, CancellationToken ct = default)
+            => Unavailable<OllamaRouterModelPullResult>();
         public Task<RouterModelPreloadResponse> PreloadModelAsync(string modelName, RouterModelPreloadRequest? request = null, CancellationToken ct = default)
             => Unavailable<RouterModelPreloadResponse>();
         public Task<RouterModelUninstallResponse> UninstallModelAsync(string model, IReadOnlyList<string> targets, CancellationToken ct = default)

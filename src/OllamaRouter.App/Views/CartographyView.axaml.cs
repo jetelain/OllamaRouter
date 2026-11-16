@@ -2,15 +2,19 @@ using Avalonia.Controls;
 using Avalonia.Interactivity;
 using OllamaRouter.App.ViewModels;
 using OllamaRouter.App.Views.Dialogs;
+using OllamaRouter.App.Views.InstallModelWizard;
 
 namespace OllamaRouter.App.Views;
 
 /// <summary>
-/// The Model Cartography &amp; Preload tab view (task #102). The per-model Preload button
-/// opens the <see cref="PreloadDialog"/> (preview-then-preload, owned by the dialog view
-/// model); the per-model Uninstall button (hidden when the model is present on no target —
-/// task #126) opens the <see cref="UninstallDialog"/> (destructive, Confirm-gated) and
-/// refreshes the matrix immediately afterwards.
+/// The Model Cartography &amp; Preload tab view (task #102). The header's Install Model button
+/// (task #125) opens the modal <see cref="InstallModelWizardWindow"/> (manual /
+/// benchmark-assisted install onto one or more fleet targets) and refreshes the matrix
+/// afterwards; the per-model Preload button opens the <see cref="PreloadDialog"/>
+/// (preview-then-preload, owned by the dialog view model); the per-model Uninstall button
+/// (hidden when the model is present on no target — task #126) opens the
+/// <see cref="UninstallDialog"/> (destructive, Confirm-gated) and refreshes the matrix
+/// immediately afterwards.
 /// </summary>
 public partial class CartographyView : UserControl
 {
@@ -31,6 +35,22 @@ public partial class CartographyView : UserControl
 
         var dialog = new PreloadDialog(viewModel.CreatePreloadDialog(row.Name));
         dialog.ShowDialog(owner);
+    }
+
+    private async void OnInstallModelClick(object? sender, RoutedEventArgs e)
+    {
+        if (DataContext is not CartographyViewModel viewModel ||
+            TopLevel.GetTopLevel(this) is not Window owner)
+        {
+            return;
+        }
+
+        var window = new InstallModelWizardWindow(viewModel.CreateInstallModelWizard());
+        await window.ShowDialog(owner);
+
+        // Immediate matrix refresh after the wizard closes (the 5 s poll + the server-side
+        // catalog refresh also cover it; this makes the install visible at once).
+        await viewModel.RefreshAsync();
     }
 
     private async void OnUninstallClick(object? sender, RoutedEventArgs e)

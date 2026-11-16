@@ -117,7 +117,7 @@ public class RouterOpenApiDocumentTests
     }
 
     /// <summary>
-    /// The approved 35 router operations: (method, document path) pairs — 31 path items.
+    /// The approved 36 router operations: (method, document path) pairs — 32 path items.
     /// NOTE: the generator emits the catch-all templates with the leading <c>*</c> stripped
     /// (the framework's documented template normalization: the registered
     /// <c>/api/router/models/{*modelName}</c> / <c>POST /api/router/models/{*tail}</c> /
@@ -139,6 +139,7 @@ public class RouterOpenApiDocumentTests
         ("GET", "/api/router/models"),
         ("GET", "/api/router/models/{modelName}"),
         ("GET", "/api/router/cartography"),
+        ("POST", "/api/router/models/pull"),
         ("POST", "/api/router/vram/reclaim"),
         ("POST", "/api/router/fleet/unload"),
         ("POST", "/api/router/context/evaluate"),
@@ -198,6 +199,7 @@ public class RouterOpenApiDocumentTests
             { ("GET", "/api/router/models"), "GetRouterModels" },
             { ("GET", "/api/router/models/{modelName}"), "GetRouterModelDetail" },
             { ("GET", "/api/router/cartography"), "GetRouterCartography" },
+            { ("POST", "/api/router/models/pull"), "PostRouterModelPull" },
             { ("POST", "/api/router/vram/reclaim"), "PostRouterVramReclaim" },
             { ("POST", "/api/router/fleet/unload"), "PostRouterFleetUnload" },
             { ("POST", "/api/router/context/evaluate"), "PostRouterContextEvaluate" },
@@ -246,6 +248,8 @@ public class RouterOpenApiDocumentTests
             { ("GET", "/api/router/models/{modelName}"),
                 [("200", "RouterModelDetailResponse"), ("404", "OllamaErrorResponse")] },
             { ("GET", "/api/router/cartography"), [("200", "RouterCartographyResponse")] },
+            { ("POST", "/api/router/models/pull"),
+                [("200", "OllamaRouterModelPullEvent"), ("400", "OllamaErrorResponse"), ("404", "OllamaErrorResponse"), ("409", "OllamaErrorResponse")] },
             { ("POST", "/api/router/vram/reclaim"),
                 [("200", "RouterVramReclaimResponse"), ("400", "OllamaErrorResponse"), ("404", "OllamaErrorResponse")] },
             { ("POST", "/api/router/fleet/unload"),
@@ -393,14 +397,14 @@ public class RouterOpenApiDocumentTests
     }
 
     [Fact]
-    public async Task Document_ContainsExactlyThe35RouterOperations_AndExcludesEverythingElse()
+    public async Task Document_ContainsExactlyThe36RouterOperations_AndExcludesEverythingElse()
     {
         await using var harness = await DocHarness.StartAsync(requireKeyForAllEndpoints: false);
         var document = await FetchDocumentAsync(harness);
         var paths = (JsonObject)document["paths"]!;
 
-        // Exactly the 35 approved (method, path) pairs (31 path items).
-        Assert.Equal(31, paths.Count);
+        // Exactly the 36 approved (method, path) pairs (32 path items).
+        Assert.Equal(32, paths.Count);
         var pathKeys = JsonObjectKeys(paths);
         var actualOperations = pathKeys
             .Select(path => (Path: path, Item: (JsonObject)paths[path]!))
@@ -542,6 +546,7 @@ public class RouterOpenApiDocumentTests
             { ("POST", "/api/router/vram/reclaim"), (typeof(RouterVramReclaimRequest), false) },
             { ("POST", "/api/router/fleet/unload"), (typeof(RouterVramReclaimRequest), false) },
             { ("POST", "/api/router/context/evaluate"), (typeof(RouterContextEvaluateRequest), true) },
+            { ("POST", "/api/router/models/pull"), (typeof(OllamaRouterModelPullRequest), true) },
             { ("POST", "/api/router/models/{tail}"), (typeof(RouterModelPreloadRequest), false) },
             { ("POST", "/api/router/models/uninstall"), (typeof(RouterModelUninstallRequest), true) },
             { ("PUT", "/api/router/config"), (typeof(UpdateRouterConfigRequest), true) },
@@ -553,8 +558,8 @@ public class RouterOpenApiDocumentTests
         await using var harness = await DocHarness.StartAsync(requireKeyForAllEndpoints: false);
         var document = await FetchDocumentAsync(harness);
 
-        // The body-accepting endpoints carry the typed request body; the other 24 do not
-        // (the plan's "nine" body list plus POST /api/router/api-keys from task #50).
+        // The body-accepting endpoints carry the typed request body; the other 25 do not
+        // (the plan's body list plus POST /api/router/api-keys from task #50 and the #125 pull).
         foreach (var (method, path) in ApprovedOperations)
         {
             var operation = GetOperation(document, method, path);
@@ -594,7 +599,7 @@ public class RouterOpenApiDocumentTests
         Assert.False(string.IsNullOrWhiteSpace(scheme["description"]?.GetValue<string>()));
 
         // The requirement is applied to EXACTLY the operations the production policy protects
-        // (18 of the 35), each with a documented 401 OllamaErrorResponse.
+        // (19 of the 36), each with a documented 401 OllamaErrorResponse.
         var protectedCount = 0;
         foreach (var (method, path) in ApprovedOperations)
         {
@@ -624,9 +629,9 @@ public class RouterOpenApiDocumentTests
         }
 
         // The #50 default protected set (incl. the #99 admin shutdown route, the #66
-        // recommendation writes, the two #95 failure-streak reset admin actions and the #126
-        // destructive model uninstall) is exactly 18 operations.
-        Assert.Equal(18, protectedCount);
+        // recommendation writes, the two #95 failure-streak reset admin actions, the #125
+        // model pull route and the #126 destructive model uninstall) is exactly 19 operations.
+        Assert.Equal(19, protectedCount);
     }
 
     [Fact]

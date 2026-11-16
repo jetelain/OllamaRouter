@@ -8,7 +8,10 @@ namespace OllamaRouter.Security;
 /// DEFAULT mode (config-affecting routes only): <c>GET/PUT /api/router/config</c>,
 /// <c>POST /api/router/targets</c>, <c>PUT/DELETE /api/router/targets/{name}</c>,
 /// <c>PUT /api/router/fleet/hardware/{targetName}</c>, <c>POST /api/router/benchmark</c>,
-/// <c>DELETE /api/router/benchmark/results</c>, the recommendation writes
+/// <c>DELETE /api/router/benchmark/results</c>, the model pull
+/// <c>POST /api/router/models/pull</c> (task #125: it mutates a target daemon — pulling blobs
+/// + creating the context alias; the same protection class as the benchmark run),
+/// the recommendation writes
 /// (<c>POST /api/router/recommendations/generate</c>,
 /// <c>POST /api/router/recommendations/apply</c>) and the key-management endpoints
 /// (<c>GET/POST /api/router/api-keys</c>, <c>DELETE /api/router/api-keys/{name}</c>,
@@ -69,6 +72,14 @@ public static class ApiSecurityPolicy
         }
 
         if (string.Equals(path, "/api/router/benchmark", StringComparison.OrdinalIgnoreCase))
+        {
+            return method == "POST";
+        }
+
+        // Model pull (task #125): pulls blobs onto a target daemon + creates the context
+        // alias — a daemon-mutating admin action (the benchmark-run protection class),
+        // POST only.
+        if (string.Equals(path, "/api/router/models/pull", StringComparison.OrdinalIgnoreCase))
         {
             return method == "POST";
         }

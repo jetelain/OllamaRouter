@@ -31,6 +31,8 @@ public class ApiSecurityPolicyTests
     // Task #95: the failure-streak reset admin actions (key-protected in default mode).
     [InlineData("POST", "/api/router/fleet/reset-streaks")]
     [InlineData("POST", "/api/router/targets/{name}/reset-streak")]
+    // Task #125: the model pull (it mutates a target daemon, like POST /api/router/benchmark).
+    [InlineData("POST", "/api/router/models/pull")]
     // Task #126: the destructive model uninstall (deletes model files from node disks).
     [InlineData("POST", "/api/router/models/uninstall")]
     [InlineData("POST", "/api/router/models/uninstall/")] // trailing slash (endpoint-routing semantics)

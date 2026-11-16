@@ -1,0 +1,53 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:conv="using:OllamaRouter.App.Converters"
+        xmlns:views="using:OllamaRouter.App.Views.InstallModelWizard"
+        xmlns:wvm="using:OllamaRouter.App.ViewModels.InstallModelWizard"
+        x:Class="OllamaRouter.App.Views.InstallModelWizard.InstallModelWizardWindow"
+        x:DataType="wvm:InstallModelWizardViewModel"
+        Title="Install Model"
+        Width="940" Height="640"
+        MinWidth="820" MinHeight="540"
+        WindowStartupLocation="CenterOwner">
+  <DockPanel>
+    <!-- 3-step progress header: all titles visible, the active step is bold -->
+    <Border DockPanel.Dock="Top" Padding="12,10" BorderBrush="#333" BorderThickness="0,0,0,1">
+      <StackPanel Orientation="Horizontal" Spacing="18">
+        <TextBlock Text="1 · Model"
+                   FontWeight="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToFontWeightConverter.Instance}, ConverterParameter=0}"/>
+        <TextBlock Text="2 · Targets"
+                   FontWeight="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToFontWeightConverter.Instance}, ConverterParameter=1}"/>
+        <TextBlock Text="3 · Review &amp; Install"
+                   FontWeight="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToFontWeightConverter.Instance}, ConverterParameter=2}"/>
+      </StackPanel>
+    </Border>
+
+    <!-- Bottom navigation bar: Cancel | Back | Next | Install | Done -->
+    <Border DockPanel.Dock="Bottom" Padding="12,10" BorderBrush="#333" BorderThickness="0,1,0,0">
+      <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
+        <Button Content="Cancel" Command="{Binding CancelCommand}"/>
+        <Button Content="Back" Command="{Binding BackCommand}"/>
+        <Button Content="Next" Command="{Binding NextCommand}"/>
+        <Button Content="Install" Command="{Binding ReviewStep.InstallCommand}" Classes="Primary"
+                IsVisible="{Binding ReviewStep.IsRunning, Converter={x:Static conv:BoolNegateConverter.Instance}}"/>
+        <Button Content="Cancel install" Command="{Binding ReviewStep.CancelInstallCommand}"
+                IsVisible="{Binding ReviewStep.IsRunning}"/>
+        <Button Content="Done" Command="{Binding DoneCommand}" Classes="Primary"
+                IsVisible="{Binding ReviewStep.RunCompleted}"/>
+      </StackPanel>
+    </Border>
+
+    <!-- Step body: all three overlap; visibility driven by SelectedStep -->
+    <Grid>
+      <Border IsVisible="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToVisibilityConverter.Instance}, ConverterParameter=0}">
+        <views:InstallModelStepView DataContext="{Binding ModelStep}"/>
+      </Border>
+      <Border IsVisible="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToVisibilityConverter.Instance}, ConverterParameter=1}">
+        <views:InstallTargetsStepView DataContext="{Binding TargetsStep}"/>
+      </Border>
+      <Border IsVisible="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToVisibilityConverter.Instance}, ConverterParameter=2}">
+        <views:InstallReviewStepView DataContext="{Binding ReviewStep}"/>
+      </Border>
+    </Grid>
+  </DockPanel>
+</Window>

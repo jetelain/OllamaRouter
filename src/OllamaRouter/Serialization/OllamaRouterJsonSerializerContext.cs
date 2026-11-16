@@ -19,6 +19,7 @@ using OllamaRouter.Endpoints.RouterApi.Vram;
 using OllamaRouter.Middleware;
 using OllamaRouter.Options;
 using OllamaRouter.Services.Monitoring;
+using OllamaRouter.Services.Models;
 using OllamaRouter.Services.Benchmarking;
 using OllamaRouter.Services.Hardware;
 using OllamaRouter.Services.Recommendations;
@@ -53,6 +54,14 @@ namespace OllamaRouter.Serialization;
 [JsonSerializable(typeof(RouterModelsResponse))]
 [JsonSerializable(typeof(RouterModelDetailResponse))]
 [JsonSerializable(typeof(RouterModelTargetCompatibility))]
+// Model pull (task #125): the POST /api/router/models/pull wire DTOs (shared client SDK)
+// + the daemon /api/pull, /api/create request and NDJSON-line wire shapes.
+[JsonSerializable(typeof(OllamaRouterModelPullRequest))]
+[JsonSerializable(typeof(OllamaRouterModelPullEvent))]
+[JsonSerializable(typeof(OllamaDaemonPullRequest))]
+[JsonSerializable(typeof(OllamaDaemonCreateRequest))]
+[JsonSerializable(typeof(OllamaDaemonCreateParameters))]
+[JsonSerializable(typeof(OllamaDaemonLineEvent))]
 [JsonSerializable(typeof(RouterCartographyResponse))]
 [JsonSerializable(typeof(CartographyNodeRow))]
 [JsonSerializable(typeof(CartographyNodeHardware))]

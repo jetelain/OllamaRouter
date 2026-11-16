@@ -61,6 +61,9 @@ namespace OllamaRouter.Client;
 [JsonSerializable(typeof(RouterModelSummary))]
 [JsonSerializable(typeof(RouterModelDetailResponse))]
 [JsonSerializable(typeof(RouterModelTargetCompatibility))]
+// Model pull (task #125): the POST /api/router/models/pull request + NDJSON event.
+[JsonSerializable(typeof(OllamaRouterModelPullRequest))]
+[JsonSerializable(typeof(OllamaRouterModelPullEvent))]
 // Cartography.
 [JsonSerializable(typeof(RouterCartographyResponse))]
 [JsonSerializable(typeof(CartographyNodeRow))]

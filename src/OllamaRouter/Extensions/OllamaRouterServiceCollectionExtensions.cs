@@ -20,6 +20,7 @@ using OllamaRouter.Services.ContextSizing;
 using OllamaRouter.Services.Monitoring;
 using OllamaRouter.Services.ModelUninstall;
 using OllamaRouter.Services.Preload;
+using OllamaRouter.Services.Models;
 using OllamaRouter.Services.Process;
 using OllamaRouter.Services.Routing;
 using OllamaRouter.Services.Benchmarking;
@@ -407,6 +408,29 @@ public static class OllamaRouterServiceCollectionExtensions
             sp.GetService<ITargetExecutionTracker>(),
             sp.GetService<IFleetHardwareService>(),
             sp.GetRequiredService<ILogger<ModelPreloadService>>()));
+
+        // Model pull (task #125): the dedicated "ModelPull" client carries NO client-level
+        // timeout (pulls are legitimately long; per-request CTS budgets apply — same shape as
+        // the "Benchmark" client) with the codebase-standard 10 s PooledConnectionLifetime.
+        // The service resolves the target LIVE from IOptionsMonitor (runtime-added targets
+        // work), drives the daemon's /api/pull (streaming) + /api/create (context alias) and
+        // best-effort refreshes the target catalog on success. All dependencies except the
+        // options monitor + client + logger are nullable-tolerant (minimal test hosts keep
+        // working, like the rest of the graph).
+        services.AddHttpClient("ModelPull", client =>
+        {
+            client.Timeout = System.Threading.Timeout.InfiniteTimeSpan;
+        })
+        .ConfigurePrimaryHttpMessageHandler(_ =>
+        {
+            return new SocketsHttpHandler { PooledConnectionLifetime = TimeSpan.FromSeconds(10) };
+        });
+        services.AddSingleton<IModelPullService>(sp => new ModelPullService(
+            sp.GetRequiredService<IOptionsMonitor<OllamaRouterOptions>>(),
+            sp.GetService<IModelCatalogCacheService>(),
+            sp.GetService<ITargetLivenessService>(),
+            sp.GetRequiredService<IHttpClientFactory>().CreateClient("ModelPull"),
+            sp.GetRequiredService<ILogger<ModelPullService>>()));
 
         // Model uninstall (task #126, report item #7): the destructive counterpart of the
         // model pre-load — validates the fleet model + target roster BEFORE any daemon call,

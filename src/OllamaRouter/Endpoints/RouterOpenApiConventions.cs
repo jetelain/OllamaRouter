@@ -29,11 +29,11 @@ namespace OllamaRouter.Endpoints;
 /// <c>HttpJsonOptions</c>) and is served at exactly <c>GET /api/router/openapi.json</c>
 /// (document name <see cref="DocumentName"/> + the <c>{documentName}</c> route parameter).
 /// <para>
-/// Scope: the 35 <c>/api/router/*</c> management operations ONLY (monitor, Ollama-compatible
+/// Scope: the 36 <c>/api/router/*</c> management operations ONLY (monitor, Ollama-compatible
 /// hybrid and YARP routes are excluded via <see cref="OpenApiOptions.ShouldInclude"/>, and the
 /// document endpoint's own template route is dropped). The security requirement is derived by
 /// calling the production <see cref="ApiSecurityPolicy.IsProtectedRoute"/> on each route
-/// template, so the document can never drift from the enforced set (18 protected operations
+/// template, so the document can never drift from the enforced set (19 protected operations
 /// in default mode; <c>ApiSecurity.RequireKeyForAllEndpoints: true</c> protects every route).
 /// </para>
 /// <para>
@@ -236,7 +236,7 @@ internal static class RouterOpenApiDocumentTransformer
         }
 
         // Security: derived from the PRODUCTION policy called with the route template (the
-        // single- and two-segment logic match their templates; exactly 18 of the 35 operations
+        // single- and two-segment logic match their templates; exactly 19 of the 36 operations
         // match). A 401 response is documented on exactly those operations.
         if (ApiSecurityPolicy.IsProtectedRoute(method, path))
         {
@@ -399,6 +399,24 @@ internal static class RouterOpenApiDocumentTransformer
                     ("200", typeof(RouterContextEvaluateResponse), "Stateless routing + dynamic context sizing preview (no LLM inference)."),
                     ("400", typeof(OllamaErrorResponse), "model is required / estimatedTokens must be >= 1"),
                     ("503", typeof(OllamaErrorResponse), "no available routing target")
+                ]),
+
+            ["POST /api/router/models/pull"] = new(requestBodyType: typeof(OllamaRouterModelPullRequest),
+                requestRequired: true,
+                requestDescription:
+                    "Required: 'model' (a valid name[:tag] model reference — the tag IS the " +
+                    "quantization selector in the Ollama registry); 'target' (a fleet target name; " +
+                    "null/absent = the primary target fallback: 'Local' when present+enabled, else the " +
+                    "first enabled effective target, else the first effective target — resolved LIVE " +
+                    "from the options monitor, so runtime-added targets work); 'aliasContext' (>= 1; " +
+                    "when set, the daemon additionally creates the derived model '{name}:{tag}-{ctx}' " +
+                    "alias via POST /api/create with parameters.num_ctx = aliasContext after the pull).",
+                responses:
+                [
+                    ("200", typeof(OllamaRouterModelPullEvent), "Streaming NDJSON (text/x-ndjson): one OllamaRouterModelPullEvent per line (started → progress* → [alias_started → alias_created] → success; 'present' replaces the progress lines when the model is already on the target; a terminal 'error' event with stage 'pull' | 'alias' replaces the success). The target's /api/tags catalog cache is refreshed after the success (the cartography matrix shows the model + alias immediately)."),
+                    ("400", typeof(OllamaErrorResponse), "Invalid model reference / aliasContext <= 0 / the computed alias collides with the model name / the resolved target is not an Ollama-protocol target."),
+                    ("404", typeof(OllamaErrorResponse), "Unknown target name (or no fleet targets configured)."),
+                    ("409", typeof(OllamaErrorResponse), "Target disabled or offline (fresh liveness probe).")
                 ]),
 
             ["POST /api/router/models/*"] = new(requestBodyType: typeof(RouterModelPreloadRequest),

@@ -82,6 +82,25 @@ public interface IOllamaRouterApiClient
     Task<RouterModelDetailResponse> GetModelDetailAsync(string modelName, CancellationToken ct = default);
 
     /// <summary>
+    /// <c>POST /api/router/models/pull</c> (task #125): pulls <paramref name="model"/>
+    /// (a <c>name[:tag]</c> reference) onto <paramref name="target"/> (null = the primary
+    /// target fallback, resolved LIVE server-side) and streams the progress back; when
+    /// <paramref name="aliasContext"/> (>= 1) is set the target additionally gets the context
+    /// alias <c>{name}:{tag}-{ctx}</c>. <paramref name="progress"/> receives the per-line pull
+    /// progress + alias lifecycle (reported on the caller's synchronization context). Pre-stream
+    /// failures (400/404/409) surface as <see cref="OllamaRouterApiException"/>; in-stream
+    /// failures surface as a <see cref="OllamaRouterModelPullResult"/> with
+    /// <c>Succeeded: false</c> + <c>Error</c> (no exception); cancellation surfaces as
+    /// <c>OperationCanceledException</c>.
+    /// </summary>
+    Task<OllamaRouterModelPullResult> PullModelAsync(
+        string model,
+        string? target = null,
+        int? aliasContext = null,
+        IProgress<OllamaRouterModelPullProgress>? progress = null,
+        CancellationToken ct = default);
+
+    /// <summary>
     /// <c>POST /api/router/models/{*modelName}/preload</c>: loads the model on the selected fleet
     /// target. <paramref name="request"/> may be null (an absent body is valid; the server then
     /// uses the query-string / class defaults).
@@ -399,6 +418,124 @@ public sealed class OllamaRouterApiClient : IOllamaRouterApiClient, IDisposable
     public Task<RouterModelDetailResponse> GetModelDetailAsync(string modelName, CancellationToken ct = default) =>
         SendAsync(HttpMethod.Get, BuildPath("api/router/models", modelName),
             OllamaRouterClientJsonContext.Default.RouterModelDetailResponse, ct);
+
+    /// <inheritdoc />
+    public async Task<OllamaRouterModelPullResult> PullModelAsync(
+        string model,
+        string? target = null,
+        int? aliasContext = null,
+        IProgress<OllamaRouterModelPullProgress>? progress = null,
+        CancellationToken ct = default)
+    {
+        var request = new OllamaRouterModelPullRequest(model, target, aliasContext);
+
+        // The request is re-created on the 401 retry (a content stream can only be consumed
+        // once), exactly like CoreAsync. HttpCompletionOption.ResponseHeadersRead: the
+        // HttpClient.Timeout bounds only send + headers; the NDJSON body stream is bound by
+        // <paramref name="ct"/> only (pulls are legitimately long).
+        HttpRequestMessage CreateMessage()
+        {
+            var message = new HttpRequestMessage(HttpMethod.Post, "api/router/models/pull");
+            var key = ResolveKey();
+            if (!string.IsNullOrEmpty(key))
+            {
+                message.Headers.Authorization = new AuthenticationHeaderValue("Bearer", key);
+            }
+
+            message.Content = CreateContent(request, OllamaRouterClientJsonContext.Default.OllamaRouterModelPullRequest);
+            return message;
+        }
+
+        var response = await _httpClient
+            .SendAsync(CreateMessage(), HttpCompletionOption.ResponseHeadersRead, ct)
+            .ConfigureAwait(false);
+
+        // 401 auto-retry (default-key auto-rotation): the SAME request is retried EXACTLY ONCE
+        // with the freshly re-read key (same semantics as CoreAsync, before the body streams).
+        if (response.StatusCode == HttpStatusCode.Unauthorized && _keyReader is not null)
+        {
+            response.Dispose();
+            ct.ThrowIfCancellationRequested();
+            response = await _httpClient
+                .SendAsync(CreateMessage(), HttpCompletionOption.ResponseHeadersRead, ct)
+                .ConfigureAwait(false);
+        }
+
+        if (!response.IsSuccessStatusCode)
+        {
+            var status = response.StatusCode;
+            var error = await ReadErrorAsync(response).ConfigureAwait(false);
+            response.Dispose();
+            throw new OllamaRouterApiException(status, error);
+        }
+
+        var servedTarget = target ?? string.Empty;
+        string? seenAlias = null;
+        try
+        {
+            using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+            using var reader = new StreamReader(stream);
+            string? line;
+            while ((line = await reader.ReadLineAsync(ct).ConfigureAwait(false)) is not null)
+            {
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    continue;
+                }
+
+                OllamaRouterModelPullEvent? evt = null;
+                try
+                {
+                    evt = JsonSerializer.Deserialize(line, OllamaRouterClientJsonContext.Default.OllamaRouterModelPullEvent);
+                }
+                catch (JsonException)
+                {
+                    // Skip a malformed line (a terminal event line is always well-formed JSON).
+                    continue;
+                }
+
+                if (evt is null)
+                {
+                    continue;
+                }
+
+                switch (evt.Event)
+                {
+                    case "started":
+                        servedTarget = evt.Target ?? servedTarget;
+                        break;
+                    case "present":
+                        progress?.Report(new OllamaRouterModelPullProgress("pull", "present", null, null, null, null));
+                        break;
+                    case "progress":
+                        progress?.Report(new OllamaRouterModelPullProgress(
+                            "pull", evt.Status ?? string.Empty, evt.TotalBytes, evt.CompletedBytes, null, null));
+                        break;
+                    case "alias_started":
+                        progress?.Report(new OllamaRouterModelPullProgress("alias", "started", null, null, evt.Alias, evt.Context));
+                        break;
+                    case "alias_created":
+                        seenAlias = evt.Alias ?? seenAlias;
+                        progress?.Report(new OllamaRouterModelPullProgress("alias", "created", null, null, evt.Alias, evt.Context));
+                        break;
+                    case "success":
+                        return new OllamaRouterModelPullResult(
+                            true, evt.Target ?? servedTarget, model, evt.Alias ?? seenAlias, aliasContext, null, evt.DurationMs);
+                    case "error":
+                        return new OllamaRouterModelPullResult(
+                            false, evt.Target ?? servedTarget, model, seenAlias, aliasContext, evt.Error ?? "pull failed", null);
+                }
+            }
+        }
+        finally
+        {
+            response.Dispose();
+        }
+
+        // Stream end without a terminal event (a clean server disconnect) — NOT a success.
+        return new OllamaRouterModelPullResult(
+            false, servedTarget, model, seenAlias, aliasContext, "unexpected end of pull stream", null);
+    }
 
     /// <inheritdoc />
     public Task<RouterModelPreloadResponse> PreloadModelAsync(

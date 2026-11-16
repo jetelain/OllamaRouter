@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.Globalization;
 using CommunityToolkit.Mvvm.ComponentModel;
+using OllamaRouter.App.ViewModels.InstallModelWizard;
 using OllamaRouter.Client;
 using OllamaRouter.Endpoints.RouterApi.Cartography;
 
@@ -241,6 +242,11 @@ public sealed partial class CartographyViewModel : RouterTabViewModel
     /// dialog window).</summary>
     public PreloadDialogViewModel CreatePreloadDialog(string modelName) =>
         new(modelName, ClientAccessor);
+
+    /// <summary>Creates the Install Model wizard view model (task #125; the view shows the
+    /// modal wizard window).</summary>
+    public InstallModelWizardViewModel CreateInstallModelWizard() =>
+        new(ClientAccessor);
 
     /// <summary>Creates the uninstall dialog view model for a model row (task #126): the
     /// dialog lists EXACTLY the targets where the model is present (pre-checked); the view

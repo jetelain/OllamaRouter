@@ -1200,6 +1200,185 @@ public sealed class OllamaRouterApiClientTests : IDisposable
         Convert.ToBase64String(Encoding.UTF8.GetBytes(label))
             .TrimEnd('=').Replace('+', '-').Replace('/', '_');
 
+    // ------------------------------------------------------------------
+    //  PullModelAsync (task #125): the streaming NDJSON pull core
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task PullModelAsync_HappyPath_SendsExactRequest_ReportsProgressInOrder_ReturnsSuccessResult()
+    {
+        var ndjson = string.Join('\n',
+            """{"event":"started","target":"Local","model":"llama3.2:13b-q4_K_M"}""",
+            """{"event":"progress","target":"Local","status":"pulling 34%","digest":"sha256:abc","totalBytes":100,"completedBytes":34}""",
+            """{"event":"progress","target":"Local","status":"pulling 100%","totalBytes":100,"completedBytes":100}""",
+            """{"event":"alias_started","target":"Local","alias":"llama3.2:13b-q4_K_M-8k","context":8192}""",
+            """{"event":"alias_created","target":"Local","alias":"llama3.2:13b-q4_K_M-8k","context":8192}""",
+            """{"event":"success","target":"Local","model":"llama3.2:13b-q4_K_M","alias":"llama3.2:13b-q4_K_M-8k","durationMs":42133}""");
+        var handler = new FakeHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(ndjson, Encoding.UTF8, "text/x-ndjson")
+        });
+        using var client = CreateClient(handler);
+        var progress = new List<OllamaRouterModelPullProgress>();
+
+        var result = await client.PullModelAsync(
+            "llama3.2:13b-q4_K_M", "Local", 8192, new Progress<OllamaRouterModelPullProgress>(progress.Add));
+
+        // The exact wire request (camelCase, all three fields).
+        var request = Assert.Single(handler.Requests);
+        Assert.Equal("POST", request.Method);
+        Assert.Equal("/api/router/models/pull", request.PathAndQuery);
+        var body = (JsonObject)JsonNode.Parse(request.Body!)!;
+        Assert.Equal("llama3.2:13b-q4_K_M", body["model"]!.GetValue<string>());
+        Assert.Equal("Local", body["target"]!.GetValue<string>());
+        Assert.Equal(8192, body["aliasContext"]!.GetValue<int>());
+
+        // The progress callbacks, in stream order (pull lines, then the alias lifecycle).
+        Assert.Equal(
+            [
+                new OllamaRouterModelPullProgress("pull", "pulling 34%", 100L, 34L, null, null),
+                new OllamaRouterModelPullProgress("pull", "pulling 100%", 100L, 100L, null, null),
+                new OllamaRouterModelPullProgress("alias", "started", null, null, "llama3.2:13b-q4_K_M-8k", 8192),
+                new OllamaRouterModelPullProgress("alias", "created", null, null, "llama3.2:13b-q4_K_M-8k", 8192)
+            ],
+            progress);
+
+        // The terminal result.
+        Assert.True(result.Succeeded);
+        Assert.Equal("Local", result.Target);
+        Assert.Equal("llama3.2:13b-q4_K_M", result.Model);
+        Assert.Equal("llama3.2:13b-q4_K_M-8k", result.Alias);
+        Assert.Equal(8192, result.AliasContext);
+        Assert.Null(result.Error);
+        Assert.Equal(42133, result.DurationMs);
+    }
+
+    [Fact]
+    public async Task PullModelAsync_PreStreamError_ThrowsOllamaRouterApiExceptionWithStatusAndError()
+    {
+        var handler = new FakeHttpMessageHandler(_ => JsonResponse(HttpStatusCode.NotFound, """{"error":"target not found: ghost"}"""));
+        using var client = CreateClient(handler);
+
+        var ex = await Assert.ThrowsAsync<OllamaRouterApiException>(
+            () => client.PullModelAsync("llama3:8b", "ghost", 8192));
+
+        Assert.Equal(HttpStatusCode.NotFound, ex.Status);
+        Assert.Equal("target not found: ghost", ex.Error);
+    }
+
+    [Fact]
+    public async Task PullModelAsync_InStreamErrorEvent_ReturnsFailedResult_WithoutThrowing()
+    {
+        var ndjson = string.Join('\n',
+            """{"event":"started","target":"Local","model":"ghost"}""",
+            """{"event":"error","target":"Local","stage":"pull","error":"model 'ghost' not found"}""");
+        var handler = new FakeHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(ndjson, Encoding.UTF8, "text/x-ndjson")
+        });
+        using var client = CreateClient(handler);
+
+        var result = await client.PullModelAsync("ghost", "Local", null);
+
+        Assert.False(result.Succeeded);
+        Assert.Equal("Local", result.Target);
+        Assert.Equal("ghost", result.Model);
+        Assert.Equal("model 'ghost' not found", result.Error);
+        Assert.Null(result.DurationMs);
+    }
+
+    [Fact]
+    public async Task PullModelAsync_TruncatedStream_ReturnsUnexpectedEndFailure()
+    {
+        // The stream ends AFTER a progress line but WITHOUT a terminal event.
+        var ndjson = string.Join('\n',
+            """{"event":"started","target":"Local","model":"m"}""",
+            """{"event":"progress","target":"Local","status":"pulling 10%"}""");
+        var handler = new FakeHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(ndjson, Encoding.UTF8, "text/x-ndjson")
+        });
+        using var client = CreateClient(handler);
+
+        var result = await client.PullModelAsync("m", "Local", null);
+
+        Assert.False(result.Succeeded);
+        Assert.Equal("unexpected end of pull stream", result.Error);
+    }
+
+    [Fact]
+    public async Task PullModelAsync_MidStreamCancellation_ThrowsOperationCanceled_WithoutPhantomSuccess()
+    {
+        var cts = new CancellationTokenSource();
+        var handler = new GateNdjsonHandler(cts.Token);
+        using var client = new OllamaRouterApiClient(BaseUrl, null, null, new HttpClient(handler));
+
+        var pullTask = client.PullModelAsync("m", "Local", null, null, cts.Token);
+        await Task.Delay(300); // let the first line be consumed and the read block on the gate
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pullTask);
+    }
+
+    /// <summary>
+    /// A canned-response stream that serves ONE <c>started</c> line and then HOLDS the read
+    /// open until the caller's token cancels (the mid-stream cancellation test: the client
+    /// must surface an <c>OperationCanceledException</c>, never a success).
+    /// </summary>
+    private sealed class GateNdjsonHandler(CancellationToken ct) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var response = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StreamContent(new GateStream(ct))
+            };
+            response.Content.Headers.ContentType =
+                new System.Net.Http.Headers.MediaTypeHeaderValue("text/x-ndjson");
+            return Task.FromResult(response);
+        }
+
+        private sealed class GateStream(CancellationToken ct) : Stream
+        {
+            private readonly byte[] _firstLine =
+                Encoding.UTF8.GetBytes("""{"event":"started","target":"Local","model":"m"}""" + '\n');
+            private int _served;
+
+            public override bool CanRead => true;
+            public override bool CanSeek => false;
+            public override bool CanWrite => false;
+            public override long Length => throw new NotSupportedException();
+
+            public override long Position
+            {
+                get => throw new NotSupportedException();
+                set => throw new NotSupportedException();
+            }
+
+            public override void Flush() => throw new NotSupportedException();
+            public override int Read(byte[] buffer, int offset, int count)
+            {
+                if (_served == 0)
+                {
+                    var n = Math.Min(count, _firstLine.Length);
+                    Buffer.BlockCopy(_firstLine, 0, buffer, offset, n);
+                    _served = 1;
+                    return n;
+                }
+
+                // Hold the read open until the test cancels the token (bounded wait).
+                ct.WaitHandle.WaitOne();
+                ct.ThrowIfCancellationRequested();
+                return 0; // EOF (unreachable: the cancellation throws first)
+            }
+
+            public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+            public override void SetLength(long value) => throw new NotSupportedException();
+            public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        }
+    }
+
     // ------------------------------------------------------------------ fake handler
 
     private sealed record CapturedRequest(

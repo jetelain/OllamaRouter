@@ -43,6 +43,34 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
     /// <summary>The ordered log of every invoked method (test assertion surface).</summary>
     public List<string> Calls { get; } = [];
 
+    /// <summary>The ordered log of <c>PullModelAsync</c> calls (model, target, aliasContext).
+    /// (task #125 — the install wizard's per-target pull assertions.)</summary>
+    public List<(string Model, string? Target, int? AliasContext)> PullCalls { get; } = [];
+
+    /// <summary>The result of <c>PullModelAsync</c> (null = default success: the alias is
+    /// computed from the reference + context via <see cref="ModelPullNaming"/>).</summary>
+    public OllamaRouterModelPullResult? PullResult { get; set; }
+
+    /// <summary>An exception thrown by <c>PullModelAsync</c> (pre-stream 400/404/409 or
+    /// transport failures).</summary>
+    public Exception? PullException { get; set; }
+
+    /// <summary>Targets whose pull returns a FAILED result (in-stream error — Succeeded
+    /// false + error text, NO exception): the "one failure does not stop the rest" test.</summary>
+    public HashSet<string> PullFailTargets { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>The error text of the <see cref="PullFailTargets"/> failed result.</summary>
+    public string PullFailError { get; set; } = "simulated pull failure";
+
+    /// <summary>The progress events emitted BEFORE the result on every <c>PullModelAsync</c>
+    /// call (the wizard's live-row assertions).</summary>
+    public List<OllamaRouterModelPullProgress> PullProgressEvents { get; } = [];
+
+    /// <summary>A simulated pull duration (ms); while the fake is "in flight" a cancelled
+    /// token makes <c>PullModelAsync</c> throw <c>OperationCanceledException</c> (the
+    /// in-flight cancellation test).</summary>
+    public int PullDelayMs { get; set; }
+
     /// <summary>The one-shot exception thrown by the NEXT call of any method (then cleared).</summary>
     public Exception? NextCallException { get; set; }
 
@@ -70,6 +98,18 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
 
     /// <summary>The <c>GET /api/router/fleet/hardware</c> rows (empty by default).</summary>
     public RouterFleetHardwareResponse HardwareResponse { get; set; } = new([]);
+
+    /// <summary>The <c>GET /api/router/benchmark/results</c> response (empty by default —
+    /// task #125: the install wizard's assisted mode reads it best-effort).</summary>
+    public RouterBenchmarkResultsResponse BenchmarkResults { get; set; } = new([]);
+
+    /// <summary>The <c>GET /api/router/models/{name}</c> response (null by default — the
+    /// fake then throws the 404 <c>model not found</c>, the NORMAL first-install case the
+    /// install wizard treats as a hint, not an error).</summary>
+    public RouterModelDetailResponse? ModelDetailResponse { get; set; }
+
+    /// <summary>Override of the <c>GET /api/router/models/{name}</c> failure (thrown when set).</summary>
+    public OllamaRouterApiException? ModelDetailException { get; set; }
 
     /// <summary>The <c>GET /api/router/config</c> configuration (empty by default).</summary>
     public RouterConfigResponse ConfigResponse { get; set; } = new(
@@ -267,8 +307,69 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
 
     /// <inheritdoc />
     public Task<RouterModelDetailResponse> GetModelDetailAsync(
-        string modelName, CancellationToken ct = default) =>
-        NotImplemented<RouterModelDetailResponse>(nameof(GetModelDetailAsync));
+        string modelName, CancellationToken ct = default)
+    {
+        Log(nameof(GetModelDetailAsync));
+        if (ModelDetailException is { } detailException)
+        {
+            throw detailException;
+        }
+
+        return ModelDetailResponse is { } detail
+            ? Task.FromResult(detail)
+            : Task.FromException<RouterModelDetailResponse>(new OllamaRouterApiException(
+                HttpStatusCode.NotFound, $"model '{modelName}' not found (fake default)"));
+    }
+
+    /// <inheritdoc />
+    public async Task<OllamaRouterModelPullResult> PullModelAsync(
+        string model,
+        string? target = null,
+        int? aliasContext = null,
+        IProgress<OllamaRouterModelPullProgress>? progress = null,
+        CancellationToken ct = default)
+    {
+        Log(nameof(PullModelAsync));
+        PullCalls.Add((model, target, aliasContext));
+
+        if (PullDelayMs > 0)
+        {
+            await Task.Delay(PullDelayMs, ct);
+        }
+
+        ct.ThrowIfCancellationRequested();
+
+        if (PullException is { } pullException)
+        {
+            throw pullException;
+        }
+
+        if (PullFailTargets.Contains(target ?? string.Empty))
+        {
+            foreach (var evt in PullProgressEvents)
+            {
+                progress?.Report(evt);
+            }
+
+            return new OllamaRouterModelPullResult(false, target ?? "Local", model, null, aliasContext, PullFailError, null);
+        }
+
+        foreach (var evt in PullProgressEvents)
+        {
+            progress?.Report(evt);
+        }
+
+        if (PullResult is { } scripted)
+        {
+            return scripted;
+        }
+
+        var alias = aliasContext is { } ctx &&
+            ModelPullNaming.TryComputeAliasName(model, ctx, out var computed)
+            ? computed
+            : null;
+        return new OllamaRouterModelPullResult(true, target ?? "Local", model, alias, aliasContext, null, 42);
+    }
 
     /// <inheritdoc />
     public Task<RouterModelPreloadResponse> PreloadModelAsync(
@@ -492,8 +593,11 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
         NotImplemented<RouterBenchmarkRunResponse>(nameof(StartBenchmarkAsync));
 
     /// <inheritdoc />
-    public Task<RouterBenchmarkResultsResponse> GetBenchmarkResultsAsync(CancellationToken ct = default) =>
-        NotImplemented<RouterBenchmarkResultsResponse>(nameof(GetBenchmarkResultsAsync));
+    public Task<RouterBenchmarkResultsResponse> GetBenchmarkResultsAsync(CancellationToken ct = default)
+    {
+        Log(nameof(GetBenchmarkResultsAsync));
+        return Task.FromResult(BenchmarkResults);
+    }
 
     /// <inheritdoc />
     public Task<RouterBenchmarkClearedResponse> ClearBenchmarkResultsAsync(CancellationToken ct = default) =>
