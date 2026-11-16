@@ -10,7 +10,7 @@
   <DockPanel Margin="8">
     <StackPanel DockPanel.Dock="Top" Spacing="6">
       <TextBlock Text="{Binding ModelName}" FontWeight="Bold" FontSize="16"/>
-      <Grid ColumnDefinitions="150,*" ColumnSpacing="8" RowSpacing="6">
+      <Grid RowDefinitions="Auto,Auto,Auto" ColumnDefinitions="150,*" ColumnSpacing="8" RowSpacing="6">
         <TextBlock Grid.Row="0" Grid.Column="0" Text="Target Pin:" VerticalAlignment="Center"/>
         <TextBox Grid.Row="0" Grid.Column="1" Text="{Binding TargetPin}" Watermark="Auto (blank = auto-select)"/>
         <TextBlock Grid.Row="1" Grid.Column="0" Text="Keep Alive (s):" VerticalAlignment="Center"/>
