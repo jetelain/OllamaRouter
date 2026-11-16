@@ -14,6 +14,12 @@ namespace OllamaRouter.Tests.App;
 /// where <c>ItemsControl</c> wraps <c>DataTemplate</c> items in a <c>ContentPresenter</c> whose
 /// content is the data item and whose visual child is the template root carrying the weight.
 /// </summary>
+/// <remarks>
+/// [Collection("Avalonia")] (task #129): creates real Avalonia controls, so it must not run in
+/// parallel with the other Avalonia-control-creating test classes (shared process-wide
+/// dispatcher/property-pool state).
+/// </remarks>
+[Collection("Avalonia")]
 public sealed class ProportionalPanelTests
 {
     [Theory]

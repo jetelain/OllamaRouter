@@ -14,8 +14,11 @@ namespace OllamaRouter.Tests.App;
 /// overprinted the labels and watermarks. Structural assertions only — no measure/arrange,
 /// because the test project never bootstraps fonts. <c>PreloadDialog</c> is a
 /// <see cref="Window"/>, so both construction and the assertions are dispatched on a headless
-/// Avalonia session (Avalonia controls are dispatcher-affine).
+/// Avalonia session (Avalonia controls are dispatcher-affine). Kept in the "Avalonia" xunit
+/// collection (task #129) so it never runs concurrently with the other Avalonia-control-creating
+/// test classes (shared process-wide dispatcher/property-pool state).
 /// </summary>
+[Collection("Avalonia")]
 public sealed class PreloadDialogLayoutTests : IClassFixture<PreloadDialogLayoutTests.HeadlessSessionFixture>
 {
     private readonly HeadlessSessionFixture _fixture;
