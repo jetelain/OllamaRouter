@@ -1189,6 +1189,12 @@ public sealed class OllamaRouterApiClientTests : IDisposable
 
     private IDefaultKeyReader KeyReader() => OllamaRouterDefaultKeyReader.Create(_configDir, new PlainKeyProtector(), _ => null);
 
+    /// <summary>Invokes the handler on the reporting thread (deterministic callback order for tests).</summary>
+    private sealed class SynchronousProgress<T>(Action<T> handler) : IProgress<T>
+    {
+        public void Report(T value) => handler(value);
+    }
+
     private static OllamaRouterApiClient CreateClient(
         FakeHttpMessageHandler handler, string? apiKey = null, IDefaultKeyReader? keyReader = null) =>
         new(BaseUrl, apiKey, keyReader, new HttpClient(handler));
@@ -1222,7 +1228,9 @@ public sealed class OllamaRouterApiClientTests : IDisposable
         var progress = new List<OllamaRouterModelPullProgress>();
 
         var result = await client.PullModelAsync(
-            "llama3.2:13b-q4_K_M", "Local", 8192, new Progress<OllamaRouterModelPullProgress>(progress.Add));
+            // Synchronous IProgress: Progress<T> posts to the thread pool, where concurrent
+            // callbacks make the collection order non-deterministic (flaky ordering).
+            "llama3.2:13b-q4_K_M", "Local", 8192, new SynchronousProgress<OllamaRouterModelPullProgress>(progress.Add));
 
         // The exact wire request (camelCase, all three fields).
         var request = Assert.Single(handler.Requests);

@@ -103,6 +103,47 @@ public sealed class AgentSessionsViewLayoutTests
         AssertSameColumnWidths("per-target breakdown table", tables.TargetHeader, tables.TargetRow);
     }
 
+    // ── AC: ColumnSpacing=8 on every table grid; header/row parity; net-neutral totals (task #132) ──
+
+    [Fact]
+    public void AllTables_CarryColumnSpacingOf8()
+    {
+        var tables = LoadTables();
+
+        foreach (var grid in AllTableGrids(tables))
+        {
+            Assert.True(grid.ColumnSpacing == 8.0,
+                $"grid [{string.Join(",", grid.ColumnDefinitions.Select(c => c.Width.ToString()))}] " +
+                $"has ColumnSpacing {grid.ColumnSpacing}, expected 8");
+        }
+    }
+
+    [Fact]
+    public void AllTables_HeaderAndRowGrids_DeclareIdenticalColumnSpacing()
+    {
+        var tables = LoadTables();
+
+        AssertSpacingParity("main sessions table", tables.MainHeader, tables.MainRow);
+        AssertSpacingParity("session detail table", tables.DetailHeader, tables.DetailRow);
+        AssertSpacingParity("per-target breakdown table", tables.TargetHeader, tables.TargetRow);
+    }
+
+    [Fact]
+    public void AllTables_TotalRenderedWidths_DoNotGrowVsBaseline()
+    {
+        var tables = LoadTables();
+
+        // Pre-fix totals (Σ fixed pixel widths, no inter-column gaps): main 1010, detail 940,
+        // per-target 910. Strategy A (task #132, maintainer-confirmed): Σ fixed + (n-1)×8 must not
+        // exceed the pre-fix total, so the min-window horizontal-scroll range does not grow.
+        Assert.True(TotalRenderedWidth(tables.MainHeader) <= 1010,
+            $"main sessions table renders {TotalRenderedWidth(tables.MainHeader)}px wide, pre-fix baseline was 1010px");
+        Assert.True(TotalRenderedWidth(tables.DetailHeader) <= 940,
+            $"session detail table renders {TotalRenderedWidth(tables.DetailHeader)}px wide, pre-fix baseline was 940px");
+        Assert.True(TotalRenderedWidth(tables.TargetHeader) <= 910,
+            $"per-target breakdown table renders {TotalRenderedWidth(tables.TargetHeader)}px wide, pre-fix baseline was 910px");
+    }
+
     // ── AC4: ListBoxItem padding offset neutralized, no compensating margins ──
 
     [Fact]
@@ -190,6 +231,37 @@ public sealed class AgentSessionsViewLayoutTests
                         $"{tableName}: text column {col} value is {valueBlock.TextAlignment}, expected Start (left)");
             }
         }
+    }
+
+    private static void AssertSpacingParity(string tableName, Grid header, Grid row)
+    {
+        Assert.True(header.ColumnSpacing == row.ColumnSpacing,
+            $"{tableName}: header grid declares ColumnSpacing {header.ColumnSpacing} " +
+            $"but the row grid declares {row.ColumnSpacing}");
+    }
+
+    private static IEnumerable<Grid> AllTableGrids(
+        (AgentSessionsView View, Grid MainHeader, Grid MainRow,
+         Grid DetailHeader, Grid DetailRow, Grid TargetHeader, Grid TargetRow) tables)
+    {
+        yield return tables.MainHeader;
+        yield return tables.MainRow;
+        yield return tables.DetailHeader;
+        yield return tables.DetailRow;
+        yield return tables.TargetHeader;
+        yield return tables.TargetRow;
+    }
+
+    /// <summary>
+    /// Total rendered width of a table grid: Σ fixed pixel column widths + (n-1)×ColumnSpacing
+    /// (star columns contribute no fixed width).
+    /// </summary>
+    private static int TotalRenderedWidth(Grid grid)
+    {
+        var fixedSum = grid.ColumnDefinitions
+            .Where(c => c.Width.IsAbsolute)
+            .Sum(c => (int)c.Width.Value);
+        return fixedSum + (grid.ColumnDefinitions.Count - 1) * (int)grid.ColumnSpacing;
     }
 
     private static void AssertSameColumnWidths(string tableName, Grid header, Grid row)
