@@ -187,17 +187,14 @@ public sealed partial class InstallReviewStepViewModel : ObservableObject, IWiza
 {
     private readonly Func<IOllamaRouterApiClient> _clientAccessor;
     private readonly Func<InstallTargetsStepViewModel> _targets;
-    private readonly Func<string> _modelReference;
     private CancellationTokenSource? _runCts;
 
     public InstallReviewStepViewModel(
         Func<IOllamaRouterApiClient> clientAccessor,
-        Func<InstallTargetsStepViewModel> targets,
-        Func<string> modelReference)
+        Func<InstallTargetsStepViewModel> targets)
     {
         _clientAccessor = clientAccessor ?? throw new ArgumentNullException(nameof(clientAccessor));
         _targets = targets ?? throw new ArgumentNullException(nameof(targets));
-        _modelReference = modelReference ?? throw new ArgumentNullException(nameof(modelReference));
     }
 
     /// <summary>The per-target run rows (review summary + live install state).</summary>
@@ -349,9 +346,8 @@ public sealed partial class InstallReviewStepViewModel : ObservableObject, IWiza
 
     private void BuildRows()
     {
-        var model = _modelReference();
         Rows.Clear();
-        foreach (var (target, context, alias, present) in _targets().BuildPlan())
+        foreach (var (target, model, context, alias, present) in _targets().BuildPlan())
         {
             Rows.Add(new InstallRunRowVm(target, model, alias, context, present, _targets().Rows
                 .FirstOrDefault(r => r.Name == target)?.Liveness ?? "unknown"));

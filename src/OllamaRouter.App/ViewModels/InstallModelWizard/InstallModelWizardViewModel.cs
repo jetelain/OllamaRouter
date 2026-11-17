@@ -33,8 +33,7 @@ public sealed partial class InstallModelWizardViewModel : ObservableObject, IAsy
             () => modelStep.Assisted);
         var reviewStep = new InstallReviewStepViewModel(
             clientAccessor,
-            () => targetsStep,
-            () => modelStep.ModelRef);
+            () => targetsStep);
 
         _steps =
         [

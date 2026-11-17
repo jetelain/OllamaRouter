@@ -92,17 +92,17 @@ public static class InstallAssistSuggester
     }
 
     /// <summary>
-    /// The pull plan of the wizard: one entry per selected target with its effective context
-    /// (null = alias OFF) and its precomputed context alias (null when the alias is OFF or
-    /// the context is missing/invalid — the server would then 400, but the wizard gate
-    /// prevents reaching that state).
+    /// The pull plan of the wizard: one entry per selected target with its (PER-TARGET)
+    /// model reference, its effective context (null = alias OFF) and its precomputed
+    /// context alias (null when the alias is OFF or the context is missing/invalid — the
+    /// server would then 400, but the wizard gate prevents reaching that state).
     /// </summary>
-    public static (string Target, int? Context, string? Alias, bool Present) PlanTarget(
+    public static (string Target, string Model, int? Context, string? Alias, bool Present) PlanTarget(
         string target, string modelReference, int? context, bool present)
     {
         var alias = context is { } ctx && ModelPullNaming.TryComputeAliasName(modelReference, ctx, out var computed)
             ? computed
             : null;
-        return (target, context, alias, present);
+        return (target, modelReference, context, alias, present);
     }
 }

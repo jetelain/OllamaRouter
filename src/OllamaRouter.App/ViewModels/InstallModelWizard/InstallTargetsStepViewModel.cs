@@ -13,12 +13,14 @@ using OllamaRouter.Services.Benchmarking;
 namespace OllamaRouter.App.ViewModels.InstallModelWizard;
 
 /// <summary>
-/// One fleet-target row of Step 1 — Targets of the Install Model wizard (task #125): the
-/// liveness + hardware summary (from <c>GET /api/router/fleet</c>), the already-present
-/// badge (from <c>GET /api/router/cartography</c>), the pullability (Ollama-type targets
-/// only — non-Ollama rows render disabled with a note), the selection checkbox and — in
-/// assisted mode — the editable per-target context with the
-/// <see cref="InstallAssistSuggester"/> badge + provenance line.
+/// One fleet-target row of Step 1 — Targets of the Install Model wizard (task #125, unified
+/// per-target inputs by task #131): the liveness + hardware summary (from
+/// <c>GET /api/router/fleet</c>), the already-present badge (from
+/// <c>GET /api/router/cartography</c>), the pullability (Ollama-type targets only —
+/// non-Ollama rows render disabled with a note), the selection checkbox and — in BOTH manual
+/// and assisted mode — the editable per-target quant/tag (prefilled with the step-0 model
+/// reference's EXPLICIT tag) + context with the computed per-target alias hint and the
+/// <see cref="InstallAssistSuggester"/> badge + provenance line (assisted mode).
 /// </summary>
 public sealed partial class InstallTargetRowVm : ObservableObject
 {
@@ -30,7 +32,7 @@ public sealed partial class InstallTargetRowVm : ObservableObject
         string hardwareText,
         bool present,
         bool selected,
-        bool assisted = false,
+        string modelReference,
         string context = "",
         string? suggestionBadge = null,
         string? suggestionProvenance = null)
@@ -41,11 +43,25 @@ public sealed partial class InstallTargetRowVm : ObservableObject
         OllamaType = ollamaType;
         HardwareText = hardwareText;
         Present = present;
-        Assisted = assisted;
         _selected = selected;
         _context = context;
         _suggestionBadge = suggestionBadge;
         _suggestionProvenance = suggestionProvenance;
+
+        // The FULL step-0 reference, parsed ONCE (the step-0 gate guarantees validity — the
+        // parse failure below is the impossible case): the tag prefill is the EXPLICIT tag
+        // only (a tagless reference prefills empty, never "latest").
+        BaseReference = modelReference.Trim();
+        if (ModelPullNaming.TryParseModelReference(modelReference, out var parsedName, out var parsedTag))
+        {
+            BaseName = parsedName;
+            _quantTag = parsedTag ?? string.Empty;
+        }
+        else
+        {
+            BaseName = modelReference;
+            _quantTag = string.Empty;
+        }
     }
 
     /// <summary>The target name (the wire <c>target</c> of the pull request).</summary>
@@ -72,9 +88,13 @@ public sealed partial class InstallTargetRowVm : ObservableObject
     /// enabled/online with a fresh liveness probe at pull time).</summary>
     public bool Pullable => OllamaType;
 
-    /// <summary>Whether the wizard ran in assisted mode (drives the per-target context input
-    /// visibility in the row template).</summary>
-    public bool Assisted { get; }
+    /// <summary>The step-0 model reference as entered (trimmed; the tagless-fallback target
+    /// of <see cref="EffectiveModelRef"/>).</summary>
+    public string BaseReference { get; }
+
+    /// <summary>The step-0 reference's NAME part (the per-target reference is composed as
+    /// <c>{BaseName}:{QuantTag}</c>).</summary>
+    public string BaseName { get; }
 
     /// <summary>The note for non-pullable rows (null for pullable rows).</summary>
     public string? Note => OllamaType ? null : "not pullable (OpenAI-compatible / OS-native)";
@@ -83,7 +103,12 @@ public sealed partial class InstallTargetRowVm : ObservableObject
     [ObservableProperty]
     private bool _selected;
 
-    /// <summary>The per-target context input (assisted mode; blank = invalid while the alias
+    /// <summary>The per-target quant/tag input (BOTH modes; prefilled with the step-0
+    /// reference's EXPLICIT tag, blank = pull the step-0 reference as-is).</summary>
+    [ObservableProperty]
+    private string _quantTag;
+
+    /// <summary>The per-target context input (BOTH modes; blank = invalid while the alias
     /// is ON).</summary>
     [ObservableProperty]
     private string _context;
@@ -97,31 +122,77 @@ public sealed partial class InstallTargetRowVm : ObservableObject
     [ObservableProperty]
     private string? _suggestionProvenance;
 
-    /// <summary>Whether the row's context parses to >= 1 (the assisted-mode gate per row).</summary>
+    /// <summary>Whether the row's context parses to >= 1 (the per-row gate while the alias is
+    /// ON).</summary>
     public bool HasValidContext => int.TryParse(Context, out var value) && value >= 1;
 
-    partial void OnContextChanged(string value) => OnPropertyChanged(nameof(HasValidContext));
+    /// <summary>Whether the row's composed model reference is valid: an EMPTY tag falls back
+    /// to the step-0 reference (valid by the step-0 gate); else the composed
+    /// <c>BaseName:tag</c> must parse with the same <see cref="ModelPullNaming"/> rules the
+    /// server enforces.</summary>
+    public bool HasValidModelRef =>
+        string.IsNullOrWhiteSpace(QuantTag)
+        || ModelPullNaming.TryParseModelReference($"{BaseName}:{QuantTag.Trim()}", out _, out _);
+
+    /// <summary>The per-row quant/tag hint (null while valid).</summary>
+    public string? ModelRefError => HasValidModelRef
+        ? null
+        : $"invalid quant/tag '{QuantTag.Trim()}' — use letters, digits, '.', '_' or '-' (e.g. q4_K_M)";
+
+    /// <summary>The per-target model reference of the pull plan: the composed
+    /// <c>BaseName:tag</c>, else the step-0 reference as-is (validity =
+    /// <see cref="HasValidModelRef"/>).</summary>
+    public string EffectiveModelRef =>
+        string.IsNullOrWhiteSpace(QuantTag) ? BaseReference : $"{BaseName}:{QuantTag.Trim()}";
+
+    /// <summary>The parent-driven alias hint chip text (set by the step view model —
+    /// <c>ComputedAlias</c> while the alias is ON, null otherwise; the row never reads the
+    /// switch itself).</summary>
+    [ObservableProperty]
+    private string? _aliasHint;
+
+    /// <summary>The computed per-target context alias from THIS row's own reference +
+    /// context (pure, independent of the alias switch; null while invalid/uncomputable).</summary>
+    public string? ComputedAlias =>
+        HasValidModelRef && HasValidContext &&
+        ModelPullNaming.TryComputeAliasName(EffectiveModelRef, int.Parse(Context), out var alias)
+            ? alias
+            : null;
+
+    partial void OnQuantTagChanged(string value)
+    {
+        OnPropertyChanged(nameof(HasValidModelRef));
+        OnPropertyChanged(nameof(ModelRefError));
+        OnPropertyChanged(nameof(EffectiveModelRef));
+        OnPropertyChanged(nameof(ComputedAlias));
+    }
+
+    partial void OnContextChanged(string value)
+    {
+        OnPropertyChanged(nameof(HasValidContext));
+        OnPropertyChanged(nameof(EffectiveContext));
+        OnPropertyChanged(nameof(ComputedAlias));
+    }
 
     partial void OnSelectedChanged(bool value) => OnPropertyChanged(nameof(HasValidContext));
 
     /// <summary>
-    /// The effective context (tokens) of this row for the install plan: the parsed per-target
-    /// input in assisted mode, else the shared manual value.
+    /// The effective context (tokens) of this row for the install plan (the parsed
+    /// per-target input in BOTH modes — null while invalid).
     /// </summary>
-    public int? EffectiveContext(bool assisted, int? sharedContext) =>
-        assisted ? (HasValidContext ? int.Parse(Context) : null) : sharedContext;
+    public int? EffectiveContext => HasValidContext ? int.Parse(Context) : null;
 }
 
 /// <summary>
-/// Step 1 — Targets of the Install Model wizard (task #125): fetch-on-entry of the fleet
-/// (liveness/hardware), the cartography (already-present badges), the config (target types)
-/// and — assisted mode only — the benchmark results + fleet-catalog model detail (the
-/// per-target context suggestions via the pure <see cref="InstallAssistSuggester"/>).
-/// Manual mode: a single shared context input + the "create context alias" switch (default
-/// ON) with the computed alias preview. Assisted mode: editable per-target contexts
-/// prefilled from the assistance (user can override before confirming) and the default
-/// selection of every ONLINE Ollama target. Gate: >= 1 selected target; valid context(s)
-/// while the alias is ON.
+/// Step 1 — Targets of the Install Model wizard (task #125, manual/assisted UNIFIED by
+/// task #131): fetch-on-entry of the fleet (liveness/hardware), the cartography
+/// (already-present badges), the config (target types) and — assisted mode only — the
+/// benchmark results + fleet-catalog model detail (the per-target context suggestions via
+/// the pure <see cref="InstallAssistSuggester"/>).
+/// Every pullable row gets its OWN quant/tag (prefilled with the step-0 reference's
+/// EXPLICIT tag) + context input in BOTH modes; the "create context alias" switch (default
+/// ON) gates the per-row completeness. Gate: >= 1 selected target; valid tag + context +
+/// computable alias per SELECTED row while the alias is ON.
 /// </summary>
 public sealed partial class InstallTargetsStepViewModel : ObservableObject, IWizardStep
 {
@@ -148,21 +219,6 @@ public sealed partial class InstallTargetsStepViewModel : ObservableObject, IWiz
     [ObservableProperty]
     private bool _createAlias = true;
 
-    /// <summary>The shared context (tokens) input (manual mode; blank = invalid while the
-    /// alias is ON).</summary>
-    [ObservableProperty]
-    private string _sharedContext = string.Empty;
-
-    /// <summary>The computed alias preview of the manual mode (null when the alias is OFF or
-    /// the context is invalid).</summary>
-    [ObservableProperty]
-    private string? _aliasPreview;
-
-    /// <summary>Whether the assisted mode was active when the rows were built (drives the
-    /// per-target context inputs' visibility).</summary>
-    [ObservableProperty]
-    private bool _assistedActive;
-
     /// <summary>The fetch error (null while healthy).</summary>
     [ObservableProperty]
     private string? _error;
@@ -171,12 +227,13 @@ public sealed partial class InstallTargetsStepViewModel : ObservableObject, IWiz
     [ObservableProperty]
     private bool _isFetching;
 
-    /// <summary>The Next gate: >= 1 selected pullable target AND valid context(s) while the
-    /// alias is ON.</summary>
+    /// <summary>The Next gate: >= 1 selected pullable target AND — while the alias is ON —
+    /// every selected row has a valid quant/tag, a valid context and a computable alias.
+    /// </summary>
     public bool IsValid =>
         Rows.Count > 0
         && Rows.Any(r => r.Pullable && r.Selected)
-        && (!CreateAlias || ContextsValid());
+        && (!CreateAlias || SelectedRowsComplete());
 
     /// <summary>The human hint of a blocked Next (shown by the window).</summary>
     public string? NextGateHint =>
@@ -184,35 +241,31 @@ public sealed partial class InstallTargetsStepViewModel : ObservableObject, IWiz
             ? "No fleet targets to install on."
             : !Rows.Any(r => r.Pullable && r.Selected)
                 ? "Select at least one Ollama target."
-                : CreateAlias && !ContextsValid()
-                    ? "Enter a context (tokens) of at least 1 for every selected target."
-                    : null;
+                : CreateAlias && Rows.Any(r => r.Pullable && r.Selected && !r.HasValidModelRef)
+                    ? "Enter a valid quant/tag (e.g. q4_K_M) for every selected target."
+                    : CreateAlias && Rows.Any(r => r.Pullable && r.Selected && !r.HasValidContext)
+                        ? "Enter a context (tokens) of at least 1 for every selected target."
+                        : CreateAlias && Rows.Any(r => r.Pullable && r.Selected && r.ComputedAlias is null)
+                            ? "The computed context alias would collide with the model reference on a selected target."
+                            : null;
 
-    private bool ContextsValid()
-    {
-        if (AssistedActive)
-        {
-            return Rows.Where(r => r.Pullable && r.Selected).All(r => r.HasValidContext);
-        }
-
-        return int.TryParse(SharedContext, out var value) && value >= 1;
-    }
+    private bool SelectedRowsComplete() =>
+        Rows.Where(r => r.Pullable && r.Selected)
+            .All(r => r.HasValidModelRef && r.HasValidContext && r.ComputedAlias is not null);
 
     /// <summary>
-    /// The install plan of the selected targets (fleet order): (target, context-or-null,
-    /// alias-or-null, already-present) — the review step renders it, the install loop
-    /// executes it SEQUENTIALLY in this order.
+    /// The install plan of the selected targets (fleet order): (target, per-target model
+    /// reference, context-or-null, alias-or-null, already-present) — the review step renders
+    /// it, the install loop executes it SEQUENTIALLY in this order (one pull per target with
+    /// THAT target's own reference + alias context).
     /// </summary>
-    public List<(string Target, int? Context, string? Alias, bool Present)> BuildPlan()
+    public List<(string Target, string Model, int? Context, string? Alias, bool Present)> BuildPlan()
     {
-        var model = _modelReference();
-        var assisted = AssistedActive;
-        var shared = CreateAlias && int.TryParse(SharedContext, out var ctx) && ctx >= 1 ? (int?)ctx : null;
-        var plan = new List<(string, int?, string?, bool)>();
+        var plan = new List<(string, string, int?, string?, bool)>();
         foreach (var row in Rows.Where(r => r.Pullable && r.Selected))
         {
-            var context = CreateAlias ? row.EffectiveContext(assisted, shared) : null;
-            plan.Add(InstallAssistSuggester.PlanTarget(row.Name, model, context, row.Present));
+            var context = CreateAlias ? row.EffectiveContext : null;
+            plan.Add(InstallAssistSuggester.PlanTarget(row.Name, row.EffectiveModelRef, context, row.Present));
         }
 
         return plan;
@@ -315,13 +368,12 @@ public sealed partial class InstallTargetsStepViewModel : ObservableObject, IWiz
                     deployment?.Present ?? false,
                     selected: assisted && ollamaType &&
                         string.Equals(item.Liveness, "Online", StringComparison.OrdinalIgnoreCase),
-                    assisted: assisted,
+                    modelReference: model,
                     context: context,
                     suggestionBadge: badge,
                     suggestionProvenance: provenance));
             }
 
-            AssistedActive = assisted;
             UnsubscribeRows();
             Rows.Clear();
             foreach (var row in rows)
@@ -342,6 +394,7 @@ public sealed partial class InstallTargetsStepViewModel : ObservableObject, IWiz
         finally
         {
             IsFetching = false;
+            RefreshAliasHints();
             RaisePlanChanged();
         }
     }
@@ -357,16 +410,23 @@ public sealed partial class InstallTargetsStepViewModel : ObservableObject, IWiz
     }
 
     /// <summary>
-    /// Keeps the gate + hint fresh on ROW changes (a checkbox toggle or a context edit —
-    /// the row's own property notifications alone would leave <see cref="IsValid"/> /
-    /// <see cref="NextGateHint"/> stale on the parent).
+    /// Keeps the gate + hint fresh on ROW changes (a checkbox toggle, a quant/tag edit or a
+    /// context edit — the row's own property notifications alone would leave <see cref="IsValid"/>
+    /// / <see cref="NextGateHint"/> stale on the parent) and re-sets that row's alias hint.
+    /// NOTE: <see cref="InstallTargetRowVm.AliasHint"/> is deliberately NOT in the reacted set
+    /// (it is set BY this handler — reacting to it would re-enter forever).
     /// </summary>
     private void OnRowPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
-        if (e.PropertyName is nameof(InstallTargetRowVm.Selected) or nameof(InstallTargetRowVm.Context)
+        if (e.PropertyName is nameof(InstallTargetRowVm.Selected) or nameof(InstallTargetRowVm.QuantTag)
+            or nameof(InstallTargetRowVm.Context)
             or nameof(InstallTargetRowVm.HasValidContext))
         {
             RaisePlanChanged();
+            if (sender is InstallTargetRowVm row)
+            {
+                row.AliasHint = CreateAlias ? row.ComputedAlias : null;
+            }
         }
     }
 
@@ -409,25 +469,21 @@ public sealed partial class InstallTargetsStepViewModel : ObservableObject, IWiz
 
     partial void OnCreateAliasChanged(bool value)
     {
-        RecomputeAliasPreview();
+        RefreshAliasHints();
         RaisePlanChanged();
     }
 
-    partial void OnSharedContextChanged(string value)
+    /// <summary>
+    /// (Re-)sets every row's parent-driven alias hint from the current alias switch state:
+    /// the row's own <see cref="InstallTargetRowVm.ComputedAlias"/> while the alias is ON,
+    /// null otherwise.
+    /// </summary>
+    private void RefreshAliasHints()
     {
-        RecomputeAliasPreview();
-        RaisePlanChanged();
-    }
-
-    private void RecomputeAliasPreview()
-    {
-        var preview = CreateAlias
-            && int.TryParse(SharedContext, out var context)
-            && context >= 1
-            && ModelPullNaming.TryComputeAliasName(_modelReference(), context, out var alias)
-                ? alias
-                : null;
-        AliasPreview = preview;
+        foreach (var row in Rows)
+        {
+            row.AliasHint = CreateAlias ? row.ComputedAlias : null;
+        }
     }
 
     private void RaisePlanChanged()

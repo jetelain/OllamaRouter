@@ -124,9 +124,9 @@ public sealed class InstallModelWizardViewModelTests
         Assert.Equal(1, vm.SelectedStep);
         await OpenAtStepAsync(vm, vm.TargetsStep, 1);
 
-        // Manual mode: select a target + a context.
+        // Manual mode: select a target + a per-row context (unified per-target inputs).
         vm.TargetsStep.Rows[0]!.Selected = true;
-        vm.TargetsStep.SharedContext = "8192";
+        vm.TargetsStep.Rows[0]!.Context = "8192";
         vm.TargetsStep.RefreshGate();
         Assert.True(vm.TargetsStep.IsValid);
 
@@ -159,11 +159,13 @@ public sealed class InstallModelWizardViewModelTests
 
         vm.TargetsStep.Rows[0]!.Selected = true; // Alpha
         vm.TargetsStep.Rows[1]!.Selected = true; // Beta
-        vm.TargetsStep.SharedContext = "8192"; // alias ON (default)
+        vm.TargetsStep.Rows[0]!.Context = "8192"; // per-row contexts (alias ON, default)
+        vm.TargetsStep.Rows[1]!.Context = "8192";
         vm.TargetsStep.RefreshGate();
 
-        // The computed alias preview (manual mode).
-        Assert.Equal("llama3.2:13b-q4_K_M-8k", vm.TargetsStep.AliasPreview);
+        // The computed PER-TARGET alias hint (the row chip text, both rows own ref + ctx).
+        Assert.Equal("llama3.2:13b-q4_K_M-8k", vm.TargetsStep.Rows[0]!.AliasHint);
+        Assert.Equal("llama3.2:13b-q4_K_M-8k", vm.TargetsStep.Rows[1]!.AliasHint);
 
         vm.NextCommand.Execute(null);
         await WaitUntilAsync(() => vm.ReviewStep.Rows.Count == 2);
@@ -218,7 +220,7 @@ public sealed class InstallModelWizardViewModelTests
         vm.TargetsStep.CreateAlias = false; // the context is NOT required now
         vm.TargetsStep.RefreshGate();
         Assert.True(vm.TargetsStep.IsValid);
-        Assert.Null(vm.TargetsStep.AliasPreview);
+        Assert.Null(vm.TargetsStep.Rows[0]!.AliasHint); // the per-row alias chip is hidden
 
         vm.NextCommand.Execute(null);
         await WaitUntilAsync(() => vm.ReviewStep.Rows.Count == 1);
@@ -243,7 +245,8 @@ public sealed class InstallModelWizardViewModelTests
 
         vm.TargetsStep.Rows[0]!.Selected = true;
         vm.TargetsStep.Rows[1]!.Selected = true;
-        vm.TargetsStep.SharedContext = "8192";
+        vm.TargetsStep.Rows[0]!.Context = "8192";
+        vm.TargetsStep.Rows[1]!.Context = "8192";
         vm.TargetsStep.RefreshGate();
         vm.NextCommand.Execute(null);
         await WaitUntilAsync(() => vm.ReviewStep.Rows.Count == 2);
@@ -284,7 +287,8 @@ public sealed class InstallModelWizardViewModelTests
 
         vm.TargetsStep.Rows[0]!.Selected = true;
         vm.TargetsStep.Rows[1]!.Selected = true;
-        vm.TargetsStep.SharedContext = "8192";
+        vm.TargetsStep.Rows[0]!.Context = "8192";
+        vm.TargetsStep.Rows[1]!.Context = "8192";
         vm.TargetsStep.RefreshGate();
         vm.NextCommand.Execute(null);
         await WaitUntilAsync(() => vm.ReviewStep.Rows.Count == 2);
@@ -313,7 +317,8 @@ public sealed class InstallModelWizardViewModelTests
 
         vm.TargetsStep.Rows[0]!.Selected = true;
         vm.TargetsStep.Rows[1]!.Selected = true;
-        vm.TargetsStep.SharedContext = "8192";
+        vm.TargetsStep.Rows[0]!.Context = "8192";
+        vm.TargetsStep.Rows[1]!.Context = "8192";
         vm.TargetsStep.RefreshGate();
         vm.NextCommand.Execute(null);
         await WaitUntilAsync(() => vm.ReviewStep.Rows.Count == 2);
@@ -412,7 +417,6 @@ public sealed class InstallModelWizardViewModelTests
         vm.ModelStep.ModelReference = Model; // an explicit tag (authoritative)
         vm.NextCommand.Execute(null);
         await OpenAtStepAsync(vm, vm.TargetsStep, 1);
-        Assert.True(vm.TargetsStep.AssistedActive);
 
         var alpha = vm.TargetsStep.Rows[0]!;
         var beta = vm.TargetsStep.Rows[1]!;
@@ -420,6 +424,11 @@ public sealed class InstallModelWizardViewModelTests
         // Online Ollama targets are PRESELECTED by default.
         Assert.True(alpha.Selected);
         Assert.True(beta.Selected);
+
+        // The per-row quant/tag is PREFILLED with the step-0 reference's EXPLICIT tag in BOTH
+        // modes (assisted here; manual asserted in the manual-mode tests).
+        Assert.Equal("13b-q4_K_M", alpha.QuantTag);
+        Assert.Equal("13b-q4_K_M", beta.QuantTag);
 
         // Alpha: the LARGEST VIABLE benchmark row wins over the catalog ceiling.
         Assert.Equal("32768", alpha.Context);
@@ -545,17 +554,294 @@ public sealed class InstallModelWizardViewModelTests
     }
 
     [Fact]
-    public void PlanTarget_ComputesTheAlias_AndPassesThroughPresence()
+    public void PlanTarget_ComputesTheAlias_AndPassesThroughPresenceAndModelReference()
     {
-        var (target, context, alias, present) = InstallAssistSuggester.PlanTarget("Alpha", Model, 8192, true);
+        var (target, model, context, alias, present) = InstallAssistSuggester.PlanTarget("Alpha", Model, 8192, true);
         Assert.Equal("Alpha", target);
+        Assert.Equal(Model, model);
         Assert.Equal(8192, context);
         Assert.Equal("llama3.2:13b-q4_K_M-8k", alias);
         Assert.True(present);
 
-        var (_, noAliasContext, noAliasName, noAliasPresent) = InstallAssistSuggester.PlanTarget("Beta", Model, null, false);
+        var (_, noAliasModel, noAliasContext, noAliasName, noAliasPresent) = InstallAssistSuggester.PlanTarget("Beta", Model, null, false);
+        Assert.Equal(Model, noAliasModel);
         Assert.Null(noAliasName);
         Assert.False(noAliasPresent);
+    }
+
+    // ------------------------------------------------------------------
+    //  Per-target quant/tag + per-target context (task #131, manual/assisted unified)
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task TagPrefill_ExplicitTag_TheRowPrefillsAndComposesItsOwnReference()
+    {
+        var fake = MakeFake();
+        var vm = new InstallModelWizardViewModel(() => fake);
+
+        vm.ModelStep.ModelReference = Model; // llama3.2:13b-q4_K_M
+        vm.NextCommand.Execute(null);
+        await OpenAtStepAsync(vm, vm.TargetsStep, 1);
+
+        Assert.All(vm.TargetsStep.Rows, row =>
+        {
+            Assert.Equal("13b-q4_K_M", row.QuantTag); // the EXPLICIT step-0 tag
+            Assert.Equal("llama3.2", row.BaseName);
+            Assert.Equal(Model, row.EffectiveModelRef);
+            Assert.True(row.HasValidModelRef);
+            Assert.Null(row.ModelRefError);
+        });
+
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task TagPrefill_TaglessReference_PrefillsEmpty_AndTheAliasUsesTheRegistryDefault()
+    {
+        var fake = MakeFake();
+        var vm = new InstallModelWizardViewModel(() => fake);
+
+        vm.ModelStep.ModelReference = ModelBase; // no explicit tag
+        vm.NextCommand.Execute(null);
+        await OpenAtStepAsync(vm, vm.TargetsStep, 1);
+
+        var alpha = vm.TargetsStep.Rows[0]!;
+        alpha.Selected = true;
+        Assert.Equal(string.Empty, alpha.QuantTag); // NEVER prefilled with "latest"
+        Assert.Equal(ModelBase, alpha.EffectiveModelRef);
+        Assert.True(alpha.HasValidModelRef);
+
+        // Alias ON + a valid context → the alias derives from the tagless ref (→ latest).
+        alpha.Context = "8192";
+        Assert.Equal("llama3.2:latest-8k", alpha.ComputedAlias);
+        Assert.Equal("llama3.2:latest-8k", alpha.AliasHint);
+
+        vm.NextCommand.Execute(null);
+        await WaitUntilAsync(() => vm.ReviewStep.Rows.Count == 1);
+        Assert.Equal(ModelBase, vm.ReviewStep.Rows[0]!.Model);
+        Assert.Equal("llama3.2:latest-8k", vm.ReviewStep.Rows[0]!.Alias);
+
+        await vm.ReviewStep.InstallCommand.ExecuteAsync(null);
+        Assert.Equal([(ModelBase, "Alpha", 8192)], fake.PullCalls);
+
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task EmptyTagFallback_ClearingThePrefillPullsTheStepZeroReferenceAsIs()
+    {
+        var fake = MakeFake();
+        var vm = new InstallModelWizardViewModel(() => fake);
+
+        vm.ModelStep.ModelReference = Model;
+        vm.NextCommand.Execute(null);
+        await OpenAtStepAsync(vm, vm.TargetsStep, 1);
+
+        var alpha = vm.TargetsStep.Rows[0]!;
+        alpha.Selected = true;
+        alpha.QuantTag = string.Empty; // the user clears the prefilled tag
+        alpha.Context = "8192";
+        Assert.True(alpha.HasValidModelRef); // the fallback is valid by the step-0 gate
+        Assert.Equal(Model, alpha.EffectiveModelRef);
+        Assert.True(vm.TargetsStep.IsValid);
+
+        vm.NextCommand.Execute(null);
+        await WaitUntilAsync(() => vm.ReviewStep.Rows.Count == 1);
+        await vm.ReviewStep.InstallCommand.ExecuteAsync(null);
+
+        Assert.Equal([(Model, "Alpha", 8192)], fake.PullCalls);
+
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task PerTargetTagAndContext_EachTargetIsPulledWithItsOwnReferenceAndContext()
+    {
+        var fake = MakeFake();
+        var vm = new InstallModelWizardViewModel(() => fake);
+
+        vm.ModelStep.ModelReference = Model;
+        vm.NextCommand.Execute(null);
+        await OpenAtStepAsync(vm, vm.TargetsStep, 1);
+
+        var alpha = vm.TargetsStep.Rows[0]!;
+        var beta = vm.TargetsStep.Rows[1]!;
+        alpha.Selected = true;
+        beta.Selected = true;
+        alpha.QuantTag = "13b-q8_0"; // a DIFFERENT quant on Alpha
+        alpha.Context = "16384";      // and a DIFFERENT context
+        beta.Context = "8192";        // Beta stays prefilled (13b-q4_K_M)
+
+        Assert.True(vm.TargetsStep.IsValid);
+        Assert.Equal("llama3.2:13b-q8_0-16k", alpha.AliasHint); // per-target alias
+        Assert.Equal("llama3.2:13b-q4_K_M-8k", beta.AliasHint);
+
+        vm.NextCommand.Execute(null);
+        await WaitUntilAsync(() => vm.ReviewStep.Rows.Count == 2);
+
+        // The review rows show the PER-TARGET reference, context and alias.
+        Assert.Equal("llama3.2:13b-q8_0", vm.ReviewStep.Rows[0]!.Model);
+        Assert.Equal(16384, vm.ReviewStep.Rows[0]!.Context);
+        Assert.Equal("llama3.2:13b-q8_0-16k", vm.ReviewStep.Rows[0]!.Alias);
+        Assert.Equal("llama3.2:13b-q4_K_M", vm.ReviewStep.Rows[1]!.Model);
+        Assert.Equal(8192, vm.ReviewStep.Rows[1]!.Context);
+        Assert.Equal("llama3.2:13b-q4_K_M-8k", vm.ReviewStep.Rows[1]!.Alias);
+
+        await vm.ReviewStep.InstallCommand.ExecuteAsync(null);
+
+        // ONE pull per target, in plan order, with THAT target's own ref + alias context.
+        Assert.Equal(
+            [
+                ("llama3.2:13b-q8_0", "Alpha", 16384),
+                ("llama3.2:13b-q4_K_M", "Beta", 8192)
+            ],
+            fake.PullCalls);
+        Assert.All(vm.ReviewStep.Rows, row => Assert.Equal(InstallRunStatus.Succeeded, row.Status));
+        Assert.Equal("Succeeded", vm.ReviewStep.RunResultText);
+
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task DistinctContexts_OnEqualReferences_YieldDistinctPerRowAliases()
+    {
+        var fake = MakeFake();
+        var vm = new InstallModelWizardViewModel(() => fake);
+
+        vm.ModelStep.ModelReference = Model;
+        vm.NextCommand.Execute(null);
+        await OpenAtStepAsync(vm, vm.TargetsStep, 1);
+
+        var alpha = vm.TargetsStep.Rows[0]!;
+        var beta = vm.TargetsStep.Rows[1]!;
+        alpha.Selected = true;
+        beta.Selected = true;
+        alpha.Context = "8192";
+        beta.Context = "16384";
+
+        // Each row's alias derives from its OWN ref + ctx (no cross-target clash).
+        Assert.Equal("llama3.2:13b-q4_K_M-8k", alpha.ComputedAlias);
+        Assert.Equal("llama3.2:13b-q4_K_M-16k", beta.ComputedAlias);
+
+        // Every valid plan has non-null aliases (no false-positive collision hint).
+        var plan = vm.TargetsStep.BuildPlan();
+        Assert.All(plan, entry => Assert.NotNull(entry.Alias));
+        Assert.Equal("llama3.2:13b-q4_K_M-8k", plan[0].Alias);
+        Assert.Equal("llama3.2:13b-q4_K_M-16k", plan[1].Alias);
+
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task InvalidTag_BlocksTheGate_WithThePerRowHint_AndFixingReenablesNext()
+    {
+        var fake = MakeFake();
+        var vm = new InstallModelWizardViewModel(() => fake);
+
+        vm.ModelStep.ModelReference = Model;
+        vm.NextCommand.Execute(null);
+        await OpenAtStepAsync(vm, vm.TargetsStep, 1);
+
+        var alpha = vm.TargetsStep.Rows[0]!;
+        alpha.Selected = true;
+        alpha.Context = "8192";
+        alpha.QuantTag = "q4_K M"; // a space: NOT a valid tag character
+
+        Assert.False(alpha.HasValidModelRef);
+        Assert.Contains("q4_K M", alpha.ModelRefError);
+        Assert.False(vm.TargetsStep.IsValid);
+        Assert.Equal("Enter a valid quant/tag (e.g. q4_K_M) for every selected target.", vm.TargetsStep.NextGateHint);
+
+        vm.NextCommand.Execute(null);
+        Assert.Equal(1, vm.SelectedStep); // blocked at step 1
+
+        // A second invalid shape (a colon inside the tag).
+        alpha.QuantTag = "a:b";
+        Assert.False(vm.TargetsStep.IsValid);
+        Assert.Equal("Enter a valid quant/tag (e.g. q4_K_M) for every selected target.", vm.TargetsStep.NextGateHint);
+
+        // Fixing the tag re-enables Next.
+        alpha.QuantTag = "13b-q8_0";
+        Assert.True(vm.TargetsStep.IsValid);
+        Assert.Null(vm.TargetsStep.NextGateHint);
+        vm.NextCommand.Execute(null);
+        Assert.Equal(2, vm.SelectedStep);
+
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task BuildPlan_EmitsPerTargetFiveFieldTuples_InFleetOrder()
+    {
+        var fake = MakeFake();
+        var vm = new InstallModelWizardViewModel(() => fake);
+
+        vm.ModelStep.ModelReference = Model;
+        vm.NextCommand.Execute(null);
+        await OpenAtStepAsync(vm, vm.TargetsStep, 1);
+
+        var alpha = vm.TargetsStep.Rows[0]!;
+        var beta = vm.TargetsStep.Rows[1]!;
+        alpha.Selected = true;
+        beta.Selected = true;
+        alpha.QuantTag = "13b-q8_0";
+        alpha.Context = "16384";
+        beta.Context = "8192";
+
+        var plan = vm.TargetsStep.BuildPlan();
+        Assert.Equal(
+            [
+                ("Alpha", "llama3.2:13b-q8_0", 16384, "llama3.2:13b-q8_0-16k", false),
+                ("Beta", "llama3.2:13b-q4_K_M", 8192, "llama3.2:13b-q4_K_M-8k", false)
+            ],
+            plan);
+
+        // Alias OFF: the context is NOT required and the tuple's context + alias are null.
+        vm.TargetsStep.CreateAlias = false;
+        alpha.Context = string.Empty;
+        Assert.True(vm.TargetsStep.IsValid);
+        Assert.Equal(
+            [
+                ("Alpha", "llama3.2:13b-q8_0", (int?)null, null, false),
+                ("Beta", "llama3.2:13b-q4_K_M", (int?)null, null, false)
+            ],
+            vm.TargetsStep.BuildPlan());
+
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task ManualAndAssistedModes_ShareTheSamePerRowGateAndPlanBehavior()
+    {
+        // VM-level unification (task #131): the gate/plan behaves identically for manual and
+        // assisted rows — every row carries its own tag + context, the shared field is gone.
+        var fake = MakeFake();
+        var vm = new InstallModelWizardViewModel(() => fake);
+
+        vm.ModelStep.ModelReference = Model;
+        vm.NextCommand.Execute(null);
+        await OpenAtStepAsync(vm, vm.TargetsStep, 1);
+
+        // MANUAL rows: the per-row inputs exist and drive the gate + alias hint.
+        var alpha = vm.TargetsStep.Rows[0]!;
+        Assert.False(alpha.Selected); // manual mode: no preselection
+        alpha.Selected = true;
+        Assert.False(vm.TargetsStep.IsValid); // alias ON, blank context
+        Assert.Equal("Enter a context (tokens) of at least 1 for every selected target.", vm.TargetsStep.NextGateHint);
+        alpha.Context = "8192";
+        Assert.True(vm.TargetsStep.IsValid);
+        Assert.Equal("llama3.2:13b-q4_K_M-8k", alpha.AliasHint);
+
+        // Toggle the alias switch: the per-row hints flip with it (parent-driven).
+        vm.TargetsStep.CreateAlias = false;
+        Assert.Null(alpha.AliasHint);
+        alpha.Context = string.Empty;
+        Assert.True(vm.TargetsStep.IsValid); // the context is NOT required now
+        vm.TargetsStep.CreateAlias = true;
+        Assert.True(alpha.ComputedAlias is null); // valid ref, but no context
+        Assert.False(vm.TargetsStep.IsValid);
+
+        await vm.DisposeAsync();
     }
 
     // ------------------------------------------------------------------
