@@ -96,6 +96,18 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
     /// <summary>The <c>GET /api/router/fleet</c> rows (empty by default).</summary>
     public RouterFleetResponse FleetResponse { get; set; } = new([]);
 
+    /// <summary>FIFO override of the <c>GET /api/router/fleet</c> payloads (task #130 — the
+    /// install wizard's re-entrancy regression tests): while non-empty, each call DEQUEUES
+    /// and serves the next item (per-call distinct payloads); otherwise the scripted
+    /// <see cref="FleetResponse"/> (the existing behavior).</summary>
+    public Queue<RouterFleetResponse>? FleetResponses { get; set; }
+
+    /// <summary>Per-call delay gates for <c>GET /api/router/fleet</c> (task #130 — mirrors the
+    /// <see cref="UninstallBlock"/> / <see cref="PullDelayMs"/> precedent): while non-empty, each
+    /// call DEQUEUES and awaits the next task BEFORE returning (making the fetch in-flight
+    /// so concurrent step entries overlap deterministically); otherwise no delay.</summary>
+    public Queue<Task>? FleetFetchBlocks { get; set; }
+
     /// <summary>The <c>GET /api/router/fleet/hardware</c> rows (empty by default).</summary>
     public RouterFleetHardwareResponse HardwareResponse { get; set; } = new([]);
 
@@ -276,10 +288,22 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
     }
 
     /// <inheritdoc />
-    public Task<RouterFleetResponse> GetFleetAsync(CancellationToken ct = default)
+    public async Task<RouterFleetResponse> GetFleetAsync(CancellationToken ct = default)
     {
         Log(nameof(GetFleetAsync));
-        return Task.FromResult(FleetResponse);
+        // Dequeue BOTH the delay gate and the payload at CALL time (FIFO per call — not per
+        // completion order): concurrent calls must keep their scripted correspondence even
+        // when a slower call finishes LAST.
+        Task? block = FleetFetchBlocks is { Count: > 0 } ? FleetFetchBlocks.Dequeue() : null;
+        RouterFleetResponse response = FleetResponses is { Count: > 0 }
+            ? FleetResponses.Dequeue()
+            : FleetResponse;
+        if (block is not null)
+        {
+            await block;
+        }
+
+        return response;
     }
 
     /// <inheritdoc />

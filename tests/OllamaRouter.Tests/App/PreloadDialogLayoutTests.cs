@@ -156,5 +156,17 @@ public sealed class PreloadDialogLayoutTests : IClassFixture<PreloadDialogLayout
     }
 }
 
+/// <summary>
+/// The EXCLUSIVE "Avalonia" xunit collection (task #130 addendum): the headless
+/// <see cref="HeadlessUnitTestSession"/> installs PROCESS-WIDE Avalonia statics (notably
+/// <c>Application.Current</c> = the session app). With only a <c>[Collection("Avalonia")]</c>
+/// group and no definition, this collection used to run IN PARALLEL with every other test
+/// class; a concurrent view-model test's dispatcher post then landed on the (non-pumping)
+/// headless session dispatcher and its fire-and-forget work never settled. Disabling
+/// parallelization keeps the headless window disjoint from all other classes in the process.
+/// </summary>
+[CollectionDefinition("Avalonia", DisableParallelization = true)]
+public sealed class AvaloniaCollectionDefinition;
+
 /// <summary>Minimal Avalonia application host for the headless layout test session.</summary>
 internal sealed class HeadlessLayoutTestApp : Application;

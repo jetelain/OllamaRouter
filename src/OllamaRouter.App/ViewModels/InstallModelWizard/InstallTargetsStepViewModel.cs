@@ -193,6 +193,10 @@ public sealed partial class InstallTargetRowVm : ObservableObject
 /// EXPLICIT tag) + context input in BOTH modes; the "create context alias" switch (default
 /// ON) gates the per-row completeness. Gate: >= 1 selected target; valid tag + context +
 /// computable alias per SELECTED row while the alias is ON.
+/// Re-entrant fetch-on-entry is LATEST-WINS (task #130): a re-entrant entry while a
+/// previous fetch is in flight starts its own fetch; only the newest entry's result is
+/// ever applied, so overlapping entries can never duplicate rows or clobber the latest
+/// response.
 /// </summary>
 public sealed partial class InstallTargetsStepViewModel : ObservableObject, IWizardStep
 {
@@ -200,6 +204,11 @@ public sealed partial class InstallTargetsStepViewModel : ObservableObject, IWiz
     private readonly Func<string> _modelReference;
     private readonly Func<bool> _assistedMode;
     private readonly List<InstallTargetRowVm> _subscribedRows = [];
+
+    /// <summary>The latest-wins fetch generation (task #130): every <see cref="OnStepEnteredAsync"/>
+    /// entry increments it; a fetch finishing after a newer entry started is superseded and
+    /// discards its result (it must not touch Rows / Error / IsFetching / the gate).</summary>
+    private int _fetchGeneration;
 
     public InstallTargetsStepViewModel(
         Func<IOllamaRouterApiClient> clientAccessor,
@@ -278,9 +287,22 @@ public sealed partial class InstallTargetsStepViewModel : ObservableObject, IWiz
     /// suggestions / ceilings — a 404 model detail is the NORMAL "not in the fleet yet"
     /// case). Assisted mode prefills the per-target contexts from the assistance and
     /// preselects every ONLINE Ollama target; manual mode leaves the selection to the user.
+    /// Re-entrancy (task #130): the wizard fires the step lifecycle fire-and-forget, so a
+    /// rapid Back→Next burst can start a SECOND fetch while the first is still in flight.
+    /// Every entry claims its own fetch generation (latest-wins); a superseded fetch — one
+    /// that finishes after a newer entry has started, in ANY completion order — discards its
+    /// whole result, so <see cref="Rows"/> always reflects the LATEST entry's response and a
+    /// target never appears twice. Each row name is additionally deduplicated
+    /// (case-insensitive, first occurrence wins) as defense in depth against a duplicated
+    /// wire payload.
     /// </summary>
     public async Task OnStepEnteredAsync(CancellationToken ct = default)
     {
+        // Claim this entry's generation BEFORE any state write or await: a newer entry
+        // increments the field, and any superseded fetch observes the mismatch after its
+        // last await and bails without touching shared state.
+        var generation = Interlocked.Increment(ref _fetchGeneration);
+
         IsFetching = true;
         Error = null;
         try
@@ -319,11 +341,20 @@ public sealed partial class InstallTargetsStepViewModel : ObservableObject, IWiz
                 m.Name.StartsWith(model + ":", StringComparison.OrdinalIgnoreCase));
 
             var rows = new List<InstallTargetRowVm>(fleet.Targets.Count);
+            var emittedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var item in fleet.Targets)
             {
                 if (string.Equals(item.Name, "Cloud", StringComparison.OrdinalIgnoreCase))
                 {
                     continue; // the Cloud pseudo-target has no Ollama daemon to pull onto
+                }
+
+                // Defense in depth (task #130): a malformed/duplicated wire payload must still
+                // yield exactly one row per target name (keep the first occurrence) — the
+                // BuildPlan() uniqueness then inherits from the row uniqueness.
+                if (!emittedNames.Add(item.Name))
+                {
+                    continue;
                 }
 
                 var type = config.Targets
@@ -374,6 +405,13 @@ public sealed partial class InstallTargetsStepViewModel : ObservableObject, IWiz
                     suggestionProvenance: provenance));
             }
 
+            // Superseded (a newer entry has started): discard the WHOLE result — Rows,
+            // Error, IsFetching and the gate stay owned by the latest entry.
+            if (generation != Volatile.Read(ref _fetchGeneration))
+            {
+                return;
+            }
+
             UnsubscribeRows();
             Rows.Clear();
             foreach (var row in rows)
@@ -385,17 +423,31 @@ public sealed partial class InstallTargetsStepViewModel : ObservableObject, IWiz
         }
         catch (OllamaRouterApiException ex)
         {
-            Error = $"Router error {(int)ex.Status}: {ex.Error ?? "(no error body)"}";
+            // Superseded failures are discarded (an older error must not overwrite the
+            // latest entry's state).
+            if (generation == Volatile.Read(ref _fetchGeneration))
+            {
+                Error = $"Router error {(int)ex.Status}: {ex.Error ?? "(no error body)"}";
+            }
         }
         catch (Exception ex)
         {
-            Error = ex.Message;
+            if (generation == Volatile.Read(ref _fetchGeneration))
+            {
+                Error = ex.Message;
+            }
         }
         finally
         {
-            IsFetching = false;
-            RefreshAliasHints();
-            RaisePlanChanged();
+            // Teardown runs only for the LATEST generation — IsFetching stays true until the
+            // latest fetch settles (an older in-flight fetch finishing first must not clear
+            // it while the newer fetch still runs).
+            if (generation == Volatile.Read(ref _fetchGeneration))
+            {
+                IsFetching = false;
+                RefreshAliasHints();
+                RaisePlanChanged();
+            }
         }
     }
 

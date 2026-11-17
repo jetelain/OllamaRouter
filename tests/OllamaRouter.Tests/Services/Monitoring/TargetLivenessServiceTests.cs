@@ -598,9 +598,11 @@ public class TargetLivenessServiceTests : IDisposable
         var (sut, _, _) = CreateSut(_ => Ok(), onlineCacheTtl: TimeSpan.FromMilliseconds(50));
 
         var state = await sut.EnsureKnownAsync(RoutingTarget.Local);
-        Assert.Equal(TargetLivenessState.Online, state);
+        Assert.Equal(TargetLivenessState.Online, state); // Online verdict == the strict-TTL predicate, fresh at probe time
 
-        Assert.True(sut.IsOnline(RoutingTarget.Local));
+        // Tolerant IsOnline right after a fresh probe: a 2 s maxAge is immune to the scheduling
+        // latency between the awaited probe and this line (a strict 50 ms check used to flake
+        // here when the continuation resumed > 50 ms late under parallel-load CI runs).
         Assert.True(sut.IsOnline(RoutingTarget.Local, TimeSpan.FromSeconds(2)));
 
         await Task.Delay(80);
@@ -656,29 +658,35 @@ public class TargetLivenessServiceTests : IDisposable
     [Fact]
     public async Task EnsureKnownAsync_SocketTimedOutException_ClassifiedAsTimeoutSubjectToHysteresis()
     {
-        var (sut, _, _) = CreateSut(_ => throw new HttpRequestException("Socket timed out", new SocketException((int)SocketError.TimedOut)));
+        var (sut, handler, _) = CreateSut(_ => throw new HttpRequestException("Socket timed out", new SocketException((int)SocketError.TimedOut)));
 
         // Strike 1: an Unknown target experiencing a timeout does NOT trip to Offline immediately (hysteresis)
         var state1 = await sut.EnsureKnownAsync(RoutingTarget.Local);
         Assert.Equal(TargetLivenessState.Unknown, state1);
 
-        // Strike 2: second consecutive timeout trips to Offline
+        // Strike 2: second consecutive timeout trips to Offline. Each sequential call to a
+        // non-Online target must run a FRESH probe (the first probe's in-flight entry must
+        // already be released — a lingering entry makes the second call coalesce onto the
+        // completed probe and silently skip its strike; task #130 addendum regression guard).
         var state2 = await sut.EnsureKnownAsync(RoutingTarget.Local);
         Assert.Equal(TargetLivenessState.Offline, state2);
+        Assert.Equal(2, handler.RequestCount);
     }
 
     [Fact]
     public async Task EnsureKnownAsync_WrappedTimeoutException_ClassifiedAsTimeoutSubjectToHysteresis()
     {
-        var (sut, _, _) = CreateSut(_ => throw new IOException("I/O timeout", new TimeoutException("operation timed out")));
+        var (sut, handler, _) = CreateSut(_ => throw new IOException("I/O timeout", new TimeoutException("operation timed out")));
 
         // Strike 1: preserved as Unknown (hysteresis)
         var state1 = await sut.EnsureKnownAsync(RoutingTarget.Local);
         Assert.Equal(TargetLivenessState.Unknown, state1);
 
-        // Strike 2: trips to Offline
+        // Strike 2: trips to Offline (fresh probe — see the SocketTimedOut sibling test for
+        // why a skipped re-probe must be impossible).
         var state2 = await sut.EnsureKnownAsync(RoutingTarget.Local);
         Assert.Equal(TargetLivenessState.Offline, state2);
+        Assert.Equal(2, handler.RequestCount);
     }
 
     // ------------------------------------------------------------------

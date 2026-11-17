@@ -98,24 +98,39 @@ public sealed class TargetLivenessService(
         // a caller cancellation never cancels the shared probe mid-flight for others.
         var probeTask = _inFlightProbes.GetOrAdd(target, _ => Task.Run(async () =>
         {
-            try
+            var outcome = await ProbeOnceAsync(target, CancellationToken.None);
+            var previous = ApplyProbeResult(target, slot, outcome.Outcome, outcome.LatencyMs, source: "on-demand");
+            if (previous != TargetLivenessState.Online && slot.ReadState() == TargetLivenessState.Online)
             {
-                var outcome = await ProbeOnceAsync(target, CancellationToken.None);
-                var previous = ApplyProbeResult(target, slot, outcome.Outcome, outcome.LatencyMs, source: "on-demand");
-                if (previous != TargetLivenessState.Online && slot.ReadState() == TargetLivenessState.Online)
-                {
-                    TriggerCatalogRefreshAsync(target);
-                }
-                return slot.ReadState();
+                TriggerCatalogRefreshAsync(target);
             }
-            finally
+            return slot.ReadState();
+        }, CancellationToken.None));
+
+        try
+        {
+            return await probeTask;
+        }
+        finally
+        {
+            // The in-flight entry is removed by the AWAITING caller, not inside the probe
+            // task's finally (task #130 addendum): a self-removal on the probe's
+            // thread-pool thread was not reliably visible to the next sequential
+            // GetOrAdd under load, so a follow-up EnsureKnownAsync could coalesce onto
+            // the ALREADY-COMPLETED probe task and return a stale state without
+            // re-probing (observed as a flaky 2-strike hysteresis test under parallel
+            // load). Removing on the caller's own thread keeps the removal and the next
+            // call's GetOrAdd in the same thread's program order. The value guard makes a
+            // LATE coalesced caller's removal idempotent and safe: while this caller's
+            // task is still the stored entry no newer probe can exist under the same key
+            // (GetOrAdd only adds when the key is absent), so a plain TryRemove cannot
+            // erase a newer probe's entry.
+            if (_inFlightProbes.TryGetValue(target, out var stored) && ReferenceEquals(stored, probeTask))
             {
                 Task<TargetLivenessState>? removed;
                 _inFlightProbes.TryRemove(target, out removed);
             }
-        }, CancellationToken.None));
-
-        return await probeTask;
+        }
     }
 
     // One best-effort strike after an uncommitted transport failure from the dispatch loop.

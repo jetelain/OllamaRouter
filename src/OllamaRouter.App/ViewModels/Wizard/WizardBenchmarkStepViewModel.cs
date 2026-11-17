@@ -76,6 +76,11 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
 
     private readonly Func<IOllamaRouterApiClient> _clientAccessor;
     private readonly DashboardPoller _poller;
+    // Single-writer gate (task #130 addendum): the poller tick (thread pool) and the command-
+    // side refresh (UI thread) both rebuild BenchmarkRows/ResultRows via Clear()/Add; without
+    // serialization they interleave ("Collection was modified") — the same bug class as the
+    // Install Model wizard row duplication. Same pattern as RouterTabViewModel._refreshGate.
+    private readonly SemaphoreSlim _refreshGate = new(1, 1);
     private List<string> _queuedTargets = [];
     private bool _disposed;
 
@@ -149,8 +154,20 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
         {
             await _clientAccessor().ClearBenchmarkResultsAsync().ConfigureAwait(false);
             _queuedTargets = [];
-            BenchmarkRows.Clear();
-            ResultRows.Clear();
+
+            // Serialize the row mutations with RefreshAsync (task #130 addendum): the poller
+            // tick may be mid-rebuild on another thread.
+            await _refreshGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                BenchmarkRows.Clear();
+                ResultRows.Clear();
+            }
+            finally
+            {
+                _refreshGate.Release();
+            }
+
             Message = "Benchmark results cleared.";
         }
         catch (OllamaRouterApiException ex)
@@ -171,8 +188,27 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
     /// <summary>
     /// The poller tick / on-demand refresh: re-reads the hardware table (best-effort) and the
     /// benchmark results, then self-stops the poller when every queued target is terminal.
+    /// Single-writer (task #130 addendum): overlapping refreshes (poller tick + command side)
+    /// serialize on <c>_refreshGate</c> so the row Clear()/Add rebuilds never interleave. The
+    /// gate wait is deliberately NON-CANCELLABLE: a self-stopped tick's cancellation cancels
+    /// the endpoint reads INSIDE the gate, not the serialization wait (a cancellable wait
+    /// drops the first tick out before it ever runs).
     /// </summary>
     public async Task RefreshAsync(CancellationToken ct = default)
+    {
+        await _refreshGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            await RefreshCoreAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _refreshGate.Release();
+        }
+    }
+
+    /// <summary>The refresh core (called under <c>_refreshGate</c> — single writer).</summary>
+    private async Task RefreshCoreAsync(CancellationToken ct)
     {
         var client = _clientAccessor();
 
@@ -280,8 +316,12 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
             return Task.CompletedTask;
         }
 
+        // Snapshot (task #130 addendum): the rows are enumerated while another caller may be
+        // mid-rebuild; the gate serializes the writers, the snapshot makes the enumeration
+        // defensive.
+        var rows = BenchmarkRows.ToList();
         var allTerminal = _queuedTargets.All(name =>
-            BenchmarkRows.FirstOrDefault(r => r.Target == name) is { } row && IsTerminal(row.Status));
+            rows.FirstOrDefault(r => r.Target == name) is { } row && IsTerminal(row.Status));
         if (allTerminal)
         {
             var poller = _poller;
@@ -313,5 +353,6 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
 
         _disposed = true;
         await _poller.DisposeAsync().ConfigureAwait(false);
+        _refreshGate.Dispose();
     }
 }

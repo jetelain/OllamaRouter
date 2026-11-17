@@ -52,12 +52,22 @@ public sealed class SetupWizardViewModelsTests
         }
     }
 
-    private static async Task WaitUntilAsync(Func<bool> condition, int maxBeats = 20000)
+    /// <summary>
+    /// Bounded cooperative settle wait: yields until the condition holds (up to
+    /// <paramref name="maxBeats"/> <see cref="Task.Yield"/> beats) and then asserts with a
+    /// self-describing failure (task #130 addendum) — a silent timeout previously produced
+    /// misleading downstream errors (e.g. an <c>IndexOutOfRangeException</c> on an empty
+    /// collection). The budget is generous (200 k beats) so a lagging fire-and-forget poller
+    /// tick under parallel load still lands in time — no real sleep.
+    /// </summary>
+    private static async Task WaitUntilAsync(Func<bool> condition, string what, int maxBeats = 200_000)
     {
         for (var i = 0; i < maxBeats && !condition(); i++)
         {
             await Task.Yield();
         }
+
+        Assert.True(condition(), $"condition not met after {maxBeats} cooperative yields: {what}");
     }
 
     private sealed class TempDir : IAsyncDisposable
@@ -269,7 +279,7 @@ public sealed class SetupWizardViewModelsTests
         var fx = BuildRoot(fake);
         await fx.Root.NextCommand.ExecuteAsync(CancellationToken.None); // 0 -> 1 (targets)
         Assert.Equal(1, fx.Root.SelectedStep);
-        await WaitUntilAsync(() => fake.Calls.Contains("GetFleetAsync"));
+        await WaitUntilAsync(() => fake.Calls.Contains("GetFleetAsync"), "the fleet poll tick to run");
         Assert.Contains("GetFleetAsync", fake.Calls);
         await fx.Root.DisposeAsync();
     }
@@ -575,9 +585,10 @@ public sealed class SetupWizardViewModelsTests
         var fake = new FakeRouterApiClient { FleetResponse = OneTargetFleet() };
         var vm = BuildTargets(fake);
         await vm.OnStepEnteredAsync(); // immediate tick
-        await WaitUntilAsync(() => vm.Rows.Count == 1);
-        Assert.Equal("Local", vm.Rows[0].Name);
-        Assert.Equal("Online", vm.Rows[0].Liveness);
+        await WaitUntilAsync(() => vm.Rows.Count == 1, "the poller tick to populate the target rows");
+        var row = Assert.Single(vm.Rows);
+        Assert.Equal("Local", row.Name);
+        Assert.Equal("Online", row.Liveness);
         await vm.DisposeAsync();
     }
 
@@ -701,9 +712,9 @@ public sealed class SetupWizardViewModelsTests
 
         await vm.RunBenchmarksCommand.ExecuteAsync(CancellationToken.None);
         // Local is still Running (non-terminal) => the poller keeps ticking at the soft rate.
-        await WaitUntilAsync(() => Volatile.Read(ref ticks) >= 2);
+        await WaitUntilAsync(() => Volatile.Read(ref ticks) >= 2, "the poller to reach its second tick");
         var s1 = Volatile.Read(ref ticks);
-        await WaitUntilAsync(() => Volatile.Read(ref ticks) > s1, maxBeats: 20000);
+        await WaitUntilAsync(() => Volatile.Read(ref ticks) > s1, "a non-terminal fleet to keep polling", maxBeats: 20000);
         Assert.True(Volatile.Read(ref ticks) > s1, "a non-terminal fleet keeps polling");
 
         // Stop the poller (awaited => the loop fully exits, no in-flight tick) so the observable
@@ -738,7 +749,7 @@ public sealed class SetupWizardViewModelsTests
         }, SoftDelay);
 
         await vm.RunBenchmarksCommand.ExecuteAsync(CancellationToken.None);
-        await WaitUntilAsync(() => Volatile.Read(ref ticks) >= 1);
+        await WaitUntilAsync(() => Volatile.Read(ref ticks) >= 1, "the first poller tick");
         // Settle: let the fire-and-forget StopAsync land and the loop observe the cancellation.
         for (var i = 0; i < 10000; i++)
         {
@@ -767,7 +778,7 @@ public sealed class SetupWizardViewModelsTests
         vm = BuildBenchmark(mock, ct => vm.RefreshAsync(ct), GatedDelay);
 
         await vm.OnStepEnteredAsync(); // immediate tick hits the 500
-        await WaitUntilAsync(() => vm.Error is not null);
+        await WaitUntilAsync(() => vm.Error is not null, "the poll tick to surface the 500 error");
         Assert.Contains("500", vm.Error);
         Assert.Contains("boom", vm.Error);
         await vm.DisposeAsync();

@@ -295,6 +295,23 @@ public sealed class AgentSessionsViewModelTests : IAsyncLifetime
         ]);
     }
 
+    /// <summary>
+    /// Bounded, no-sleep settle wait (task #130 addendum, defense in depth): assigning
+    /// <c>SelectedRow</c> fires the detail fetch FIRE-AND-FORGET, so the detail state is
+    /// asserted only after the observable result has landed (bounded cooperative yields —
+    /// no real sleep). The bounded terminal assert turns a leaked/stalled dispatch into a
+    /// self-describing failure instead of a misleading one.
+    /// </summary>
+    private static async Task WaitDetailSettledAsync(Func<bool> settled, string what)
+    {
+        for (var i = 0; i < 20_000 && !settled(); i++)
+        {
+            await Task.Yield();
+        }
+
+        Assert.True(settled(), $"timed out waiting for {what}");
+    }
+
     [Fact]
     public async Task SelectRow_FetchesDetailAndPopulatesTargetRows()
     {
@@ -305,6 +322,9 @@ public sealed class AgentSessionsViewModelTests : IAsyncLifetime
         await _viewModel.RefreshAsync();
 
         _viewModel.SelectedRow = _viewModel.Sessions[0];
+
+        await WaitDetailSettledAsync(
+            () => _viewModel.SelectedTargetRows.Count == 2, "the detail fetch to populate 2 target rows");
 
         Assert.Equal("sel-1", _viewModel.SelectedRow!.AgentId);
         Assert.Null(_viewModel.SelectedDetailError);
@@ -332,8 +352,17 @@ public sealed class AgentSessionsViewModelTests : IAsyncLifetime
         Assert.Single(_viewModel.SelectedTargetRows);
 
         // The 5 s poll re-lists the SAME session (its counters grew) — the selection survives.
+        // Capture the current detail row FIRST: the re-fetch (fired by the re-pointed
+        // selection) may already be in flight by the time RefreshAsync returns.
+        var oldRow = _viewModel.SelectedTargetRows[0];
         SeedAndRefreshSession("stick", 9.0, 0.9);
         await _viewModel.RefreshAsync();
+
+        // The re-fetch repopulates the detail rows with NEW row instances (the old batch is
+        // cleared and re-added) — settle on that replacement.
+        await WaitDetailSettledAsync(
+            () => _viewModel.SelectedTargetRows.Count == 1 && !ReferenceEquals(oldRow, _viewModel.SelectedTargetRows[0]),
+            "the detail re-fetch to repopulate the target rows");
 
         var stillSelected = _viewModel.SelectedRow!;
         Assert.NotNull(stillSelected);
@@ -372,6 +401,9 @@ public sealed class AgentSessionsViewModelTests : IAsyncLifetime
         await _viewModel.RefreshAsync();
 
         _viewModel.SelectedRow = _viewModel.Sessions[0];
+
+        await WaitDetailSettledAsync(
+            () => _viewModel.SelectedDetailError is not null, "the detail 404 error to surface");
 
         Assert.NotNull(_viewModel.SelectedRow);
         Assert.Contains("404", _viewModel.SelectedDetailError);
