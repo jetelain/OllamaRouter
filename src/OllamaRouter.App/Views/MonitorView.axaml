@@ -11,7 +11,7 @@
       <Setter Property="Foreground" Value="#FF7B7B"/>
     </Style>
   </UserControl.Styles>
-             <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto">
+  <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
     <StackPanel Spacing="16" Margin="12,12,12,48">
       <TextBlock Text="{Binding LastError}" Foreground="#FF7B7B" TextWrapping="Wrap" IsVisible="{Binding IsErrorVisible}"/>
 
@@ -24,25 +24,25 @@
           </Grid>
 
           <!-- Fleet table header -->
-          <Grid ColumnSpacing="8" ColumnDefinitions="140,148,80,90,148,90,80,80,140" Margin="0,0,0,4">
+          <Grid ColumnSpacing="8" ColumnDefinitions="140,80,90,148,68,58,80,140" Margin="0,0,0,4">
             <TextBlock Grid.Column="0" Text="TARGET" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
-            <TextBlock Grid.Column="1" Text="URL" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
-            <TextBlock Grid.Column="2" Text="HW" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
-            <TextBlock Grid.Column="3" Text="LIVENESS" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
-            <TextBlock Grid.Column="4" Text="ACTIVE MODEL" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
-            <TextBlock Grid.Column="5" Text="KEEP-ALIVE" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold" TextAlignment="Right"/>
-            <TextBlock Grid.Column="6" Text="IN-FLIGHT" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold" TextAlignment="Right"/>
-            <TextBlock Grid.Column="7" Text="CONTEXT" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold" TextAlignment="Right"/>
-            <TextBlock Grid.Column="8" Text="ENABLED" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="1" Text="HW" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="2" Text="LIVENESS" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="3" Text="ACTIVE MODEL" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="4" Text="KEEP-ALIVE" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold" TextAlignment="Right"/>
+            <TextBlock Grid.Column="5" Text="IN-FLIGHT" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold" TextAlignment="Right"/>
+            <TextBlock Grid.Column="6" Text="CONTEXT" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold" TextAlignment="Right"/>
+            <TextBlock Grid.Column="7" Text="ENABLED" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
           </Grid>
 
           <!-- Fleet rows -->
           <ItemsControl ItemsSource="{Binding FleetRows}">
             <ItemsControl.ItemTemplate>
               <DataTemplate>
-                <Grid ColumnSpacing="8" ColumnDefinitions="140,148,80,90,148,90,80,80,140" Margin="0,4" VerticalAlignment="Center">
-                  <!-- Target with color emoji and target color text -->
-                  <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                <Grid ColumnSpacing="8" ColumnDefinitions="140,80,90,148,68,58,80,140" Margin="0,4" VerticalAlignment="Center">
+                  <!-- Target with color emoji and target color text; the URL (column removed, task #145)
+                       stays one hover away via the cell tooltip. -->
+                  <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center" ToolTip.Tip="{Binding Url}">
                     <TextBlock Text="{Binding Name, Converter={x:Static views:TargetEmojiConverter.Instance}}"
                                FontFamily="Segoe UI Emoji, Apple Color Emoji" VerticalAlignment="Center"/>
                     <TextBlock Text="{Binding Name, Converter={x:Static views:TargetNameConverter.Instance}}"
@@ -50,18 +50,16 @@
                                FontWeight="SemiBold" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
                   </StackPanel>
 
-                  <TextBlock Grid.Column="1" Text="{Binding Url, TargetNullValue='-'}"
-                             Foreground="{DynamicResource SemiColorText2}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
-                  <TextBlock Grid.Column="2" Text="{Binding HardwareProfile, TargetNullValue='-'}" VerticalAlignment="Center"/>
-                  <TextBlock Grid.Column="3" Text="{Binding Liveness}" VerticalAlignment="Center"/>
-                  <TextBlock Grid.Column="4" Text="{Binding ActiveModel, TargetNullValue='-'}"
+                  <TextBlock Grid.Column="1" Text="{Binding HardwareProfile, TargetNullValue='-'}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="2" Text="{Binding Liveness}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="3" Text="{Binding ActiveModel, TargetNullValue='-'}"
                              TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
-                  <TextBlock Grid.Column="5" Text="{Binding KeepAliveDisplay}" VerticalAlignment="Center" TextAlignment="Right"/>
-                  <TextBlock Grid.Column="6" Text="{Binding InFlightRequests}" VerticalAlignment="Center" TextAlignment="Right"/>
-                  <TextBlock Grid.Column="7" Text="{Binding ContextAllocation, TargetNullValue='-'}" VerticalAlignment="Center" TextAlignment="Right"/>
+                  <TextBlock Grid.Column="4" Text="{Binding KeepAliveDisplay}" VerticalAlignment="Center" TextAlignment="Right"/>
+                  <TextBlock Grid.Column="5" Text="{Binding InFlightRequests}" VerticalAlignment="Center" TextAlignment="Right"/>
+                  <TextBlock Grid.Column="6" Text="{Binding ContextAllocation, TargetNullValue='-'}" VerticalAlignment="Center" TextAlignment="Right"/>
 
                   <!-- Enable/Disable toggle -->
-                  <StackPanel Grid.Column="8" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                  <StackPanel Grid.Column="7" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
                     <CheckBox IsChecked="{Binding Enabled, Mode=OneWay}" IsHitTestVisible="False" VerticalAlignment="Center"/>
                     <Button Content="Toggle" Command="{Binding ToggleCommand}" CommandParameter="{Binding}" VerticalAlignment="Center" Padding="8,2" FontSize="11"/>
                   </StackPanel>
@@ -87,7 +85,7 @@
           <TextBlock Text="Statistics" FontWeight="Bold" FontSize="16"/>
 
           <!-- Stats table header -->
-          <Grid ColumnSpacing="8" ColumnDefinitions="124,74,84,84,74,84,84,92" Margin="0,0,0,4">
+          <Grid ColumnSpacing="8" ColumnDefinitions="120,64,70,70,64,70,70,80" Margin="0,0,0,4">
             <TextBlock Grid.Column="0" Text="TARGET" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
             <TextBlock Grid.Column="1" Text="TODAY REQ" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold" TextAlignment="Right"/>
             <TextBlock Grid.Column="2" Text="TODAY IN" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold" TextAlignment="Right"/>
@@ -103,7 +101,7 @@
             <ItemsControl.ItemTemplate>
               <DataTemplate>
                 <Border BorderBrush="{DynamicResource SemiColorBorder}" BorderThickness="0,0,0,1" Padding="0,3">
-                  <Grid ColumnSpacing="8" ColumnDefinitions="124,74,84,84,74,84,84,92">
+                  <Grid ColumnSpacing="8" ColumnDefinitions="120,64,70,70,64,70,70,80">
                     <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
                       <TextBlock Text="{Binding Target, Converter={x:Static views:TargetEmojiConverter.Instance}}"
                                  FontFamily="Segoe UI Emoji, Apple Color Emoji" VerticalAlignment="Center"/>
@@ -162,8 +160,8 @@
                          IsVisible="{Binding HasUsageActivity, Converter={x:Static converters:BoolNegateConverter.Instance}}"/>
             </Grid>
 
-            <!-- Usage Legend with color dots (task #117): one horizontal row per chunk of ≤3
-                 targets (UsageRatioLegendRows) so >3 targets break onto a second line within the
+            <!-- Usage Legend with color dots (task #117): one horizontal row per chunk of ≤2
+                 targets (UsageRatioLegendRows) so >2 targets break onto a second line within the
                  panel width instead of one unbounded single row. -->
             <ItemsControl ItemsSource="{Binding UsageRatioLegendRows}" IsVisible="{Binding HasUsageActivity}">
               <ItemsControl.ItemTemplate>
@@ -240,7 +238,7 @@
       <Border Theme="{DynamicResource CardBorder}" Padding="14">
         <StackPanel Spacing="8">
           <TextBlock Text="In-Progress Requests" FontWeight="Bold" FontSize="16"/>
-          <Grid ColumnSpacing="8" ColumnDefinitions="140,204,98,90,90,104,*" Margin="0,0,0,4">
+          <Grid ColumnSpacing="8" ColumnDefinitions="120,150,72,64,64,*,100" Margin="0,0,0,4">
             <TextBlock Grid.Column="0" Text="TARGET" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
             <TextBlock Grid.Column="1" Text="MODEL" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
             <TextBlock Grid.Column="2" Text="EST. TOKENS" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold" TextAlignment="Right"/>
@@ -252,7 +250,7 @@
           <ItemsControl ItemsSource="{Binding ActiveRequests}">
             <ItemsControl.ItemTemplate>
               <DataTemplate>
-                <Grid ColumnSpacing="8" ColumnDefinitions="140,204,98,90,90,104,*" Margin="0,3">
+                <Grid ColumnSpacing="8" ColumnDefinitions="120,150,72,64,64,*,100" Margin="0,3">
                   <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
                     <TextBlock Text="{Binding Target, Converter={x:Static views:TargetEmojiConverter.Instance}}"
                                FontFamily="Segoe UI Emoji, Apple Color Emoji" VerticalAlignment="Center"/>
@@ -265,7 +263,7 @@
                   <TextBlock Grid.Column="3" Text="{Binding ElapsedMs, Converter={x:Static views:DurationMsConverter.Instance}}" VerticalAlignment="Center" TextAlignment="Right"/>
                   <TextBlock Grid.Column="4" Text="{Binding ReasoningEffort, TargetNullValue='-'}" Foreground="{DynamicResource SemiColorText2}" VerticalAlignment="Center"/>
                   <TextBlock Grid.Column="5" Text="{Binding SessionId, TargetNullValue='-'}" Foreground="{DynamicResource SemiColorText2}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
-                  <TextBlock Grid.Column="6" Text="{Binding AgentId, TargetNullValue='-'}" Foreground="{DynamicResource SemiColorText2}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="6" Text="{Binding AgentId, TargetNullValue='-'}" Foreground="{DynamicResource SemiColorText2}" TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding AgentId}" VerticalAlignment="Center"/>
                 </Grid>
               </DataTemplate>
             </ItemsControl.ItemTemplate>
@@ -277,7 +275,7 @@
       <Border Theme="{DynamicResource CardBorder}" Padding="14">
         <StackPanel Spacing="8">
           <TextBlock Text="Recent Requests" FontWeight="Bold" FontSize="16"/>
-          <Grid ColumnSpacing="8" ColumnDefinitions="124,124,184,90,90,90,90,70" Margin="0,0,0,4">
+          <Grid ColumnSpacing="8" ColumnDefinitions="76,120,150,64,64,64,64,52" Margin="0,0,0,4">
             <TextBlock Grid.Column="0" Text="TIMESTAMP" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
             <TextBlock Grid.Column="1" Text="TARGET" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
             <TextBlock Grid.Column="2" Text="MODEL" Foreground="{DynamicResource SemiColorText2}" FontSize="11" FontWeight="SemiBold"/>
@@ -290,7 +288,7 @@
           <ItemsControl ItemsSource="{Binding RecentRequests}">
             <ItemsControl.ItemTemplate>
                 <DataTemplate x:DataType="vm:MonitorRecentRequestRow">
-                  <Grid ColumnSpacing="8" ColumnDefinitions="124,124,184,90,90,90,90,70" Margin="0,2">
+                  <Grid ColumnSpacing="8" ColumnDefinitions="76,120,150,64,64,64,64,52" Margin="0,2">
                     <TextBlock Grid.Column="0" Text="{Binding Timestamp, StringFormat='{}{0:HH:mm:ss}'}" Foreground="{DynamicResource SemiColorText2}" VerticalAlignment="Center"/>
                     <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
                       <TextBlock Text="{Binding Target, Converter={x:Static views:TargetEmojiConverter.Instance}}"

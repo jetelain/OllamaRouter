@@ -66,7 +66,7 @@ public sealed class MonitorRecentRequestColumnTests
     // ── VM integration: legend row splitting on refresh ──
 
     [Fact]
-    public async Task RefreshAsync_WithFourTargets_SplitsTheLegendIntoTwoRowsOf3And1()
+    public async Task RefreshAsync_WithFourTargets_SplitsTheLegendIntoTwoRowsOf2And2()
     {
         var client = new FakeRouterApiClient
         {
@@ -91,12 +91,12 @@ public sealed class MonitorRecentRequestColumnTests
         await viewModel.RefreshAsync();
 
         Assert.Equal(4, viewModel.UsageRatios.Count);
-        Assert.Equal(new[] { 3, 1 }, viewModel.UsageRatioLegendRows.Select(r => r.Count));
+        Assert.Equal(new[] { 2, 2 }, viewModel.UsageRatioLegendRows.Select(r => r.Count));
         Assert.Equal(viewModel.UsageRatios, viewModel.UsageRatioLegendRows.SelectMany(r => r));
     }
 
     [Fact]
-    public async Task RefreshAsync_WithAtMostThreeTargets_KeepsTheLegendOnOneRow()
+    public async Task RefreshAsync_WithASingleTarget_KeepsTheLegendOnOneRow()
     {
         var client = new FakeRouterApiClient { MonitorState = MonitorViewModelTests.BuildMonitorState() };
         var viewModel = new MonitorViewModel(() => client);

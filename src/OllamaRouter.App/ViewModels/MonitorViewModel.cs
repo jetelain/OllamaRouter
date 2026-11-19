@@ -264,12 +264,12 @@ public sealed partial class MonitorViewModel : RouterTabViewModel
     /// Splits the flat usage-ratio legend items into rows of at most <paramref name="itemsPerRow"/>
     /// items (task #117) so the legend wraps deterministically within the panel width (the page
     /// ScrollViewer measures content with infinite width, so a WrapPanel would never wrap).
-    /// Consecutive order-preserving chunks: n≤3 → 1 row, n=4 → [3,1], n=5 → [3,2], n=6 → [3,3],
-    /// n=7 → [3,3,1]; null/empty input → an empty row list. The fixed per-row cap bounds the
+    /// Consecutive order-preserving chunks: n≤2 → 1 row, n=4 → [2,2], n=5 → [2,2,1],
+    /// n=6 → [2,2,2], n=7 → [2,2,2,1]; null/empty input → an empty row list. The fixed per-row cap bounds the
     /// legend's natural width, so it can never drive horizontal overflow.
     /// </summary>
     public static IReadOnlyList<IReadOnlyList<MonitorUsageRatioItem>> BuildUsageRatioLegendRows(
-        IReadOnlyList<MonitorUsageRatioItem> items, int itemsPerRow = 3)
+        IReadOnlyList<MonitorUsageRatioItem> items, int itemsPerRow = 2)
     {
         if (itemsPerRow < 1)
         {
@@ -307,9 +307,9 @@ public sealed partial class MonitorViewModel : RouterTabViewModel
     private bool _hasUsageActivity;
 
     /// <summary>
-    /// The usage-ratio legend items split into rows of ≤3 (task #117, see
+    /// The usage-ratio legend items split into rows of ≤2 (task #117, see
     /// <see cref="BuildUsageRatioLegendRows"/>): the legend renders one horizontal row per entry,
-    /// breaking onto a second line within the panel width when more than 3 targets exist.
+    /// breaking onto a second line within the panel width when more than 2 targets exist.
     /// Rebuilt together with <see cref="UsageRatios"/> on every refresh.
     /// </summary>
     [ObservableProperty]
@@ -463,7 +463,7 @@ public sealed partial class MonitorViewModel : RouterTabViewModel
                 });
             }
 
-            // Legend wrapping (task #117): chunk the flat legend into ≤3 items per row so it
+            // Legend wrapping (task #117): chunk the flat legend into ≤2 items per row so it
             // breaks onto a second line within the panel width instead of one unbounded row.
             UsageRatioLegendRows = BuildUsageRatioLegendRows(UsageRatios);
 

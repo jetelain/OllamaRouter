@@ -1,9 +1,11 @@
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.Primitives;
 using Avalonia.Data;
 using Avalonia.Markup.Xaml.Templates;
 using Avalonia.Media;
 using Avalonia.Styling;
+using OllamaRouter.App.ViewModels;
 using OllamaRouter.App.Views;
 
 namespace OllamaRouter.Tests.App;
@@ -32,6 +34,13 @@ public sealed class AgentSessionsViewLayoutTests
     private static readonly int[] DetailTextColumns = [5]; // LAST SEEN
     private static readonly int[] TargetNumericColumns = [1, 2, 3, 4, 5, 6, 7, 8];
     private static readonly int[] TargetTextColumns = [0]; // TARGET
+
+    // Task #145: table-grid width budget at the 960px minimum window (A1):
+    // 960 − 12 (TabControl Margin="6,4,6,6") − 24 (view StackPanel margin 12px each side)
+    // − 28 (card Border padding 14px each side) = 896. Star columns contribute 0 fixed width.
+    private const int MinWindowTableBudget = 896;
+
+    private static readonly DateTimeOffset FixedLastSeenAt = new(2026, 11, 19, 20, 35, 7, TimeSpan.Zero);
 
     // ── AC1: EST. COST → CLOUD VALUE rename (data bindings untouched) ──
 
@@ -129,19 +138,85 @@ public sealed class AgentSessionsViewLayoutTests
     }
 
     [Fact]
-    public void AllTables_TotalRenderedWidths_DoNotGrowVsBaseline()
+    public void AllTables_TotalRenderedWidths_FitTheMinWindowBudget()
     {
         var tables = LoadTables();
 
-        // Pre-fix totals (Σ fixed pixel widths, no inter-column gaps): main 1010, detail 940,
-        // per-target 910. Strategy A (task #132, maintainer-confirmed): Σ fixed + (n-1)×8 must not
-        // exceed the pre-fix total, so the min-window horizontal-scroll range does not grow.
-        Assert.True(TotalRenderedWidth(tables.MainHeader) <= 1010,
-            $"main sessions table renders {TotalRenderedWidth(tables.MainHeader)}px wide, pre-fix baseline was 1010px");
-        Assert.True(TotalRenderedWidth(tables.DetailHeader) <= 940,
-            $"session detail table renders {TotalRenderedWidth(tables.DetailHeader)}px wide, pre-fix baseline was 940px");
-        Assert.True(TotalRenderedWidth(tables.TargetHeader) <= 910,
-            $"per-target breakdown table renders {TotalRenderedWidth(tables.TargetHeader)}px wide, pre-fix baseline was 910px");
+        // Task #145: the outer ScrollViewer's horizontal scrollbar is disabled, so every table
+        // (and the summary stats grid) must render fully inside the 896px budget of the 960px
+        // minimum window (Σ fixed pixel widths + (n−1)×spacing; star columns contribute 0).
+        var summaryGrid = SummaryStatsGrid(tables.View);
+        var tablesByGrid = new[]
+        {
+            ("main sessions table", tables.MainHeader),
+            ("session detail table", tables.DetailHeader),
+            ("per-target breakdown table", tables.TargetHeader),
+            ("summary stats grid", summaryGrid),
+        };
+        foreach (var (name, grid) in tablesByGrid)
+        {
+            var total = TotalRenderedWidth(grid);
+            Assert.True(total <= MinWindowTableBudget,
+                $"{name} renders {total}px wide, but the min-window table budget is {MinWindowTableBudget}px");
+        }
+    }
+
+    [Fact]
+    public void SessionsTable_SessionIdColumn_IsStar()
+    {
+        var tables = LoadTables();
+
+        // Task #145: AGENT / SESSION ID absorbs the remaining width (star) so session IDs render
+        // in full at 960px (216px, up from the fixed 156).
+        Assert.True(tables.MainHeader.ColumnDefinitions[0].Width.IsStar,
+            $"AGENT / SESSION ID column is {tables.MainHeader.ColumnDefinitions[0].Width}, expected star");
+    }
+
+    [Fact]
+    public void SummaryGrid_ColumnSpacingIs12()
+    {
+        var tables = LoadTables();
+
+        // Task #145: the summary grid is NOT a table grid — its ColumnSpacing tightened from 16
+        // to 12 so its declared bounds fit the 896px budget (total 890) with zero visible change.
+        var summaryGrid = SummaryStatsGrid(tables.View);
+        Assert.True(summaryGrid.ColumnSpacing == 12.0,
+            $"summary stats grid has ColumnSpacing {summaryGrid.ColumnSpacing}, expected 12");
+    }
+
+    [Fact]
+    public void LastSeenCells_FormatWithMMddHHmm()
+    {
+        var tables = LoadTables();
+
+        // Task #145: LAST SEEN dropped the date+year and seconds — both the sessions table and
+        // the Session Detail figures grid render "MM-dd HH:mm" (e.g. 11-19 20:35). The row grids
+        // are built detached, so the DataContext is set on the LAST SEEN cell itself (the
+        // main-table binding path is LastSeenAt; the detail binding path is SelectedRow.LastSeenAt,
+        // so its DataContext must be an AgentSessionsViewModel).
+        var row = new AgentSessionRow("agent-1", 1, 100, 10, 50, 0.0, FixedLastSeenAt, null, null, null, null, null, null);
+
+        var mainLastSeen = tables.MainRow.Children.OfType<TextBlock>()
+            .Single(tb => Grid.GetColumn(tb) == 6);
+        mainLastSeen.DataContext = row;
+        Assert.Equal("11-19 20:35", mainLastSeen.Text);
+
+        var detailLastSeen = tables.DetailRow.Children.OfType<TextBlock>()
+            .Single(tb => Grid.GetColumn(tb) == 5);
+        var viewModel = new AgentSessionsViewModel(() => new FakeRouterApiClient());
+        viewModel.SelectedRow = row;
+        detailLastSeen.DataContext = viewModel;
+        Assert.Equal("11-19 20:35", detailLastSeen.Text);
+    }
+
+    [Fact]
+    public void OuterScrollViewer_DisablesHorizontalScroll()
+    {
+        var view = LoadView();
+
+        // Task #145: no page-level horizontal scroll — everything must fit the 960px minimum window.
+        var scrollView = AllControls(view).OfType<ScrollViewer>().First();
+        Assert.Equal(ScrollBarVisibility.Disabled, scrollView.HorizontalScrollBarVisibility);
     }
 
     // ── AC4: ListBoxItem padding offset neutralized, no compensating margins ──
@@ -204,6 +279,16 @@ public sealed class AgentSessionsViewLayoutTests
     }
 
     // ── Shared helpers ──
+
+    /// <summary>
+    /// The summary stats grid (locatable via its "ACTUAL COST" label, which sits inside one of
+    /// the grid's direct-child StackPanels — not a direct grid child, and not reachable from an
+    /// ancestor grid's direct children).
+    /// </summary>
+    private static Grid SummaryStatsGrid(Control view) =>
+        AllControls(view).OfType<Grid>().Single(g =>
+            g.Children.OfType<StackPanel>().Any(sp =>
+                AllControls(sp).OfType<TextBlock>().Any(tb => tb.Text == "ACTUAL COST")));
 
     private static void AssertColumnsAligned(string tableName, Grid header, Grid row, int[] numericColumns, int[] textColumns)
     {

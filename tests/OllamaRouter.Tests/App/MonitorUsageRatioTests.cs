@@ -69,14 +69,14 @@ public sealed class MonitorUsageRatioTests
         Assert.Equal("B: 1.2% (1.3k tokens, 7 req)", item.FormattedTooltip);
     }
 
-    // ── task #117: BuildUsageRatioLegendRows (legend wraps to ≤3 items per row) ──
+    // ── task #117 (task #145: ≤2 per row): BuildUsageRatioLegendRows (legend wraps to ≤2 items per row) ──
 
     private static MonitorUsageRatioItem Item(string name) => new() { Name = name, Location = "local" };
 
     [Fact]
-    public void BuildUsageRatioLegendRows_UpToThreeItems_SingleRowPreservingOrder()
+    public void BuildUsageRatioLegendRows_UpToTwoItems_SingleRowPreservingOrder()
     {
-        foreach (var count in new[] { 1, 2, 3 })
+        foreach (var count in new[] { 1, 2 })
         {
             var items = Enumerable.Range(0, count).Select(i => Item($"T{i}")).ToList();
             var rows = MonitorViewModel.BuildUsageRatioLegendRows(items);
@@ -87,11 +87,11 @@ public sealed class MonitorUsageRatioTests
     }
 
     [Theory]
-    [InlineData(4, 3, 1)]
-    [InlineData(5, 3, 2)]
-    [InlineData(6, 3, 3)]
-    [InlineData(7, 3, 3, 1)]
-    public void BuildUsageRatioLegendRows_MoreThanThreeItems_ChunksIntoConsecutiveRows(
+    [InlineData(4, 2, 2)]
+    [InlineData(5, 2, 2, 1)]
+    [InlineData(6, 2, 2, 2)]
+    [InlineData(7, 2, 2, 2, 1)]
+    public void BuildUsageRatioLegendRows_MoreThanTwoItems_ChunksIntoConsecutiveRows(
         int count, params int[] expectedSizes)
     {
         var items = Enumerable.Range(0, count).Select(i => Item($"T{i}")).ToList();

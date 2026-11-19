@@ -1,5 +1,6 @@
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.Primitives;
 using Avalonia.Data;
 using Avalonia.Markup.Xaml.Templates;
 using OllamaRouter.App.Views;
@@ -7,15 +8,17 @@ using OllamaRouter.App.Views;
 namespace OllamaRouter.Tests.App;
 
 /// <summary>
-/// Monitor view layout contract tests (task #132): pins the inter-column separation of the four
-/// fixed-width tables — every header grid and its row-template grid carries
-/// <see cref="Grid.ColumnSpacing"/> of 8 (so the right-aligned IN-FLIGHT / CONTEXT / ELAPSED
-/// values no longer butt against the next column's left-aligned content), the header and row
-/// grids declare byte-identical <see cref="Grid.ColumnDefinitions"/>, and the net-neutral width
-/// strategy (Strategy A, maintainer-confirmed) keeps each table's rendered total
-/// (Σ fixed pixel widths + (n−1)×8) at or below its pre-fix total. Also pins the ENABLED
-/// column's display-only <see cref="CheckBox"/> + <c>Toggle</c> button contract, which the
-/// grid-level spacing must not have disturbed.
+/// Monitor view layout contract tests (task #132, re-baselined by task #145): pins the
+/// inter-column separation of the four fixed-width tables — every header grid and its
+/// row-template grid carries <see cref="Grid.ColumnSpacing"/> of 8 (so the right-aligned
+/// IN-FLIGHT / CONTEXT / ELAPSED values no longer butt against the next column's left-aligned
+/// content), the header and row grids declare byte-identical <see cref="Grid.ColumnDefinitions"/>,
+/// and every table's rendered total (Σ fixed pixel widths + (n−1)×8) fits the 896px budget of
+/// the 960px minimum window (the outer ScrollViewer's horizontal scrollbar is disabled, so
+/// nothing may be clipped). Also pins the ENABLED column's display-only <see cref="CheckBox"/>
+/// + <c>Toggle</c> button contract, the Fleet TARGET cell's URL tooltip (the URL column was
+/// removed), the uniform TARGET (120) / MODEL (150) widths across the In-Progress / Recent /
+/// Statistics tables, and the In-Progress star SESSION + fixed-100 AGENT layout.
 /// </summary>
 /// <remarks>
 /// [Collection("Avalonia")]: this class creates <see cref="MonitorView"/> control trees, so it
@@ -28,9 +31,12 @@ namespace OllamaRouter.Tests.App;
 [Collection("Avalonia")]
 public sealed class MonitorViewLayoutTests
 {
-    private static readonly int[] PreFixWidthBaselines = [1060, 890, 760, 930];
-    private static readonly string[] BaselineTableNames =
-        ["fleet table", "in-progress requests table", "stats table", "recent requests table"];
+    /// <summary>
+    /// Table-grid width budget at the 960px minimum window (task #145, A1):
+    /// 960 − 12 (TabControl Margin="6,4,6,6") − 24 (view StackPanel margin 12px each side)
+    /// − 28 (card Border padding 14px each side) = 896. Star columns contribute 0 fixed width.
+    /// </summary>
+    private const int MinWindowTableBudget = 896;
 
     [Fact]
     public void FleetTable_HeaderAndRow_CarryColumnSpacingOf8()
@@ -153,24 +159,104 @@ public sealed class MonitorViewLayoutTests
     }
 
     [Fact]
-    public void AllTables_TotalRenderedWidths_DoNotGrowVsBaseline()
+    public void AllTables_TotalRenderedWidths_FitTheMinWindowBudget()
     {
         var tables = LoadTables();
 
-        // Pre-fix totals (Σ fixed pixel widths, no inter-column gaps): fleet 1060, in-progress
-        // fixed 890 (star column contributes 0), stats 760, recent 930. Strategy A
-        // (task #132, maintainer-confirmed): Σ fixed + (n-1)×8 must not exceed the pre-fix total,
-        // so the min-window horizontal-scroll range does not grow.
-        var grids = new[]
+        // Task #145: the outer ScrollViewer's horizontal scrollbar is disabled, so every table
+        // must render fully inside the 896px budget of the 960px minimum window (Σ fixed pixel
+        // widths + (n−1)×8; star columns contribute 0). Largest table: fleet at 860px.
+        var tablesByGrid = new[]
         {
-            tables.FleetHeader, tables.InProgressHeader, tables.StatsHeader, tables.RecentHeader,
+            ("fleet table", tables.FleetHeader),
+            ("in-progress requests table", tables.InProgressHeader),
+            ("stats table", tables.StatsHeader),
+            ("recent requests table", tables.RecentHeader),
         };
-        for (var i = 0; i < grids.Length; i++)
+        foreach (var (name, grid) in tablesByGrid)
         {
-            var total = TotalRenderedWidth(grids[i]);
-            Assert.True(total <= PreFixWidthBaselines[i],
-                $"{BaselineTableNames[i]} renders {total}px wide, pre-fix baseline was {PreFixWidthBaselines[i]}px");
+            var total = TotalRenderedWidth(grid);
+            Assert.True(total <= MinWindowTableBudget,
+                $"{name} renders {total}px wide, but the min-window table budget is {MinWindowTableBudget}px");
         }
+    }
+
+    [Fact]
+    public void FleetTable_HasEightColumns_AndNoUrlHeader()
+    {
+        var tables = LoadTables();
+
+        // Task #145: the URL column was removed from the Fleet table (8 columns, down from 9);
+        // the URL survives as a hover tooltip on the TARGET cell.
+        Assert.Equal(8, tables.FleetHeader.ColumnDefinitions.Count);
+        Assert.DoesNotContain(tables.FleetHeader.Children.OfType<TextBlock>(), tb => tb.Text == "URL");
+    }
+
+    [Fact]
+    public void FleetRow_TargetCell_CarriesUrlTooltip()
+    {
+        var tables = LoadTables();
+
+        var targetCell = tables.FleetRow.Children.Single(c => Grid.GetColumn(c) == 0);
+        var panel = Assert.IsType<StackPanel>(targetCell);
+        Assert.True(Avalonia.Data.BindingOperations.GetBindingExpressionBase(panel, ToolTip.TipProperty) is not null,
+            "fleet TARGET cell lost its ToolTip.Tip binding");
+        Assert.Equal("Url", BindingPath(panel, ToolTip.TipProperty));
+    }
+
+    [Fact]
+    public void TargetAndModelColumns_AreUniformAcrossMonitorTables()
+    {
+        var tables = LoadTables();
+
+        // Task #145: one TARGET width and one MODEL width across the three Monitor tables.
+        Assert.Equal(120.0, AbsoluteWidth(tables.InProgressHeader, "TARGET"));
+        Assert.Equal(120.0, AbsoluteWidth(tables.RecentHeader, "TARGET"));
+        Assert.Equal(120.0, AbsoluteWidth(tables.StatsHeader, "TARGET"));
+        Assert.Equal(150.0, AbsoluteWidth(tables.InProgressHeader, "MODEL"));
+        Assert.Equal(150.0, AbsoluteWidth(tables.RecentHeader, "MODEL"));
+    }
+
+    [Fact]
+    public void InProgressTable_SessionIsStar_AndAgentIsFixedWidthWithTooltip()
+    {
+        var tables = LoadTables();
+        var sessionColumn = HeaderColumn(tables.InProgressHeader, "SESSION");
+        var agentColumn = HeaderColumn(tables.InProgressHeader, "AGENT");
+
+        // Task #145: SESSION absorbs the freed width (star) so long session IDs render in full
+        // at 960px; AGENT is fixed-width with ellipsis + tooltip.
+        Assert.True(tables.InProgressHeader.ColumnDefinitions[sessionColumn].Width.IsStar,
+            $"SESSION column is {tables.InProgressHeader.ColumnDefinitions[sessionColumn].Width}, expected star");
+        var agentWidth = tables.InProgressHeader.ColumnDefinitions[agentColumn].Width;
+        Assert.True(agentWidth.IsAbsolute && agentWidth.Value == 100.0,
+            $"AGENT column is {agentWidth}, expected absolute 100");
+
+        var agentCell = tables.InProgressRow.Children.OfType<TextBlock>().Single(tb => Grid.GetColumn(tb) == agentColumn);
+        Assert.Equal(Avalonia.Media.TextTrimming.CharacterEllipsis, agentCell.TextTrimming);
+        Assert.True(Avalonia.Data.BindingOperations.GetBindingExpressionBase(agentCell, ToolTip.TipProperty) is not null,
+            "AGENT cell lost its ToolTip.Tip binding");
+        Assert.Equal("AgentId", BindingPath(agentCell, ToolTip.TipProperty));
+    }
+
+    [Fact]
+    public void RecentRequestsTable_TimestampColumn_Is76px()
+    {
+        var tables = LoadTables();
+
+        // Task #145: TIMESTAMP shrank from 124px to just enough for the HH:mm:ss time-only format.
+        Assert.Equal(76.0, AbsoluteWidth(tables.RecentHeader, "TIMESTAMP"));
+    }
+
+    [Fact]
+    public void OuterScrollViewer_DisablesHorizontalScroll()
+    {
+        var view = new MonitorView();
+        view.ApplyTemplate();
+
+        // Task #145: no page-level horizontal scroll — everything must fit the 960px minimum window.
+        var scrollView = AllControls(view).OfType<ScrollViewer>().First();
+        Assert.Equal(ScrollBarVisibility.Disabled, scrollView.HorizontalScrollBarVisibility);
     }
 
     // ── Shared helpers ──
@@ -230,6 +316,14 @@ public sealed class MonitorViewLayoutTests
     {
         var markerBlock = header.Children.OfType<TextBlock>().Single(tb => tb.Text == marker);
         return Grid.GetColumn(markerBlock);
+    }
+
+    private static double AbsoluteWidth(Grid header, string marker)
+    {
+        var column = HeaderColumn(header, marker);
+        var width = header.ColumnDefinitions[column].Width;
+        Assert.True(width.IsAbsolute, $"{marker} column is {width}, expected an absolute width");
+        return width.Value;
     }
 
     private static void AssertRightAlignedPair(string label, int column, Grid header, Grid row, string valueBindingPath)
