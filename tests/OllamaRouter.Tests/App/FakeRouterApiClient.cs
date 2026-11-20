@@ -108,8 +108,37 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
     /// so concurrent step entries overlap deterministically); otherwise no delay.</summary>
     public Queue<Task>? FleetFetchBlocks { get; set; }
 
+    // -- Daemon-side hardware probe scripting (task #144) ------------------------
+
+    /// <summary>Per-call delay gates for <c>ProbeTargetHardwareAsync</c> (task #144 — mirrors
+    /// <see cref="FleetFetchBlocks"/>): while non-empty, each call DEQUEUES and awaits the next
+    /// task BEFORE returning (keeping the probe in flight so the busy-state carry-over can
+    /// be observed across row rebuilds); otherwise no delay.</summary>
+    public Queue<Task>? ProbeFetchBlocks { get; set; }
+
+    /// <summary>The one-shot exception thrown by the NEXT <c>ProbeTargetHardwareAsync</c> call
+    /// (then cleared; mirrors the <see cref="PullException"/> precedent).</summary>
+    public Exception? ProbeException { get; set; }
+
+    /// <summary>Targets whose probe FAILS (→ 502 <see cref="OllamaRouterApiException"/> with
+    /// <see cref="ProbeFailError"/>; the hardware store is NOT written — mirrors the server,
+    /// where the store is written only after a successful probe).</summary>
+    public HashSet<string> ProbeFailTargets { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>The error text of a <see cref="ProbeFailTargets"/> probe failure.</summary>
+    public string ProbeFailError { get; set; } = "simulated probe failure";
+
+    /// <summary>Per-target probe result overrides (default: a synthetic RTX 4090 profile).</summary>
+    public Dictionary<string, NodeHardwareProfile> ProbeProfiles { get; } =
+        new(StringComparer.OrdinalIgnoreCase);
+
     /// <summary>The <c>GET /api/router/fleet/hardware</c> rows (empty by default).</summary>
     public RouterFleetHardwareResponse HardwareResponse { get; set; } = new([]);
+
+    /// <summary>Sticky <c>GET /api/router/fleet/hardware</c> failure (thrown on every hardware
+    /// call until cleared — the wizard treats a failed hardware fetch as "unknown state
+    /// unknown" → no auto-probes; mirrors the <see cref="InfoException"/> precedent).</summary>
+    public OllamaRouterApiException? HardwareException { get; set; }
 
     /// <summary>The <c>GET /api/router/benchmark/results</c> response (empty by default —
     /// task #125: the install wizard's assisted mode reads it best-effort).</summary>
@@ -191,6 +220,10 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
     /// <summary>Every <c>POST /api/router/targets</c> request, in call order.</summary>
     public List<AddTargetRequest> AddTargetCalls { get; } = [];
 
+    /// <summary>Every <c>POST /api/router/fleet/hardware/{target}/probe</c> target name, in
+    /// call order (task #144).</summary>
+    public List<string> ProbeCalls { get; } = [];
+
     /// <summary>Every <c>PUT /api/router/targets/{name}</c> (name, request) pair.</summary>
     public List<(string Name, UpdateTargetRequest Request)> UpdateTargetCalls { get; } = [];
 
@@ -236,6 +269,18 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
     /// <summary>The current in-memory target store (config order preserved by
     /// <see cref="ConfigResponse"/>; this exposes the CRUD side).</summary>
     public IReadOnlyDictionary<string, RouterTargetConfigDto> Targets => _targets;
+
+    /// <summary>The probe-derived hardware store (task #144 — mirrors the daemon's
+    /// targets-hardware.json): target → (profile, "ssh"); written ONLY after a successful
+    /// probe; <see cref="GetFleetHardwareAsync"/> merges it into the scripted
+    /// <see cref="HardwareResponse"/> (an empty store ⇒ today's byte-identical behavior, so
+    /// existing tests are unaffected).</summary>
+    private readonly Dictionary<string, (NodeHardwareProfile Profile, string Source)> _hardwareStore =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>The probe-derived hardware store (assertion surface).</summary>
+    public IReadOnlyDictionary<string, (NodeHardwareProfile Profile, string Source)> HardwareStore =>
+        _hardwareStore;
 
     // ---------------------------------------------------------------------------
 
@@ -310,7 +355,39 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
     public Task<RouterFleetHardwareResponse> GetFleetHardwareAsync(CancellationToken ct = default)
     {
         Log(nameof(GetFleetHardwareAsync));
-        return Task.FromResult(HardwareResponse);
+        if (HardwareException is { } hardwareException)
+        {
+            throw hardwareException;
+        }
+
+        lock (_gate)
+        {
+            // An empty store ⇒ byte-identical to the scripted response (existing behavior).
+            if (_hardwareStore.Count == 0)
+            {
+                return Task.FromResult(HardwareResponse);
+            }
+
+            // Mirror the server's probe → store → GET flow: nodes already in the scripted
+            // response are REPLACED by the stored entry (source "ssh", reachable), store-only
+            // targets are appended.
+            var nodes = HardwareResponse.Nodes.ToList();
+            foreach (var (target, (profile, source)) in _hardwareStore)
+            {
+                var merged = new FleetHardwareNode(target, source, profile, true);
+                var index = nodes.FindIndex(n => string.Equals(n.Target, target, StringComparison.OrdinalIgnoreCase));
+                if (index >= 0)
+                {
+                    nodes[index] = merged;
+                }
+                else
+                {
+                    nodes.Add(merged);
+                }
+            }
+
+            return Task.FromResult(new RouterFleetHardwareResponse(nodes));
+        }
     }
 
     /// <inheritdoc />
@@ -319,8 +396,41 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
         NotImplemented<NodeHardwareProfile>(nameof(UpdateTargetHardwareAsync));
 
     /// <inheritdoc />
-    public Task<NodeHardwareProfile> ProbeTargetHardwareAsync(string target, CancellationToken ct = default) =>
-        NotImplemented<NodeHardwareProfile>(nameof(ProbeTargetHardwareAsync));
+    public async Task<NodeHardwareProfile> ProbeTargetHardwareAsync(string target, CancellationToken ct = default)
+    {
+        Log(nameof(ProbeTargetHardwareAsync));
+        ProbeCalls.Add(target);
+
+        Task? block = ProbeFetchBlocks is { Count: > 0 } ? ProbeFetchBlocks.Dequeue() : null;
+        if (block is not null)
+        {
+            await block;
+        }
+
+        if (ProbeException is { } probeException)
+        {
+            ProbeException = null;
+            throw probeException;
+        }
+
+        if (ProbeFailTargets.Contains(target))
+        {
+            throw new OllamaRouterApiException(HttpStatusCode.BadGateway, ProbeFailError);
+        }
+
+        // The store is written ONLY after a successful probe (mirrors the server).
+        var profile = ProbeProfiles.TryGetValue(target, out var scripted)
+            ? scripted
+            : new NodeHardwareProfile(
+                target, "Linux", "x64", false, 32768, SystemRamType.Ddr5,
+                [new GpuDeviceProfile("NVIDIA", "RTX 4090", 24576, "GDDR6X", 384, 1008)],
+                24576, 1008);
+        lock (_gate)
+        {
+            _hardwareStore[target] = (profile, "ssh");
+        }
+        return profile;
+    }
 
     /// <inheritdoc />
     public Task<RouterCartographyResponse> GetCartographyAsync(CancellationToken ct = default)
@@ -526,6 +636,19 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
             throw new OllamaRouterApiException(HttpStatusCode.BadRequest, "invalid target type");
         }
 
+        // Task #143 mirror: a non-blank sshUser must match the POSIX-ish username charset;
+        // sshPort must be 1..65535 when present.
+        if (request.SshUser is { Length: > 0 } &&
+            !System.Text.RegularExpressions.Regex.IsMatch(request.SshUser, "^[A-Za-z0-9._-]{1,64}$"))
+        {
+            throw new OllamaRouterApiException(HttpStatusCode.BadRequest, "invalid sshUser");
+        }
+
+        if (request.SshPort is { } addSshPort && (addSshPort < 1 || addSshPort > 65535))
+        {
+            throw new OllamaRouterApiException(HttpStatusCode.BadRequest, "invalid sshPort");
+        }
+
         if (_targets.ContainsKey(request.Name))
         {
             throw new OllamaRouterApiException(
@@ -542,7 +665,9 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
             request.Provider,
             request.Models,
             request.ApiKey is not null,
-            request.PowerWatts);
+            request.PowerWatts,
+            SshUser: string.IsNullOrWhiteSpace(request.SshUser) ? null : request.SshUser,
+            SshPort: request.SshPort);
         _targets[request.Name] = target;
         return Task.FromResult(new AddTargetResponse(
             true, request.TestConnectionFirst, "Online", request.Models?.Count ?? 0, target, 12, null));
@@ -576,6 +701,13 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
             Provider = request.Provider is { } provider ? provider : current.Provider,
             Models = request.Models ?? current.Models,
             PowerWatts = request.PowerWatts ?? current.PowerWatts,
+            // Task #143 wire semantics: null/absent = no change, "" = clear, value = set.
+            SshUser = request.SshUser is null
+                ? current.SshUser
+                : request.SshUser.Length == 0 ? null : request.SshUser,
+            // Task #143 wire semantics: null/absent = no change, value = set (no clear
+            // semantics on the port — the documented powerWatts precedent).
+            SshPort = request.SshPort ?? current.SshPort,
         };
         _targets[name] = updated;
         return Task.FromResult(new UpdateTargetResponse(true, "target updated", updated));

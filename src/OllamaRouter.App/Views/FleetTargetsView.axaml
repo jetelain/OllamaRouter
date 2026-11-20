@@ -46,10 +46,14 @@
                     <TextBlock Text="{Binding Provider}" Foreground="{DynamicResource SemiColorText2}"/>
                     <TextBlock Text="{Binding Url}" Foreground="{DynamicResource SemiColorText2}" TextTrimming="CharacterEllipsis" MaxWidth="300"/>
                     <TextBlock Text="{Binding ApiKeyConfigured, StringFormat='key: {0}'}" Foreground="{DynamicResource SemiColorText2}"/>
+                    <TextBlock Text="{Binding SshLabel}" Foreground="{DynamicResource SemiColorText2}"/>
                   </StackPanel>
                   <TextBlock Grid.Column="4" Text="{Binding ResidentModels.Count}"
                              ToolTip.Tip="Resident models" VerticalAlignment="Center" TextAlignment="Right"/>
                   <StackPanel Grid.Column="5" Orientation="Horizontal" Spacing="6">
+                    <Button Content="{Binding UpdateHardwareButtonContent}" IsEnabled="{Binding CanUpdateHardware}"
+                            Click="OnUpdateHardwareClick" Tag="{Binding}"
+                            ToolTip.Tip="Re-run the daemon-side hardware probe for this target (overwrites the stored profile)"/>
                     <Button Content="Edit" Click="OnEditTargetClick" Tag="{Binding}"/>
                     <Button Content="Delete" Classes="Danger" Click="OnDeleteTargetClick" Tag="{Binding}"/>
                   </StackPanel>

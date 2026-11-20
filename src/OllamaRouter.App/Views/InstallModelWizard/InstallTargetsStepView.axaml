@@ -27,6 +27,9 @@
                     <TextBlock Text="{Binding HardwareText}" Foreground="{DynamicResource SemiColorText2}"
                                FontSize="11" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"
                                ToolTip.Tip="{Binding HardwareText}"/>
+                    <Button Content="{Binding ReprobeButtonContent}" MinWidth="64" FontSize="11" VerticalAlignment="Center"
+                            IsVisible="{Binding ShowReprobe}" IsEnabled="{Binding CanReprobe}" Click="OnReProbeClick"
+                            ToolTip.Tip="Run the daemon-side hardware probe for this target now"/>
                     <Border Theme="{DynamicResource TagBorder}" Padding="6,2" CornerRadius="4" VerticalAlignment="Center"
                             IsVisible="{Binding Present}">
                       <TextBlock Text="already present" FontSize="11"/>

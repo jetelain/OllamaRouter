@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
 using OllamaRouter.App.ViewModels.Wizard;
 using OllamaRouter.Client;
 using OllamaRouter.Endpoints.RouterApi.Benchmark;
@@ -9,6 +10,7 @@ using OllamaRouter.Endpoints.RouterApi.Config;
 using OllamaRouter.Endpoints.RouterApi.Fleet;
 using OllamaRouter.Endpoints.RouterApi.Models;
 using OllamaRouter.Services.Benchmarking;
+using OllamaRouter.Services.Hardware;
 
 namespace OllamaRouter.App.ViewModels.InstallModelWizard;
 
@@ -35,7 +37,8 @@ public sealed partial class InstallTargetRowVm : ObservableObject
         string modelReference,
         string context = "",
         string? suggestionBadge = null,
-        string? suggestionProvenance = null)
+        string? suggestionProvenance = null,
+        bool probeable = false)
     {
         Name = name;
         Liveness = liveness;
@@ -47,6 +50,7 @@ public sealed partial class InstallTargetRowVm : ObservableObject
         _context = context;
         _suggestionBadge = suggestionBadge;
         _suggestionProvenance = suggestionProvenance;
+        _showReprobe = probeable;
 
         // The FULL step-0 reference, parsed ONCE (the step-0 gate guarantees validity — the
         // parse failure below is the impossible case): the tag prefill is the EXPLICIT tag
@@ -77,8 +81,14 @@ public sealed partial class InstallTargetRowVm : ObservableObject
     /// are OpenAI-compatible / OS-native and can never be pulled.</summary>
     public bool OllamaType { get; }
 
-    /// <summary>The hardware summary line (e.g. "RTX 4090 · VRAM 24564 MB · 1.0 GB/s").</summary>
-    public string HardwareText { get; }
+    /// <summary>
+    /// The hardware summary line (e.g. "RTX 4090 · VRAM 24564 MB · 1.0 GB/s"). Observable
+    /// (task #144): the daemon-side ssh hardware probe updates the line IN PLACE after its
+    /// completion — "Probing hardware…" while in flight, the formatted profile on success,
+    /// the original unknown text on failure (fail-soft).
+    /// </summary>
+    [ObservableProperty]
+    private string _hardwareText = string.Empty;
 
     /// <summary>Whether the model is ALREADY present on this target (the cartography badge —
     /// the pull is a fast no-op in that case, the alias step still runs).</summary>
@@ -151,6 +161,31 @@ public sealed partial class InstallTargetRowVm : ObservableObject
     [ObservableProperty]
     private string? _aliasHint;
 
+    /// <summary>Whether a daemon-side hardware probe is in flight for this row (task #144
+    /// busy state of the per-row re-probe affordance).</summary>
+    [ObservableProperty]
+    private bool _probingHardware;
+
+    /// <summary>
+    /// Whether the per-row re-probe affordance is shown (task #144): seeded true when the
+    /// row is ssh-probeable with UNKNOWN hardware; flips to false after a SUCCESSFUL probe
+    /// (auto or manual); a FAILED probe keeps it true so the user can retry manually.
+    /// </summary>
+    [ObservableProperty]
+    private bool _showReprobe;
+
+    /// <summary>Whether the re-probe action is available (not already in flight).</summary>
+    public bool CanReprobe => !ProbingHardware;
+
+    /// <summary>The transient content of the re-probe button (busy state).</summary>
+    public string ReprobeButtonContent => ProbingHardware ? "Probing…" : "Probe";
+
+    partial void OnProbingHardwareChanged(bool value)
+    {
+        OnPropertyChanged(nameof(CanReprobe));
+        OnPropertyChanged(nameof(ReprobeButtonContent));
+    }
+
     /// <summary>The computed per-target context alias from THIS row's own reference +
     /// context (pure, independent of the alias switch; null while invalid/uncomputable).</summary>
     public string? ComputedAlias =>
@@ -204,6 +239,10 @@ public sealed partial class InstallTargetsStepViewModel : ObservableObject, IWiz
     private readonly Func<string> _modelReference;
     private readonly Func<bool> _assistedMode;
     private readonly List<InstallTargetRowVm> _subscribedRows = [];
+
+    /// <summary>The transient hardware line of a row while its daemon-side ssh probe is in
+    /// flight (task #144).</summary>
+    private const string ProbingHardwareText = "Probing hardware…";
 
     /// <summary>The latest-wins fetch generation (task #130): every <see cref="OnStepEnteredAsync"/>
     /// entry increments it; a fetch finishing after a newer entry started is superseded and
@@ -315,6 +354,24 @@ public sealed partial class InstallTargetsStepViewModel : ObservableObject, IWiz
             var cartography = await client.GetCartographyAsync(ct).ConfigureAwait(false);
             var config = await client.GetConfigAsync(ct).ConfigureAwait(false);
 
+            // Task #144: the hardware profiles are fetched BEST-EFFORT (their absence only
+            // loses the auto-population — the fleet rows still render their hardware line via
+            // the fleet endpoint). A FAILED fetch means "unknown state unknown" → NO
+            // auto-probes this entry (the step fetch must never fail on it).
+            RouterFleetHardwareResponse? hardware = null;
+            try
+            {
+                hardware = await client.GetFleetHardwareAsync(ct).ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                // Best-effort: see above — no auto-probes this entry.
+            }
+
+            var hardwareByName = hardware is null
+                ? null
+                : hardware.Nodes.ToDictionary(n => n.Target, StringComparer.OrdinalIgnoreCase);
+
             RouterBenchmarkResultsResponse? benchmarks = null;
             try
             {
@@ -357,9 +414,11 @@ public sealed partial class InstallTargetsStepViewModel : ObservableObject, IWiz
                     continue;
                 }
 
-                var type = config.Targets
-                    .FirstOrDefault(t => string.Equals(t.Name, item.Name, StringComparison.OrdinalIgnoreCase))
-                    ?.Type ?? "ollama";
+                // Task #144: resolve the config target ONCE (type AND ssh credential come
+                // from it; the lookup is reused for both).
+                var configTarget = config.Targets.FirstOrDefault(t =>
+                    string.Equals(t.Name, item.Name, StringComparison.OrdinalIgnoreCase));
+                var type = configTarget?.Type ?? "ollama";
                 var ollamaType = string.Equals(type, "ollama", StringComparison.OrdinalIgnoreCase);
 
                 var deployment = modelRow?.Deployments
@@ -402,7 +461,14 @@ public sealed partial class InstallTargetsStepViewModel : ObservableObject, IWiz
                     modelReference: model,
                     context: context,
                     suggestionBadge: badge,
-                    suggestionProvenance: provenance));
+                    suggestionProvenance: provenance,
+                    probeable: hardwareByName is not null &&
+                        (hardwareByName.TryGetValue(item.Name, out var hardwareNode) is false ||
+                         string.Equals(hardwareNode.Source, "none", StringComparison.OrdinalIgnoreCase) ||
+                         hardwareNode.Profile is null) &&
+                        ollamaType &&
+                        !string.Equals(item.Location, "local", StringComparison.OrdinalIgnoreCase) &&
+                        !string.IsNullOrWhiteSpace(configTarget?.SshUser)));
             }
 
             // Superseded (a newer entry has started): discard the WHOLE result — Rows,
@@ -420,6 +486,22 @@ public sealed partial class InstallTargetsStepViewModel : ObservableObject, IWiz
             }
 
             SubscribeRows();
+
+            // Task #144 auto-probe pass — AFTER the latest-wins check above, so a
+            // superseded entry never reaches it. One fire-and-forget daemon-side probe per
+            // eligible row (at most one per step entry per row — NO retry storm). The probe
+            // is server-bounded at ~30 s and must never block this entry's completion
+            // (IsFetching settles with the probes still in flight).
+            foreach (var row in Rows)
+            {
+                if (row.ShowReprobe && !row.ProbingHardware)
+                {
+                    var originalText = row.HardwareText;
+                    row.HardwareText = ProbingHardwareText;
+                    row.ProbingHardware = true;
+                    _ = ProbeRowAsync(row, generation, originalText);
+                }
+            }
         }
         catch (OllamaRouterApiException ex)
         {
@@ -517,6 +599,124 @@ public sealed partial class InstallTargetsStepViewModel : ObservableObject, IWiz
         }
 
         return string.Join(" · ", parts);
+    }
+
+    /// <summary>
+    /// Formats a daemon-side hardware profile into the same one-line summary shape as
+    /// <see cref="FormatHardware(RouterTargetItem)"/> (GPU · VRAM · BW): the first non-blank
+    /// GPU model name (else "CPU"), the total fast memory when > 0, the effective
+    /// bandwidth when > 0.
+    /// </summary>
+    private static string FormatHardwareProfile(NodeHardwareProfile profile)
+    {
+        var parts = new List<string>();
+        var gpu = profile.Gpus.FirstOrDefault(g => !string.IsNullOrWhiteSpace(g.ModelName))?.ModelName;
+        parts.Add(string.IsNullOrWhiteSpace(gpu) ? "CPU" : gpu);
+        if (profile.TotalFastMemoryMB > 0)
+        {
+            parts.Add($"VRAM {profile.TotalFastMemoryMB} MB");
+        }
+
+        if (profile.EffectiveBandwidthGBs > 0)
+        {
+            parts.Add($"BW {profile.EffectiveBandwidthGBs:0.#} GB/s");
+        }
+
+        return string.Join(" · ", parts);
+    }
+
+    /// <summary>
+    /// The daemon-side hardware probe of one row (task #144): runs to completion on the
+    /// thread pool with <see cref="CancellationToken.None"/> — the probe is server-bounded at
+    /// ~30 s and settles long after the step entry. LATEST-WINS (task #130): the generation
+    /// check runs BEFORE the first row write, so a superseded entry's probe result is
+    /// discarded WITHOUT touching any row. Success → the row's hardware line is replaced IN
+    /// PLACE by the formatted profile and the re-probe affordance disappears; failure → the
+    /// line reverts to the original unknown text (fail-soft: NO <see cref="Error"/>, NO gate
+    /// impact, the re-probe affordance stays for a manual retry).
+    /// </summary>
+    private async Task ProbeRowAsync(InstallTargetRowVm row, int generation, string originalText)
+    {
+        NodeHardwareProfile? profile = null;
+        try
+        {
+            profile = await _clientAccessor().ProbeTargetHardwareAsync(row.Name, CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // Fail-soft by design: the exception is swallowed — the row degrades back to the
+            // original unknown text and the manual re-probe affordance remains.
+        }
+
+        // A superseded entry's probe result never touches Rows/Error — return BEFORE any
+        // row write (the guard applies to probe completions, not only fetches).
+        if (generation != Volatile.Read(ref _fetchGeneration))
+        {
+            return;
+        }
+
+        await RunOnUiAsync(() =>
+        {
+            if (profile is not null)
+            {
+                row.HardwareText = FormatHardwareProfile(profile);
+                row.ProbingHardware = false;
+                row.ShowReprobe = false;
+            }
+            else
+            {
+                row.HardwareText = originalText;
+                row.ProbingHardware = false;
+                // ShowReprobe stays true: the manual re-probe affordance remains.
+            }
+        });
+    }
+
+    /// <summary>
+    /// The per-row MANUAL re-probe affordance (task #144, unprobed rows): re-runs the
+    /// daemon-side hardware probe with the CURRENT fetch generation (if a newer step entry
+    /// starts meanwhile, its fetch re-reads everything and the stale result is discarded by
+    /// the latest-wins check in <see cref="ProbeRowAsync"/>). No-op for a null/stale row or a
+    /// probe already in flight.
+    /// </summary>
+    [RelayCommand]
+    public async Task ReProbeHardwareAsync(InstallTargetRowVm? row, CancellationToken ct = default)
+    {
+        if (row is null || !Rows.Contains(row) || row.ProbingHardware)
+        {
+            return;
+        }
+
+        var originalText = row.HardwareText;
+        row.HardwareText = ProbingHardwareText;
+        row.ProbingHardware = true;
+        _ = ProbeRowAsync(row, Volatile.Read(ref _fetchGeneration), originalText);
+    }
+
+    /// <summary>
+    /// Marshals <paramref name="action"/> to the UI thread (inline when there is no Avalonia
+    /// application — the tests — or the caller is already on the UI thread). Used ONLY by
+    /// the probe-completion path: probes settle ~30 s later on a thread-pool thread and
+    /// must not rely on the fetch path's no-dispatch convention.
+    /// </summary>
+    private static async Task RunOnUiAsync(Action action)
+    {
+        try
+        {
+            if (Avalonia.Application.Current is null || Avalonia.Threading.Dispatcher.UIThread.CheckAccess())
+            {
+                action();
+            }
+            else
+            {
+                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(action);
+            }
+        }
+        catch
+        {
+            action();
+        }
     }
 
     partial void OnCreateAliasChanged(bool value)

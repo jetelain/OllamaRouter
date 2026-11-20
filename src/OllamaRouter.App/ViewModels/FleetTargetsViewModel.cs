@@ -19,7 +19,7 @@ namespace OllamaRouter.App.ViewModels;
 /// values reported by the fleet endpoint (API-bound scope: no wire API persists them).
 /// </para>
 /// </summary>
-public sealed partial class FleetTargetRow
+public sealed partial class FleetTargetRow : ObservableObject
 {
     /// <summary>The canonical target name.</summary>
     public required string Name { get; init; }
@@ -102,6 +102,25 @@ public sealed partial class FleetTargetRow
     /// <summary>The declared models roster (null/empty when none declared).</summary>
     public IReadOnlyList<TargetModelDto>? Models { get; init; }
 
+    /// <summary>The daemon-side hardware probe ssh user (null = unset; null/blank → the row
+    /// is not ssh-probeable; the probe host is the target URL's host, key-based auth).</summary>
+    public string? SshUser { get; init; }
+
+    /// <summary>The daemon-side hardware probe ssh port (null = the default port 22).</summary>
+    public int? SshPort { get; init; }
+
+    // -- Hardware probe busy state (task #144; carried by name across row rebuilds) --
+
+    /// <summary>Whether a daemon-side hardware probe is in flight for this target (auto OR
+    /// explicit; the view model carries it by name across the 5 s row rebuilds).</summary>
+    [ObservableProperty]
+    private bool _isProbing;
+
+    /// <summary>A transient inline probe error (explicit 'Update hardware' failures ONLY —
+    /// auto-probes stay silent; shown until the next refresh, then cleared — no timer).</summary>
+    [ObservableProperty]
+    private string? _probeError;
+
     // -- Execution (from GET /api/router/fleet) ---------------------------------
 
     /// <summary>The in-flight request count.</summary>
@@ -149,6 +168,32 @@ public sealed partial class FleetTargetRow
 
     /// <summary>The hardware profile GPU devices (null when the profile is unknown).</summary>
     public IReadOnlyList<GpuDeviceProfile>? Gpus => HardwareProfile?.Gpus;
+
+    /// <summary>The ssh credential label of the row info strip (null when unset).</summary>
+    public string? SshLabel => SshUser is null ? null : $"ssh: {SshUser}@(port {SshPort ?? 22})";
+
+    /// <summary>
+    /// Whether the row is ssh-probeable (task #144 shared eligibility predicate, both
+    /// surfaces): an Ollama-protocol, NON-LOCAL target with a non-blank ssh user (the
+    /// daemon probes the local workstation itself; non-Ollama rows are never probed).
+    /// </summary>
+    public bool IsSshProbeable =>
+        string.Equals(Type, "ollama", StringComparison.OrdinalIgnoreCase)
+        && !string.Equals(Location, "local", StringComparison.OrdinalIgnoreCase)
+        && !string.IsNullOrWhiteSpace(SshUser);
+
+    /// <summary>Whether the per-row 'Update hardware' action is available (enabled ONLY for
+    /// ssh-probeable rows, and not already in flight).</summary>
+    public bool CanUpdateHardware => !IsProbing && IsSshProbeable;
+
+    /// <summary>The transient content of the 'Update hardware' button (busy state).</summary>
+    public string UpdateHardwareButtonContent => IsProbing ? "Probing…" : "Update hardware";
+
+    partial void OnIsProbingChanged(bool value)
+    {
+        OnPropertyChanged(nameof(CanUpdateHardware));
+        OnPropertyChanged(nameof(UpdateHardwareButtonContent));
+    }
 }
 
 /// <summary>
@@ -174,6 +219,29 @@ public sealed partial class FleetTargetsViewModel : RouterTabViewModel
     /// <summary>The merged fleet target rows (config order; Cloud pseudo-target excluded by
     /// the server).</summary>
     public ObservableCollection<FleetTargetRow> Rows { get; } = [];
+
+    // -- Hardware probe bookkeeping (task #144): EVERY mutation under _probeGate ----
+    // Refresh ticks and ~30 s probe completions race by design, so the in-flight set, the
+    // pending transient errors and the auto-retry suppression are lock-guarded; ROW property
+    // writes happen only inside the RunOnUiAsync marshal (rows are rebuilt every tick, so
+    // the busy state is carried by NAME, never on the row objects).
+
+    private readonly object _probeGate = new();
+
+    /// <summary>Targets with an in-flight daemon-side hardware probe (auto OR explicit;
+    /// case-insensitive).</summary>
+    private readonly HashSet<string> _probingTargets = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Pending transient inline probe errors by target name (explicit 'Update
+    /// hardware' failures; carried over to the next rebuild and consumed there — transient,
+    /// no timer).</summary>
+    private readonly Dictionary<string, string> _probeErrorByName = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Auto-probe suppression (maintainer decision 2026-11-20): a FAILED auto-probe
+    /// is not retried on later refresh ticks (no retry storm against a dead host). The
+    /// explicit 'Update hardware' button ALWAYS works; suppression is lifted by a successful
+    /// Edit/Add/Delete of that target and by a VM rebuild.</summary>
+    private readonly HashSet<string> _autoProbeNoRetry = new(StringComparer.OrdinalIgnoreCase);
 
     private static async Task RunOnUiAsync(Action action)
     {
@@ -206,6 +274,7 @@ public sealed partial class FleetTargetsViewModel : RouterTabViewModel
         var configByName = config.Targets.ToDictionary(t => t.Name, StringComparer.OrdinalIgnoreCase);
         var hardwareByName = hardware.Nodes.ToDictionary(n => n.Target, StringComparer.OrdinalIgnoreCase);
 
+        var eligibleNames = new List<string>();
         await RunOnUiAsync(() =>
         {
             Rows.Clear();
@@ -217,7 +286,7 @@ public sealed partial class FleetTargetsViewModel : RouterTabViewModel
                 var hw = fleetItem?.Hardware;
                 var loc = fleetItem?.Location ?? "remote";
                 Views.TargetLocationVisuals.Register(target.Name, loc);
-                Rows.Add(new FleetTargetRow
+                var row = new FleetTargetRow
                 {
                     Name = target.Name,
                     Url = target.Url,
@@ -243,6 +312,8 @@ public sealed partial class FleetTargetsViewModel : RouterTabViewModel
                     ApiKeyConfigured = target.ApiKeyConfigured,
                     PowerWatts = target.PowerWatts,
                     Models = target.Models,
+                    SshUser = target.SshUser,
+                    SshPort = target.SshPort,
                     InFlightRequests = fleetItem?.Execution.InFlightRequests ?? 0,
                     ActiveModel = fleetItem?.Execution.ActiveModel,
                     ResidentModels = fleetItem?.Execution.ResidentModels
@@ -250,9 +321,217 @@ public sealed partial class FleetTargetsViewModel : RouterTabViewModel
                     HardwareSource = node?.Source,
                     HardwareReachable = node?.Reachable,
                     HardwareProfile = node?.Profile,
-                });
+                };
+
+                // Task #144: carry the probe busy state over by NAME (rows are rebuilt every
+                // tick but a ~30 s probe outlives them), and carry a pending explicit-probe
+                // error over ONCE (consumed here → it clears on the refresh after that one).
+                // The bookkeeping collections are read/CONSUMED under the SAME gate the
+                // thread-pool probe cores write under (refresh ticks and ~30 s probe
+                // completions race by design); the row property writes stay on the UI
+                // marshal, outside the gate.
+                var inFlight = false;
+                var eligible = false;
+                string? carriedError = null;
+                lock (_probeGate)
+                {
+                    inFlight = _probingTargets.Contains(target.Name);
+                    if (!inFlight && _probeErrorByName.TryGetValue(target.Name, out var pendingError))
+                    {
+                        carriedError = pendingError;
+                        _probeErrorByName.Remove(target.Name);
+                    }
+
+                    // Auto-probe eligibility (task #144, maintainer-confirmed trigger): an
+                    // ssh-probeable row (ollama + non-local + sshUser set) with NO stored
+                    // profile yet (no node / source "none" / null profile), not already in
+                    // flight and not suppressed after a failed auto-probe.
+                    var noProfile = node is null
+                        || string.Equals(node.Source, "none", StringComparison.OrdinalIgnoreCase)
+                        || node.Profile is null;
+                    eligible = row.IsSshProbeable && noProfile && !inFlight
+                        && !_autoProbeNoRetry.Contains(target.Name);
+                }
+
+                row.IsProbing = inFlight;
+                if (carriedError is not null)
+                {
+                    row.ProbeError = carriedError;
+                }
+
+                if (eligible)
+                {
+                    eligibleNames.Add(target.Name);
+                }
+
+                Rows.Add(row);
             }
         });
+
+        // The auto-probe pass runs AFTER the apply (outside the UI marshal): one
+        // fire-and-forget probe per eligible name — eligibleNames is a local list, so no
+        // cross-thread collection access. A probe outlives this refresh (the 5 s poll must
+        // never be blocked by a ~30 s ssh probe).
+        foreach (var name in eligibleNames)
+        {
+            FireProbe(name, auto: true);
+        }
+    }
+
+    /// <summary>
+    /// Re-runs the daemon-side hardware probe for one row (the per-row 'Update hardware'
+    /// action; the probe OVERWRITES the stored profile — including manual ones — enforced by
+    /// the endpoint). Explicit probes are ALWAYS permitted for an ssh-probeable row, even
+    /// when the auto-probe is suppressed for it. Fire-and-forget: the probe is server-bounded
+    /// (~30 s) and must never block the tab's 5 s polling or the other rows. No tab-level
+    /// banner on failure — per-row inline error only.
+    /// </summary>
+    [RelayCommand]
+    public async Task UpdateHardwareAsync(FleetTargetRow? row, CancellationToken ct = default)
+    {
+        // null / not ssh-probeable / already in flight → no-op.
+        if (row is null || !row.CanUpdateHardware)
+        {
+            return;
+        }
+
+        FireProbe(row.Name, auto: false);
+    }
+
+    /// <summary>
+    /// Adds <paramref name="name"/> to the in-flight set (dedupe by name: a second fire
+    /// while a probe is already in flight is a no-op) and starts the probe core
+    /// fire-and-forget.
+    /// </summary>
+    private void FireProbe(string name, bool auto)
+    {
+        lock (_probeGate)
+        {
+            if (!_probingTargets.Add(name))
+            {
+                return;
+            }
+        }
+
+        _ = ProbeTargetCoreAsync(name, auto);
+    }
+
+    /// <summary>
+    /// The probe core (auto OR explicit): runs to completion on the thread pool with
+    /// <see cref="CancellationToken.None"/> — the probe is server-bounded at ~30 s and must
+    /// settle to release the per-row busy state even if the tab's ct is cancelled.
+    /// Success → any pending error is dropped + a best-effort refresh (the single-writer
+    /// gate may skip it while the poller holds the lock — the next tick picks up the profile,
+    /// which is acceptable). Failure → explicit: a transient per-row inline error (the tab
+    /// banner stays quiet); auto: SILENT + auto-retry suppression (config-condition 400
+    /// failures stay retryable; host-level failures suppress — no retry storm against a dead
+    /// host).
+    /// </summary>
+    private async Task ProbeTargetCoreAsync(string name, bool auto)
+    {
+        string? rowError = null;
+
+        // The per-row busy state is set on the CURRENT row immediately (UI-marshalled — the
+        // probe may be fired from a non-UI context; in tests there is no Avalonia application
+        // so the marshal runs inline).
+        await RunOnUiAsync(() =>
+        {
+            var row = Rows.FirstOrDefault(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (row is not null)
+            {
+                row.IsProbing = true;
+            }
+        });
+
+        try
+        {
+            await ClientAccessor().ProbeTargetHardwareAsync(name, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (OllamaRouterApiException ex)
+        {
+            rowError = ex.Error ?? ex.Message;
+            lock (_probeGate)
+            {
+                if (auto && ex.Status != System.Net.HttpStatusCode.BadRequest)
+                {
+                    _autoProbeNoRetry.Add(name);
+                }
+
+                if (!auto)
+                {
+                    _probeErrorByName[name] = rowError;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            // Transport-level failure (connection refused / timeout): the explicit path gets
+            // the same per-row error treatment; the auto path stays silent + suppressed.
+            rowError = ex.Message;
+            lock (_probeGate)
+            {
+                if (auto)
+                {
+                    _autoProbeNoRetry.Add(name);
+                }
+
+                if (!auto)
+                {
+                    _probeErrorByName[name] = rowError;
+                }
+            }
+        }
+        finally
+        {
+            lock (_probeGate)
+            {
+                _probingTargets.Remove(name);
+            }
+
+            // The rows are rebuilt under this task (the 5 s poll) — resolve the CURRENT row
+            // by name and marshal the busy-state release to the UI thread.
+            await RunOnUiAsync(() =>
+            {
+                var row = Rows.FirstOrDefault(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase));
+                if (row is null)
+                {
+                    return;
+                }
+
+                row.IsProbing = false;
+                if (!auto && rowError is not null)
+                {
+                    row.ProbeError = rowError;
+                }
+            });
+        }
+
+        if (rowError is null)
+        {
+            // Success: drop any PENDING transient error (a previously failed explicit probe
+            // whose error a refresh has not consumed yet must not resurface on a row that
+            // just probed fine) and refresh so the rebuilt row shows the new profile
+            // (source "ssh").
+            lock (_probeGate)
+            {
+                _probeErrorByName.Remove(name);
+            }
+
+            await RefreshAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Lifts the auto-probe suppression of <paramref name="name"/> (maintainer decision
+    /// 2026-11-20): a successful config save (or delete) of that target means the ssh
+    /// credential may have been fixed — the next refresh auto-probes it again.
+    /// </summary>
+    private void RemoveAutoProbeSuppression(string name)
+    {
+        lock (_probeGate)
+        {
+            _autoProbeNoRetry.Remove(name);
+        }
     }
 
     /// <summary>
@@ -272,6 +551,7 @@ public sealed partial class FleetTargetsViewModel : RouterTabViewModel
         try
         {
             await ClientAccessor().AddTargetAsync(request, ct).ConfigureAwait(false);
+            RemoveAutoProbeSuppression(request.Name);
             await RefreshAsync(ct).ConfigureAwait(false);
         }
         catch (OllamaRouterApiException ex)
@@ -304,6 +584,7 @@ public sealed partial class FleetTargetsViewModel : RouterTabViewModel
         try
         {
             await ClientAccessor().UpdateTargetAsync(edit.Name, edit.Request, ct).ConfigureAwait(false);
+            RemoveAutoProbeSuppression(edit.Name);
             await RefreshAsync(ct).ConfigureAwait(false);
         }
         catch (OllamaRouterApiException ex)
@@ -331,6 +612,7 @@ public sealed partial class FleetTargetsViewModel : RouterTabViewModel
         try
         {
             await ClientAccessor().DeleteTargetAsync(name, ct).ConfigureAwait(false);
+            RemoveAutoProbeSuppression(name);
             await RefreshAsync(ct).ConfigureAwait(false);
         }
         catch (OllamaRouterApiException ex)
@@ -425,6 +707,8 @@ public sealed partial class TargetEditFormViewModel : ObservableObject
     private string _hardwareHint = string.Empty;
     private string _apiKey = string.Empty;
     private string _powerWatts = string.Empty;
+    private string _sshUser = string.Empty;
+    private string _sshPort = string.Empty;
     private bool _testConnectionFirst = true;
     private bool _apiKeyTouched;
     private string? _validationErrorMessage;
@@ -451,6 +735,9 @@ public sealed partial class TargetEditFormViewModel : ObservableObject
             _maxParallel = existing.ConfigMaxParallel.ToString();
             _hardwareHint = existing.HardwareHint ?? string.Empty;
             _powerWatts = existing.PowerWatts?.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                ?? string.Empty;
+            _sshUser = existing.SshUser ?? string.Empty;
+            _sshPort = existing.SshPort?.ToString(System.Globalization.CultureInfo.InvariantCulture)
                 ?? string.Empty;
             ExistingApiKeyConfigured = existing.ApiKeyConfigured;
             foreach (var model in existing.Models ?? (IReadOnlyList<TargetModelDto>)Array.Empty<TargetModelDto>())
@@ -584,6 +871,41 @@ public sealed partial class TargetEditFormViewModel : ObservableObject
         }
     }
 
+    /// <summary>
+    /// The daemon-side hardware probe ssh user (optional; the probe host is the target URL's
+    /// host, key-based auth — no password). Wire semantics on submit: ADD — blank → null
+    /// (unset); EDIT — blank → <c>""</c> (CLEAR, task #143 wire), value → set.
+    /// </summary>
+    public string SshUser
+    {
+        get => _sshUser;
+        set
+        {
+            if (SetProperty(ref _sshUser, value))
+            {
+                ClearError();
+            }
+        }
+    }
+
+    /// <summary>
+    /// The daemon-side hardware probe ssh port (optional; blank = the default port 22).
+    /// Wire semantics on submit: blank → null (ADD: unset; EDIT: NO CHANGE — the port wire
+    /// has no clear semantics, the documented powerWatts precedent; clearing a set port
+    /// requires editing config/config.json), value → set.
+    /// </summary>
+    public string SshPort
+    {
+        get => _sshPort;
+        set
+        {
+            if (SetProperty(ref _sshPort, value))
+            {
+                ClearError();
+            }
+        }
+    }
+
     /// <summary>Whether an immediate liveness probe runs before persisting (add mode; default
     /// true — probe failure → 422 with a retry hint).</summary>
     public bool TestConnectionFirst
@@ -669,7 +991,10 @@ public sealed partial class TargetEditFormViewModel : ObservableObject
             ApiKey: string.IsNullOrWhiteSpace(ApiKey) ? null : ApiKey,
             Provider: string.IsNullOrWhiteSpace(Provider) ? null : Provider.Trim(),
             Models: addModels,
-            PowerWatts: ParseWatts()), null);
+            PowerWatts: ParseWatts(),
+            // Task #144: ADD — blank = null (unset); value = set.
+            SshUser: SshUserWireValue(),
+            SshPort: ParseSshPort()), null);
     }
 
     /// <summary>
@@ -702,7 +1027,12 @@ public sealed partial class TargetEditFormViewModel : ObservableObject
             Models: updateModels,
             // Blank = null = NO CHANGE (clearing a previously set override is a documented
             // API limitation — editing config/config.json removes the key).
-            PowerWatts: ParseWatts()), null);
+            PowerWatts: ParseWatts(),
+            // Task #144 (maintainer decision 2026-11-20): EDIT — blank = "" (CLEAR per the
+            // task #143 sshUser wire), value = set; sshPort blank = null (NO CHANGE — the
+            // port wire cannot clear, the powerWatts precedent).
+            SshUser: SshUserWireValue(),
+            SshPort: ParseSshPort()), null);
     }
 
     private void ClearError()
@@ -761,6 +1091,22 @@ public sealed partial class TargetEditFormViewModel : ObservableObject
             return false;
         }
 
+        // Task #144: the daemon-side probe ssh credential (same charset the server enforces —
+        // POSIX-ish, safe to interpolate into {user}@{host}).
+        if (!string.IsNullOrWhiteSpace(SshUser) &&
+            !System.Text.RegularExpressions.Regex.IsMatch(SshUser, "^[A-Za-z0-9._-]{1,64}$"))
+        {
+            error = "sshUser must be 1–64 characters of letters, digits, '.', '_' or '-' (or blank).";
+            return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(SshPort) &&
+            (!int.TryParse(SshPort, out var sshPort) || sshPort < 1 || sshPort > 65535))
+        {
+            error = "sshPort must be a port between 1 and 65535 (or blank).";
+            return false;
+        }
+
         error = null;
         return true;
     }
@@ -773,6 +1119,24 @@ public sealed partial class TargetEditFormViewModel : ObservableObject
             ? null
             : double.Parse(PowerWatts, System.Globalization.NumberStyles.Float,
                 System.Globalization.CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// The sshUser wire value: ADD mode — blank → null (unset); EDIT mode — blank →
+    /// <c>""</c> (CLEAR per the task #143 <c>UpdateTargetRequest.SshUser</c> wire semantics),
+    /// value → the value (validated by <see cref="ValidateCommon"/>).
+    /// </summary>
+    private string? SshUserWireValue()
+    {
+        var value = string.IsNullOrWhiteSpace(_sshUser) ? null : _sshUser;
+        return _isEdit ? value ?? string.Empty : value;
+    }
+
+    /// <summary>The ssh port wire value: blank → null (ADD: unset; EDIT: NO CHANGE — the
+    /// port wire cannot clear), else the parsed port (validated 1–65535).</summary>
+    private int? ParseSshPort() =>
+        string.IsNullOrWhiteSpace(_sshPort)
+            ? null
+            : int.Parse(_sshPort, System.Globalization.CultureInfo.InvariantCulture);
 
     private IReadOnlyList<TargetModelDto>? BuildModels()
     {

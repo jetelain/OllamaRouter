@@ -16,7 +16,7 @@
 
     <ScrollViewer>
       <StackPanel Spacing="8">
-        <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto,Auto,Auto" RowSpacing="6" ColumnSpacing="8">
+        <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto,Auto,Auto,Auto,Auto" RowSpacing="6" ColumnSpacing="8">
           <TextBlock Grid.Row="0" Grid.Column="0" Text="Name:" VerticalAlignment="Center"/>
           <TextBox Grid.Row="0" Grid.Column="1" Text="{Binding Name}"/>
 
@@ -46,6 +46,15 @@
           <TextBlock Grid.Row="7" Grid.Column="0" Text="Power (W):" VerticalAlignment="Center"
                      ToolTip.Tip="Node power-draw override; blank = no change (clearing a set override requires editing config/config.json)."/>
           <TextBox Grid.Row="7" Grid.Column="1" Text="{Binding PowerWatts}" Watermark="blank = no change"/>
+
+          <TextBlock Grid.Row="8" Grid.Column="0" Text="SSH User:" VerticalAlignment="Center"
+                     ToolTip.Tip="ssh user for the daemon-side hardware probe; the host is the target URL's host (key-based auth, no password). Blank = unset (add) / clear (edit)."/>
+          <TextBox Grid.Row="8" Grid.Column="1" Text="{Binding SshUser}"
+                   Watermark="e.g. gpuadmin — key-based auth; blank = unset (add) / clear (edit)"/>
+
+          <TextBlock Grid.Row="9" Grid.Column="0" Text="SSH Port:" VerticalAlignment="Center"
+                     ToolTip.Tip="ssh port of the daemon-side hardware probe; blank = the default port 22. Edit mode: blank = no change (clearing a set port requires editing config/config.json)."/>
+          <TextBox Grid.Row="9" Grid.Column="1" Text="{Binding SshPort}" Watermark="default 22; blank = no change (edit)"/>
         </Grid>
 
         <StackPanel Spacing="4">

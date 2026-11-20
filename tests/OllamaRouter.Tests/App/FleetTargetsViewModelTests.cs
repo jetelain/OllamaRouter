@@ -1,4 +1,5 @@
 using OllamaRouter.App.ViewModels;
+using OllamaRouter.Client;
 using OllamaRouter.Endpoints.RouterApi.Config;
 using OllamaRouter.Endpoints.RouterApi.Fleet;
 using OllamaRouter.Endpoints.RouterApi.Targets;
@@ -291,6 +292,490 @@ public sealed class FleetTargetsViewModelTests : IAsyncLifetime
 
         form.Models.Clear();
         Assert.Null(form.BuildAddRequest().Error);
+    }
+
+    // -- Task #144: ssh credential form fields + the daemon-side hardware probe ---
+
+    private static async Task WaitUntilAsync(Func<bool> condition, int maxBeats = 20000)
+    {
+        for (var i = 0; i < maxBeats && !condition(); i++)
+        {
+            await Task.Yield();
+        }
+
+        Assert.True(condition());
+    }
+
+    private static TaskCompletionSource Gate() =>
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>Builds a FIFO <see cref="Queue{T}"/> (the <c>Queue{T}(IEnumerable{T})</c>
+    /// constructor does not make <c>Queue{T}</c> a valid collection-expression target).</summary>
+    private static Queue<T> AsQueue<T>(params T[] items) => new(items);
+
+    /// <summary>
+    /// The task #144 seed: five targets exercising the ssh-probeable matrix — GpuBox
+    /// (remote ollama + sshUser + no profile → the ONLY auto-probe eligible row), Local
+    /// (local — the daemon probes itself, never ssh-probed), Plain (remote ollama, no
+    /// sshUser), Groq (remote openai), Profiled (remote ollama + sshUser but already
+    /// profiled, source "peer").
+    /// </summary>
+    private static void SeedSshFleet(FakeRouterApiClient client)
+    {
+        client.SeedTarget(new RouterTargetConfigDto(
+            "GpuBox", "http://10.0.0.7:11434/", true, null, 1, "ollama", null,
+            null, false, null, "gpuadmin", 2222));
+        client.SeedTarget(new RouterTargetConfigDto(
+            "Local", "http://127.0.0.1:11434/", true, null, 1, "ollama", null,
+            null, false, null, "gpuadmin", null));
+        client.SeedTarget(new RouterTargetConfigDto(
+            "Plain", "http://10.0.0.8:11434/", true, null, 1, "ollama", null,
+            null, false, null, null, null));
+        client.SeedTarget(new RouterTargetConfigDto(
+            "Groq", "https://api.groq.com/openai/v1/", true, null, 1, "openai", "Groq",
+            null, false, null, "gpuadmin", null));
+        client.SeedTarget(new RouterTargetConfigDto(
+            "Profiled", "http://10.0.0.9:11434/", true, null, 1, "ollama", null,
+            null, false, null, "gpuadmin", null));
+        client.FleetResponse = new RouterFleetResponse(
+        [
+            new RouterTargetItem("GpuBox", "http://10.0.0.7:11434/", true, "Online", 10, "remote",
+                new RouterTargetHardware("CPU", [], null, 1, 0.2),
+                new RouterTargetExecution(0, null, "-"), null),
+            new RouterTargetItem("Local", "http://127.0.0.1:11434/", true, "Online", 5, "local",
+                new RouterTargetHardware("CPU", [], null, 1, 0.2),
+                new RouterTargetExecution(0, null, "-"), null),
+            new RouterTargetItem("Plain", "http://10.0.0.8:11434/", true, "Online", 10, "remote",
+                new RouterTargetHardware("CPU", [], null, 1, 0.2),
+                new RouterTargetExecution(0, null, "-"), null),
+            new RouterTargetItem("Groq", "https://api.groq.com/openai/v1/", true, "Online", 40, "remote",
+                new RouterTargetHardware("CPU", [], null, 1, 0.2),
+                new RouterTargetExecution(0, null, "-"), null),
+            new RouterTargetItem("Profiled", "http://10.0.0.9:11434/", true, "Online", 10, "remote",
+                new RouterTargetHardware("CPU", [], null, 1, 0.2),
+                new RouterTargetExecution(0, null, "-"), null),
+        ]);
+        client.HardwareResponse = new RouterFleetHardwareResponse(
+        [
+            new FleetHardwareNode("Profiled", "peer",
+                new NodeHardwareProfile(
+                    "Profiled", "Linux", "x64", false, 16384, SystemRamType.Ddr5,
+                    [new GpuDeviceProfile("NVIDIA", "RTX 3090", 24576, "GDDR6X", 384, 936)],
+                    24576, 936),
+                true),
+        ]);
+    }
+
+    [Fact]
+    public void CreateEditForm_PrefillsSshUserAndSshPort_FromTheRow()
+    {
+        var row = new FleetTargetRow { Name = "GpuBox", SshUser = "gpuadmin", SshPort = 2222 };
+
+        var form = _viewModel.CreateEditForm(row);
+
+        Assert.Equal("gpuadmin", form.SshUser);
+        Assert.Equal("2222", form.SshPort);
+        Assert.Equal("ssh: gpuadmin@(port 2222)", row.SshLabel);
+    }
+
+    [Fact]
+    public void CreateEditForm_BlankSshFields_StayBlank_AndBlankIsValid()
+    {
+        var row = new FleetTargetRow
+        {
+            Name = "Plain",
+            Url = "http://10.0.0.8:11434/",
+            ConfigMaxParallel = 1,
+        };
+
+        var form = _viewModel.CreateEditForm(row);
+
+        Assert.Equal(string.Empty, form.SshUser);
+        Assert.Equal(string.Empty, form.SshPort);
+        Assert.Null(form.BuildUpdateRequest().Error); // blank ssh fields are valid (both modes)
+        Assert.Null(row.SshLabel); // no label when unset
+    }
+
+    [Fact]
+    public void BuildAddRequest_SshFields_ValidateUsernameCharsetAndPortRange()
+    {
+        var form = new TargetEditFormViewModel(isEdit: false);
+        form.Name = "ok";
+        form.Url = "http://10.0.0.7:11434";
+        Assert.Null(form.BuildAddRequest().Error); // blank = valid
+
+        const string userError =
+            "sshUser must be 1–64 characters of letters, digits, '.', '_' or '-' (or blank).";
+        const string portError = "sshPort must be a port between 1 and 65535 (or blank).";
+
+        form.SshUser = "bad user"; // space
+        Assert.Equal(userError, form.BuildAddRequest().Error);
+
+        form.SshUser = "üser"; // non-ASCII
+        Assert.Equal(userError, form.BuildAddRequest().Error);
+
+        form.SshUser = new string('a', 65); // > 64 chars
+        Assert.Equal(userError, form.BuildAddRequest().Error);
+
+        form.SshUser = "gpu.admin-1"; // valid charset
+        form.SshPort = "0";
+        Assert.Equal(portError, form.BuildAddRequest().Error);
+
+        form.SshPort = "70000";
+        Assert.Equal(portError, form.BuildAddRequest().Error);
+
+        form.SshPort = "abc"; // non-numeric
+        Assert.Equal(portError, form.BuildAddRequest().Error);
+
+        form.SshPort = "2222";
+        Assert.Null(form.BuildAddRequest().Error);
+    }
+
+    [Fact]
+    public void BuildAddRequest_SshFields_BlankSendsNull_ValueSendsTheValue()
+    {
+        var form = new TargetEditFormViewModel(isEdit: false);
+        form.Name = "ok";
+        form.Url = "http://10.0.0.7:11434";
+        var (blank, blankError) = form.BuildAddRequest();
+        Assert.Null(blankError);
+        Assert.Null(blank.SshUser); // ADD: blank = unset (null)
+        Assert.Null(blank.SshPort);
+
+        form.SshUser = "gpuadmin";
+        form.SshPort = "2222";
+        var (filled, filledError) = form.BuildAddRequest();
+        Assert.Null(filledError);
+        Assert.Equal("gpuadmin", filled.SshUser);
+        Assert.Equal(2222, filled.SshPort);
+    }
+
+    [Fact]
+    public async Task AddTarget_SshFields_CarryTheWireAndRoundTripToTheRow()
+    {
+        await _viewModel.RefreshAsync(); // empty fleet: no auto-probes
+
+        var form = _viewModel.CreateAddForm();
+        form.Name = "GpuBox";
+        form.Url = "http://10.0.0.7:11434";
+        form.SshUser = "gpuadmin";
+        form.SshPort = "2222";
+        var (request, error) = form.BuildAddRequest();
+        Assert.Null(error);
+
+        await _viewModel.AddTargetCommand.ExecuteAsync(request);
+
+        var sent = Assert.Single(_client.AddTargetCalls);
+        Assert.Equal("gpuadmin", sent.SshUser);
+        Assert.Equal(2222, sent.SshPort);
+        var row = _viewModel.Rows.Single(r => r.Name == "GpuBox");
+        Assert.Equal("gpuadmin", row.SshUser); // round-tripped via the fake store
+        Assert.Equal(2222, row.SshPort);
+        Assert.Equal("ssh: gpuadmin@(port 2222)", row.SshLabel);
+        Assert.True(row.CanUpdateHardware); // ssh-probeable row → the button is enabled
+    }
+
+    [Fact]
+    public async Task EditTarget_SshUserBlank_Clears_AndSshPortBlank_IsNoChange()
+    {
+        SeedSshFleet(_client);
+        await _viewModel.RefreshAsync();
+        await WaitUntilAsync(() => _client.ProbeCalls.Count == 1); // GpuBox auto-probe settled
+
+        var row = _viewModel.Rows.Single(r => r.Name == "GpuBox");
+        var form = _viewModel.CreateEditForm(row);
+        Assert.Equal("gpuadmin", form.SshUser);
+        Assert.Equal("2222", form.SshPort);
+        form.SshUser = string.Empty; // explicitly emptied → CLEAR (task #143 wire)
+        form.SshPort = string.Empty; // blank → NO CHANGE (no clear semantics on the port wire)
+
+        var (request, error) = form.BuildUpdateRequest();
+        Assert.Null(error);
+        Assert.Equal(string.Empty, request.SshUser);
+        Assert.Null(request.SshPort);
+
+        await _viewModel.EditTargetCommand.ExecuteAsync(("GpuBox", request));
+
+        var stored = _client.Targets["GpuBox"];
+        Assert.Null(stored.SshUser); // cleared on the store
+        Assert.Equal(2222, stored.SshPort); // untouched
+    }
+
+    [Fact]
+    public async Task EditTarget_SshFieldsWithValue_SetOnTheStore()
+    {
+        SeedSshFleet(_client);
+        await _viewModel.RefreshAsync();
+        await WaitUntilAsync(() => _client.ProbeCalls.Count == 1); // GpuBox auto-probe settled
+
+        var row = _viewModel.Rows.Single(r => r.Name == "Plain");
+        var form = _viewModel.CreateEditForm(row);
+        form.SshUser = "root";
+        form.SshPort = "22";
+        var (request, error) = form.BuildUpdateRequest();
+        Assert.Null(error);
+        Assert.Equal("root", request.SshUser);
+        Assert.Equal(22, request.SshPort);
+
+        await _viewModel.EditTargetCommand.ExecuteAsync(("Plain", request));
+
+        var stored = _client.Targets["Plain"];
+        Assert.Equal("root", stored.SshUser);
+        Assert.Equal(22, stored.SshPort);
+    }
+
+    [Fact]
+    public async Task UpdateHardware_NonProbeableRows_IssueNoProbeCall_AndLeaveStateUntouched()
+    {
+        SeedSshFleet(_client);
+        await _viewModel.RefreshAsync();
+        await WaitUntilAsync(() => _client.ProbeCalls.Count == 1); // GpuBox auto-probe only
+        var baseline = _client.ProbeCalls.ToList();
+
+        // local / no-sshUser / non-ollama rows are NEVER ssh-probeable → the button is
+        // disabled and the command is a no-op.
+        var local = _viewModel.Rows.Single(r => r.Name == "Local");
+        var plain = _viewModel.Rows.Single(r => r.Name == "Plain");
+        var groq = _viewModel.Rows.Single(r => r.Name == "Groq");
+        Assert.False(local.CanUpdateHardware);
+        Assert.False(plain.CanUpdateHardware);
+        Assert.False(groq.CanUpdateHardware);
+        Assert.Equal("Update hardware", local.UpdateHardwareButtonContent);
+
+        await _viewModel.UpdateHardwareCommand.ExecuteAsync(local);
+        await _viewModel.UpdateHardwareCommand.ExecuteAsync(plain);
+        await _viewModel.UpdateHardwareCommand.ExecuteAsync(groq);
+        await _viewModel.UpdateHardwareCommand.ExecuteAsync((FleetTargetRow?)null);
+
+        Assert.Equal(baseline, _client.ProbeCalls); // no new probe calls
+        Assert.False(local.IsProbing);
+        Assert.Null(local.ProbeError);
+        Assert.Null(_viewModel.LastError);
+    }
+
+    [Fact]
+    public async Task UpdateHardware_EligibleRow_ProbesExactlyOnce_AndRefreshShowsSshSource()
+    {
+        SeedSshFleet(_client);
+        await _viewModel.RefreshAsync();
+        await WaitUntilAsync(() => _client.ProbeCalls.Count == 1); // GpuBox auto-probe only
+        var row = _viewModel.Rows.Single(r => r.Name == "Profiled");
+        Assert.Equal("peer", row.HardwareSource);
+        Assert.True(row.CanUpdateHardware);
+
+        await _viewModel.UpdateHardwareCommand.ExecuteAsync(row);
+        await WaitUntilAsync(() => _viewModel.Rows.Single(r => r.Name == "Profiled").HardwareSource == "ssh");
+
+        // The explicit probe ran EXACTLY once (plus the GpuBox auto-probe from the refresh).
+        Assert.Equal(["GpuBox", "Profiled"], [.. _client.ProbeCalls]);
+        var refreshed = _viewModel.Rows.Single(r => r.Name == "Profiled");
+        Assert.Equal("ssh", refreshed.HardwareSource); // the inspector shows the new source
+        Assert.NotNull(refreshed.HardwareProfile);
+        Assert.Equal("RTX 4090", refreshed.HardwareProfile!.Gpus[0].ModelName); // fake default
+        Assert.True(refreshed.HardwareReachable);
+        Assert.False(refreshed.IsProbing);
+        Assert.Null(refreshed.ProbeError);
+        Assert.Null(_viewModel.LastError);
+    }
+
+    [Fact]
+    public async Task UpdateHardware_InFlight_AConcurrentRefreshRebuildsTheRowStillProbing()
+    {
+        SeedSshFleet(_client);
+        await _viewModel.RefreshAsync();
+        await WaitUntilAsync(() => _client.ProbeCalls.Count == 1);
+
+        var gate = Gate();
+        _client.ProbeFetchBlocks = AsQueue(gate.Task);
+        var row = _viewModel.Rows.Single(r => r.Name == "Profiled");
+        var rowReference = row;
+
+        await _viewModel.UpdateHardwareCommand.ExecuteAsync(row);
+        Assert.True(row.IsProbing);
+        Assert.False(row.CanUpdateHardware);
+        Assert.Equal("Probing…", row.UpdateHardwareButtonContent);
+
+        // The 5 s poll REBUILDS the rows: the busy state must survive the rebuild (carried
+        // by name, not on the row object), and NO second probe call may fire while in flight.
+        await _viewModel.RefreshAsync();
+        var rebuilt = _viewModel.Rows.Single(r => r.Name == "Profiled");
+        Assert.NotSame(rowReference, rebuilt);
+        Assert.True(rebuilt.IsProbing);
+        Assert.False(rebuilt.CanUpdateHardware);
+        Assert.Equal("Probing…", rebuilt.UpdateHardwareButtonContent);
+        Assert.Equal(2, _client.ProbeCalls.Count); // dedupe: the in-flight probe is not re-fired
+
+        gate.SetResult();
+        await WaitUntilAsync(() => _viewModel.Rows.Single(r => r.Name == "Profiled").HardwareSource == "ssh");
+        var settled = _viewModel.Rows.Single(r => r.Name == "Profiled");
+        Assert.False(settled.IsProbing);
+        Assert.True(settled.CanUpdateHardware);
+        Assert.Equal("Update hardware", settled.UpdateHardwareButtonContent);
+    }
+
+    [Fact]
+    public async Task UpdateHardware_Failure_SetsTheRowError_KeepsTheBannerQuiet_ClearsOnTheNextRefreshes()
+    {
+        SeedSshFleet(_client);
+        await _viewModel.RefreshAsync();
+        await WaitUntilAsync(() => _client.ProbeCalls.Count == 1);
+
+        _client.ProbeFailTargets.Add("Profiled");
+        var row = _viewModel.Rows.Single(r => r.Name == "Profiled");
+        await _viewModel.UpdateHardwareCommand.ExecuteAsync(row);
+
+        // The row shows the server's readable message; the tab-level banner stays quiet.
+        await WaitUntilAsync(() => _viewModel.Rows.Single(r => r.Name == "Profiled").ProbeError is not null);
+        Assert.Equal("simulated probe failure", _viewModel.Rows.Single(r => r.Name == "Profiled").ProbeError);
+        Assert.Null(_viewModel.LastError);
+
+        // The error survives exactly ONE more rebuild (carried over + consumed there)…
+        await _viewModel.RefreshAsync();
+        Assert.Equal(
+            "simulated probe failure", _viewModel.Rows.Single(r => r.Name == "Profiled").ProbeError);
+        // …and clears on the refresh after that (transient, no timer).
+        await _viewModel.RefreshAsync();
+        Assert.Null(_viewModel.Rows.Single(r => r.Name == "Profiled").ProbeError);
+    }
+
+    [Fact]
+    public async Task UpdateHardware_Success_DropsThePendingErrorOfAPreviouslyFailedProbe()
+    {
+        SeedSshFleet(_client);
+        await _viewModel.RefreshAsync();
+        await WaitUntilAsync(() => _client.ProbeCalls.Count == 1); // GpuBox auto-probe settled
+
+        // Explicit probe #1 fails → a transient error is pending (no refresh has consumed
+        // it yet — the tests have no background poller)…
+        _client.ProbeFailTargets.Add("Profiled");
+        var row = _viewModel.Rows.Single(r => r.Name == "Profiled");
+        await _viewModel.UpdateHardwareCommand.ExecuteAsync(row);
+        await WaitUntilAsync(() => _viewModel.Rows.Single(r => r.Name == "Profiled").ProbeError is not null);
+
+        // …and explicit probe #2 is fired while that stale error is still pending (gated in
+        // flight). The success must DROP the pending error — otherwise the success refresh
+        // would resurface a stale failure on a row that just probed fine.
+        _client.ProbeFailTargets.Clear();
+        var gate = Gate();
+        _client.ProbeFetchBlocks = AsQueue(gate.Task);
+        await _viewModel.UpdateHardwareCommand.ExecuteAsync(row);
+        gate.SetResult();
+
+        await WaitUntilAsync(() =>
+            _client.ProbeCalls.Count == 3 &&
+            _viewModel.Rows.Single(r => r.Name == "Profiled").HardwareSource == "ssh");
+
+        var settled = _viewModel.Rows.Single(r => r.Name == "Profiled");
+        Assert.Equal("ssh", settled.HardwareSource);
+        Assert.Null(settled.ProbeError); // the stale failure did NOT resurface on the successful row
+        Assert.False(settled.IsProbing);
+        Assert.Null(_viewModel.LastError);
+    }
+
+    [Fact]
+    public async Task AutoProbe_OnRefresh_FiresExactlyOnceForTheEligibleRow()
+    {
+        SeedSshFleet(_client);
+
+        await _viewModel.RefreshAsync();
+
+        await WaitUntilAsync(() => _client.ProbeCalls.Count == 1);
+        // Fires EXACTLY for ssh-probeable + no-profile rows: local / no-sshUser / openai /
+        // already-profiled rows are never auto-probed.
+        Assert.Equal(["GpuBox"], [.. _client.ProbeCalls]);
+
+        // The probe's own success refresh is skipped by the single-writer gate while the
+        // firing refresh holds the lock — the NEXT tick (as in production) picks up the
+        // profile (source "ssh").
+        await _viewModel.RefreshAsync();
+        var gpuBox = _viewModel.Rows.Single(r => r.Name == "GpuBox");
+        Assert.Equal("ssh", gpuBox.HardwareSource);
+        Assert.NotNull(gpuBox.HardwareProfile);
+        Assert.True(gpuBox.HardwareReachable);
+
+        // A further refresh fires NO auto-probe (GpuBox is profiled now; the others were
+        // never eligible).
+        await _viewModel.RefreshAsync();
+        Assert.Equal(1, _client.ProbeCalls.Count);
+    }
+
+    [Fact]
+    public async Task AutoProbe_InFlight_ASecondRefreshIssuesNoSecondCall()
+    {
+        SeedSshFleet(_client);
+        var gate = Gate();
+        _client.ProbeFetchBlocks = AsQueue(gate.Task);
+
+        await _viewModel.RefreshAsync();
+        await WaitUntilAsync(() => _client.ProbeCalls.Count == 1);
+        Assert.True(_viewModel.Rows.Single(r => r.Name == "GpuBox").IsProbing);
+
+        // Tick 2 while the first probe is gated: deduped by the in-flight set — no second call.
+        await _viewModel.RefreshAsync();
+        Assert.Equal(1, _client.ProbeCalls.Count);
+        Assert.True(_viewModel.Rows.Single(r => r.Name == "GpuBox").IsProbing); // carried by name
+
+        gate.SetResult();
+        await WaitUntilAsync(() => _viewModel.Rows.Single(r => r.Name == "GpuBox").HardwareSource == "ssh");
+        Assert.False(_viewModel.Rows.Single(r => r.Name == "GpuBox").IsProbing);
+    }
+
+    [Fact]
+    public async Task AutoProbe_Failure_IsSilentAndSuppressed_UntilAConfigEditLiftsIt()
+    {
+        SeedSshFleet(_client);
+        _client.ProbeFailTargets.Add("GpuBox");
+
+        await _viewModel.RefreshAsync();
+        await WaitUntilAsync(() => _client.ProbeCalls.Count == 1);
+        await WaitUntilAsync(() => !_viewModel.Rows.Any(r => r.IsProbing));
+
+        // Silent: no row error, no tab banner…
+        Assert.All(_viewModel.Rows, r => Assert.Null(r.ProbeError));
+        Assert.Null(_viewModel.LastError);
+        // …and suppressed (no retry storm against a dead host): further refreshes issue no
+        // auto calls.
+        await _viewModel.RefreshAsync();
+        await _viewModel.RefreshAsync();
+        Assert.Equal(1, _client.ProbeCalls.Count);
+
+        // A successful config save of that target LIFTS the suppression → the next refresh
+        // auto-probes again (the ssh credential may have been fixed).
+        var row = _viewModel.Rows.Single(r => r.Name == "GpuBox");
+        var form = _viewModel.CreateEditForm(row);
+        var (request, _) = form.BuildUpdateRequest();
+        _client.ProbeFailTargets.Clear();
+        await _viewModel.EditTargetCommand.ExecuteAsync(("GpuBox", request));
+
+        await WaitUntilAsync(() => _client.ProbeCalls.Count == 2);
+        // The lifted auto-probe's success refresh is skipped while the edit's refresh holds
+        // the gate — the next tick picks up the profile.
+        await _viewModel.RefreshAsync();
+        Assert.Equal("ssh", _viewModel.Rows.Single(r => r.Name == "GpuBox").HardwareSource);
+    }
+
+    [Fact]
+    public async Task AutoProbe_ConfigCondition400Failure_StaysRetryable()
+    {
+        SeedSshFleet(_client);
+        // A 400 config-condition failure (e.g. "no sshUser") is NOT suppressed — only
+        // host-level failures (502/timeout) are.
+        _client.ProbeException = new OllamaRouterApiException(
+            System.Net.HttpStatusCode.BadRequest, "no sshUser configured for target GpuBox");
+
+        await _viewModel.RefreshAsync();
+        await WaitUntilAsync(() => _client.ProbeCalls.Count == 1);
+        await WaitUntilAsync(() => !_viewModel.Rows.Any(r => r.IsProbing));
+        Assert.All(_viewModel.Rows, r => Assert.Null(r.ProbeError));
+
+        // The next refresh fires AGAIN (suppression was not set) — and succeeds this time.
+        await _viewModel.RefreshAsync();
+        await WaitUntilAsync(() => _client.ProbeCalls.Count == 2);
+        // The success refresh is skipped while this refresh holds the gate — the next tick
+        // picks up the profile.
+        await _viewModel.RefreshAsync();
+        Assert.Equal("ssh", _viewModel.Rows.Single(r => r.Name == "GpuBox").HardwareSource);
+        Assert.Equal(2, _client.ProbeCalls.Count);
     }
 
     /// <inheritdoc />

@@ -100,4 +100,15 @@ public partial class FleetTargetsView : UserControl
 
         viewModel.TogglePersistedEnabledCommand.Execute(row);
     }
+
+    private void OnUpdateHardwareClick(object? sender, RoutedEventArgs e)
+    {
+        var viewModel = ViewModel;
+        if (viewModel is null || e.Source is not Control { DataContext: FleetTargetRow row })
+        {
+            return;
+        }
+
+        viewModel.UpdateHardwareCommand.Execute(row);
+    }
 }
