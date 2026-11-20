@@ -10,6 +10,15 @@
         Width="1020" Height="700"
         MinWidth="860" MinHeight="560">
   <DockPanel>
+    <!-- Task #150: branding header (OllamaRouter name + logo) — Setup Wizard window ONLY,
+         docked ABOVE the step strip (the main app window is untouched). -->
+    <Border DockPanel.Dock="Top" Padding="12,8" BorderBrush="#333" BorderThickness="0,0,0,1">
+      <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+        <Image Source="avares://ollamarouter-app/Assets/icon.ico" Width="28" Height="28"/>
+        <TextBlock Text="OllamaRouter" FontSize="18" FontWeight="Bold" VerticalAlignment="Center"/>
+      </StackPanel>
+    </Border>
+
     <!-- 4-step progress header: all titles visible, the active step is bold -->
     <Border DockPanel.Dock="Top" Padding="12,10" BorderBrush="#333" BorderThickness="0,0,0,1">
       <StackPanel Orientation="Horizontal" Spacing="18">

@@ -298,8 +298,22 @@ public sealed class FleetTargetsViewModelTests : IAsyncLifetime
 
     private static async Task WaitUntilAsync(Func<bool> condition, int maxBeats = 20000)
     {
-        for (var i = 0; i < maxBeats && !condition(); i++)
+        var satisfied = false;
+        for (var i = 0; i < maxBeats && !satisfied; i++)
         {
+            try
+            {
+                satisfied = condition();
+            }
+            catch (InvalidOperationException)
+            {
+                // The VM's async continuations run on thread-pool threads in the test host
+                // (no Avalonia dispatcher) and may rebuild Rows (an ObservableCollection, i.e.
+                // a List) WHILE the poll enumerates it — a transient "collection was modified"
+                // is not the condition being awaited: treat it as "not yet" and poll again.
+                satisfied = false;
+            }
+
             await Task.Yield();
         }
 

@@ -19,11 +19,32 @@ public enum Port11434Status
 }
 
 /// <summary>
-/// Step 1 — Local Ollama for the Router (task #103, spec §3.5): detects a local Ollama, shows
-/// the <c>:11434</c> port state (router-running / foreign / free), and offers the one-click
-/// "Configure Local Ollama for Router" action (Windows + macOS; Linux gets manual
-/// instructions). <see cref="LocalOllamaConfigurator"/> performs the actual work behind
-/// injectable seams.
+/// The classification of the effective Ollama port surfaced by Step 1's "Configuration for
+/// router" section (task #150). <see cref="Ok"/> = serving on the router-expected
+/// <c>:11435</c>; <see cref="WrongPort"/> = serving on a DIFFERENT port (the one-click
+/// "Fix port" case).
+/// </summary>
+public enum OllamaPortStatus
+{
+    Unknown,
+    NotRunning,
+    Ok,
+    WrongPort,
+    NotDetected,
+}
+
+/// <summary>
+/// Step 1 — Local Ollama for the Router (task #103, spec §3.5; reworked by task #150):
+/// state-driven detection with one-click actions. Section 1 "Ollama": Install (the official
+/// ollama.com script — all OSes), Start (Win/macOS), Update (stop → script → restart — all
+/// OSes) and a green running check; which of these are visible is driven by the detection
+/// state. Section 2 "Configuration for router": the effective-Ollama-port check (≠ 11435 →
+/// warning + one-click "Fix port" via the existing start-only env-write + restart path), the
+/// LAN-mesh option, and the state-driven <c>:11434</c> router row — "Start router" while the
+/// port is free (task #150, M2: the legacy "Configure Local Ollama for Router" button is
+/// gone, subsumed by Start + Fix port + Start router). <see cref="LocalOllamaConfigurator"/>
+/// performs the actual work behind injectable seams; every failure surfaces a readable
+/// (red) message — never a crash or a silent hang.
 /// </summary>
 public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, IWizardStep
 {
@@ -38,8 +59,7 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
     {
         _configurator = configurator ?? throw new ArgumentNullException(nameof(configurator));
         _connection = connection ?? throw new ArgumentNullException(nameof(connection));
-        // Forward the (test) port-wait gate to the configurator so both the configure and the
-        // start-only paths use it.
+        // Forward the (test) port-wait gate to the configurator so every action path uses it.
         if (delay is not null)
         {
             _configurator.Delay = delay;
@@ -64,6 +84,11 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
     [ObservableProperty]
     private string? _message;
 
+    /// <summary>The severity of <see cref="Message"/> (true → rendered red): set from each
+    /// action's Success flag; informational text (e.g. the refresh hints) stays non-error.</summary>
+    [ObservableProperty]
+    private bool _messageIsError;
+
     [ObservableProperty]
     private bool _isBusy;
 
@@ -72,8 +97,15 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
     [ObservableProperty]
     private bool _lanMeshEnabled;
 
-    /// <summary>True on Linux (neither Windows nor macOS) → the one-click action is disabled and
-    /// the manual-instructions block is shown.</summary>
+    [ObservableProperty]
+    private OllamaPortStatus _ollamaPortStatus = OllamaPortStatus.Unknown;
+
+    [ObservableProperty]
+    private int? _ollamaDetectedPort;
+
+    /// <summary>True on Linux (neither Windows nor macOS) → Start and Fix port are disabled
+    /// (the existing configurator paths gate on <c>SupportsOneClick</c>); Install and Update
+    /// stay one-click (task #150, M1) and the manual-instructions block is shown.</summary>
     public bool IsLinux => !_configurator.SupportsOneClick;
 
     /// <summary>One-line detection summary (raises <see cref="PropertyChanged"/> on its inputs below).</summary>
@@ -82,16 +114,214 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
           + (string.IsNullOrWhiteSpace(OllamaBinaryPath) ? string.Empty : $" ({OllamaBinaryPath})")
         : "Ollama not found on this machine";
 
-    /// <summary>The on-demand re-check command (bound to the Step 1 Re-check button).</summary>
-    [RelayCommand]
+    // -- Section 1 "Ollama": state → visible actions (task #150 contract matrix) ----------
+
+    /// <summary>Not installed → the one-click Install (official script, all OSes).</summary>
+    public bool ShowInstallButton => !OllamaInstalled;
+
+    /// <summary>Installed + stopped → the one-click Start (Win/macOS only).</summary>
+    public bool ShowStartButton => OllamaInstalled && !OllamaRunning && !IsLinux;
+
+    /// <summary>Installed → the one-click Update (stop → script → restart, all OSes).</summary>
+    public bool ShowUpdateButton => OllamaInstalled;
+
+    /// <summary>Installed + running → the green check.</summary>
+    public bool ShowRunningCheck => OllamaRunning;
+
+    // -- Section 2 "Configuration for router": port check + router row (task #150) --------
+
+    /// <summary>The human label for the effective Ollama port (raises with the port state
+    /// and the detected port).</summary>
+    public string OllamaPortLabel => OllamaPortStatus switch
+    {
+        OllamaPortStatus.Ok => $"Ollama is serving on :{LocalOllamaConfigurator.OllamaPort} ✓",
+        OllamaPortStatus.WrongPort =>
+            $"Ollama is serving on :{OllamaDetectedPort} — the router expects :{LocalOllamaConfigurator.OllamaPort}",
+        OllamaPortStatus.NotRunning => "Ollama is not running — start it in the section above",
+        OllamaPortStatus.NotDetected => "Ollama is running but its port could not be detected — try Re-check",
+        _ => "Checking the Ollama port…",
+    };
+
+    public bool ShowPortOk => OllamaPortStatus == OllamaPortStatus.Ok;
+
+    public bool ShowPortWrong => OllamaPortStatus == OllamaPortStatus.WrongPort;
+
+    public bool ShowPortNotRunning => OllamaPortStatus == OllamaPortStatus.NotRunning;
+
+    public bool ShowPortNotDetected => OllamaPortStatus == OllamaPortStatus.NotDetected;
+
+    public bool ShowPortUnknown => OllamaPortStatus == OllamaPortStatus.Unknown;
+
+    /// <summary>Wrong port → the one-click "Fix port" (Win/macOS: the existing start-only
+    /// env-write + restart path).</summary>
+    public bool ShowFixPortButton => OllamaPortStatus == OllamaPortStatus.WrongPort && !IsLinux;
+
+    /// <summary>Router port free + a launcher available (local mode) → "Start router"
+    /// (task #150, M2 — Free = "not running"; ForeignService/RouterRunning show no button).</summary>
+    public bool ShowStartRouterButton => Port11434Status == Port11434Status.Free && _connection.DaemonLauncher is not null;
+
+    // -- Commands (all busy-gated: while IsBusy, NO action runs concurrently) -------------
+
+    /// <summary>
+    /// One-click Install (task #150): runs the official ollama.com script for the platform
+    /// (elevated on Windows) with a "several minutes" status message, then re-detects — the
+    /// new state is reflected without a manual Re-check.
+    /// </summary>
+    [RelayCommand(CanExecute = nameof(CanInstallOllama))]
+    private async Task InstallOllama()
+    {
+        IsBusy = true;
+        try
+        {
+            Message = "Installing Ollama via the official script — this can take several minutes…";
+            MessageIsError = false;
+            var result = await _configurator.InstallOllamaAsync(CancellationToken.None).ConfigureAwait(false);
+            Message = result.Message;
+            MessageIsError = !result.Success;
+            await RefreshAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    /// <summary>
+    /// One-click Update (task #150): stop Ollama → official script → restart (all OSes). On
+    /// a script failure the message reports that Ollama is left stopped and how to recover.
+    /// </summary>
+    [RelayCommand(CanExecute = nameof(CanUpdateOllama))]
+    private async Task UpdateOllama()
+    {
+        IsBusy = true;
+        try
+        {
+            Message = "Updating Ollama: stop → official script → restart…";
+            MessageIsError = false;
+            var result = await _configurator.UpdateOllamaAsync(CancellationToken.None).ConfigureAwait(false);
+            Message = result.Message;
+            MessageIsError = !result.Success;
+            await RefreshAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    /// <summary>
+    /// One-click Start Ollama (env + start + port-wait; no router start) — for the "installed
+    /// but not running" case (Win/macOS).
+    /// </summary>
+    [RelayCommand(CanExecute = nameof(CanStartOllama))]
+    private async Task StartOllama()
+    {
+        if (!_configurator.SupportsOneClick)
+        {
+            return;
+        }
+
+        IsBusy = true;
+        try
+        {
+            var result = await _configurator.StartOllamaOnlyAsync(LanMeshEnabled, CancellationToken.None).ConfigureAwait(false);
+            Message = result.Message;
+            MessageIsError = !result.Success;
+            await RefreshAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    /// <summary>
+    /// One-click Fix port (task #150, Win/macOS): reuses the existing start-only path —
+    /// writes OLLAMA_HOST to <c>127.0.0.1:11435</c> (or <c>0.0.0.0:11435</c> with the
+    /// LAN-mesh checkbox) and restarts Ollama with the explicit env + port wait.
+    /// </summary>
+    [RelayCommand(CanExecute = nameof(CanFixPort))]
+    private async Task FixPort()
+    {
+        IsBusy = true;
+        try
+        {
+            Message = "Fixing the Ollama port (set OLLAMA_HOST and restart Ollama)…";
+            MessageIsError = false;
+            var result = await _configurator.StartOllamaOnlyAsync(LanMeshEnabled, CancellationToken.None).ConfigureAwait(false);
+            Message = result.Message;
+            MessageIsError = !result.Success;
+            await RefreshAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    /// <summary>
+    /// One-click Start router (task #150, M2): reuses the existing
+    /// <see cref="IAppConnectionService.DaemonLauncher"/> — success/failure is a message,
+    /// NEVER a throw (the Step 2/4 daemon-down tolerance precedent).
+    /// </summary>
+    [RelayCommand(CanExecute = nameof(CanStartRouter))]
+    private async Task StartRouter()
+    {
+        IsBusy = true;
+        try
+        {
+            Message = "Starting the router on :11434…";
+            MessageIsError = false;
+            try
+            {
+                var status = await _connection.DaemonLauncher!.StartAsync(CancellationToken.None).ConfigureAwait(false);
+                Message = status.State == RouterDaemonState.Running
+                    ? "Router is running on :11434 ✓"
+                    : "Router is starting on :11434";
+                MessageIsError = false;
+            }
+            catch (Exception ex)
+            {
+                // Typed launcher failures (port occupied / executable not found / start
+                // timeout) and anything else: a readable message, never a crash.
+                Message = $"Could not start the router: {ex.Message}";
+                MessageIsError = true;
+            }
+
+            await RefreshAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    /// <summary>The on-demand re-check command (bound to the Step 1 Re-check button; always
+    /// available, busy-gated like every other action — task #150).</summary>
+    [RelayCommand(CanExecute = nameof(CanRecheck))]
     private Task Recheck() => RefreshAsync(CancellationToken.None);
 
-    /// <summary>Re-checks the local Ollama detection and the <c>:11434</c> port state.</summary>
-    public async Task RefreshAsync(CancellationToken ct = default)    {
+    /// <summary>
+    /// Re-checks the local Ollama detection, its EFFECTIVE port (task #150) and the
+    /// <c>:11434</c> port state. One binary detection per refresh: the port check reuses the
+    /// detection pass (the task #147 "the initial entry runs exactly once" invariant).
+    /// </summary>
+    public async Task RefreshAsync(CancellationToken ct = default)
+    {
         var detection = await _configurator.DetectAsync(ct).ConfigureAwait(false);
         OllamaInstalled = detection.Installed;
         OllamaBinaryPath = detection.BinaryPath;
         OllamaRunning = detection.ProcessRunning;
+
+        var portCheck = await _configurator.DetectPortAsync(detection, ct).ConfigureAwait(false);
+        OllamaPortStatus = !portCheck.OllamaRunning
+            ? OllamaPortStatus.NotRunning
+            : portCheck.DetectedPort is null
+                ? OllamaPortStatus.NotDetected
+                : portCheck.DetectedPort == LocalOllamaConfigurator.OllamaPort
+                    ? OllamaPortStatus.Ok
+                    : OllamaPortStatus.WrongPort;
+        OllamaDetectedPort = portCheck.DetectedPort;
 
         var launcher = _connection.DaemonLauncher;
         if (launcher is null)
@@ -117,80 +347,69 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
     /// <summary>Step lifecycle: nothing to stop (no poller).</summary>
     public Task OnStepLeftAsync() => Task.CompletedTask;
 
-    /// <summary>
-    /// The one-click "Configure Local Ollama for Router": sets the OLLAMA_* environment,
-    /// restarts Ollama on <c>:11435</c> and starts the router on <c>:11434</c>.
-    /// </summary>
-    [RelayCommand(CanExecute = nameof(CanConfigure))]
-    private async Task ConfigureForRouter()
-    {
-        if (!_configurator.SupportsOneClick)
-        {
-            return;
-        }
+    private bool CanInstallOllama() => ShowInstallButton && !IsBusy;
 
-        IsBusy = true;
-        try
-        {
-            var result = await _configurator.ConfigureForRouterAsync(LanMeshEnabled, _connection, CancellationToken.None)
-                .ConfigureAwait(false);
-            Message = result.Message;
-            await RefreshAsync(CancellationToken.None).ConfigureAwait(false);
-        }
-        finally
-        {
-            IsBusy = false;
-        }
-    }
-
-    /// <summary>
-    /// Starts only Ollama on <c>:11435</c> (env + start + port-wait; no router start) — for the
-    /// "installed but not running" case.
-    /// </summary>
-    [RelayCommand(CanExecute = nameof(CanStartOllama))]
-    private async Task StartOllama()
-    {
-        if (!_configurator.SupportsOneClick)
-        {
-            return;
-        }
-
-        IsBusy = true;
-        try
-        {
-            var result = await _configurator.StartOllamaOnlyAsync(LanMeshEnabled, CancellationToken.None).ConfigureAwait(false);
-            Message = result.Message;
-            await RefreshAsync(CancellationToken.None).ConfigureAwait(false);
-        }
-        finally
-        {
-            IsBusy = false;
-        }
-    }
-
-    private bool CanConfigure() => _configurator.SupportsOneClick && !IsBusy;
+    private bool CanUpdateOllama() => ShowUpdateButton && !IsBusy;
 
     private bool CanStartOllama() => _configurator.SupportsOneClick && OllamaInstalled && !OllamaRunning && !IsBusy;
 
+    private bool CanFixPort() => ShowFixPortButton && !IsBusy;
+
+    private bool CanStartRouter() => ShowStartRouterButton && !IsBusy;
+
+    private bool CanRecheck() => !IsBusy;
+
     partial void OnIsBusyChanged(bool value)
     {
-        ConfigureForRouterCommand.NotifyCanExecuteChanged();
+        // Busy disables ALL Step 1 actions concurrently (task #150, AC6).
+        InstallOllamaCommand.NotifyCanExecuteChanged();
         StartOllamaCommand.NotifyCanExecuteChanged();
+        UpdateOllamaCommand.NotifyCanExecuteChanged();
+        FixPortCommand.NotifyCanExecuteChanged();
+        StartRouterCommand.NotifyCanExecuteChanged();
+        RecheckCommand.NotifyCanExecuteChanged();
     }
 
     partial void OnOllamaInstalledChanged(bool value)
     {
         OnPropertyChanged(nameof(DetectionText));
+        OnPropertyChanged(nameof(ShowInstallButton));
+        OnPropertyChanged(nameof(ShowStartButton));
+        OnPropertyChanged(nameof(ShowUpdateButton));
+        InstallOllamaCommand.NotifyCanExecuteChanged();
         StartOllamaCommand.NotifyCanExecuteChanged();
+        UpdateOllamaCommand.NotifyCanExecuteChanged();
     }
 
     partial void OnOllamaRunningChanged(bool value)
     {
         OnPropertyChanged(nameof(DetectionText));
+        OnPropertyChanged(nameof(ShowStartButton));
+        OnPropertyChanged(nameof(ShowRunningCheck));
         StartOllamaCommand.NotifyCanExecuteChanged();
     }
 
     partial void OnOllamaBinaryPathChanged(string? value) => OnPropertyChanged(nameof(DetectionText));
+
+    partial void OnOllamaPortStatusChanged(OllamaPortStatus value)
+    {
+        OnPropertyChanged(nameof(OllamaPortLabel));
+        OnPropertyChanged(nameof(ShowPortOk));
+        OnPropertyChanged(nameof(ShowPortWrong));
+        OnPropertyChanged(nameof(ShowPortNotRunning));
+        OnPropertyChanged(nameof(ShowPortNotDetected));
+        OnPropertyChanged(nameof(ShowPortUnknown));
+        OnPropertyChanged(nameof(ShowFixPortButton));
+        FixPortCommand.NotifyCanExecuteChanged();
+    }
+
+    partial void OnOllamaDetectedPortChanged(int? value) => OnPropertyChanged(nameof(OllamaPortLabel));
+
+    partial void OnPort11434StatusChanged(Port11434Status value)
+    {
+        OnPropertyChanged(nameof(ShowStartRouterButton));
+        StartRouterCommand.NotifyCanExecuteChanged();
+    }
 
     /// <summary>Human summary for a port state (bound to the status label).</summary>
     internal static string Describe(Port11434Status status) => status switch

@@ -1,5 +1,6 @@
 <UserControl xmlns="https://github.com/avaloniaui"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:conv="using:OllamaRouter.App.Converters"
              xmlns:vm="using:OllamaRouter.App.ViewModels.Wizard"
              x:Class="OllamaRouter.App.Views.Wizard.WizardEnvironmentStepView"
              x:DataType="vm:WizardEnvironmentStepViewModel">
@@ -7,28 +8,55 @@
     <StackPanel Spacing="12">
       <TextBlock Text="Step 1 — Local Ollama for the Router" FontSize="18" FontWeight="Bold"/>
       <TextBlock TextWrapping="Wrap"
-                 Text="Move a raw Ollama daemon off the router port to :11435 and start ollamarouter-server on :11434."/>
+                 Text="Install, start and update Ollama with one click, keep it on :11435, and run ollamarouter-server on :11434."/>
 
+      <!-- Section 1: Ollama — the detection state drives which actions are visible (task #150). -->
       <Border Padding="10" CornerRadius="6" Background="#1E1E2A">
         <StackPanel Spacing="6">
+          <TextBlock Text="Ollama" FontSize="15" FontWeight="Bold"/>
           <TextBlock Text="{Binding DetectionText}" FontWeight="SemiBold" TextWrapping="Wrap"/>
-          <TextBlock Text="{Binding RouterStatusLabel}" FontWeight="Bold" TextWrapping="Wrap"/>
+          <TextBlock Text="✓ Ollama is running" FontWeight="Bold" Foreground="#8BC34A"
+                     IsVisible="{Binding ShowRunningCheck}"/>
+          <StackPanel Orientation="Horizontal" Spacing="8">
+            <Button Content="Install Ollama" IsVisible="{Binding ShowInstallButton}" Command="{Binding InstallOllamaCommand}"/>
+            <Button Content="Start Ollama" IsVisible="{Binding ShowStartButton}" Command="{Binding StartOllamaCommand}"/>
+            <Button Content="Update Ollama" IsVisible="{Binding ShowUpdateButton}" Command="{Binding UpdateOllamaCommand}"/>
+            <Button Content="Re-check" Command="{Binding RecheckCommand}"/>
+          </StackPanel>
         </StackPanel>
       </Border>
 
-      <CheckBox IsChecked="{Binding LanMeshEnabled}"
-                Content="Expose local Ollama on the LAN (0.0.0.0:11435) instead of loopback"/>
+      <!-- Section 2: Configuration for router — LAN mesh + Ollama port check + :11434 router row. -->
+      <Border Padding="10" CornerRadius="6" Background="#1E1E2A">
+        <StackPanel Spacing="6">
+          <TextBlock Text="Configuration for router" FontSize="15" FontWeight="Bold"/>
+          <CheckBox IsChecked="{Binding LanMeshEnabled}"
+                    Content="Expose local Ollama on the LAN (0.0.0.0:11435) instead of loopback"/>
+          <TextBlock Text="{Binding OllamaPortLabel}" Foreground="#8BC34A" FontWeight="Bold"
+                     TextWrapping="Wrap" IsVisible="{Binding ShowPortOk}"/>
+          <StackPanel Spacing="4" IsVisible="{Binding ShowPortWrong}">
+            <TextBlock Text="{Binding OllamaPortLabel}" Foreground="#FFB74D" TextWrapping="Wrap"/>
+            <Button Content="Fix port" IsVisible="{Binding ShowFixPortButton}" Command="{Binding FixPortCommand}"/>
+          </StackPanel>
+          <TextBlock Text="{Binding OllamaPortLabel}" Foreground="#9E9E9E" TextWrapping="Wrap"
+                     IsVisible="{Binding ShowPortNotRunning}"/>
+          <TextBlock Text="{Binding OllamaPortLabel}" Foreground="#9E9E9E" TextWrapping="Wrap"
+                     IsVisible="{Binding ShowPortNotDetected}"/>
+          <TextBlock Text="{Binding OllamaPortLabel}" Foreground="#9E9E9E" TextWrapping="Wrap"
+                     IsVisible="{Binding ShowPortUnknown}"/>
+          <StackPanel Orientation="Horizontal" Spacing="8">
+            <TextBlock Text="{Binding RouterStatusLabel}" FontWeight="Bold" TextWrapping="Wrap"
+                       VerticalAlignment="Center"/>
+            <Button Content="Start router" IsVisible="{Binding ShowStartRouterButton}" Command="{Binding StartRouterCommand}"/>
+          </StackPanel>
+        </StackPanel>
+      </Border>
 
-      <StackPanel Orientation="Horizontal" Spacing="8">
-        <Button Content="Configure Local Ollama for Router" Command="{Binding ConfigureForRouterCommand}"/>
-        <Button Content="Start Ollama" Command="{Binding StartOllamaCommand}"/>
-        <Button Content="Re-check" Command="{Binding RecheckCommand}"/>
-      </StackPanel>
-
-      <!-- Linux: one-click is disabled; show the manual steps (per maintainer decision D3). -->
+      <!-- Linux: Install/Update are one-click above; start + the port stay manual (task #150, M1). -->
       <Border Padding="10" CornerRadius="6" Background="#2A2A1E" IsVisible="{Binding IsLinux}">
         <StackPanel Spacing="4">
-          <TextBlock Text="Linux: one-click is not supported — configure manually:" FontWeight="Bold"/>
+          <TextBlock Text="Linux: install and update are one-click above; on Linux, start Ollama and set the port manually:"
+                     FontWeight="Bold" TextWrapping="Wrap"/>
           <TextBlock Text="export OLLAMA_HOST=127.0.0.1:11435" FontFamily="monospace"/>
           <TextBlock Text="export OLLAMA_FLASH_ATTENTION=1" FontFamily="monospace"/>
           <TextBlock Text="export OLLAMA_KV_CACHE_TYPE=q8_0" FontFamily="monospace"/>
@@ -37,7 +65,8 @@
       </Border>
 
       <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4"/>
-      <TextBlock Text="{Binding Message}" TextWrapping="Wrap" Foreground="#8BC34A"/>
+      <TextBlock Text="{Binding Message}" TextWrapping="Wrap"
+                 Foreground="{Binding MessageIsError, Converter={x:Static conv:BoolToMessageForegroundConverter.Instance}}"/>
     </StackPanel>
   </ScrollViewer>
 </UserControl>

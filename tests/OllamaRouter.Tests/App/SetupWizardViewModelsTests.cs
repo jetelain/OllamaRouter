@@ -103,7 +103,7 @@ public sealed class SetupWizardViewModelsTests
         }
     }
 
-    private static IAppConnectionService FakeConnection(FakeRouterApiClient? client = null, FakeDaemonLauncher? launcher = null)
+    internal static IAppConnectionService FakeConnection(FakeRouterApiClient? client = null, FakeDaemonLauncher? launcher = null)
     {
         var mock = new Mock<IAppConnectionService>();
         if (client is not null)
@@ -123,7 +123,11 @@ public sealed class SetupWizardViewModelsTests
             {
                 IsWindows = _ => isWindows,
                 IsMacOS = _ => isMacOS,
-                BinaryProbe = _ => Detection,
+                BinaryProbe = paths =>
+                {
+                    ProbedPaths.Add(paths);
+                    return Detection;
+                },
                 EnvWriter = (n, v, t) => EnvWrites.Add((n, v, t)),
                 ProcessNames = name =>
                 {
@@ -133,19 +137,35 @@ public sealed class SetupWizardViewModelsTests
                 ProcessKiller = (n, pid) =>
                 {
                     Kills.Add((n, pid));
+                    Events.Add($"kill:{n}:{pid}");
                     return true;
                 },
                 ProcessStarter = info =>
                 {
                     Starts.Add(info);
+                    Events.Add($"start:{info.FileName}");
                     return "handle-1";
                 },
                 PortProbe = port =>
                 {
                     ProbedPorts.Add(port);
-                    return PortOpen;
+                    // Task #150: per-port overrides win; the plain bool stays the default so
+                    // every pre-existing test behaves exactly as before.
+                    return PortMap.TryGetValue(port, out var open) ? open : PortOpen;
                 },
                 Delay = _ => { Delays++; return Task.CompletedTask; },
+                ScriptRunner = (info, _) =>
+                {
+                    ScriptStarts.Add(info);
+                    Events.Add($"script:{info.FileName}");
+                    if (ScriptException is not null)
+                    {
+                        return Task.FromException<ProcessRunResult>(ScriptException);
+                    }
+
+                    return Task.FromResult(NextScriptResult);
+                },
+                OllamaHostReader = () => OllamaHostValue,
                 PortWaitBudget = TimeSpan.FromHours(1),
             };
         }
@@ -153,12 +173,38 @@ public sealed class SetupWizardViewModelsTests
         public LocalOllamaConfigurator Configurator { get; }
         public OllamaDetection Detection { get; set; } = new(true, "/usr/local/bin/ollama", false);
         public bool PortOpen { get; set; }
+        /// <summary>Per-port probe results (task #150); falls back to <see cref="PortOpen"/>.</summary>
+        public Dictionary<int, bool> PortMap { get; } = [];
         public List<(string Name, string Value, EnvironmentVariableTarget Target)> EnvWrites { get; } = [];
         public List<(string Name, int Pid)> Kills { get; } = [];
         public List<string> QueriedNames { get; } = [];
         public List<ProcessStartInfo> Starts { get; } = [];
         public List<int> ProbedPorts { get; } = [];
+        /// <summary>The candidate-path lists passed to the binary probe (task #150: asserts
+        /// the per-OS search paths, e.g. the Linux fix in <c>BuildOllamaStartInfo</c>).</summary>
+        public List<IReadOnlyList<string>> ProbedPaths { get; } = [];
         public int Delays { get; private set; }
+
+        // -- Task #150: the official-script seams -------------------------------------------
+
+        /// <summary>The launch infos passed to the (fake) script runner, in order.</summary>
+        public List<ProcessStartInfo> ScriptStarts { get; } = [];
+
+        /// <summary>The scripted script outcome (default: exit 0, empty tails).</summary>
+        public ProcessRunResult NextScriptResult { get; set; } = new(0, string.Empty, string.Empty);
+
+        /// <summary>Script a script-launch failure (e.g. a declined UAC prompt).</summary>
+        public Exception? ScriptException { get; set; }
+
+        /// <summary>The persisted OLLAMA_HOST value served by the (fake) reader.</summary>
+        public string? OllamaHostValue { get; set; }
+
+        /// <summary>
+        /// The shared ordered side-effect log (task #150): <c>kill:{name}:{pid}</c> /
+        /// <c>script:{fileName}</c> / <c>start:{fileName}</c> — the contractual
+        /// stop → script → restart ordering is asserted on this list.
+        /// </summary>
+        public List<string> Events { get; } = [];
     }
 
     /// <summary>
@@ -186,6 +232,8 @@ public sealed class SetupWizardViewModelsTests
                 ProcessNames = _ => [],
                 PortProbe = _ => false,
                 Delay = _ => Task.CompletedTask,
+                // Hermetic (task #150): never read the real persisted OLLAMA_HOST in tests.
+                OllamaHostReader = () => null,
             };
         }
 
@@ -559,10 +607,24 @@ public sealed class SetupWizardViewModelsTests
         Assert.Empty(h.EnvWrites);
         Assert.Empty(h.Starts);
 
-        // The Step 1 view-model disables the configure command on Linux.
+        // The Step 1 view-model: Start (the existing one-click path) is disabled on Linux, while
+        // Install/Update stay one-click (task #150, M1) — the configurator-level "Windows and
+        // macOS only" assertion above keeps the legacy primitive's contract.
         var vm = new WizardEnvironmentStepViewModel(h.Configurator, connection);
+        await vm.RefreshAsync(); // detection: installed (harness default), not running
         Assert.True(vm.IsLinux);
-        Assert.False(vm.ConfigureForRouterCommand.CanExecute(null));
+        Assert.False(vm.ShowStartButton);
+        Assert.False(vm.StartOllamaCommand.CanExecute(null));
+        Assert.False(vm.ShowFixPortButton);
+        Assert.False(vm.FixPortCommand.CanExecute(null));
+        Assert.True(vm.ShowUpdateButton);
+        Assert.True(vm.UpdateOllamaCommand.CanExecute(null));
+        Assert.True(vm.ShowRunningCheck == false);
+        // Flip to uninstalled: Install is one-click on Linux too (M1).
+        h.Detection = new OllamaDetection(false, null, false);
+        await vm.RefreshAsync();
+        Assert.True(vm.ShowInstallButton);
+        Assert.True(vm.InstallOllamaCommand.CanExecute(null));
     }
 
     [Fact]
@@ -613,6 +675,637 @@ public sealed class SetupWizardViewModelsTests
         listener.Start();
         var port = ((IPEndPoint)listener.LocalEndpoint).Port;
         Assert.True(LocalOllamaConfigurator.DefaultPortProbe(port));
+    }
+
+    // ==================================================================
+    //  Step 1 — install / update / port check (task #150)
+    // ==================================================================
+
+    [Fact]
+    public async Task Step150_Install_Windows_PowershellInstallScript_UacElevated()
+    {
+        var h = new ConfigHarness(isWindows: true, isMacOS: false);
+        var result = await h.Configurator.InstallOllamaAsync(CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.False(result.OllamaStarted);
+        Assert.Contains("installer finished", result.Message);
+        var info = Assert.Single(h.ScriptStarts);
+        Assert.Equal("powershell.exe", info.FileName);
+        Assert.Equal("-NoProfile -ExecutionPolicy Bypass -Command \"irm https://ollama.com/install.ps1 | iex\"", info.Arguments);
+        Assert.True(info.UseShellExecute);
+        Assert.Equal("runas", info.Verb);
+        // An install runs ONLY the script: no env writes, no kills, no serve starts.
+        Assert.Empty(h.EnvWrites);
+        Assert.Empty(h.Kills);
+        Assert.Empty(h.Starts);
+        Assert.Equal(["script:powershell.exe"], h.Events);
+    }
+
+    [Theory]
+    [InlineData(false, true)]   // macOS
+    [InlineData(false, false)]  // Linux
+    public async Task Step150_Install_MacOSAndLinux_ShCurlInstallSh_Redirected(bool isWindows, bool isMacOS)
+    {
+        var h = new ConfigHarness(isWindows, isMacOS);
+        var result = await h.Configurator.InstallOllamaAsync(CancellationToken.None);
+        Assert.True(result.Success);
+        var info = Assert.Single(h.ScriptStarts);
+        Assert.Equal("/bin/sh", info.FileName);
+        Assert.Equal("-c \"curl -fsSL https://ollama.com/install.sh | sh\"", info.Arguments);
+        Assert.False(info.UseShellExecute);
+        Assert.True(info.CreateNoWindow);
+        Assert.True(info.RedirectStandardOutput);
+        Assert.True(info.RedirectStandardError);
+        Assert.Empty(h.EnvWrites);
+        Assert.Empty(h.Kills);
+        Assert.Empty(h.Starts);
+    }
+
+    [Fact]
+    public async Task Step150_Install_NonZeroExit_FailureNamesCodeAndTails()
+    {
+        var h = new ConfigHarness(isWindows: false, isMacOS: true)
+        {
+            NextScriptResult = new ProcessRunResult(1, "downloading ollama…", "curl: (6) Could not resolve host: ollama.com"),
+        };
+        var result = await h.Configurator.InstallOllamaAsync(CancellationToken.None);
+        Assert.False(result.Success);
+        Assert.Contains("The Ollama installer exited with code 1", result.Message);
+        Assert.Contains("downloading ollama…", result.Message);
+        Assert.Contains("Could not resolve host", result.Message);
+    }
+
+    [Fact]
+    public async Task Step150_Install_LaunchThrows_UacDeclined_ReadableFailureNoThrow()
+    {
+        var h = new ConfigHarness(isWindows: true, isMacOS: false)
+        {
+            ScriptException = new System.ComponentModel.Win32Exception(1223, "The operation was canceled by the user."),
+        };
+        var result = await h.Configurator.InstallOllamaAsync(CancellationToken.None);
+        Assert.False(result.Success);
+        Assert.Contains("The Ollama installer could not be started", result.Message);
+        Assert.Contains("canceled by the user", result.Message);
+    }
+
+    [Fact]
+    public async Task Step150_Update_StopScriptRestart_Ordering_AndExplicitEnvRestart()
+    {
+        var h = new ConfigHarness(isWindows: true, isMacOS: false)
+        {
+            PortOpen = true, // the post-update restart port-wait succeeds immediately
+            Detection = new OllamaDetection(true, "/usr/local/bin/ollama", true),
+        };
+        var result = await h.Configurator.UpdateOllamaAsync(CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.True(result.OllamaStarted);
+        Assert.Equal($"Ollama updated and serving on :{LocalOllamaConfigurator.OllamaPort}.", result.Message);
+        // Contractual ordering: kill → script → serve start.
+        Assert.Equal(["kill:ollama:111", "script:powershell.exe", "start:/usr/local/bin/ollama"], h.Events);
+        // The restart is the EXPLICIT-env serve form (no stale inheritance).
+        var serve = Assert.Single(h.Starts, s => s.FileName == "/usr/local/bin/ollama");
+        Assert.Contains("serve", serve.Arguments);
+        Assert.Equal("127.0.0.1:11435", serve.EnvironmentVariables["OLLAMA_HOST"]);
+        Assert.Equal("1", serve.EnvironmentVariables["OLLAMA_FLASH_ATTENTION"]);
+        Assert.Equal("q8_0", serve.EnvironmentVariables["OLLAMA_KV_CACHE_TYPE"]);
+    }
+
+    [Fact]
+    public async Task Step150_Update_ScriptFailure_LeftStopped_NoRestart()
+    {
+        var h = new ConfigHarness(isWindows: true, isMacOS: false)
+        {
+            NextScriptResult = new ProcessRunResult(1, string.Empty, "boom"),
+        };
+        var result = await h.Configurator.UpdateOllamaAsync(CancellationToken.None);
+        Assert.False(result.Success);
+        Assert.False(result.OllamaStarted);
+        Assert.Contains("Ollama was stopped and the update failed", result.Message);
+        Assert.Contains("exited with code 1", result.Message);
+        Assert.Contains("Retry Update, or start Ollama again manually", result.Message);
+        // NO serve start after a failed script — Ollama is honestly left stopped.
+        Assert.Equal(["kill:ollama:111", "script:powershell.exe"], h.Events);
+        Assert.Empty(h.Starts);
+    }
+
+    [Fact]
+    public async Task Step150_Update_LaunchFailure_LeftStopped_Message()
+    {
+        var h = new ConfigHarness(isWindows: false, isMacOS: true)
+        {
+            ScriptException = new InvalidOperationException("spawn /bin/sh failed"),
+        };
+        var result = await h.Configurator.UpdateOllamaAsync(CancellationToken.None);
+        Assert.False(result.Success);
+        Assert.Contains("Ollama was stopped and the update failed", result.Message);
+        Assert.Contains("could not be started", result.Message);
+        Assert.Contains("spawn /bin/sh failed", result.Message);
+        // The launch attempt was made (and failed); NO serve start follows a launch failure.
+        Assert.Equal(["kill:ollama:111", "script:/bin/sh"], h.Events);
+        Assert.DoesNotContain(h.Events, e => e.StartsWith("start:"));
+        Assert.Empty(h.Starts);
+    }
+
+    [Fact]
+    public async Task Step150_Update_BinaryNotFoundAfterScript_Message()
+    {
+        var h = new ConfigHarness(isWindows: true, isMacOS: false)
+        {
+            Detection = new OllamaDetection(false, null, false), // the script removed/moved the binary
+        };
+        var result = await h.Configurator.UpdateOllamaAsync(CancellationToken.None);
+        Assert.False(result.Success);
+        Assert.Contains("No local Ollama installation was found after the update script", result.Message);
+        Assert.Empty(h.Starts);
+    }
+
+    [Fact]
+    public async Task Step150_Update_Linux_RestartViaServe_ExplicitEnv_LinuxSearchPaths()
+    {
+        var h = new ConfigHarness(isWindows: false, isMacOS: false)
+        {
+            PortOpen = true,
+            Detection = new OllamaDetection(true, "/usr/local/bin/ollama", true),
+        };
+        var result = await h.Configurator.UpdateOllamaAsync(CancellationToken.None);
+        Assert.True(result.Success);
+        Assert.True(result.OllamaStarted);
+        // The re-detection used the LINUX search paths (the task #150 path-selection fix).
+        var paths = Assert.Single(h.ProbedPaths);
+        Assert.Contains("/usr/local/bin/ollama", paths);
+        Assert.Contains("/snap/bin/ollama", paths);
+        // <binary> serve with EXPLICIT env — no persistent env write on Linux (M1).
+        var serve = Assert.Single(h.Starts, s => s.FileName == "/usr/local/bin/ollama");
+        Assert.Contains("serve", serve.Arguments);
+        Assert.Equal("127.0.0.1:11435", serve.EnvironmentVariables["OLLAMA_HOST"]);
+        Assert.Empty(h.EnvWrites);
+        Assert.Equal(["kill:ollama:111", "script:/bin/sh", "start:/usr/local/bin/ollama"], h.Events);
+    }
+
+    [Fact]
+    public async Task Step150_Update_PortWaitTimeout_BudgetMessage()
+    {
+        var h = new ConfigHarness(isWindows: true, isMacOS: false) { PortOpen = false };
+        h.Configurator.PortWaitBudget = TimeSpan.Zero; // elapses immediately
+        var result = await h.Configurator.UpdateOllamaAsync(CancellationToken.None);
+        Assert.False(result.Success);
+        Assert.False(result.OllamaStarted);
+        Assert.Contains("did not open port 11435", result.Message);
+    }
+
+    [Fact]
+    public async Task Step150_DetectPort_NotRunning_ZeroPortProbes()
+    {
+        var h = new ConfigHarness(isWindows: true, isMacOS: false);
+        h.Detection = new OllamaDetection(true, "/usr/local/bin/ollama", false);
+        var check = await h.Configurator.DetectPortAsync(CancellationToken.None);
+        Assert.False(check.OllamaRunning);
+        Assert.Null(check.DetectedPort);
+        Assert.Empty(h.ProbedPorts);
+    }
+
+    [Fact]
+    public async Task Step150_DetectPort_ConfirmedEnvValueWins_SingleProbe()
+    {
+        var h = new ConfigHarness(isWindows: true, isMacOS: false)
+        {
+            OllamaHostValue = "0.0.0.0:11434",
+            PortMap = { [11434] = true, [11435] = false },
+            Detection = new OllamaDetection(true, "/x", true),
+        };
+        var check = await h.Configurator.DetectPortAsync(CancellationToken.None);
+        Assert.True(check.OllamaRunning);
+        Assert.Equal(11434, check.DetectedPort);
+        Assert.Equal([11434], h.ProbedPorts); // the confirmed-env probe is the only one
+    }
+
+    [Fact]
+    public async Task Step150_DetectPort_EnvProbeClosed_FallsThroughToCandidates()
+    {
+        var h = new ConfigHarness(isWindows: true, isMacOS: false)
+        {
+            OllamaHostValue = "127.0.0.1:11500",
+            PortMap = { [11500] = false, [11435] = true },
+            Detection = new OllamaDetection(true, "/x", true),
+        };
+        var check = await h.Configurator.DetectPortAsync(CancellationToken.None);
+        Assert.Equal(11435, check.DetectedPort);
+        Assert.Equal([11500, 11435], h.ProbedPorts);
+    }
+
+    [Fact]
+    public async Task Step150_DetectPort_FirstOpenCandidateWins_FastPathAndDrift()
+    {
+        // Fast path: 11435 open → exactly one probe.
+        var fast = new ConfigHarness(isWindows: true, isMacOS: false)
+        {
+            PortMap = { [11435] = true },
+            Detection = new OllamaDetection(true, "/x", true),
+        };
+        Assert.Equal(11435, (await fast.Configurator.DetectPortAsync(CancellationToken.None)).DetectedPort);
+        Assert.Equal([11435], fast.ProbedPorts);
+
+        // Drift to 11434 (the router port — the canonical conflict).
+        var driftRouter = new ConfigHarness(isWindows: true, isMacOS: false)
+        {
+            PortMap = { [11435] = false, [11434] = true },
+            Detection = new OllamaDetection(true, "/x", true),
+        };
+        Assert.Equal(11434, (await driftRouter.Configurator.DetectPortAsync(CancellationToken.None)).DetectedPort);
+        Assert.Equal([11435, 11434], driftRouter.ProbedPorts);
+
+        // Drift to 11436.
+        var driftAlt = new ConfigHarness(isWindows: true, isMacOS: false)
+        {
+            PortMap = { [11435] = false, [11434] = false, [11436] = true },
+            Detection = new OllamaDetection(true, "/x", true),
+        };
+        Assert.Equal(11436, (await driftAlt.Configurator.DetectPortAsync(CancellationToken.None)).DetectedPort);
+    }
+
+    [Fact]
+    public async Task Step150_DetectPort_RunningNothingOpen_NotDetected()
+    {
+        var h = new ConfigHarness(isWindows: true, isMacOS: false);
+        h.Detection = new OllamaDetection(true, "/x", true);
+        var check = await h.Configurator.DetectPortAsync(CancellationToken.None);
+        Assert.True(check.OllamaRunning);
+        Assert.Null(check.DetectedPort);
+        Assert.Equal(7, h.ProbedPorts.Count); // every candidate probed, none open
+        Assert.Contains(11435, h.ProbedPorts);
+    }
+
+    [Theory]
+    [InlineData("127.0.0.1:11435", 11435)]
+    [InlineData("0.0.0.0:11435", 11435)]
+    [InlineData(":11435", 11435)]
+    [InlineData("11435", 11435)]
+    [InlineData(null, null)]
+    [InlineData("", null)]
+    [InlineData("junk", null)]
+    [InlineData("127.0.0.1:", null)]
+    [InlineData("70000", null)]
+    [InlineData("0", null)]
+    public void Step150_TryParseOllamaHostPort(string? host, int? expected)
+    {
+        Assert.Equal(expected, LocalOllamaConfigurator.TryParseOllamaHostPort(host));
+    }
+
+    // ------------------------------------------------------------------
+    //  Step 1 — view model: state machine, port states, commands (task #150)
+    // ------------------------------------------------------------------
+
+    private static (WizardEnvironmentStepViewModel Vm, ConfigHarness H, FakeDaemonLauncher? Launcher) BuildEnvStep(
+        bool isWindows = true, bool isMacOS = false, FakeDaemonLauncher? launcher = null)
+    {
+        var h = new ConfigHarness(isWindows, isMacOS);
+        var vm = new WizardEnvironmentStepViewModel(h.Configurator, FakeConnection(null, launcher));
+        return (vm, h, launcher);
+    }
+
+    [Fact]
+    public async Task Step150_State_NotInstalled_InstallOnly()
+    {
+        var (vm, h, _) = BuildEnvStep();
+        h.Detection = new OllamaDetection(false, null, false);
+        await vm.RefreshAsync();
+
+        Assert.False(vm.OllamaInstalled);
+        Assert.True(vm.ShowInstallButton);
+        Assert.False(vm.ShowStartButton);
+        Assert.False(vm.ShowUpdateButton);
+        Assert.False(vm.ShowRunningCheck);
+        Assert.True(vm.InstallOllamaCommand.CanExecute(null));
+        Assert.False(vm.StartOllamaCommand.CanExecute(null));
+        Assert.False(vm.UpdateOllamaCommand.CanExecute(null));
+        Assert.True(vm.RecheckCommand.CanExecute(null));
+        Assert.Equal(OllamaPortStatus.NotRunning, vm.OllamaPortStatus);
+    }
+
+    [Fact]
+    public async Task Step150_State_InstalledStopped_StartAndUpdate()
+    {
+        var (vm, h, _) = BuildEnvStep(); // harness default: installed, not running
+        await vm.RefreshAsync();
+
+        Assert.True(vm.OllamaInstalled);
+        Assert.False(vm.OllamaRunning);
+        Assert.False(vm.ShowInstallButton);
+        Assert.True(vm.ShowStartButton);
+        Assert.True(vm.ShowUpdateButton);
+        Assert.False(vm.ShowRunningCheck);
+        Assert.False(vm.InstallOllamaCommand.CanExecute(null));
+        Assert.True(vm.StartOllamaCommand.CanExecute(null));
+        Assert.True(vm.UpdateOllamaCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task Step150_State_InstalledRunning_CheckAndUpdate_NoStart()
+    {
+        var (vm, h, _) = BuildEnvStep();
+        h.Detection = new OllamaDetection(true, "/usr/local/bin/ollama", true);
+        h.PortMap[11435] = true;
+        await vm.RefreshAsync();
+
+        Assert.True(vm.OllamaRunning);
+        Assert.True(vm.ShowRunningCheck);
+        Assert.False(vm.ShowInstallButton);
+        Assert.False(vm.ShowStartButton);
+        Assert.True(vm.ShowUpdateButton);
+        Assert.False(vm.StartOllamaCommand.CanExecute(null));
+        Assert.True(vm.UpdateOllamaCommand.CanExecute(null));
+        Assert.Equal(OllamaPortStatus.Ok, vm.OllamaPortStatus);
+    }
+
+    [Fact]
+    public async Task Step150_State_Linux_InstallAndUpdateOneClick_StartAndFixPortDisabled()
+    {
+        var (vm, h, _) = BuildEnvStep(isWindows: false, isMacOS: false);
+        Assert.True(vm.IsLinux);
+        h.Detection = new OllamaDetection(false, null, false);
+        await vm.RefreshAsync();
+        Assert.True(vm.ShowInstallButton);
+        Assert.True(vm.InstallOllamaCommand.CanExecute(null));
+
+        h.Detection = new OllamaDetection(true, "/usr/local/bin/ollama", true);
+        h.PortMap[11436] = true; // a drifted port
+        await vm.RefreshAsync();
+        Assert.True(vm.ShowUpdateButton);
+        Assert.True(vm.UpdateOllamaCommand.CanExecute(null));
+        Assert.False(vm.ShowStartButton);
+        Assert.False(vm.StartOllamaCommand.CanExecute(null));
+        Assert.Equal(OllamaPortStatus.WrongPort, vm.OllamaPortStatus);
+        Assert.True(vm.ShowPortWrong);
+        Assert.False(vm.ShowFixPortButton); // Linux: no persistent env path (M1)
+        Assert.False(vm.FixPortCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task Step150_Port_Ok_GreenLabel_ContainsPortAndCheck()
+    {
+        var (vm, h, _) = BuildEnvStep();
+        h.Detection = new OllamaDetection(true, "/x", true);
+        h.PortMap[11435] = true;
+        await vm.RefreshAsync();
+
+        Assert.Equal(OllamaPortStatus.Ok, vm.OllamaPortStatus);
+        Assert.True(vm.ShowPortOk);
+        Assert.Equal(11435, vm.OllamaDetectedPort);
+        Assert.Equal("Ollama is serving on :11435 ✓", vm.OllamaPortLabel);
+        Assert.False(vm.ShowFixPortButton);
+        Assert.False(vm.FixPortCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task Step150_Port_WrongPort_WarningNamesPort_FixPortEnabledOnWindows()
+    {
+        var (vm, h, _) = BuildEnvStep();
+        h.Detection = new OllamaDetection(true, "/x", true);
+        h.PortMap[11434] = true;
+        await vm.RefreshAsync();
+
+        Assert.Equal(OllamaPortStatus.WrongPort, vm.OllamaPortStatus);
+        Assert.True(vm.ShowPortWrong);
+        Assert.Equal(11434, vm.OllamaDetectedPort);
+        Assert.Equal("Ollama is serving on :11434 — the router expects :11435", vm.OllamaPortLabel);
+        Assert.True(vm.ShowFixPortButton);
+        Assert.True(vm.FixPortCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task Step150_Port_NotRunning_AndNotDetected_Labels()
+    {
+        var (vm, h, _) = BuildEnvStep();
+        h.Detection = new OllamaDetection(true, "/x", false); // stopped
+        await vm.RefreshAsync();
+        Assert.Equal(OllamaPortStatus.NotRunning, vm.OllamaPortStatus);
+        Assert.True(vm.ShowPortNotRunning);
+        Assert.Equal("Ollama is not running — start it in the section above", vm.OllamaPortLabel);
+        Assert.Empty(h.ProbedPorts); // stopped: zero port probes
+
+        h.Detection = new OllamaDetection(true, "/x", true); // running, nothing open
+        await vm.RefreshAsync();
+        Assert.Equal(OllamaPortStatus.NotDetected, vm.OllamaPortStatus);
+        Assert.True(vm.ShowPortNotDetected);
+        Assert.Equal("Ollama is running but its port could not be detected — try Re-check", vm.OllamaPortLabel);
+        Assert.Null(vm.OllamaDetectedPort);
+    }
+
+    [Fact]
+    public async Task Step150_Install_BusyDuringScript_SuccessMessage_AndRedetectReflectsInstalled()
+    {
+        var (vm, h, _) = BuildEnvStep();
+        h.Detection = new OllamaDetection(false, null, false); // not installed → Install available
+        await vm.RefreshAsync();
+        Assert.True(vm.InstallOllamaCommand.CanExecute(null));
+        var probesBefore = h.ProbedPaths.Count;
+
+        h.Configurator.ScriptRunner = (info, _) =>
+        {
+            h.ScriptStarts.Add(info);
+            Assert.True(vm.IsBusy); // busy DURING the script run
+            Assert.Contains("several minutes", vm.Message!);
+            h.Detection = new OllamaDetection(true, "/usr/local/bin/ollama", false); // the install landed
+            return Task.FromResult(new ProcessRunResult(0, string.Empty, string.Empty));
+        };
+
+        await vm.InstallOllamaCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.Contains("installer finished", vm.Message!);
+        Assert.False(vm.MessageIsError);
+        Assert.True(vm.OllamaInstalled); // the re-detect reflected the new state automatically
+        Assert.False(vm.ShowInstallButton);
+        Assert.True(vm.ShowUpdateButton);
+        Assert.True(vm.UpdateOllamaCommand.CanExecute(null));
+        Assert.False(vm.IsBusy);
+        Assert.Equal(probesBefore + 1, h.ProbedPaths.Count); // the re-detect is exactly ONE detection
+    }
+
+    [Fact]
+    public async Task Step150_Install_Failure_RedMessage_RetryAvailable()
+    {
+        var (vm, h, _) = BuildEnvStep();
+        h.Detection = new OllamaDetection(false, null, false);
+        await vm.RefreshAsync();
+        h.NextScriptResult = new ProcessRunResult(1, string.Empty, "curl: (6) Could not resolve host: ollama.com");
+
+        await vm.InstallOllamaCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.True(vm.MessageIsError);
+        Assert.Contains("exited with code 1", vm.Message!);
+        Assert.Contains("Could not resolve host", vm.Message);
+        Assert.False(vm.OllamaInstalled);
+        Assert.True(vm.ShowInstallButton); // retry stays available
+        Assert.True(vm.InstallOllamaCommand.CanExecute(null));
+        Assert.False(vm.IsBusy);
+    }
+
+    [Fact]
+    public async Task Step150_Update_BusyAndMessage_OrderingAndRedetect()
+    {
+        var (vm, h, _) = BuildEnvStep(); // installed, not running
+        await vm.RefreshAsync();
+        h.PortOpen = true; // the restart port-wait succeeds immediately
+        var probesBefore = h.ProbedPaths.Count;
+
+        await vm.UpdateOllamaCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.Equal($"Ollama updated and serving on :{LocalOllamaConfigurator.OllamaPort}.", vm.Message);
+        Assert.False(vm.MessageIsError);
+        Assert.Equal(["kill:ollama:111", "script:powershell.exe", "start:/usr/local/bin/ollama"], h.Events);
+        Assert.Equal(probesBefore + 2, h.ProbedPaths.Count); // BuildOllamaStartInfo re-detect + the refresh
+        Assert.False(vm.IsBusy);
+    }
+
+    [Fact]
+    public async Task Step150_FixPort_StartOllamaOnlyPath_LoopbackHost()
+    {
+        var (vm, h, _) = BuildEnvStep();
+        h.Detection = new OllamaDetection(true, "/usr/local/bin/ollama", true);
+        h.PortMap[11434] = true; // Ollama running on the WRONG port
+        await vm.RefreshAsync();
+        Assert.True(vm.FixPortCommand.CanExecute(null));
+        h.PortOpen = true; // the port-wait succeeds after the restart
+
+        await vm.FixPortCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.Contains("serving on 127.0.0.1:11435", vm.Message!);
+        Assert.False(vm.MessageIsError);
+        Assert.Contains(("OLLAMA_HOST", "127.0.0.1:11435", EnvironmentVariableTarget.User), h.EnvWrites);
+        var serve = Assert.Single(h.Starts, s => s.FileName == "/usr/local/bin/ollama");
+        Assert.Equal("127.0.0.1:11435", serve.EnvironmentVariables["OLLAMA_HOST"]);
+        Assert.Equal(OllamaPortStatus.Ok, vm.OllamaPortStatus); // re-detect: fixed
+    }
+
+    [Fact]
+    public async Task Step150_FixPort_LanMeshChecked_Uses0000Host()
+    {
+        var (vm, h, _) = BuildEnvStep();
+        h.Detection = new OllamaDetection(true, "/usr/local/bin/ollama", true);
+        h.PortMap[11434] = true;
+        await vm.RefreshAsync();
+        vm.LanMeshEnabled = true;
+        h.PortOpen = true;
+
+        await vm.FixPortCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.Contains(("OLLAMA_HOST", "0.0.0.0:11435", EnvironmentVariableTarget.User), h.EnvWrites);
+        var serve = Assert.Single(h.Starts, s => s.FileName == "/usr/local/bin/ollama");
+        Assert.Equal("0.0.0.0:11435", serve.EnvironmentVariables["OLLAMA_HOST"]);
+    }
+
+    [Fact]
+    public async Task Step150_StartRouter_StartsDaemon_StatusFlipsToRouterRunning()
+    {
+        var launcher = new FakeDaemonLauncher
+        {
+            Status = new RouterDaemonStatus(RouterDaemonState.Stopped, null, null),
+            AfterStart = FakeDaemonLauncher.RunningStatus(),
+        };
+        var (vm, _, l) = BuildEnvStep(launcher: launcher);
+        await vm.RefreshAsync();
+        Assert.Equal(Port11434Status.Free, vm.Port11434Status);
+        Assert.True(vm.ShowStartRouterButton);
+        Assert.True(vm.StartRouterCommand.CanExecute(null));
+
+        await vm.StartRouterCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.Contains("StartAsync", launcher.Calls);
+        Assert.Contains("Router is running on :11434", vm.Message!);
+        Assert.False(vm.MessageIsError);
+        Assert.Equal(Port11434Status.RouterRunning, vm.Port11434Status);
+        Assert.False(vm.ShowStartRouterButton); // the button disappears once running
+        Assert.False(vm.StartRouterCommand.CanExecute(null));
+        Assert.False(vm.IsBusy);
+    }
+
+    [Fact]
+    public async Task Step150_StartRouter_TypedLauncherFailure_RedMessage_NoThrow()
+    {
+        var launcher = new FakeDaemonLauncher
+        {
+            Status = new RouterDaemonStatus(RouterDaemonState.Stopped, null, null),
+            StartException = new RouterDaemonPortOccupiedException(
+                new RouterDaemonStatus(RouterDaemonState.PortOccupiedByOtherService, null, "busy")),
+        };
+        var (vm, _, _) = BuildEnvStep(launcher: launcher);
+        await vm.RefreshAsync();
+        Assert.True(vm.StartRouterCommand.CanExecute(null));
+
+        await vm.StartRouterCommand.ExecuteAsync(CancellationToken.None); // must not throw
+
+        Assert.True(vm.MessageIsError);
+        Assert.Contains("Could not start the router", vm.Message!);
+        Assert.False(vm.IsBusy);
+    }
+
+    [Fact]
+    public async Task Step150_StartRouter_DisabledWhenRunningForeignOrNoLauncher()
+    {
+        // Router already running: no button.
+        var running = new FakeDaemonLauncher { Status = FakeDaemonLauncher.RunningStatus() };
+        var (vmRunning, _, _) = BuildEnvStep(launcher: running);
+        await vmRunning.RefreshAsync();
+        Assert.Equal(Port11434Status.RouterRunning, vmRunning.Port11434Status);
+        Assert.False(vmRunning.ShowStartRouterButton);
+        Assert.False(vmRunning.StartRouterCommand.CanExecute(null));
+
+        // Foreign service on :11434: the warning label, no button.
+        var foreign = new FakeDaemonLauncher
+        {
+            Status = new RouterDaemonStatus(RouterDaemonState.PortOccupiedByOtherService, null, "occupied"),
+        };
+        var (vmForeign, _, _) = BuildEnvStep(launcher: foreign);
+        await vmForeign.RefreshAsync();
+        Assert.Equal(Port11434Status.ForeignService, vmForeign.Port11434Status);
+        Assert.Contains("Raw Ollama occupies", vmForeign.RouterStatusLabel);
+        Assert.False(vmForeign.ShowStartRouterButton);
+
+        // No launcher (remote mode): the existing "unavailable" label, no button.
+        var (vmRemote, _, _) = BuildEnvStep(launcher: null);
+        await vmRemote.RefreshAsync();
+        Assert.Equal(Port11434Status.Unknown, vmRemote.Port11434Status);
+        Assert.Contains("Router launcher unavailable", vmRemote.RouterStatusLabel);
+        Assert.False(vmRemote.ShowStartRouterButton);
+    }
+
+    [Fact]
+    public async Task Step150_Busy_DisablesEveryStep1Action()
+    {
+        var launcher = new FakeDaemonLauncher { Status = new RouterDaemonStatus(RouterDaemonState.Stopped, null, null) };
+        var (vm, h, _) = BuildEnvStep(launcher: launcher);
+        h.Detection = new OllamaDetection(false, null, false); // Install available + router Free
+        await vm.RefreshAsync();
+        Assert.True(vm.InstallOllamaCommand.CanExecute(null));
+        Assert.True(vm.StartRouterCommand.CanExecute(null));
+        Assert.True(vm.RecheckCommand.CanExecute(null));
+
+        var gate = new TaskCompletionSource<ProcessRunResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        h.Configurator.ScriptRunner = (info, _) =>
+        {
+            h.ScriptStarts.Add(info);
+            return gate.Task; // hold the install open until the test releases it
+        };
+
+        var running = vm.InstallOllamaCommand.ExecuteAsync(CancellationToken.None);
+        await Task.Yield(); // let the command reach the script gate
+
+        Assert.True(vm.IsBusy);
+        Assert.False(vm.InstallOllamaCommand.CanExecute(null));
+        Assert.False(vm.StartOllamaCommand.CanExecute(null));
+        Assert.False(vm.UpdateOllamaCommand.CanExecute(null));
+        Assert.False(vm.FixPortCommand.CanExecute(null));
+        Assert.False(vm.StartRouterCommand.CanExecute(null));
+        Assert.False(vm.RecheckCommand.CanExecute(null)); // no concurrent actions while busy
+
+        gate.SetResult(new ProcessRunResult(0, string.Empty, string.Empty));
+        await running;
+
+        Assert.False(vm.IsBusy);
+        Assert.True(vm.InstallOllamaCommand.CanExecute(null));
+        Assert.True(vm.RecheckCommand.CanExecute(null));
     }
 
     // ==================================================================
@@ -1123,5 +1816,28 @@ public sealed class SetupWizardViewModelsTests
         Assert.Equal(Avalonia.Media.FontWeight.Normal, conv.Convert(2, typeof(Avalonia.Media.FontWeight), "3", culture));
         Assert.Equal(Avalonia.Media.FontWeight.Normal, conv.Convert(2, typeof(Avalonia.Media.FontWeight), "bogus", culture));
         Assert.Equal(Avalonia.Media.FontWeight.Bold, conv.Convert(2, typeof(Avalonia.Media.FontWeight), 2, culture)); // int form still works
+    }
+
+    // ==================================================================
+    //  BoolToMessageForegroundConverter (task #150)
+    // ==================================================================
+
+    [Fact]
+    public void BoolToMessageForegroundConverter_TrueSoftRed_FalseAndNonBoolGreen()
+    {
+        var conv = BoolToMessageForegroundConverter.Instance;
+        var culture = System.Globalization.CultureInfo.InvariantCulture;
+
+        var error = Assert.IsType<Avalonia.Media.SolidColorBrush>(conv.Convert(true, typeof(object), null, culture));
+        Assert.Equal(Avalonia.Media.Color.Parse("#F2A0A0"), error.Color);
+
+        var ok = Assert.IsType<Avalonia.Media.SolidColorBrush>(conv.Convert(false, typeof(object), null, culture));
+        Assert.Equal(Avalonia.Media.Color.Parse("#8BC34A"), ok.Color);
+
+        var nonBool = Assert.IsType<Avalonia.Media.SolidColorBrush>(conv.Convert("bogus", typeof(object), null, culture));
+        Assert.Equal(Avalonia.Media.Color.Parse("#8BC34A"), nonBool.Color);
+
+        // One-way converter: ConvertBack is a no-op for bindings.
+        Assert.Throws<System.NotSupportedException>(() => conv.ConvertBack(null, typeof(object), null, culture));
     }
 }
