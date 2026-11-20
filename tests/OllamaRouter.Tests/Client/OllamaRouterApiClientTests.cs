@@ -265,6 +265,51 @@ public sealed class OllamaRouterApiClientTests : IDisposable
     }
 
     [Fact]
+    public async Task Non2xx_SuccessFalseMessageBody_SurfacesParsedMessage_NotRawJson()
+    {
+        // Task #146: the Setup API failure shape `{"success": false, "message": "..."}` must
+        // surface its human-readable message — never the raw JSON body.
+        var message = "failed to persist target: the configuration file /tmp/cfg/config.json is not valid JSON — fix or rename the file and retry; no changes were saved.";
+        var handler = new FakeHttpMessageHandler(_ => JsonResponse(HttpStatusCode.InternalServerError,
+            "{\"success\": false, \"message\": \"" + message + "\"}"));
+        using var client = CreateClient(handler);
+
+        var exception = await Assert.ThrowsAsync<OllamaRouterApiException>(() =>
+            client.UpdateTargetAsync("X", new UpdateTargetRequest(Enabled: true)));
+
+        Assert.Equal(HttpStatusCode.InternalServerError, exception.Status);
+        Assert.Equal(message, exception.Error);
+        Assert.DoesNotContain("{", exception.Error);
+    }
+
+    [Fact]
+    public async Task Non2xx_ErrorAndMessagePresent_ErrorFieldWins()
+    {
+        var handler = new FakeHttpMessageHandler(_ => JsonResponse(HttpStatusCode.InternalServerError,
+            "{\"error\": \"the error wins\", \"message\": \"the message\"}"));
+        using var client = CreateClient(handler);
+
+        var exception = await Assert.ThrowsAsync<OllamaRouterApiException>(() => client.GetInfoAsync());
+
+        Assert.Equal("the error wins", exception.Error);
+    }
+
+    [Fact]
+    public async Task Non2xx_JsonObjectWithoutEitherField_RawBodyTruncatedTo512()
+    {
+        // A JSON object carrying neither `error` nor `message` keeps the raw-fallback
+        // behavior (truncated to 512 chars).
+        var raw = "{\"success\": false, \"detail\": \"" + new string('y', 700) + "\"}";
+        var handler = new FakeHttpMessageHandler(_ => JsonResponse(HttpStatusCode.InternalServerError, raw));
+        using var client = CreateClient(handler);
+
+        var exception = await Assert.ThrowsAsync<OllamaRouterApiException>(() => client.GetInfoAsync());
+
+        Assert.Equal(512, exception.Error!.Length);
+        Assert.Equal(raw[..512], exception.Error);
+    }
+
+    [Fact]
     public async Task Unauthorized_ReloadsRotatedKeyFromDisk_RetriesSameRequestOnce_WithNewKey()
     {
         var oldKey = MakeKey("old-default");

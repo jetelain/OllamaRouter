@@ -4,10 +4,15 @@ namespace OllamaRouter.Middleware;
 
 /// <summary>
 /// Shared Ollama-protocol error payload (<c>{"error": "..."}</c>) returned by the router's
-/// proxy and management endpoints on failure.
+/// proxy and management endpoints on failure. The optional <see cref="Message"/> field
+/// (task #146) covers the Setup API's <c>{"success": false, "message": "..."}</c> failure
+/// bodies: it is deserialized client-side for human-readable error surfacing and omitted
+/// from serialization when null (the daemon wire format stays byte-identical).
 /// </summary>
 public sealed record OllamaErrorResponse(
-    [property: JsonPropertyName("error")] string Error);
+    [property: JsonPropertyName("error")] string? Error = null,
+    [property: JsonPropertyName("message")]
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Message = null);
 
 /// <summary>
 /// Diagnostics payload returned as <c>503 Service Unavailable</c> when all enabled

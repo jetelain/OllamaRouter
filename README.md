@@ -260,6 +260,8 @@ Run `ollamarouter start` (or `ollamarouter-server`, or `dotnet run --project src
 
 User settings live in **`config/config.json`** (next to the executable, surviving updates) and override the read-only **`appsettings.json`** factory defaults:
 
+The file accepts `//` and `/* */` comments and trailing commas (JSONC). Every successful save from the app or the Setup API rewrites the file as clean JSON — hand-added comments are dropped on the next save.
+
 ```json
 {
   "OllamaRouter": {

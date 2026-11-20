@@ -878,7 +878,26 @@ public sealed class OllamaRouterApiClient : IOllamaRouterApiClient, IDisposable
         try
         {
             var parsed = JsonSerializer.Deserialize(raw, OllamaRouterClientJsonContext.Default.OllamaErrorResponse);
-            return string.IsNullOrWhiteSpace(parsed?.Error) ? Truncate(raw) : parsed!.Error;
+            if (parsed is null)
+            {
+                return Truncate(raw);
+            }
+
+            // error → message → raw (truncated to 512 chars): the plain `error` shape wins;
+            // the Setup API's `{"success": false, "message": "..."}` bodies surface their
+            // human-readable message (task #146) instead of the raw JSON; a JSON body
+            // carrying neither field falls back to the raw text exactly as before.
+            if (!string.IsNullOrWhiteSpace(parsed.Error))
+            {
+                return parsed.Error;
+            }
+
+            if (!string.IsNullOrWhiteSpace(parsed.Message))
+            {
+                return parsed.Message;
+            }
+
+            return Truncate(raw);
         }
         catch (JsonException)
         {

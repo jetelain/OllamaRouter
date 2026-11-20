@@ -778,6 +778,38 @@ public sealed class FleetTargetsViewModelTests : IAsyncLifetime
         Assert.Equal(2, _client.ProbeCalls.Count);
     }
 
+    [Fact]
+    public async Task DeleteTargetApiFailure_BannerShowsHumanReadableMessage_NotRawJson()
+    {
+        // Task #146: the red banner must show the daemon's human-readable sentence carried
+        // in the exception's parsed `Error` — never the raw `{"success": false, ...}` body.
+        SeedFleet(_client);
+        var humanMessage = "failed to persist target: the configuration file /tmp/cfg/config.json is not valid JSON even after ignoring // and /* */ comments and trailing commas — fix or rename the file and retry; no changes were saved.";
+        _client.NextCallException = new OllamaRouterApiException(
+            System.Net.HttpStatusCode.InternalServerError, humanMessage);
+
+        await _viewModel.DeleteTargetAsync("Local");
+
+        Assert.Equal(humanMessage, _viewModel.LastError);
+        Assert.Contains("config.json", _viewModel.LastError);
+        Assert.DoesNotContain("{\"", _viewModel.LastError);
+        Assert.DoesNotContain("success\"", _viewModel.LastError);
+    }
+
+    [Fact]
+    public async Task EditTargetApiFailure_BannerShowsHumanReadableMessage_NotRawJson()
+    {
+        SeedFleet(_client);
+        var humanMessage = "failed to persist target: the configuration file /tmp/cfg/config.json is not valid JSON even after ignoring // and /* */ comments and trailing commas — fix or rename the file and retry; no changes were saved.";
+        _client.NextCallException = new OllamaRouterApiException(
+            System.Net.HttpStatusCode.InternalServerError, humanMessage);
+
+        await _viewModel.EditTargetCommand.ExecuteAsync(("Local", new UpdateTargetRequest(Enabled: false)));
+
+        Assert.Equal(humanMessage, _viewModel.LastError);
+        Assert.DoesNotContain("{\"", _viewModel.LastError);
+    }
+
     /// <inheritdoc />
     public Task InitializeAsync() => Task.CompletedTask;
 

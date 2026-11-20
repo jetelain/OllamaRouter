@@ -10,11 +10,12 @@ OllamaRouter uses a **two-layer configuration model** to keep user settings safe
 - **Optional.** The file does not exist on a fresh install. The router boots with factory defaults; the file is created lazily — either by the Setup API (dynamic fleet configuration) or manually. Absence is a normal, silent state.
 - **Survives updates.** Because the file lives in `config/` beside the executable — not among the files a publish/upgrade replaces — deleting or updating the application never touches your settings.
 - **Reloadable.** The provider is wired with `reloadOnChange: true`, so downstream `IOptionsMonitor` consumers observe file changes at runtime.
+- **Read-tolerant, write-normalizing (JSONC).** `//` and `/* */` comments (outside string literals) and trailing commas are accepted when the file is read. A successful save (Setup API or app) re-serializes the file as clean, comment-free, strict JSON — values are preserved, comments are not.
 - **Fail-open on corruption.** If `config/config.json` exists but contains invalid JSON, the router logs a prominent error at startup, **ignores the file, and continues booting with factory defaults** — a botched hand-edit or a truncated write can never brick the router. Fix or delete the file to apply user settings.
 
 ## Key format
 
-Standard .NET configuration keys for the `OllamaRouter` section — the same JSONC shape as `appsettings.json` (comments and trailing commas are tolerated). Only include the keys you want to override; everything else falls through to the factory defaults.
+Standard .NET configuration keys for the `OllamaRouter` section — the same JSONC shape as `appsettings.json` (comments and trailing commas are tolerated). Only include the keys you want to override; everything else falls through to the factory defaults. A successful save (Setup API or app) re-serializes the file as clean, comment-free, strict JSON — values are preserved, comments are not.
 
 ```jsonc
 {

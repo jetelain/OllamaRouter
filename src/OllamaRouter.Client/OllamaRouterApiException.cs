@@ -5,9 +5,9 @@ namespace OllamaRouter.Client;
 /// <summary>
 /// Thrown by <see cref="OllamaRouterApiClient"/> when the router returns a non-2xx response
 /// (after the single automatic 401 default-key reload, when applicable). <see cref="Error"/>
-/// carries the parsed <c>error</c> property of the shared <c>{"error": "..."}</c> wire shape
-/// (or the raw response body, truncated to 512 characters, when the body is not
-/// parseable as that shape).
+/// carries the parsed <c>error</c> property of the shared <c>{"error": "..."}</c> wire shape,
+/// else the parsed <c>message</c> property (the Setup API's <c>{"success": false, "message": "..."}</c>
+/// failure bodies — task #146), else the raw response body truncated to 512 characters.
 /// </summary>
 public sealed class OllamaRouterApiException : Exception
 {
@@ -26,8 +26,9 @@ public sealed class OllamaRouterApiException : Exception
     public HttpStatusCode Status { get; }
 
     /// <summary>
-    /// The parsed <c>error</c> property of the response body, or the raw body text
-    /// (truncated to 512 characters) when the body is not a JSON <c>{"error": "..."}</c> object.
+    /// The parsed <c>error</c> property of the response body, else the parsed <c>message</c>
+    /// property (Setup API failure bodies), else the raw body text (truncated to 512
+    /// characters) when the body carries neither field.
     /// </summary>
     public string? Error { get; }
 }

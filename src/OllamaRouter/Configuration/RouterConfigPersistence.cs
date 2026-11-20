@@ -35,6 +35,16 @@ public sealed record RouterConfigPersistResult(bool Success, string? Error = nul
 /// new file. Every method never throws.
 /// </para>
 /// <para>
+/// JSONC note (task #146): the LOAD path is comment-tolerant — <c>//</c> and <c>/* */</c>
+/// comments (outside string literals) and trailing commas are stripped before parsing,
+/// matching the daemon's configuration layer. Every successful save re-serializes the file
+/// as clean strict JSON, so hand-added comments are dropped on the next save
+/// (read-tolerant, write-normalizing). A file that is STILL unparseable after stripping —
+/// including an empty / comment-only document — blocks all saves with an actionable
+/// message (the file path + fix instructions) and is left byte-identical (never
+/// repaired, renamed or touched).
+/// </para>
+/// <para>
 /// Precedence note: <c>config/config.json</c> sits BELOW environment variables / CLI arguments in
 /// the configuration chain. If the operator pinned a value via environment, a PUT persists the
 /// file value but the effective bound value keeps the environment value (standard .NET behavior;
@@ -63,7 +73,9 @@ public sealed record RouterConfigPersistResult(bool Success, string? Error = nul
     /// On a legacy configuration (in-memory <c>Targets</c> empty, Local/Remote synthesized from
     /// <c>LocalUrl</c>/<c>RemoteUrl</c>) the caller passes the synthesized entries in the list,
     /// which materializes them into the array. Returns failure (no in-memory change) when the
-    /// file cannot be written or the existing file is present but unparseable. Never throws.
+    /// file cannot be written, or the existing file is present but still unparseable after
+    /// <c>//</c> / <c>/* */</c> comment + trailing-comma stripping (the corrupt file is left
+    /// byte-identical and saves stay blocked until it is fixed or renamed). Never throws.
     /// </summary>
     Task<RouterConfigPersistResult> PersistTargetsAsync(
         IReadOnlyList<OllamaTargetOptions> targets,
@@ -73,7 +85,8 @@ public sealed record RouterConfigPersistResult(bool Success, string? Error = nul
     /// Applies the provided sections (null sections ignored) to <c>config/config.json</c> (merge,
     /// preserving all other user keys incl. an existing <c>Recording:TokenMetricsCsv</c>), writes
     /// atomically, then applies the same values to the live in-memory options instance
-    /// (reference-swap per section) + <c>Normalize()</c>. Same failure contract as
+    /// (reference-swap per section) + <c>Normalize()</c>. Same failure contract (incl. the
+    /// JSONC-tolerant load and the corrupt-file block) as
     /// <see cref="PersistTargetsAsync"/>. Never throws.
     /// </summary>
     Task<RouterConfigPersistResult> PersistConfigAsync(
@@ -567,8 +580,14 @@ public sealed class RouterConfigPersistence : IRouterConfigPersistence
 
     /// <summary>
     /// Loads the existing file as a JSON object root, or creates an empty root when the file is
-    /// absent. Returns (error: null, root) on success; (error message, null) when a PRESENT
-    /// file is unparseable or has a non-object root (the file is left untouched).
+    /// absent. The file content is read ONCE as bytes and passed through
+    /// <see cref="JsonCommentStripper.Strip"/> (JSONC: <c>//</c> + <c>/* */</c> comments outside
+    /// strings, trailing commas) before strict parsing (task #146) — a comment-only / empty
+    /// document stays CORRUPT (it parses to nothing), agreeing with the daemon's configuration
+    /// provider, which refuses such files too. Returns (error: null, root) on success;
+    /// (actionable error message, null) when a PRESENT file cannot be read, is still
+    /// unparseable after stripping, or has a non-object root — the file is ALWAYS left
+    /// untouched on every failure path (no write/rename/delete can have run).
     /// </summary>
     private async Task<(string? Error, JsonObject? Root)> LoadOrCreateRootAsync(CancellationToken cancellationToken)
     {
@@ -577,20 +596,50 @@ public sealed class RouterConfigPersistence : IRouterConfigPersistence
             return (null, new JsonObject());
         }
 
+        byte[] bytes;
         try
         {
-            var text = await File.ReadAllTextAsync(ConfigFilePath, cancellationToken).ConfigureAwait(false);
-            var parsed = JsonNode.Parse(text);
-            if (parsed is not JsonObject objectRoot)
-            {
-                return ($"existing file {ConfigFilePath} does not contain a JSON object root", null);
-            }
-            return (null, objectRoot);
+            bytes = await File.ReadAllBytesAsync(ConfigFilePath, cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or FileNotFoundException)
         {
-            return ($"existing file {ConfigFilePath} could not be parsed: {ex.Message}", null);
+            return ($"the configuration file {ConfigFilePath} could not be read: {ex.Message} — check file permissions and retry; no changes were saved.", null);
         }
+
+        var text = System.Text.Encoding.UTF8.GetString(bytes);
+        if (text.Length > 0 && text[0] == '\uFEFF')
+        {
+            // A UTF-8 BOM is not JSON — drop it so BOM-prefixed hand-saved files still load
+            // (the stripper itself passes the BOM through byte-identical).
+            text = text[1..];
+        }
+
+        var stripped = JsonCommentStripper.Strip(text);
+        JsonNode? parsed;
+        try
+        {
+            parsed = JsonNode.Parse(stripped);
+        }
+        catch (JsonException ex)
+        {
+            // One diagnostics line (size + first ≤64 bytes hex) makes future corruption
+            // debuggable without re-producing it; the user-facing message is the canonical
+            // actionable sentence below.
+            _logger?.LogError(
+                "Configuration file {Path} failed to parse as JSON ({ParseError}); file size {Size} bytes, first bytes (hex): {FirstBytesHex}",
+                ConfigFilePath,
+                ex.Message,
+                bytes.Length,
+                Convert.ToHexString(bytes.AsSpan(0, Math.Min(64, bytes.Length))));
+            return ($"the configuration file {ConfigFilePath} is not valid JSON even after ignoring // and /* */ comments and trailing commas — fix or rename the file and retry; no changes were saved.", null);
+        }
+
+        if (parsed is not JsonObject objectRoot)
+        {
+            return ($"the configuration file {ConfigFilePath} does not contain a JSON object at the top level (the root must be a JSON object) — fix or rename the file and retry; no changes were saved.", null);
+        }
+
+        return (null, objectRoot);
     }
 
     /// <summary>Gets (or creates) the <c>OllamaRouter</c> section object within the file root.</summary>
