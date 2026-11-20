@@ -319,6 +319,10 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
         NotImplemented<NodeHardwareProfile>(nameof(UpdateTargetHardwareAsync));
 
     /// <inheritdoc />
+    public Task<NodeHardwareProfile> ProbeTargetHardwareAsync(string target, CancellationToken ct = default) =>
+        NotImplemented<NodeHardwareProfile>(nameof(ProbeTargetHardwareAsync));
+
+    /// <inheritdoc />
     public Task<RouterCartographyResponse> GetCartographyAsync(CancellationToken ct = default)
     {
         Log(nameof(GetCartographyAsync));

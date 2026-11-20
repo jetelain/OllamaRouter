@@ -737,6 +737,8 @@ public sealed class OllamaRouterDaemonLauncherTests : IDisposable
         public Task<RouterFleetHardwareResponse> GetFleetHardwareAsync(CancellationToken ct = default) => Unavailable<RouterFleetHardwareResponse>();
         public Task<NodeHardwareProfile> UpdateTargetHardwareAsync(string target, NodeHardwareProfile profile, CancellationToken ct = default)
             => Unavailable<NodeHardwareProfile>();
+        public Task<NodeHardwareProfile> ProbeTargetHardwareAsync(string target, CancellationToken ct = default)
+            => Unavailable<NodeHardwareProfile>();
         public Task<RouterCartographyResponse> GetCartographyAsync(CancellationToken ct = default) => Unavailable<RouterCartographyResponse>();
         public Task<RouterModelsResponse> GetModelsAsync(CancellationToken ct = default) => Unavailable<RouterModelsResponse>();
         public Task<RouterModelDetailResponse> GetModelDetailAsync(string modelName, CancellationToken ct = default) => Unavailable<RouterModelDetailResponse>();

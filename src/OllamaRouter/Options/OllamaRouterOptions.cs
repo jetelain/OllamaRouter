@@ -611,6 +611,33 @@ public sealed class OllamaTargetOptions
     public string? RouterUrl { get; set; }
 
     /// <summary>
+    /// The ssh user used by the daemon-side explicit hardware probe
+    /// (<c>POST /api/router/fleet/hardware/{targetName}/probe</c>, task #143) to reach this
+    /// target's host (the host is derived from <see cref="Url"/>). KEY-BASED authentication
+    /// ONLY (the ssh user's installed private key — no password support, no identity-file
+    /// handling); null/absent = the target cannot be ssh-probed. When present the value must
+    /// match <c>^[A-Za-z0-9._-]{1,64}$</c> (validated at the API edge).
+    /// </summary>
+    public string? SshUser { get; set; }
+
+    /// <summary>
+    /// The ssh port for the daemon-side explicit hardware probe (task #143); null/absent
+    /// (or out of range) = the default port 22 (see <see cref="GetEffectiveSshPort"/>).
+    /// </summary>
+    public int? SshPort { get; set; }
+
+    /// <summary>
+    /// The effective ssh port for the probe: the configured <see cref="SshPort"/> when it is a
+    /// valid 1–65535 value, otherwise the default 22 (defensive read for hand-edited
+    /// config.json files).
+    /// </summary>
+    public int GetEffectiveSshPort()
+    {
+        var port = SshPort;
+        return port is not null && port >= 1 && port <= 65535 ? port.Value : 22;
+    }
+
+    /// <summary>
     /// Protocol family of this target (task #61). Defaults to <see cref="TargetType.Ollama"/>
     /// — a configuration file omitting the field (or binding the value "Ollama") keeps the
     /// exact pre-fleet behavior. <see cref="TargetType.OpenAI"/> enables the converter dispatch

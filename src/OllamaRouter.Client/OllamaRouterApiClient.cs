@@ -68,6 +68,17 @@ public interface IOllamaRouterApiClient
     Task<NodeHardwareProfile> UpdateTargetHardwareAsync(
         string target, NodeHardwareProfile profile, CancellationToken ct = default);
 
+    /// <summary>
+    /// <c>POST /api/router/fleet/hardware/{target}/probe</c> (task #143): runs the daemon-side
+    /// explicit hardware probe (local bash for the local workstation target, ssh to
+    /// <c>{sshUser}@{host}</c> for remote targets — key-based auth, requires a configured
+    /// <c>sshUser</c>) and stores the digest result with the provenance label "local"/"ssh"
+    /// (an explicit probe is authoritative — it overwrites even a manual profile); echoes
+    /// the stored profile. Non-2xx (400 no sshUser / 404 unknown target / 502 probe failure,
+    /// 401 without a key) surface as <see cref="OllamaRouterApiException"/>.
+    /// </summary>
+    Task<NodeHardwareProfile> ProbeTargetHardwareAsync(string target, CancellationToken ct = default);
+
     // ------------------------------------------------------------------
     //  Cartography + models + preload + VRAM
     // ------------------------------------------------------------------
@@ -399,6 +410,14 @@ public sealed class OllamaRouterApiClient : IOllamaRouterApiClient, IDisposable
             typeInfo,
             ct);
     }
+
+    /// <inheritdoc />
+    public Task<NodeHardwareProfile> ProbeTargetHardwareAsync(string target, CancellationToken ct = default) =>
+        SendAsync(
+            HttpMethod.Post,
+            BuildPath("api/router/fleet/hardware", target, "probe"),
+            OllamaRouterClientJsonContext.Default.NodeHardwareProfile,
+            ct);
 
     // ------------------------------------------------------------------
     //  IOllamaRouterApiClient — cartography + models + preload + VRAM

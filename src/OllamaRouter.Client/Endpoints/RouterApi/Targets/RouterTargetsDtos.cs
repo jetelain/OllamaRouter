@@ -11,7 +11,9 @@ namespace OllamaRouter.Endpoints.RouterApi.Targets;
 /// <c>ollama|openai|osnative</c>), <c>apiKey</c> (null/absent = no change, <c>""</c> clears),
 /// <c>provider</c> (<c>""</c> clears) and <c>models</c> (null/absent = no change, a provided list
 /// — possibly empty — replaces the roster). Task #84 adds <c>powerWatts</c> (number|null;
-/// null/absent = no change, negative → 400).
+/// null/absent = no change, negative → 400). Task #143 appends the daemon-side hardware probe
+/// ssh credential <c>sshUser</c> (null/absent = no change, <c>""</c> clears, a non-blank value must
+/// match ^[A-Za-z0-9._-]{1,64}) and <c>sshPort</c> (null/absent = no change, 1–65535 when present).
 /// </summary>
 public sealed record UpdateTargetRequest(
     [property: JsonPropertyName("url")] string? Url = null,
@@ -26,7 +28,16 @@ public sealed record UpdateTargetRequest(
     // distinguish an explicit JSON null from an absent key; clearing a previously set
     // override is done by editing config/config.json, which removes the key when the
     // in-memory value is null).
-    [property: JsonPropertyName("powerWatts")] double? PowerWatts = null);
+    [property: JsonPropertyName("powerWatts")] double? PowerWatts = null,
+    // Task #143: ssh credential for the daemon-side explicit hardware probe (POST
+    // /api/router/fleet/hardware/{targetName}/probe; key-based auth only, the probe host is
+    // derived from the target url). null/absent = NO CHANGE; "" CLEARS the stored sshUser;
+    // a non-blank value must match ^[A-Za-z0-9._-]{1,64}$ (POSIX-ish username charset —
+    // safe to interpolate into {user}@{host}). sshPort null/absent = no change; a present
+    // value must be 1–65535 (clearing a set port = edit config/config.json, the documented
+    // powerWatts precedent — STJ cannot distinguish JSON null from an absent key).
+    [property: JsonPropertyName("sshUser")] string? SshUser = null,
+    [property: JsonPropertyName("sshPort")] int? SshPort = null);
 
 /// <summary>
 /// Response of <c>PUT /api/router/targets/{name}</c> (task #19): success flag + message,
@@ -47,7 +58,9 @@ public sealed record UpdateTargetResponse(
 /// upstream provider <c>apiKey</c> (required-for-behavior only on <c>openai</c>; provided on a
 /// non-<c>openai</c> target → 400), the informational <c>provider</c> label and the declared
 /// <c>models</c> roster (blank names → 400; <c>osnative</c> is accepted — config-storable,
-/// unroutable until tasks #63/#64).
+/// unroutable until tasks #63/#64). Task #143 appends the daemon-side hardware probe ssh
+/// credential <c>sshUser</c> (null/blank = unset, a non-blank value must match
+/// ^[A-Za-z0-9._-]{1,64}) and <c>sshPort</c> (1–65535 when present, absent = the default port 22).
 /// </summary>
 public sealed record AddTargetRequest(
     [property: JsonPropertyName("name")] string Name,
@@ -61,7 +74,13 @@ public sealed record AddTargetRequest(
     [property: JsonPropertyName("models")] IReadOnlyList<TargetModelDto>? Models = null,
     // Task #84: node power-draw override (watts; null = unset ⇒ the resolution chain
     // Pricing:DefaultNodePowerWatts → 150 W applies).
-    [property: JsonPropertyName("powerWatts")] double? PowerWatts = null);
+    [property: JsonPropertyName("powerWatts")] double? PowerWatts = null,
+    // Task #143: ssh credential for the daemon-side explicit hardware probe (key-based auth
+    // only). null/blank = unset (the target cannot be ssh-probed); a non-blank value must
+    // match ^[A-Za-z0-9._-]{1,64}$; sshPort must be 1–65535 when present (absent = the
+    // default port 22 at probe time).
+    [property: JsonPropertyName("sshUser")] string? SshUser = null,
+    [property: JsonPropertyName("sshPort")] int? SshPort = null);
 
 /// <summary>
 /// One declared model of a target's synthetic catalog (task #61) in the Setup API wire

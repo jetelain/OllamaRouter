@@ -51,7 +51,8 @@ public class RouterHardwareEndpointsTests
         OllamaRouterOptions options,
         IHardwareProfileProvider? localProvider = null,
         IFleetHardwareService? fleetHardware = null,
-        LocalGpuSnapshot? localGpuSnapshot = null)
+        LocalGpuSnapshot? localGpuSnapshot = null,
+        LinuxHardwareProbeExecutor? probeExecutor = null)
     {
         var builder = WebApplication.CreateBuilder();
         builder.WebHost.UseUrls("http://127.0.0.1:0");
@@ -103,6 +104,10 @@ public class RouterHardwareEndpointsTests
         {
             builder.Services.AddSingleton(fleetHardware);
         }
+        if (probeExecutor is not null)
+        {
+            builder.Services.AddSingleton(probeExecutor);
+        }
 
         var app = builder.Build();
         app.MapOllamaRouterApiEndpoints();
@@ -132,6 +137,52 @@ public class RouterHardwareEndpointsTests
         ],
         CloudOverflow = { Enabled = true }
     };
+
+    private static OllamaRouterOptions LocalPlusSshPeerOptions() => new()
+    {
+        Targets =
+        [
+            new OllamaTargetOptions
+            {
+                Name = "Local",
+                Url = "http://127.0.0.1:11435",
+                MaxVramMB = 16384,
+                MaxParallel = 1
+            },
+            new OllamaTargetOptions
+            {
+                Name = "Peer",
+                Url = "http://192.168.1.50:11434",
+                MaxVramMB = 98304,
+                MaxParallel = 4,
+                SshUser = "ops",
+                SshPort = 2222
+            }
+        ],
+        CloudOverflow = { Enabled = true }
+    };
+
+    private static string ProbeFrame(string hostname) =>
+        "===BEGIN_HW===\n" +
+        $"HOSTNAME={hostname}\n" +
+        "ARCH=x86_64\n" +
+        "CPU=Probe CPU\n" +
+        "RAM_MB=32768\n" +
+        "---DMIDECODE_MEMORY---\n" +
+        "Handle 0x0101, DMI type 17, 40 bytes\n\tMemory Device\n\t\tLocator: DIMM_A1\n\t\tType: DDR5\n\t\tSize: 32 GB\n" +
+        "---NVIDIA_GPUS---\n" +
+        "NVIDIA GeForce RTX 4090, 24564\n" +
+        "---ROCM_GPUS---\n" +
+        "---LSPCI_GPUS---\n" +
+        "===END_HW===\n";
+
+    private static string SshArgsFor(OllamaTargetOptions target) =>
+        OllamaRouter.Services.Hardware.LinuxHardwareProbeExecutor.BuildSshArguments(
+            target.SshUser!,
+            new Uri(target.Url).Host,
+            target.GetEffectiveSshPort(),
+            Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(
+                OllamaRouter.Services.Hardware.LinuxHardwareProbeScript.ScriptText)));
 
     private static IHardwareProfileProvider FakeLocalProvider(NodeHardwareProfile? profile = null)
     {
@@ -442,5 +493,267 @@ public class RouterHardwareEndpointsTests
                 // Best effort.
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    //  POST /api/router/fleet/hardware/{targetName}/probe  (task #143)
+    // ------------------------------------------------------------------
+
+    private static FleetHardwareService CreateFleetService(
+        string stateDir,
+        OllamaRouterOptions options,
+        IHardwareProfileProvider localProvider)
+    {
+        var probeClient = new HttpClient(new HardwareProfileTests.ThrowingHandler())
+        {
+            Timeout = TimeSpan.FromSeconds(3)
+        };
+        return new FleetHardwareService(
+            new TestOptionsMonitor<OllamaRouterOptions>(options),
+            localProvider,
+            probeClient,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<FleetHardwareService>.Instance,
+            System.IO.Path.Combine(stateDir, "targets-hardware.json"));
+    }
+
+    [Fact]
+    public async Task ProbeEndpoint_LocalTarget_StoresLocalProvenance_AndEchoesTheProfile()
+    {
+        using var stateDir = new TempDir();
+        var options = LocalPlusSshPeerOptions();
+        var localProvider = FakeLocalProvider();
+        var fleet = CreateFleetService(stateDir.Path, options, localProvider);
+
+        // The daemon runs the embedded script via `bash` (stdin) — faked with a canned frame.
+        var runner = new FakeProcessRunner().Succeeds("bash", string.Empty, ProbeFrame("probed-local"));
+        await using var harness = await CreateTestAppAsync(
+            options,
+            localProvider: localProvider,
+            fleetHardware: fleet,
+            probeExecutor: new LinuxHardwareProbeExecutor(
+                runner, Microsoft.Extensions.Logging.Abstractions.NullLogger<LinuxHardwareProbeExecutor>.Instance));
+
+        using var response = await harness.Client.PostAsync("/api/router/fleet/hardware/Local/probe", new StringContent(string.Empty));
+        Assert.Equal(System.Net.HttpStatusCode.OK, response.StatusCode);
+        var echoed = JsonNode.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Equal("probed-local", echoed!["nodeName"]!.ToString());
+        Assert.Equal("linux", echoed["os"]!.ToString());
+
+        // Stored with the "local" provenance (and persisted to the state file).
+        Assert.Equal("probed-local", fleet.GetProfile("Local")!.NodeName);
+        var raw = await File.ReadAllTextAsync(System.IO.Path.Combine(stateDir.Path, "targets-hardware.json"));
+        Assert.Contains("probed-local", raw, StringComparison.Ordinal);
+        Assert.Contains("\"local\"", raw, StringComparison.Ordinal);
+
+        // Exactly ONE bash launch, script over stdin (the local probe path is the single
+        // embedded-script path — no per-tool launches).
+        var invocation = Assert.Single(runner.GetInvocations());
+        Assert.Equal("bash", invocation.FileName);
+        Assert.Equal(LinuxHardwareProbeScript.ScriptText, invocation.StandardInput);
+    }
+
+    [Fact]
+    public async Task ProbeEndpoint_RemoteTarget_StoresSshProvenance_OverwritesManual_AndInvokesSshWithHardenedArgs()
+    {
+        using var stateDir = new TempDir();
+        var options = LocalPlusSshPeerOptions();
+        var localProvider = FakeLocalProvider();
+        var fleet = CreateFleetService(stateDir.Path, options, localProvider);
+
+        // A stored "manual" profile the explicit probe must OVERWRITE.
+        var manual = SampleProfile("manual-node");
+        Assert.True(await fleet.UpsertProfileAsync("Peer", manual));
+
+        var peer = options.Targets.First(t => t.Name == "Peer");
+        var expectedArgs = SshArgsFor(peer);
+        var runner = new FakeProcessRunner().Succeeds("ssh", expectedArgs, ProbeFrame("probed-peer"));
+        await using var harness = await CreateTestAppAsync(
+            options,
+            localProvider: localProvider,
+            fleetHardware: fleet,
+            probeExecutor: new LinuxHardwareProbeExecutor(
+                runner, Microsoft.Extensions.Logging.Abstractions.NullLogger<LinuxHardwareProbeExecutor>.Instance));
+
+        using var response = await harness.Client.PostAsync("/api/router/fleet/hardware/Peer/probe", new StringContent(string.Empty));
+        Assert.Equal(System.Net.HttpStatusCode.OK, response.StatusCode);
+        var echoed = JsonNode.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Equal("probed-peer", echoed!["nodeName"]!.ToString());
+
+        // The explicit probe is authoritative: it REPLACED the manual profile in the store.
+        Assert.Equal("probed-peer", fleet.GetProfile("Peer")!.NodeName);
+
+        // GET /api/router/fleet/hardware reflects the new "ssh" provenance.
+        using var get = await harness.Client.GetAsync("/api/router/fleet/hardware");
+        Assert.Equal(System.Net.HttpStatusCode.OK, get.StatusCode);
+        var node = JsonNode.Parse(await get.Content.ReadAsStringAsync());
+        var peerRow = node!["nodes"]!.AsArray().First(n => n!["target"]!.ToString() == "Peer")!;
+        Assert.Equal("ssh", peerRow["source"]!.ToString());
+        Assert.Equal("probed-peer", peerRow["profile"]!["nodeName"]!.ToString());
+
+        // The ssh invocation carries the hardened argument string VERBATIM: -p 2222
+        // (the configured sshPort), BatchMode/no-prompt flags, ops@{url host}, base64 payload.
+        var invocation = Assert.Single(runner.GetInvocations());
+        Assert.Equal("ssh", invocation.FileName);
+        Assert.Equal(expectedArgs, invocation.Arguments);
+        Assert.Contains("-p 2222 ", invocation.Arguments, StringComparison.Ordinal);
+        Assert.Contains("-o BatchMode=yes ", invocation.Arguments, StringComparison.Ordinal);
+        Assert.Contains("ops@192.168.1.50 ", invocation.Arguments, StringComparison.Ordinal);
+        Assert.EndsWith("| base64 -d | bash'", invocation.Arguments, StringComparison.Ordinal);
+        Assert.Equal(LinuxHardwareProbeExecutor.ProbeTimeoutMs, invocation.TimeoutMs);
+
+        // Persisted with the ssh provenance.
+        var raw = await File.ReadAllTextAsync(System.IO.Path.Combine(stateDir.Path, "targets-hardware.json"));
+        Assert.Contains("probed-peer", raw, StringComparison.Ordinal);
+        Assert.Contains("\"ssh\"", raw, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ProbeEndpoint_UnknownTarget_Returns404_WithClearError()
+    {
+        using var stateDir = new TempDir();
+        var options = LocalPlusSshPeerOptions();
+        var localProvider = FakeLocalProvider();
+        var fleet = CreateFleetService(stateDir.Path, options, localProvider);
+        var runner = new FakeProcessRunner();
+        await using var harness = await CreateTestAppAsync(
+            options,
+            localProvider: localProvider,
+            fleetHardware: fleet,
+            probeExecutor: new LinuxHardwareProbeExecutor(
+                runner, Microsoft.Extensions.Logging.Abstractions.NullLogger<LinuxHardwareProbeExecutor>.Instance));
+
+        using var response = await harness.Client.PostAsync("/api/router/fleet/hardware/NoSuchTarget/probe", new StringContent(string.Empty));
+        Assert.Equal(System.Net.HttpStatusCode.NotFound, response.StatusCode);
+        var node = JsonNode.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Contains("NoSuchTarget", node!["error"]!.ToString(), StringComparison.Ordinal);
+        Assert.Empty(runner.GetInvocations()); // no process was launched for an unknown target
+    }
+
+    [Fact]
+    public async Task ProbeEndpoint_RemoteTargetWithoutSshUser_Returns400_WithActionableMessage()
+    {
+        using var stateDir = new TempDir();
+        var options = LocalPlusPeerOptions(); // Peer has NO sshUser
+        var localProvider = FakeLocalProvider();
+        var fleet = CreateFleetService(stateDir.Path, options, localProvider);
+        var runner = new FakeProcessRunner();
+        await using var harness = await CreateTestAppAsync(
+            options,
+            localProvider: localProvider,
+            fleetHardware: fleet,
+            probeExecutor: new LinuxHardwareProbeExecutor(
+                runner, Microsoft.Extensions.Logging.Abstractions.NullLogger<LinuxHardwareProbeExecutor>.Instance));
+
+        using var response = await harness.Client.PostAsync("/api/router/fleet/hardware/Peer/probe", new StringContent(string.Empty));
+        Assert.Equal(System.Net.HttpStatusCode.BadRequest, response.StatusCode);
+        var node = JsonNode.Parse(await response.Content.ReadAsStringAsync());
+        var error = node!["error"]!.ToString();
+        Assert.Contains("sshUser", error, StringComparison.Ordinal);
+        Assert.Contains("/api/router/targets/Peer", error, StringComparison.Ordinal);
+        Assert.Empty(runner.GetInvocations()); // no ssh was attempted
+    }
+
+    [Fact]
+    public async Task ProbeEndpoint_SshAuthFailure_Returns502_AndLeavesTheStoredProfileUntouched()
+    {
+        using var stateDir = new TempDir();
+        var options = LocalPlusSshPeerOptions();
+        var localProvider = FakeLocalProvider();
+        var fleet = CreateFleetService(stateDir.Path, options, localProvider);
+
+        var manual = SampleProfile("manual-node");
+        Assert.True(await fleet.UpsertProfileAsync("Peer", manual));
+
+        var peer = options.Targets.First(t => t.Name == "Peer");
+        var args = SshArgsFor(peer);
+        var runner = new FakeProcessRunner().FailsWithStdErr(
+            "ssh", args, 255, "ops@192.168.1.50: Permission denied (publickey).");
+        await using var harness = await CreateTestAppAsync(
+            options,
+            localProvider: localProvider,
+            fleetHardware: fleet,
+            probeExecutor: new LinuxHardwareProbeExecutor(
+                runner, Microsoft.Extensions.Logging.Abstractions.NullLogger<LinuxHardwareProbeExecutor>.Instance));
+
+        using var response = await harness.Client.PostAsync("/api/router/fleet/hardware/Peer/probe", new StringContent(string.Empty));
+        Assert.Equal(System.Net.HttpStatusCode.BadGateway, response.StatusCode);
+        var node = JsonNode.Parse(await response.Content.ReadAsStringAsync());
+        var error = node!["error"]!.ToString();
+        Assert.Contains("code 255", error, StringComparison.Ordinal);
+        Assert.Contains("Permission denied (publickey)", error, StringComparison.Ordinal);
+
+        // The stored profile is UNTOUCHED: the manual profile is still served, byte-identical
+        // provenance, and the state file still holds the manual node.
+        Assert.Same(manual, fleet.GetProfile("Peer"));
+        using var get = await harness.Client.GetAsync("/api/router/fleet/hardware");
+        var nodeJson = JsonNode.Parse(await get.Content.ReadAsStringAsync());
+        var peerRow = nodeJson!["nodes"]!.AsArray().First(n => n!["target"]!.ToString() == "Peer")!;
+        Assert.Equal("manual", peerRow["source"]!.ToString());
+        Assert.Equal("manual-node", peerRow["profile"]!["nodeName"]!.ToString());
+        var raw = await File.ReadAllTextAsync(System.IO.Path.Combine(stateDir.Path, "targets-hardware.json"));
+        Assert.Contains("manual-node", raw, StringComparison.Ordinal);
+        Assert.DoesNotContain("probed-peer", raw, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ProbeEndpoint_LocalProbeFailure_Returns502_WithReadableError()
+    {
+        using var stateDir = new TempDir();
+        var options = LocalPlusSshPeerOptions();
+        var localProvider = FakeLocalProvider();
+        var fleet = CreateFleetService(stateDir.Path, options, localProvider);
+
+        // `bash` absent (e.g. a non-Linux daemon host) → launch failure → 502, no 5xx crash.
+        var runner = new FakeProcessRunner().FailsToStart("bash", string.Empty, "bash: command not found");
+        await using var harness = await CreateTestAppAsync(
+            options,
+            localProvider: localProvider,
+            fleetHardware: fleet,
+            probeExecutor: new LinuxHardwareProbeExecutor(
+                runner, Microsoft.Extensions.Logging.Abstractions.NullLogger<LinuxHardwareProbeExecutor>.Instance));
+
+        using var response = await harness.Client.PostAsync("/api/router/fleet/hardware/Local/probe", new StringContent(string.Empty));
+        Assert.Equal(System.Net.HttpStatusCode.BadGateway, response.StatusCode);
+        var node = JsonNode.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Contains("failed to launch", node!["error"]!.ToString(), StringComparison.OrdinalIgnoreCase);
+
+        // The store is untouched: no probe profile was persisted for the failed probe (the
+        // state file is written only on successful stores; GetProfile of the Local row would
+        // live-serve the provider profile on a cache miss, so we assert on the store state).
+        var stateFile = System.IO.Path.Combine(stateDir.Path, "targets-hardware.json");
+        if (File.Exists(stateFile))
+        {
+            var raw = await File.ReadAllTextAsync(stateFile);
+            Assert.DoesNotContain("probed-local", raw, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public async Task ProbeEndpoint_SshOutputWithoutMarkers_Returns502_AndLeavesTheStoredProfileUntouched()
+    {
+        using var stateDir = new TempDir();
+        var options = LocalPlusSshPeerOptions();
+        var localProvider = FakeLocalProvider();
+        var fleet = CreateFleetService(stateDir.Path, options, localProvider);
+
+        var manual = SampleProfile("manual-node");
+        Assert.True(await fleet.UpsertProfileAsync("Peer", manual));
+
+        var peer = options.Targets.First(t => t.Name == "Peer");
+        var args = SshArgsFor(peer);
+        // A non-Linux remote (no bash / no frame) fails the digest softly.
+        var runner = new FakeProcessRunner().Succeeds("ssh", args, "bash: not found\n");
+        await using var harness = await CreateTestAppAsync(
+            options,
+            localProvider: localProvider,
+            fleetHardware: fleet,
+            probeExecutor: new LinuxHardwareProbeExecutor(
+                runner, Microsoft.Extensions.Logging.Abstractions.NullLogger<LinuxHardwareProbeExecutor>.Instance));
+
+        using var response = await harness.Client.PostAsync("/api/router/fleet/hardware/Peer/probe", new StringContent(string.Empty));
+        Assert.Equal(System.Net.HttpStatusCode.BadGateway, response.StatusCode);
+        var node = JsonNode.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Contains("marker frame", node!["error"]!.ToString(), StringComparison.Ordinal);
+        Assert.Same(manual, fleet.GetProfile("Peer"));
     }
 }

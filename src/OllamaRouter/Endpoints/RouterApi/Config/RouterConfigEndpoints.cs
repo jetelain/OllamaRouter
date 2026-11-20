@@ -88,7 +88,9 @@ public static class RouterConfigEndpoints
                         .ToList()
                     : null,
                 !string.IsNullOrWhiteSpace(t.ApiKey),
-                t.PowerWatts))
+                t.PowerWatts,
+                t.SshUser,
+                t.SshPort))
             .ToList();
 
         var recording = options.Recording ?? new RecordingOptions();

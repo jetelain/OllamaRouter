@@ -10,6 +10,7 @@ using OllamaRouter.Services.Catalog;
 using OllamaRouter.Services.Monitoring;
 using OllamaRouter.Services.Routing;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace OllamaRouter.Endpoints.RouterApi.Targets;
 
@@ -21,6 +22,15 @@ namespace OllamaRouter.Endpoints.RouterApi.Targets;
 
 public static class RouterTargetsEndpoints
 {
+    /// <summary>
+    /// Task #143: the ssh username charset of the daemon-side hardware probe credential
+    /// (POSIX-ish: letters, digits, dot, dash, underscore — 1..64 chars, no spaces / @ / : /
+    /// separators, so the value is safe to interpolate into the ssh command's
+    /// <c>{user}@{host}</c> argument).
+    /// </summary>
+    internal static readonly Regex SshUserPattern =
+        new("^[A-Za-z0-9._-]{1,64}$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
     /// <summary>
     /// Maps the target provisioning endpoints (<c>POST/PUT/DELETE /api/router/targets[/{name}]</c>).
     /// </summary>
@@ -178,6 +188,21 @@ public static class RouterTargetsEndpoints
             return AddTargetFailure("powerWatts must be >= 0", StatusCodes.Status400BadRequest);
         }
 
+        // Task #143: the ssh credential of the daemon-side hardware probe — a non-blank
+        // sshUser must match the POSIX-ish username charset; sshPort must be 1..65535.
+        var addSshUser = string.IsNullOrWhiteSpace(addRequest.SshUser) ? null : addRequest.SshUser;
+        if (addSshUser is not null && !SshUserPattern.IsMatch(addSshUser))
+        {
+            return AddTargetFailure(
+                "sshUser must be 1-64 characters of [A-Za-z0-9._-] (letters, digits, dot, dash, underscore only)",
+                StatusCodes.Status400BadRequest);
+        }
+
+        if (addRequest.SshPort is { } addSshPort && (addSshPort < 1 || addSshPort > 65535))
+        {
+            return AddTargetFailure("sshPort must be between 1 and 65535", StatusCodes.Status400BadRequest);
+        }
+
         if (effectiveTargets.Any(t => string.Equals(t.Name, name, StringComparison.OrdinalIgnoreCase)))
         {
             return AddTargetFailure(
@@ -205,7 +230,9 @@ public static class RouterTargetsEndpoints
             ApiKey = string.IsNullOrWhiteSpace(apiKey) ? null : apiKey.Trim(),
             Provider = normalizedProvider,
             Models = modelsList,
-            PowerWatts = addRequest.PowerWatts
+            PowerWatts = addRequest.PowerWatts,
+            SshUser = addSshUser,
+            SshPort = addRequest.SshPort
         });
 
         // Immediate liveness probe (coalesced, bounded by the probe client timeout). Skipped
@@ -318,7 +345,9 @@ public static class RouterTargetsEndpoints
                     ? modelsList.Select(m => new TargetModelDto(m.Name, m.ContextLength, m.Quantization)).ToList()
                     : null,
                 !string.IsNullOrWhiteSpace(apiKey),
-                addRequest.PowerWatts),
+                addRequest.PowerWatts,
+                addSshUser,
+                addRequest.SshPort),
             latencyMs),
             OllamaRouterJsonSerializerContext.Default.AddTargetResponse,
             statusCode: StatusCodes.Status201Created);
@@ -360,7 +389,8 @@ public static class RouterTargetsEndpoints
              updateRequest.HardwareHint is null && updateRequest.MaxParallel is null &&
              updateRequest.Type is null && updateRequest.ApiKey is null &&
              updateRequest.Provider is null && updateRequest.Models is null &&
-             updateRequest.PowerWatts is null))
+             updateRequest.PowerWatts is null && updateRequest.SshUser is null &&
+             updateRequest.SshPort is null))
         {
             return UpdateTargetFailure($"no target fields provided for '{name}'", StatusCodes.Status400BadRequest);
         }
@@ -369,6 +399,23 @@ public static class RouterTargetsEndpoints
         if (updateRequest.PowerWatts is { } updatePowerWatts && updatePowerWatts < 0)
         {
             return UpdateTargetFailure("powerWatts must be >= 0", StatusCodes.Status400BadRequest);
+        }
+
+        // Task #143: ssh credential validation (null/absent = no change; "" clears the user;
+        // a non-blank value must match the POSIX-ish username charset; sshPort 1..65535) —
+        // BEFORE the target lookup/persist, mirroring the other per-field 400s.
+        if (updateRequest.SshUser is { } updateSshUserCandidate &&
+            !string.IsNullOrWhiteSpace(updateSshUserCandidate) &&
+            !SshUserPattern.IsMatch(updateSshUserCandidate))
+        {
+            return UpdateTargetFailure(
+                "sshUser must be 1-64 characters of [A-Za-z0-9._-] (letters, digits, dot, dash, underscore only) or \"\" to clear it",
+                StatusCodes.Status400BadRequest);
+        }
+
+        if (updateRequest.SshPort is { } updateSshPortCandidate && (updateSshPortCandidate < 1 || updateSshPortCandidate > 65535))
+        {
+            return UpdateTargetFailure("sshPort must be between 1 and 65535", StatusCodes.Status400BadRequest);
         }
 
         // Task #61: an explicitly provided type must be one of the known families (null/absent
@@ -472,6 +519,19 @@ public static class RouterTargetsEndpoints
             updated.PowerWatts = powerWatts;
         }
 
+        // Task #143: ssh credential (null/absent = no change; ""/blank clears the user; a
+        // non-blank value was validated above; sshPort copied verbatim when present —
+        // clearing a set port = edit config/config.json, the documented powerWatts precedent).
+        if (updateRequest.SshUser is { } updateSshUser)
+        {
+            updated.SshUser = string.IsNullOrWhiteSpace(updateSshUser) ? null : updateSshUser;
+        }
+
+        if (updateRequest.SshPort is { } updateSshPort)
+        {
+            updated.SshPort = updateSshPort;
+        }
+
         var newTargets = effectiveTargets.ToList();
         newTargets[index] = updated;
 
@@ -504,7 +564,9 @@ public static class RouterTargetsEndpoints
                     ? updatedModels.Select(m => new TargetModelDto(m.Name, m.ContextLength, m.Quantization)).ToList()
                     : null,
                 !string.IsNullOrWhiteSpace(updated.ApiKey),
-                updated.PowerWatts)),
+                updated.PowerWatts,
+                updated.SshUser,
+                updated.SshPort)),
             OllamaRouterJsonSerializerContext.Default.UpdateTargetResponse);
     }
 
@@ -737,6 +799,8 @@ public static class RouterTargetsEndpoints
         ApiKey = target.ApiKey,
         Provider = target.Provider,
         PowerWatts = target.PowerWatts,
+        SshUser = target.SshUser,
+        SshPort = target.SshPort,
         Models = target.Models is { Count: > 0 } existing
             ? existing.Select(m => new TargetModelConfig
                 {

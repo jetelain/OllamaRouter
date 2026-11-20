@@ -49,8 +49,11 @@ public sealed record NodeHardwareProfile(
 
 /// <summary>
 /// One node row of <c>GET /api/router/fleet/hardware</c>: the target's canonical name,
-/// the profile provenance ("local"/"peer"/"persisted"/"manual"/"none"), the profile
-/// (null when nothing is known and no probe succeeded) and the reachability flag.
+/// the profile provenance ("local" = the daemon's own local probe result, "peer" = a live
+/// peer-daemon probe, "persisted" = a stored profile (manual/ssh/local) served from disk,
+/// "ssh" = the daemon-side explicit ssh probe of task #143, "manual" = an externally
+/// pushed profile, "none" = nothing known), the profile (null when nothing is known and
+/// no probe succeeded) and the reachability flag.
 /// </summary>
 public sealed record FleetHardwareNode(
     [property: JsonPropertyName("target")] string Target,
@@ -68,7 +71,8 @@ public sealed record RouterFleetHardwareResponse(
 /// <summary>
 /// Persisted wrapper of one stored fleet hardware profile in <c>targets-hardware.json</c>:
 /// the profile itself, the last update timestamp (ISO-8601) and the provenance
-/// ("manual" for externally pushed profiles, "peer" for peer-daemon refreshes).
+/// ("manual" for externally pushed profiles, "peer" for peer-daemon refreshes,
+/// "local"/"ssh" for the daemon-side explicit probes of task #143).
 /// </summary>
 public sealed record HardwareProfileState(
     [property: JsonPropertyName("profile")] NodeHardwareProfile Profile,

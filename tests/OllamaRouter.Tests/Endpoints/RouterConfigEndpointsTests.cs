@@ -649,6 +649,84 @@ public class RouterConfigEndpointsTests
         Assert.False(persisted.ContainsKey("PowerWatts")); // no key on disk when unset
     }
 
+    // ------------------------------------------------------------------
+    //  Task #143: per-target sshUser / sshPort (config exposure + persistence)
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task ConfigEndpoint_ExposeSshUserAndSshPort_PresentWhenSet_NullWhenUnset()
+    {
+        var options = SingleTargetOptions();
+        options.Targets[0]!.SshUser = "ops";
+        options.Targets[0]!.SshPort = 2222;
+        // A second target WITHOUT ssh credentials (not ssh-probeable by the daemon).
+        options.Targets.Add(new OllamaTargetOptions
+        {
+            Name = "Bare",
+            Url = "http://192.168.1.107:11435"
+        });
+        await using var harness = await CreateTestAppAsync(options);
+
+        using var response = await harness.Client.GetAsync("/api/router/config");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var raw = await response.Content.ReadAsStringAsync();
+        response.Dispose();
+        var json = (JsonNode.Parse(raw)! as JsonObject)!;
+        var targets = (json["targets"]! as JsonArray)!;
+
+        // The App UI can know which rows are ssh-probeable from this response.
+        var withSsh = targets.OfType<JsonObject>().Single(t => t!["name"]!.GetValue<string>() == "Local");
+        Assert.Equal("ops", withSsh["sshUser"]!.GetValue<string>());
+        Assert.Equal(2222, withSsh["sshPort"]!.GetValue<int>());
+
+        var withoutSsh = targets.OfType<JsonObject>().Single(t => t!["name"]!.GetValue<string>() == "Bare");
+        Assert.Null(withoutSsh["sshUser"]);  // emitted as JSON null (unset)
+        Assert.Null(withoutSsh["sshPort"]);
+    }
+
+    [Fact]
+    public async Task PostTarget_SshCredentials_PersistedEchoedAndApplied_NoKeysOnDiskWhenUnset()
+    {
+        var options = SingleTargetOptions();
+        await using var harness = await CreateTestAppAsync(options);
+
+        var json = (await PostJsonAsync(
+            harness.Client,
+            "/api/router/targets",
+            "{\"name\":\"Laptop\",\"url\":\"http://192.168.1.105:11435\",\"testConnectionFirst\":false,\"sshUser\":\"ops\",\"sshPort\":2222}")) as JsonObject;
+        Assert.NotNull(json);
+        Assert.True(json!["success"]!.GetValue<bool>());
+
+        // Echoed in the created-target DTO and applied to the live in-memory options.
+        var target = (json["target"]! as JsonObject)!;
+        Assert.Equal("ops", target["sshUser"]!.GetValue<string>());
+        Assert.Equal(2222, target["sshPort"]!.GetValue<int>());
+        var live = harness.Options.CurrentValue.Targets.Single(t => t.Name == "Laptop");
+        Assert.Equal("ops", live.SshUser);
+        Assert.Equal(2222, live.SshPort);
+
+        // Persisted under the documented PascalCase keys (config/config.json round-trip).
+        var file = ReadConfigFile(harness);
+        var persisted = ((file["OllamaRouter"]!["Targets"]! as JsonArray)!.OfType<JsonObject>())
+            .Single(t => t!["Name"]!.GetValue<string>() == "Laptop");
+        Assert.Equal("ops", persisted["SshUser"]!.GetValue<string>());
+        Assert.Equal(2222, persisted["SshPort"]!.GetValue<int>());
+
+        // A target WITHOUT ssh credentials: JSON null in the echo, NO keys on disk.
+        var plain = (await PostJsonAsync(
+            harness.Client,
+            "/api/router/targets",
+            "{\"name\":\"Bare\",\"url\":\"http://192.168.1.107:11435\",\"testConnectionFirst\":false}")) as JsonObject;
+        Assert.NotNull(plain);
+        Assert.True(plain!["success"]!.GetValue<bool>());
+        var plainTarget = (plain["target"]! as JsonObject)!;
+        Assert.Null(plainTarget["sshUser"]);
+        var persistedBare = ((ReadConfigFile(harness)["OllamaRouter"]!["Targets"]! as JsonArray)!.OfType<JsonObject>())
+            .Single(t => t!["Name"]!.GetValue<string>() == "Bare");
+        Assert.False(persistedBare.ContainsKey("SshUser"));
+        Assert.False(persistedBare.ContainsKey("SshPort"));
+    }
+
     [Fact]
     public async Task PutTarget_PowerWatts_AppliedEchoed_OmittedNoChange_Negative400()
     {

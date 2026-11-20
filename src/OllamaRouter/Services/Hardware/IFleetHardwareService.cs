@@ -35,4 +35,18 @@ public interface IFleetHardwareService
     /// Manual entries are authoritative: peer refresh must never overwrite them.
     /// </summary>
     Task<bool> UpsertProfileAsync(string targetName, NodeHardwareProfile profile, CancellationToken ct = default);
+    /// <summary>
+    /// Stores the digest result of an EXPLICIT daemon-side hardware probe (task #143
+    /// <c>POST /api/router/fleet/hardware/{targetName}/probe</c>) with the given provenance
+    /// label (<c>"local"</c> for the local bash probe, <c>"ssh"</c> for the ssh probe) and
+    /// persists it. An explicit probe is AUTHORITATIVE: it REPLACES whatever is stored for
+    /// the target, including a <c>"manual"</c> profile (unlike the automatic peer refresh,
+    /// which never overwrites manual entries). Returns false when the target name is not a
+    /// known fleet target (case-insensitive).
+    /// </summary>
+    Task<bool> StoreProbeProfileAsync(
+        string targetName,
+        NodeHardwareProfile profile,
+        string source,
+        CancellationToken cancellationToken = default);
 }

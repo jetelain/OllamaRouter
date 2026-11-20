@@ -29,11 +29,11 @@ namespace OllamaRouter.Endpoints;
 /// <c>HttpJsonOptions</c>) and is served at exactly <c>GET /api/router/openapi.json</c>
 /// (document name <see cref="DocumentName"/> + the <c>{documentName}</c> route parameter).
 /// <para>
-/// Scope: the 36 <c>/api/router/*</c> management operations ONLY (monitor, Ollama-compatible
+/// Scope: the 37 <c>/api/router/*</c> management operations ONLY (monitor, Ollama-compatible
 /// hybrid and YARP routes are excluded via <see cref="OpenApiOptions.ShouldInclude"/>, and the
 /// document endpoint's own template route is dropped). The security requirement is derived by
 /// calling the production <see cref="ApiSecurityPolicy.IsProtectedRoute"/> on each route
-/// template, so the document can never drift from the enforced set (19 protected operations
+/// template, so the document can never drift from the enforced set (20 protected operations
 /// in default mode; <c>ApiSecurity.RequireKeyForAllEndpoints: true</c> protects every route).
 /// </para>
 /// <para>
@@ -236,7 +236,7 @@ internal static class RouterOpenApiDocumentTransformer
         }
 
         // Security: derived from the PRODUCTION policy called with the route template (the
-        // single- and two-segment logic match their templates; exactly 19 of the 36 operations
+        // single- and two-segment logic match their templates; exactly 20 of the 37 operations
         // match). A 401 response is documented on exactly those operations.
         if (ApiSecurityPolicy.IsProtectedRoute(method, path))
         {
@@ -317,6 +317,15 @@ internal static class RouterOpenApiDocumentTransformer
                     ("200", typeof(NodeHardwareProfile), "The stored profile."),
                     ("400", typeof(OllamaErrorResponse), "Invalid or missing hardware profile body (nodeName required)."),
                     ("404", typeof(OllamaErrorResponse), "target not found: {targetName}")
+                ]),
+
+            ["POST /api/router/fleet/hardware/*/probe"] = new(typeof(NodeHardwareProfile),
+                responses:
+                [
+                    ("200", typeof(NodeHardwareProfile), "The stored profile (provenance \"local\" for the local bash probe, \"ssh\" for the remote ssh probe) — the explicit probe is authoritative and REPLACES the stored profile (including \"manual\" ones)."),
+                    ("400", typeof(OllamaErrorResponse), "Remote target without a configured sshUser (set it via PUT /api/router/targets/{targetName} before probing)."),
+                    ("404", typeof(OllamaErrorResponse), "target not found: {targetName}"),
+                    ("502", typeof(OllamaErrorResponse), "Probe failure (launch failure, unreachable host, ssh auth failure, timeout, non-Linux remote or missing marker frame — the stored profile is untouched).")
                 ]),
 
             ["POST /api/router/benchmark"] = new(requestBodyType: typeof(RouterBenchmarkRequest),

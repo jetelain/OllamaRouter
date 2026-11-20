@@ -74,6 +74,9 @@ public sealed class RouterRecommendationEndpointsTests : IDisposable
             Task.FromResult<IReadOnlyList<FleetHardwareNode>>([]);
         public Task<bool> UpsertProfileAsync(string targetName, NodeHardwareProfile profile, CancellationToken ct = default) =>
             Task.FromResult(false);
+        public Task<bool> StoreProbeProfileAsync(
+            string targetName, NodeHardwareProfile profile, string source, CancellationToken cancellationToken = default) =>
+            Task.FromResult(false);
     }
 
     private readonly string _stateDirectory;

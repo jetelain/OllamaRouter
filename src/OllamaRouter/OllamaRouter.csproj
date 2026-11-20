@@ -105,5 +105,10 @@
   <ItemGroup>
     <!-- Monitor page served verbatim by GET /monitor (OllamaRouter.Endpoints.monitor.html). -->
     <EmbeddedResource Include="Endpoints\monitor.html" />
+    <!-- Task #143: the single embedded bash probe script (the ONLY Linux hardware
+         collector; run locally via `bash` over stdin, remotely base64-over-ssh). Read
+         at runtime via Assembly.GetManifestResourceStream (AOT-safe; no build-output
+         file access). -->
+    <EmbeddedResource Include="Services\Hardware\linux-hardware-probe.sh" />
   </ItemGroup>
 </Project>

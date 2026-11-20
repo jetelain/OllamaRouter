@@ -15,7 +15,6 @@ namespace OllamaRouter.Services.Hardware;
 /// </summary>
 public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
 {
-    private const int DmidecodeTimeoutMs = 5000;
     private const int WmicTimeoutMs = 5000;
     private const int PowerShellTimeoutMs = 15000;
     private const int SysctlTimeoutMs = 2000;
@@ -23,31 +22,31 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
 
     private readonly IProcessRunner _processRunner;
     private readonly IGpuVramProvider _gpuVramProvider;
+    private readonly LinuxHardwareProbeExecutor _probeExecutor;
     private readonly ILogger<LocalHardwareProfileProvider> _logger;
     private readonly Func<NodeHardwareProfile>? _testOverride;
-    private readonly Func<string, string?>? _memInfoReader;
     private readonly Func<Task<NodeHardwareProfile>> _probe;
     private Task<NodeHardwareProfile>? _cached;
     private readonly object _cacheGate = new();
 
     /// <summary>
     /// Creates the provider. <paramref name="testOverride"/> short-circuits the probe
-    /// entirely (tests inject a canned profile); <paramref name="memInfoReader"/>
-    /// overrides the <c>/proc/meminfo</c> file read (tests inject canned content,
-    /// null = the real file read).
+    /// entirely (tests inject a canned profile); <paramref name="probeExecutor"/> runs the
+    /// single embedded bash probe script on Linux (task #143 — the ONLY Linux collector;
+    /// local runs feed it over stdin, and its C# digest is the ONLY parser).
     /// </summary>
     internal LocalHardwareProfileProvider(
         IProcessRunner processRunner,
         IGpuVramProvider gpuVramProvider,
         ILogger<LocalHardwareProfileProvider> logger,
-        Func<NodeHardwareProfile>? testOverride = null,
-        Func<string, string?>? memInfoReader = null)
+        LinuxHardwareProbeExecutor probeExecutor,
+        Func<NodeHardwareProfile>? testOverride = null)
     {
         _processRunner = processRunner ?? throw new ArgumentNullException(nameof(processRunner));
         _gpuVramProvider = gpuVramProvider ?? throw new ArgumentNullException(nameof(gpuVramProvider));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _probeExecutor = probeExecutor ?? throw new ArgumentNullException(nameof(probeExecutor));
         _testOverride = testOverride;
-        _memInfoReader = memInfoReader;
         _probe = _testOverride is not null
             ? () => Task.FromResult(_testOverride())
             : () => ProbeAsync();
@@ -74,6 +73,29 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
             : "unknown";
         var architecture = RuntimeInformation.ProcessArchitecture.ToString().ToLowerInvariant();
 
+        if (OperatingSystem.IsLinux())
+        {
+            // Task #143: the embedded bash probe script (the ONLY Linux collector — fed over
+            // stdin, no temp file) + the single C# digest (the ONLY parser/classification/
+            // derivation engine — LinuxHardwareDigest). No direct /proc file reads and no
+            // per-tool C# probing on Linux anymore.
+            var linux = await _probeExecutor.ProbeLocalAsync().ConfigureAwait(false);
+            if (linux.Profile is { } profile)
+            {
+                return profile;
+            }
+
+            // Fail-soft contract: a failed probe still yields a profile (unknowns/zeros,
+            // nodeName = this machine). The bash script is the only Linux collector, so NO
+            // per-tool C# fallback probe runs on the degraded path.
+            _logger.LogWarning(
+                "The Linux hardware probe script failed ({Error}); serving the degraded unknown profile.",
+                linux.Error);
+            return BuildProfile(
+                os, architecture, string.Empty, 0, SystemRamType.Unknown, 0,
+                Array.Empty<GpuDeviceProfile>(), Environment.MachineName);
+        }
+
         string cpuBrand = "";
         long systemRamMB = 0;
         SystemRamType ramType = SystemRamType.Unknown;
@@ -86,13 +108,6 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
             {
                 cpuBrand = ProbeWindowsCpuBrand();
                 (systemRamMB, ramType, channels) = ProbeWindowsRam();
-                gpus = ProbeDiscreteGpus();
-            }
-            else if (OperatingSystem.IsLinux())
-            {
-                cpuBrand = ProbeLinuxCpuBrand();
-                systemRamMB = ProbeLinuxRamMB();
-                (ramType, channels) = ProbeLinuxRamType();
                 gpus = ProbeDiscreteGpus();
             }
             else if (OperatingSystem.IsMacOS())
@@ -121,11 +136,28 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
 
         if (gpus.Count == 0)
         {
-            // The vendor CLI snapshot is the last-resort GPU identity source on any OS.
+            // The vendor CLI snapshot is the last-resort GPU identity source (non-Linux).
             gpus = await ProbeVendorGpuSnapshotAsync();
         }
 
-        var nodeName = Environment.MachineName;
+        return BuildProfile(os, architecture, cpuBrand, systemRamMB, ramType, channels, gpus, Environment.MachineName);
+    }
+
+    /// <summary>
+    /// The shared final derivation of a profile: the three <see cref="HardwareMetrics"/> calls
+    /// (unified-memory detection, fast-memory total, effective bandwidth) in ONE place so
+    /// every branch (Windows / macOS / unknown-OS / degraded Linux) computes identical semantics.
+    /// </summary>
+    private static NodeHardwareProfile BuildProfile(
+        string os,
+        string architecture,
+        string cpuBrand,
+        long systemRamMB,
+        SystemRamType ramType,
+        int channels,
+        IReadOnlyList<GpuDeviceProfile> gpus,
+        string nodeName)
+    {
         var isUnified = HardwareMetrics.DetectUnifiedMemory(os, architecture, cpuBrand, ramType, gpus);
         var totalFastMemoryMB = HardwareMetrics.ComputeTotalFastMemoryMB(isUnified, systemRamMB, gpus);
         var bandwidth = HardwareMetrics.ComputeEffectiveBandwidthGBs(isUnified, ramType, cpuBrand, channels, gpus);
@@ -200,7 +232,7 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
         return name.Trim();
     }
 
-    private static string CleanGpuModelName(string vendor, string rawName)
+    internal static string CleanGpuModelName(string vendor, string rawName)
     {
         var name = rawName.Trim();
         while (name.StartsWith("NVIDIA ", StringComparison.OrdinalIgnoreCase))
@@ -212,6 +244,86 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
             name = name[4..].Trim();
         }
         return name;
+    }
+
+    // ------------------------------------------------------------------
+    //  dmidecode memory parsing (shared by the Windows branch AND the task #143 Linux
+    //  digest of the embedded probe script — the single source of the RAM type / channel
+    //  semantics)
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// Parses <c>dmidecode -t memory</c> output: the RAM type from the first populated
+    /// memory device ("Type: DDR5" etc.) and the channel count as the number of distinct
+    /// per-device "Locator:" bank prefixes (DIMM A1 / DIMM A2 → bank A). The array-level
+    /// "Bank Locator:" lines are ignored (they repeat per device, not per channel).
+    /// </summary>
+    internal static (SystemRamType Type, int Channels) ParseDmidecodeMemory(string output)
+    {
+        SystemRamType type = SystemRamType.Unknown;
+        var banks = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var inDevice = false;
+
+        foreach (var rawLine in output.Split('\n'))
+        {
+            var line = rawLine.Trim();
+            if (line.StartsWith("Memory Device", StringComparison.OrdinalIgnoreCase))
+            {
+                inDevice = true;
+                continue;
+            }
+
+            if (!inDevice)
+            {
+                continue;
+            }
+
+            if (line.StartsWith("Type:", StringComparison.OrdinalIgnoreCase))
+            {
+                var value = line.AsSpan(5).ToString().Trim();
+                if (value.Length > 0 && !string.Equals(value, "Unknown", StringComparison.OrdinalIgnoreCase))
+                {
+                    type = ParseDmidecodeType(value);
+                }
+            }
+            else if (line.StartsWith("Locator:", StringComparison.OrdinalIgnoreCase))
+            {
+                var value = line.AsSpan(8).ToString().Trim();
+                if (value.Length > 0 && !string.Equals(value, "Unknown", StringComparison.OrdinalIgnoreCase))
+                {
+                    var digitStart = value.Length;
+                    while (digitStart > 0 && char.IsDigit(value[digitStart - 1]))
+                    {
+                        digitStart--;
+                    }
+
+                    if (digitStart > 0)
+                    {
+                        banks.Add(value[..digitStart]);
+                    }
+                }
+            }
+            else if (line.StartsWith("Size:", StringComparison.OrdinalIgnoreCase) &&
+                     string.Equals(line.AsSpan(5).ToString().Trim(), "No Module Installed", StringComparison.OrdinalIgnoreCase))
+            {
+                inDevice = false;
+            }
+        }
+
+        return (type, banks.Count);
+    }
+
+    /// <summary>
+    /// Maps a dmidecode "Type:" line value (e.g. "DDR5", "LPDDR5", "DDR4") to the RAM tier.
+    /// </summary>
+    internal static SystemRamType ParseDmidecodeType(string value)
+    {
+        var v = value.Trim().ToUpperInvariant();
+        return v.Contains("LPDDR5") ? SystemRamType.LpDdr5X
+            : v.Contains("DDR5") ? SystemRamType.Ddr5
+            : v.Contains("DDR4") ? SystemRamType.Ddr4
+            : v.Contains("DDR3") ? SystemRamType.Ddr3
+            : SystemRamType.Unknown;
     }
 
     // ------------------------------------------------------------------
@@ -451,132 +563,9 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
         Math.Max((int)a, (int)b) == (int)a ? a : b;
 
     // ------------------------------------------------------------------
-    //  Linux probes (direct /proc/meminfo read + dmidecode + vendor CLIs)
+    //  Windows discrete-GPU probes (nvidia-smi / rocm-smi; Windows branch only since
+    //  task #143 — on Linux the embedded bash probe script is the single collector)
     // ------------------------------------------------------------------
-
-    private long ProbeLinuxRamMB()
-    {
-        try
-        {
-            var content = _memInfoReader is not null
-                ? _memInfoReader("/proc/meminfo")
-                : File.Exists("/proc/meminfo") ? File.ReadAllText("/proc/meminfo") : null;
-            if (content is null)
-            {
-                return 0;
-            }
-
-            foreach (var rawLine in content.Split('\n'))
-            {
-                var line = rawLine.TrimStart();
-                if (line.StartsWith("MemTotal:", StringComparison.OrdinalIgnoreCase))
-                {
-                    var fields = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                    if (fields.Length >= 2 && long.TryParse(fields[1], out var kb))
-                    {
-                        return Math.Max(0, kb / 1024);
-                    }
-                }
-            }
-        }
-        catch
-        {
-            // Fail-soft: unknown RAM size.
-        }
-
-        return 0;
-    }
-
-    private (SystemRamType, int) ProbeLinuxRamType()
-    {
-        try
-        {
-            var result = _processRunner.Run("dmidecode", "-t memory", DmidecodeTimeoutMs);
-            if (result.Succeeded)
-            {
-                return ParseDmidecodeMemory(result.StdOut);
-            }
-        }
-        catch
-        {
-            // Fail-soft: unknown RAM type.
-        }
-
-        return (SystemRamType.Unknown, 0);
-    }
-
-    /// <summary>
-    /// Parses <c>dmidecode -t memory</c> output: the RAM type from the first populated
-    /// memory device ("Type: DDR5" etc.) and the channel count as the number of distinct
-    /// per-device "Locator:" bank prefixes (DIMM A1 / DIMM A2 → bank A). The array-level
-    /// "Bank Locator:" lines are ignored (they repeat per device, not per channel).
-    /// </summary>
-    internal static (SystemRamType Type, int Channels) ParseDmidecodeMemory(string output)
-    {
-        SystemRamType type = SystemRamType.Unknown;
-        var banks = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var inDevice = false;
-
-        foreach (var rawLine in output.Split('\n'))
-        {
-            var line = rawLine.Trim();
-            if (line.StartsWith("Memory Device", StringComparison.OrdinalIgnoreCase))
-            {
-                inDevice = true;
-                continue;
-            }
-
-            if (!inDevice)
-            {
-                continue;
-            }
-
-            if (line.StartsWith("Type:", StringComparison.OrdinalIgnoreCase))
-            {
-                var value = line.AsSpan(5).ToString().Trim();
-                if (value.Length > 0 && !string.Equals(value, "Unknown", StringComparison.OrdinalIgnoreCase))
-                {
-                    type = ParseDmidecodeType(value);
-                }
-            }
-            else if (line.StartsWith("Locator:", StringComparison.OrdinalIgnoreCase))
-            {
-                var value = line.AsSpan(8).ToString().Trim();
-                if (value.Length > 0 && !string.Equals(value, "Unknown", StringComparison.OrdinalIgnoreCase))
-                {
-                    var digitStart = value.Length;
-                    while (digitStart > 0 && char.IsDigit(value[digitStart - 1]))
-                    {
-                        digitStart--;
-                    }
-
-                    if (digitStart > 0)
-                    {
-                        banks.Add(value[..digitStart]);
-                    }
-                }
-            }
-            else if (line.StartsWith("Size:", StringComparison.OrdinalIgnoreCase) &&
-                     string.Equals(line.AsSpan(5).ToString().Trim(), "No Module Installed", StringComparison.OrdinalIgnoreCase))
-            {
-                inDevice = false;
-            }
-        }
-
-        return (type, banks.Count);
-    }
-
-    internal static SystemRamType ParseDmidecodeType(string value)
-    {
-        var v = value.Trim().ToUpperInvariant();
-        return v.Contains("LPDDR5") ? SystemRamType.LpDdr5X
-            : v.Contains("DDR5") ? SystemRamType.Ddr5
-            : v.Contains("DDR4") ? SystemRamType.Ddr4
-            : v.Contains("DDR3") ? SystemRamType.Ddr3
-            : SystemRamType.Unknown;
-    }
-
-    private IReadOnlyList<GpuDeviceProfile> ProbeLinuxGpus() => ProbeDiscreteGpus();
 
     private IReadOnlyList<GpuDeviceProfile> ProbeDiscreteGpus()
     {
@@ -692,7 +681,7 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
         return ("Unknown", 0);
     }
 
-    private static int ParseLeadingInt(string value)
+    internal static int ParseLeadingInt(string value)
     {
         var trimmed = value.Trim();
         var numberEnd = 0;
@@ -819,33 +808,6 @@ public sealed class LocalHardwareProfileProvider : IHardwareProfileProvider
                 if (!string.IsNullOrWhiteSpace(brand))
                 {
                     return brand.Trim();
-                }
-            }
-        }
-        catch
-        {
-            // Fail-soft
-        }
-
-        return "";
-    }
-
-    private static string ProbeLinuxCpuBrand()
-    {
-        try
-        {
-            if (File.Exists("/proc/cpuinfo"))
-            {
-                foreach (var line in File.ReadLines("/proc/cpuinfo"))
-                {
-                    if (line.StartsWith("model name", StringComparison.OrdinalIgnoreCase))
-                    {
-                        var colon = line.IndexOf(':');
-                        if (colon > 0)
-                        {
-                            return line[(colon + 1)..].Trim();
-                        }
-                    }
                 }
             }
         }

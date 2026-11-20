@@ -36,6 +36,12 @@ public class ApiSecurityPolicyTests
     // Task #126: the destructive model uninstall (deletes model files from node disks).
     [InlineData("POST", "/api/router/models/uninstall")]
     [InlineData("POST", "/api/router/models/uninstall/")] // trailing slash (endpoint-routing semantics)
+    // Task #143: the daemon-side explicit hardware probe (admin operation: it launches an
+    // outbound ssh to remote targets).
+    [InlineData("POST", "/api/router/fleet/hardware/{targetName}/probe")]
+    [InlineData("POST", "/api/router/fleet/hardware/Peer/probe")]
+    [InlineData("post", "/Api/Router/Fleet/Hardware/PEER/PROBE")] // case-insensitive path + method
+    [InlineData("POST", "/api/router/fleet/hardware/Peer/probe/")] // trailing slash (endpoint-routing semantics)
     [InlineData("post", "/Api/Router/Models/UNINSTALL")] // case-insensitive path + method
     public void IsProtectedRoute_DefaultSet_IncludesConfigAffectingRoutes(string method, string path)
     {
@@ -147,6 +153,14 @@ public class ApiSecurityPolicyTests
     [InlineData("POST", "/api/router/fleet/reset-streak")] // wrong path (no -s)
     [InlineData("GET", "/api/router/fleet/reset-streaks")] // wrong method on the #95 fleet route
     [InlineData("DELETE", "/api/router/fleet/reset-streaks")] // wrong method on the #95 fleet route
+    // Task #143: the probe template is POST-only; other methods and non-"probe" second
+    // segments stay open (the single-segment PUT hardware rule is untouched).
+    [InlineData("GET", "/api/router/fleet/hardware/Peer/probe")]
+    [InlineData("PUT", "/api/router/fleet/hardware/Peer/probe")]
+    [InlineData("DELETE", "/api/router/fleet/hardware/Peer/probe")]
+    [InlineData("POST", "/api/router/fleet/hardware/Peer/reprobe")] // wrong two-segment suffix
+    [InlineData("POST", "/api/router/fleet/hardware/probe")] // one segment: no two-segment match
+    [InlineData("POST", "/api/router/fleet/hardware/Peer/probe/deeper")] // three segments: no two-segment match
     [InlineData("GET", "/api/router/unknown")]
     [InlineData("GET", "/api/router/admin/shutdown")] // wrong method on the admin route
     [InlineData("POST", "/api/router/admin/other")] // unknown path under the admin prefix

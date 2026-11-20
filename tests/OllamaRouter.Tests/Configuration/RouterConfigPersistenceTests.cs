@@ -216,8 +216,81 @@ public class RouterConfigPersistenceTests
     }
 
     // ------------------------------------------------------------------
+    //  Task #143: SshUser / SshPort persistence (PowerWatts pattern: the key is present
+    //  when set, REMOVED when null — a cleared field never lingers on disk)
+    // ------------------------------------------------------------------
+
+    private static List<OllamaTargetOptions> SshTargets(string name, string? sshUser, int? sshPort) =>
+    [
+        new()
+        {
+            Name = name,
+            Url = $"http://192.168.1.{10 + name.Length}:11435",
+            SshUser = sshUser,
+            SshPort = sshPort
+        }
+    ];
+
+    [Fact]
+    public async Task PersistTargets_SshCredentials_WrittenToConfigJson_AndRemovedWhenNull()
+    {
+        await using var harness = await CreateHarnessAsync(new FakeCredentialStore());
+
+        // SET: the keys are written to config.json under the documented PascalCase names.
+        var first = await harness.Persistence.PersistTargetsAsync(SshTargets("Gpu", "ops", 2222));
+        Assert.True(first.Success, first.Error);
+        var node = FirstTargetNode(harness.Persistence);
+        Assert.Equal("ops", node["SshUser"]!.GetValue<string>());
+        Assert.Equal(2222, node["SshPort"]!.GetValue<int>());
+
+        // CLEARED (null): the keys are removed from disk — a cleared field never lingers.
+        var second = await harness.Persistence.PersistTargetsAsync(SshTargets("Gpu", null, null));
+        Assert.True(second.Success, second.Error);
+        var cleared = FirstTargetNode(harness.Persistence);
+        Assert.False(cleared.ContainsKey("SshUser"));
+        Assert.False(cleared.ContainsKey("SshPort"));
+    }
+
+    [Fact]
+    public async Task PersistTargets_UnrelatedMerge_PreservesSshCredentialsOnDisk()
+    {
+        await using var harness = await CreateHarnessAsync(new FakeCredentialStore());
+
+        // Seed: one ssh-probeable target + one bare target.
+        var seeded = await harness.Persistence.PersistTargetsAsync(
+            SshTargets("Gpu", "ops", 2222)
+                .Concat(new List<OllamaTargetOptions>
+                {
+                    new() { Name = "Bare", Url = "http://192.168.1.20:11435" }
+                }).ToList());
+        Assert.True(seeded.Success, seeded.Error);
+
+        // An unrelated merge (enabling "Bare") must PRESERVE Gpu's ssh credentials verbatim
+        // (ApplyHeterogeneousTargetFields keeps untouched fields from the on-disk node).
+        var merge = new List<OllamaTargetOptions>(harness.Options.CurrentValue.Targets);
+        merge.Single(t => t.Name == "Bare").Enabled = true;
+        var result = await harness.Persistence.PersistTargetsAsync(merge);
+        Assert.True(result.Success, result.Error);
+
+        var gpuNode = TargetNode(harness.Persistence, "Gpu");
+        Assert.Equal("ops", gpuNode["SshUser"]!.GetValue<string>());
+        Assert.Equal(2222, gpuNode["SshPort"]!.GetValue<int>());
+        var bareNode = TargetNode(harness.Persistence, "Bare");
+        Assert.True(bareNode["Enabled"]!.GetValue<bool>());
+        Assert.False(bareNode.ContainsKey("SshUser"));
+        Assert.False(bareNode.ContainsKey("SshPort"));
+    }
+
+    // ------------------------------------------------------------------
     //  Helpers
     // ------------------------------------------------------------------
+
+    private static JsonObject TargetNode(IRouterConfigPersistence persistence, string name)
+    {
+        var root = (JsonObject)JsonNode.Parse(File.ReadAllText(persistence.ConfigFilePath))!;
+        return ((JsonArray)root["OllamaRouter"]!["Targets"]!).OfType<JsonObject>()
+            .Single(t => t!["Name"]!.GetValue<string>() == name);
+    }
 
     private static List<OllamaTargetOptions> OpenAiTargets(string name, string? apiKey) =>
     [

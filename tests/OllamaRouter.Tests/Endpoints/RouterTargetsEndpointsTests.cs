@@ -767,4 +767,156 @@ public class RouterTargetsKeyringEndpointsTests
         Assert.Equal("keyring:groq", targetNode["ApiKey"]!.GetValue<string>());
         Assert.DoesNotContain("sk-new", fileContent);
     }
+
+    // ------------------------------------------------------------------
+    //  Task #143: the sshUser / sshPort wire fields (add / update / persist / validate)
+    // ------------------------------------------------------------------
+
+    private static OllamaTargetOptions SshProbeableTarget() => new()
+    {
+        Name = "gpu",
+        Url = "http://192.168.1.50:11434",
+        SshUser = "ops",
+        SshPort = 2222
+    };
+
+    [Fact]
+    public async Task AddTarget_WithSshCredentials_PersistsBoth_AndEchoesThem()
+    {
+        var store = new FakeCredentialStore { IsAvailable = true };
+        await using var harness = await CreateKeyringHarnessAsync(store);
+
+        using var response = await harness.PostAsync("/api/router/targets", """
+            {
+              "name": "gpu",
+              "url": "http://192.168.1.50:11434",
+              "testConnectionFirst": false,
+              "sshUser": "ops",
+              "sshPort": 2222
+            }
+            """);
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+
+        // The created-target echo carries the ssh fields...
+        var echoed = JsonNode.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Equal("ops", echoed!["target"]!["sshUser"]!.GetValue<string>());
+        Assert.Equal(2222, echoed["target"]!["sshPort"]!.GetValue<int>());
+
+        // ...and config.json round-trips them.
+        var targetNode = (JsonObject)ReadTargetsNode(harness.ConfigPath)[0]!;
+        Assert.Equal("ops", targetNode["SshUser"]!.GetValue<string>());
+        Assert.Equal(2222, targetNode["SshPort"]!.GetValue<int>());
+    }
+
+    [Fact]
+    public async Task UpdateTarget_SshCredentials_RoundTripThroughConfigJson()
+    {
+        var store = new FakeCredentialStore { IsAvailable = true };
+        await using var harness = await CreateKeyringHarnessAsync(
+            store, new OllamaRouterOptions { Targets = [SshProbeableTarget()] });
+
+        using var response = await harness.PutAsync("/api/router/targets/gpu", """{ "sshUser": "root", "sshPort": 2223 }""");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var echoed = JsonNode.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Equal("root", echoed!["target"]!["sshUser"]!.GetValue<string>());
+        Assert.Equal(2223, echoed["target"]!["sshPort"]!.GetValue<int>());
+
+        var targetNode = (JsonObject)ReadTargetsNode(harness.ConfigPath)[0]!;
+        Assert.Equal("root", targetNode["SshUser"]!.GetValue<string>());
+        Assert.Equal(2223, targetNode["SshPort"]!.GetValue<int>());
+
+        // The boundary values are valid.
+        using var edge = await harness.PutAsync("/api/router/targets/gpu", """{ "sshPort": 65535 }""");
+        Assert.Equal(HttpStatusCode.OK, edge.StatusCode);
+        var edgeNode = (JsonObject)ReadTargetsNode(harness.ConfigPath)[0]!;
+        Assert.Equal(65535, edgeNode["SshPort"]!.GetValue<int>());
+    }
+
+    [Fact]
+    public async Task UpdateTarget_SshUserAbsentKeepsValue_EmptyStringClearsIt()
+    {
+        var store = new FakeCredentialStore { IsAvailable = true };
+        await using var harness = await CreateKeyringHarnessAsync(
+            store, new OllamaRouterOptions { Targets = [SshProbeableTarget()] });
+
+        // null/absent = NO CHANGE (the user survives an unrelated update; the port too).
+        using var untouched = await harness.PutAsync("/api/router/targets/gpu", """{ "maxParallel": 2 }""");
+        Assert.Equal(HttpStatusCode.OK, untouched.StatusCode);
+        var keptNode = (JsonObject)ReadTargetsNode(harness.ConfigPath)[0]!;
+        Assert.Equal("ops", keptNode["SshUser"]!.GetValue<string>());
+        Assert.Equal(2222, keptNode["SshPort"]!.GetValue<int>());
+
+        // "" CLEARS the user (the key never lingers on disk; the port is untouched —
+        // clearing a set port is a config.json edit, the documented powerWatts precedent).
+        using var cleared = await harness.PutAsync("/api/router/targets/gpu", """{ "sshUser": "" }""");
+        Assert.Equal(HttpStatusCode.OK, cleared.StatusCode);
+        var clearedNode = (JsonObject)ReadTargetsNode(harness.ConfigPath)[0]!;
+        Assert.Null(clearedNode["SshUser"]);
+        Assert.Equal(2222, clearedNode["SshPort"]!.GetValue<int>());
+        Assert.Null(JsonNode.Parse(await cleared.Content.ReadAsStringAsync())!["target"]!["sshUser"]);
+    }
+
+    [Theory]
+    [InlineData("""{ "sshUser": "bad user" }""")] // space
+    [InlineData("""{ "sshUser": "bad@user" }""")] // '@' would break the {user}@{host} interpolation
+    [InlineData("""{ "sshUser": "bad:user" }""")] // ':' is not a username character
+    [InlineData("""{ "sshUser": "user\\name" }""")] // path separator
+    [InlineData("""{ "sshUser": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" }""")] // 65 chars > 64
+    public async Task UpdateTarget_InvalidSshUser_Returns400_WithoutPersisting(string body)
+    {
+        var store = new FakeCredentialStore { IsAvailable = true };
+        await using var harness = await CreateKeyringHarnessAsync(
+            store, new OllamaRouterOptions { Targets = [SshProbeableTarget()] });
+
+        using var response = await harness.PutAsync("/api/router/targets/gpu", body);
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var node = JsonNode.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Contains("sshUser", node!["message"]!.ToString(), StringComparison.Ordinal);
+
+        // Validation is BEFORE the persist: nothing was written (no file was even created
+        // and the live in-memory options keep the stored user).
+        Assert.Equal("ops", harness.Options.CurrentValue.Targets.Single(t => t.Name == "gpu").SshUser);
+    }
+
+    [Theory]
+    [InlineData("""{ "sshPort": 0 }""")]
+    [InlineData("""{ "sshPort": 65536 }""")]
+    [InlineData("""{ "sshPort": -1 }""")]
+    public async Task UpdateTarget_InvalidSshPort_Returns400_WithoutPersisting(string body)
+    {
+        var store = new FakeCredentialStore { IsAvailable = true };
+        await using var harness = await CreateKeyringHarnessAsync(
+            store, new OllamaRouterOptions { Targets = [SshProbeableTarget()] });
+
+        using var response = await harness.PutAsync("/api/router/targets/gpu", body);
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var node = JsonNode.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Contains("sshPort", node!["message"]!.ToString(), StringComparison.Ordinal);
+
+        // Validation is BEFORE the persist: the live in-memory options keep the stored port.
+        Assert.Equal(2222, harness.Options.CurrentValue.Targets.Single(t => t.Name == "gpu").SshPort);
+    }
+
+    [Fact]
+    public async Task AddTarget_InvalidSshCredentials_Return400_NoTargetCreated()
+    {
+        var store = new FakeCredentialStore { IsAvailable = true };
+        await using var harness = await CreateKeyringHarnessAsync(store);
+
+        using var badUser = await harness.PostAsync("/api/router/targets", """
+            { "name": "gpu", "url": "http://192.168.1.50:11434", "testConnectionFirst": false, "sshUser": "bad user" }
+            """);
+        Assert.Equal(HttpStatusCode.BadRequest, badUser.StatusCode);
+
+        using var badPort = await harness.PostAsync("/api/router/targets", """
+            { "name": "gpu", "url": "http://192.168.1.50:11434", "testConnectionFirst": false, "sshPort": 70000 }
+            """);
+        Assert.Equal(HttpStatusCode.BadRequest, badPort.StatusCode);
+        var node = JsonNode.Parse(await badPort.Content.ReadAsStringAsync());
+        Assert.Contains("sshPort", node!["error"]!.ToString(), StringComparison.Ordinal);
+
+        // Neither attempt persisted: the live in-memory options remain empty (validation is
+        // BEFORE the target lookup/persist, so no file was written either).
+        Assert.Empty(harness.Options.CurrentValue.GetEffectiveTargets());
+    }
 }

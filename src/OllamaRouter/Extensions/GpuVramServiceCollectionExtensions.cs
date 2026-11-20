@@ -56,10 +56,17 @@ public static class GpuVramServiceCollectionExtensions
         // Local workstation hardware profiler (fail-soft OS probes; lazy single-flight cache).
         // Explicit factory: the optional test-injection Func<...> constructor parameters must NOT
         // be resolved from DI (NodeHardwareProfile is not a registered service).
+        // Task #143: the Linux branch runs the single embedded bash probe script through the
+        // dedicated executor (local = bash over stdin; the same executor serves the daemon-side
+        // ssh probe of the fleet hardware probe endpoint).
+        services.AddSingleton<LinuxHardwareProbeExecutor>(sp => new LinuxHardwareProbeExecutor(
+            sp.GetRequiredService<IProcessRunner>(),
+            sp.GetRequiredService<ILogger<LinuxHardwareProbeExecutor>>()));
         services.AddSingleton<IHardwareProfileProvider>(sp => new LocalHardwareProfileProvider(
             sp.GetRequiredService<IProcessRunner>(),
             sp.GetRequiredService<IGpuVramProvider>(),
-            sp.GetRequiredService<ILogger<LocalHardwareProfileProvider>>()));
+            sp.GetRequiredService<ILogger<LocalHardwareProfileProvider>>(),
+            sp.GetRequiredService<LinuxHardwareProbeExecutor>()));
         return services;
     }
 }

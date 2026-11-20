@@ -24,7 +24,10 @@ namespace OllamaRouter.Security;
 /// host is config-lifetime-affecting and must never be reachable keyless), plus the model
 /// uninstall action (task #126: <c>POST /api/router/models/uninstall</c> — DESTRUCTIVE AND
 /// PERSISTENT, like the target-DELETE admin actions: it removes multi-GB model files from
-/// fleet node disks permanently, so it must never be reachable keyless).
+/// fleet node disks permanently, so it must never be reachable keyless) and the daemon-side
+/// explicit hardware probe (task #143: <c>POST /api/router/fleet/hardware/{targetName}/probe</c>
+/// — like the hardware PUT it is an admin operation, with the extra property that it
+/// launches an outbound ssh to a remote target, so it must never be reachable keyless).
 /// </para>
 /// <para>
 /// Explicitly NOT in the default set: <c>POST /targets</c> (monitor availability toggle —
@@ -148,6 +151,14 @@ public static class ApiSecurityPolicy
             return method == "POST";
         }
 
+        // Daemon-side explicit hardware probe (task #143): fixed prefix + exactly TWO
+        // non-empty segments whose LAST is 'probe' (the single-segment PUT rule below is
+        // NOT loosened). Admin operation — it launches an outbound ssh — POST only.
+        if (TryGetProbeSegment(path))
+        {
+            return method == "POST";
+        }
+
         if (TryGetSingleSegment(path, "/api/router/fleet/hardware/", out _))
         {
             return method == "PUT";
@@ -198,5 +209,26 @@ public static class ApiSecurityPolicy
                slashIndex < rest.Length - 1 &&
                !rest[(slashIndex + 1)..].Contains('/') &&
                string.Equals(rest[(slashIndex + 1)..], "reset-streak", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// True when <paramref name="path"/> is <c>/api/router/fleet/hardware/{name}/probe</c>
+    /// (task #143): the fixed prefix (case-insensitive) followed by EXACTLY two non-empty
+    /// segments whose LAST equals <c>probe</c> (case-insensitive).
+    /// </summary>
+    private static bool TryGetProbeSegment(string path)
+    {
+        const string prefix = "/api/router/fleet/hardware/";
+        if (path.Length <= prefix.Length || !path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var rest = path[prefix.Length..];
+        var slashIndex = rest.IndexOf('/');
+        return slashIndex > 0 &&
+               slashIndex < rest.Length - 1 &&
+               !rest[(slashIndex + 1)..].Contains('/') &&
+               string.Equals(rest[(slashIndex + 1)..], "probe", StringComparison.OrdinalIgnoreCase);
     }
 }

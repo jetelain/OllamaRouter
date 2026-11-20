@@ -32,12 +32,26 @@ internal interface IProcessRunner
     /// for it to exit. On timeout the process is killed and partial output is returned with <see cref="ProcessResult.TimedOut"/> set.
     /// </summary>
     ProcessResult Run(string fileName, string arguments, int timeoutMs);
+
+    /// <summary>
+    /// Runs <paramref name="fileName"/> with <paramref name="arguments"/> and an optional
+    /// <paramref name="standardInput"/> payload written to the process stdin BEFORE the output
+    /// drain starts (the caller keeps payloads small enough for the pipe buffer, so the
+    /// synchronous write + drain order cannot deadlock). <c>null</c> stdin behaves exactly like
+    /// <see cref="Run(string, string, int)"/>.
+    /// </summary>
+    ProcessResult Run(string fileName, string arguments, int timeoutMs, string? standardInput);
 }
 
 /// <inheritdoc cref="IProcessRunner" />
 internal sealed class ProcessRunner : IProcessRunner
 {
-    public ProcessResult Run(string fileName, string arguments, int timeoutMs)
+    /// <inheritdoc />
+    public ProcessResult Run(string fileName, string arguments, int timeoutMs) =>
+        Run(fileName, arguments, timeoutMs, standardInput: null);
+
+    /// <inheritdoc />
+    public ProcessResult Run(string fileName, string arguments, int timeoutMs, string? standardInput)
     {
         System.Diagnostics.Process process;
         try
@@ -50,6 +64,7 @@ internal sealed class ProcessRunner : IProcessRunner
                     Arguments = arguments,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
+                    RedirectStandardInput = true,
                     UseShellExecute = false,
                     CreateNoWindow = true
                 }
@@ -59,6 +74,25 @@ internal sealed class ProcessRunner : IProcessRunner
         catch (Exception ex)
         {
             return ProcessResult.FailedToStart(ex.Message);
+        }
+
+        try
+        {
+            // Stdin is written BEFORE draining stdout/stderr: the payloads this daemon feeds
+            // are script-sized (<< the pipe buffer), so the synchronous write cannot deadlock
+            // against the output drain that follows.
+            if (standardInput is not null)
+            {
+                process.StandardInput.Write(standardInput);
+                process.StandardInput.Flush();
+            }
+
+            process.StandardInput.Close();
+        }
+        catch
+        {
+            // The process may have exited before the write completed (a short script that
+            // closed its stdin early): the output capture below still runs.
         }
 
         string stdOut = string.Empty;

@@ -424,6 +424,26 @@ public sealed class RouterConfigPersistence : IRouterConfigPersistence
         {
             node.Remove("PowerWatts");
         }
+
+        // Task #143: the daemon-side hardware probe ssh credential; the keys are REMOVED
+        // when unset (a cleared field never lingers on disk — the PowerWatts pattern).
+        if (target.SshUser is { } sshUser && sshUser.Length > 0)
+        {
+            node["SshUser"] = sshUser;
+        }
+        else
+        {
+            node.Remove("SshUser");
+        }
+
+        if (target.SshPort is { } sshPort)
+        {
+            node["SshPort"] = sshPort;
+        }
+        else
+        {
+            node.Remove("SshPort");
+        }
     }
 
     /// <summary>

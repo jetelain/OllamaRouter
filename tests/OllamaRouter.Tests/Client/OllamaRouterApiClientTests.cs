@@ -422,7 +422,7 @@ public sealed class OllamaRouterApiClientTests : IDisposable
         Assert.Equal(8192, target.MaxContextCeiling);
     }
 
-    // ------------------------------------------------- 33-method route-table round-trip
+    // ------------------------------------------------- 34-method route-table round-trip
 
     [Theory]
     [InlineData("GetInfoAsync")]
@@ -431,6 +431,7 @@ public sealed class OllamaRouterApiClientTests : IDisposable
     [InlineData("GetFleetAsync")]
     [InlineData("GetFleetHardwareAsync")]
     [InlineData("UpdateTargetHardwareAsync")]
+    [InlineData("ProbeTargetHardwareAsync")]
     [InlineData("GetCartographyAsync")]
     [InlineData("GetModelsAsync")]
     [InlineData("GetModelDetailAsync")]
@@ -575,6 +576,16 @@ public sealed class OllamaRouterApiClientTests : IDisposable
                 Assert.Equal(24564, r.Gpus[0].VramMB);
             }),
 
+        ["ProbeTargetHardwareAsync"] = new(
+            "POST", "/api/router/fleet/hardware/Desktop/probe", null, null, HttpStatusCode.OK,
+            HardwareProfileJson,
+            async client => await client.ProbeTargetHardwareAsync("Desktop"),
+            result =>
+            {
+                var r = (NodeHardwareProfile)result!;
+                Assert.Equal("desktop", r.NodeName);
+            }),
+
         ["GetCartographyAsync"] = new(
             "GET", "/api/router/cartography", null, null, HttpStatusCode.OK, CartographyJson,
             async client => await client.GetCartographyAsync(),
@@ -708,7 +719,8 @@ public sealed class OllamaRouterApiClientTests : IDisposable
             "PUT", "/api/router/targets/Edge",
             """
             {"url":"http://edge:11434","enabled":false,"hardwareHint":null,"maxParallel":4,
-             "type":null,"apiKey":null,"provider":null,"models":null,"powerWatts":80}
+             "type":null,"apiKey":null,"provider":null,"models":null,"powerWatts":80,
+             "sshUser":null,"sshPort":null}
             """,
             null, HttpStatusCode.OK, UpdateTargetResponseJson,
             async client => await client.UpdateTargetAsync("Edge",
@@ -1076,7 +1088,8 @@ public sealed class OllamaRouterApiClientTests : IDisposable
     private const string AddTargetBodyJson = """
         {"name":"Edge","url":"http://edge:11434","maxParallel":2,"testConnectionFirst":true,
          "hardwareHint":"RTX 4090","type":"ollama","apiKey":null,"provider":"LocalLab",
-         "models":[{"name":"llama3:8b","contextLength":8192,"quantization":"q8_0"}],"powerWatts":95}
+         "models":[{"name":"llama3:8b","contextLength":8192,"quantization":"q8_0"}],"powerWatts":95,
+         "sshUser":null,"sshPort":null}
         """;
 
     private const string AddTargetResponseJson = """

@@ -88,6 +88,9 @@ public static class RouterFleetEndpoints
         .WithSummary("Fleet hardware topology of every fleet node.")
         .WithDescription("The full fleet topology: parallel peer probes of the remote router daemons (their own local profile "
             + "endpoints), fail-soft per node (unreachable nodes degrade to their last stored profile or are absent). "
+            + "The 'source' discriminator of each row is the profile provenance: \"local\" (the daemon's own local probe), "
+            + "\"ssh\" (the daemon-side ssh probe of task #143), \"manual\" (an externally pushed profile), \"persisted\" (a "
+            + "stored profile served from disk), \"peer\" (a live peer-daemon probe) or \"none\" (nothing known). "
             + "The Cloud pseudo-target is never a fleet hardware node (it has no Ollama daemon to probe). Read-only — no key "
             + "required in default mode.");
         app.MapPut("/api/router/fleet/hardware/{targetName}", async (HttpRequest request, string targetName, IFleetHardwareService fleetHardware, CancellationToken cancellationToken) =>
@@ -130,6 +133,91 @@ public static class RouterFleetEndpoints
         .WithDescription("Manual profile push for bare Ollama targets without a router daemon. Request body: a NodeHardwareProfile "
             + "JSON with a non-empty 'nodeName' (missing → 400 OllamaErrorResponse); unknown targetName → 404. On success the "
             + "stored profile is echoed (200). Protected by the API-key middleware (default protected set).");
+        // Task #143: the daemon-side EXPLICIT hardware probe — the single embedded bash probe
+        // script (the only Linux collector) run locally via `bash` (stdin) for the local
+        // workstation target, or base64-over-ssh (key-based, BatchMode, 30 s bound) for remote
+        // targets with a configured sshUser; the digest result is stored with the provenance
+        // label "local"/"ssh" and REPLACES whatever was stored (an explicit probe is
+        // authoritative — it overwrites even "manual" profiles). The store is only touched
+        // AFTER a successful digest (a probe failure never clobbers the stored state).
+        app.MapPost("/api/router/fleet/hardware/{targetName}/probe", async (
+            IOptionsMonitor<OllamaRouterOptions> options,
+            LinuxHardwareProbeExecutor probeExecutor,
+            IFleetHardwareService fleetHardware,
+            string targetName,
+            CancellationToken cancellationToken) =>
+        {
+            var targets = options.CurrentValue.GetEffectiveTargets();
+            var target = targets.FirstOrDefault(t =>
+                string.Equals(t.Name, targetName, StringComparison.OrdinalIgnoreCase));
+            if (target is null)
+            {
+                return Results.Json(
+                    new OllamaErrorResponse($"target not found: {targetName}"),
+                    OllamaRouterJsonSerializerContext.Default.OllamaErrorResponse,
+                    statusCode: StatusCodes.Status404NotFound);
+            }
+
+            LinuxProbeResult outcome;
+            string source;
+            if (FleetHardwareService.IsLocalWorkstationTarget(target))
+            {
+                source = "local";
+                outcome = await probeExecutor.ProbeLocalAsync(cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                if (string.IsNullOrWhiteSpace(target.SshUser))
+                {
+                    return Results.Json(
+                        new OllamaErrorResponse(
+                            $"target '{targetName}' has no sshUser configured; set sshUser via PUT /api/router/targets/{targetName} before probing"),
+                        OllamaRouterJsonSerializerContext.Default.OllamaErrorResponse,
+                        statusCode: StatusCodes.Status400BadRequest);
+                }
+
+                source = "ssh";
+                outcome = await probeExecutor.ProbeRemoteAsync(target, cancellationToken).ConfigureAwait(false);
+            }
+
+            if (outcome.Profile is not { } profile)
+            {
+                // Probe failure (launch failure / unreachable host / ssh auth failure / timeout /
+                // missing markers): 502 with the readable cause; the stored profile is UNTOUCHED
+                // (the store is only written after a successful digest).
+                return Results.Json(
+                    new OllamaErrorResponse(outcome.Error ?? "the hardware probe failed"),
+                    OllamaRouterJsonSerializerContext.Default.OllamaErrorResponse,
+                    statusCode: StatusCodes.Status502BadGateway);
+            }
+
+            var stored = await fleetHardware.StoreProbeProfileAsync(targetName, profile, source, cancellationToken)
+                .ConfigureAwait(false);
+            if (!stored)
+            {
+                // Defensive: the membership check above already passed; a concurrent target
+                // removal can drop it in between the check and the store.
+                return Results.Json(
+                    new OllamaErrorResponse($"target not found: {targetName}"),
+                    OllamaRouterJsonSerializerContext.Default.OllamaErrorResponse,
+                    statusCode: StatusCodes.Status404NotFound);
+            }
+
+            return Results.Json(profile, OllamaRouterJsonSerializerContext.Default.NodeHardwareProfile);
+        })
+        .WithName("PostRouterFleetHardwareProbe")
+        .WithTags("Hardware Profiling")
+        .WithSummary("Runs the daemon-side explicit hardware probe for a target (protected: API key required).")
+        .WithDescription("Runs the single embedded bash probe script daemon-side and digests its output with the shared C# "
+            + "digest engine (task #143). The local workstation target runs the script via `bash` and stores the result with "
+            + "provenance \"local\"; a remote target requires a configured 'sshUser' (missing → 400) and runs the script over "
+            + "ssh to {sshUser}@{host} on sshPort (default 22) with KEY-BASED authentication only (the ssh user's installed "
+            + "private key — no password support), BatchMode non-interactive hardening and a 30 s bound, storing the result with "
+            + "provenance \"ssh\". An explicit probe is AUTHORITATIVE: it replaces the stored profile (including \"manual\" ones). "
+            + "On success (200) the stored profile is echoed (a NodeHardwareProfile). Failures: 404 unknown target, 400 remote "
+            + "target without sshUser, 502 probe failure (unreachable host, ssh auth failure, timeout, non-Linux remote, missing "
+            + "marker frame — the stored profile is untouched). Protected by the API-key middleware (default protected set — "
+            + "it launches an outbound ssh). No request body.");
         return app;
     }
 

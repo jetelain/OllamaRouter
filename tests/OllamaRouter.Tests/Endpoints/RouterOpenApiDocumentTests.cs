@@ -117,7 +117,7 @@ public class RouterOpenApiDocumentTests
     }
 
     /// <summary>
-    /// The approved 36 router operations: (method, document path) pairs — 32 path items.
+    /// The approved 37 router operations: (method, document path) pairs — 33 path items.
     /// NOTE: the generator emits the catch-all templates with the leading <c>*</c> stripped
     /// (the framework's documented template normalization: the registered
     /// <c>/api/router/models/{*modelName}</c> / <c>POST /api/router/models/{*tail}</c> /
@@ -133,6 +133,7 @@ public class RouterOpenApiDocumentTests
         ("GET", "/api/router/hardware"),
         ("GET", "/api/router/fleet/hardware"),
         ("PUT", "/api/router/fleet/hardware/{targetName}"),
+        ("POST", "/api/router/fleet/hardware/{targetName}/probe"),
         ("POST", "/api/router/benchmark"),
         ("GET", "/api/router/benchmark/results"),
         ("DELETE", "/api/router/benchmark/results"),
@@ -193,6 +194,7 @@ public class RouterOpenApiDocumentTests
             { ("GET", "/api/router/hardware"), "GetRouterHardware" },
             { ("GET", "/api/router/fleet/hardware"), "GetRouterFleetHardware" },
             { ("PUT", "/api/router/fleet/hardware/{targetName}"), "PutRouterFleetHardwareProfile" },
+            { ("POST", "/api/router/fleet/hardware/{targetName}/probe"), "PostRouterFleetHardwareProbe" },
             { ("POST", "/api/router/benchmark"), "PostRouterBenchmarkRun" },
             { ("GET", "/api/router/benchmark/results"), "GetRouterBenchmarkResults" },
             { ("DELETE", "/api/router/benchmark/results"), "DeleteRouterBenchmarkResults" },
@@ -240,6 +242,8 @@ public class RouterOpenApiDocumentTests
             { ("GET", "/api/router/fleet/hardware"), [("200", "RouterFleetHardwareResponse")] },
             { ("PUT", "/api/router/fleet/hardware/{targetName}"),
                 [("200", "NodeHardwareProfile"), ("400", "OllamaErrorResponse"), ("404", "OllamaErrorResponse")] },
+            { ("POST", "/api/router/fleet/hardware/{targetName}/probe"),
+                [("200", "NodeHardwareProfile"), ("400", "OllamaErrorResponse"), ("404", "OllamaErrorResponse"), ("502", "OllamaErrorResponse")] },
             { ("POST", "/api/router/benchmark"),
                 [("202", "RouterBenchmarkRunResponse"), ("400", "OllamaErrorResponse"), ("404", "OllamaErrorResponse"), ("409", "OllamaErrorResponse")] },
             { ("GET", "/api/router/benchmark/results"), [("200", "RouterBenchmarkResultsResponse")] },
@@ -308,6 +312,7 @@ public class RouterOpenApiDocumentTests
         new Dictionary<(string, string), (string, string)[]>
         {
             { ("PUT", "/api/router/fleet/hardware/{targetName}"), [("targetName", "string")] },
+            { ("POST", "/api/router/fleet/hardware/{targetName}/probe"), [("targetName", "string")] },
             { ("GET", "/api/router/models/{modelName}"), [("modelName", "string")] },
             { ("POST", "/api/router/vram/reclaim"), [("target", "string"), ("location", "string"), ("disableTarget", "boolean")] },
             { ("POST", "/api/router/fleet/unload"), [("target", "string"), ("location", "string"), ("disableTarget", "boolean")] },
@@ -397,14 +402,14 @@ public class RouterOpenApiDocumentTests
     }
 
     [Fact]
-    public async Task Document_ContainsExactlyThe36RouterOperations_AndExcludesEverythingElse()
+    public async Task Document_ContainsExactlyThe37RouterOperations_AndExcludesEverythingElse()
     {
         await using var harness = await DocHarness.StartAsync(requireKeyForAllEndpoints: false);
         var document = await FetchDocumentAsync(harness);
         var paths = (JsonObject)document["paths"]!;
 
-        // Exactly the 36 approved (method, path) pairs (32 path items).
-        Assert.Equal(32, paths.Count);
+        // Exactly the 37 approved (method, path) pairs (33 path items).
+        Assert.Equal(33, paths.Count);
         var pathKeys = JsonObjectKeys(paths);
         var actualOperations = pathKeys
             .Select(path => (Path: path, Item: (JsonObject)paths[path]!))
@@ -599,7 +604,7 @@ public class RouterOpenApiDocumentTests
         Assert.False(string.IsNullOrWhiteSpace(scheme["description"]?.GetValue<string>()));
 
         // The requirement is applied to EXACTLY the operations the production policy protects
-        // (19 of the 36), each with a documented 401 OllamaErrorResponse.
+        // (20 of the 37), each with a documented 401 OllamaErrorResponse.
         var protectedCount = 0;
         foreach (var (method, path) in ApprovedOperations)
         {
@@ -630,8 +635,9 @@ public class RouterOpenApiDocumentTests
 
         // The #50 default protected set (incl. the #99 admin shutdown route, the #66
         // recommendation writes, the two #95 failure-streak reset admin actions, the #125
-        // model pull route and the #126 destructive model uninstall) is exactly 19 operations.
-        Assert.Equal(19, protectedCount);
+        // model pull route, the #126 destructive model uninstall and the #143 daemon-side
+        // hardware probe) is exactly 20 operations.
+        Assert.Equal(20, protectedCount);
     }
 
     [Fact]

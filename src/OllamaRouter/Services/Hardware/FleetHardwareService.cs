@@ -239,6 +239,35 @@ public sealed class FleetHardwareService : IFleetHardwareService, IHostedService
         return Task.FromResult(true);
     }
 
+    /// <summary>
+    /// Stores the digest result of an EXPLICIT daemon-side hardware probe (task #143
+    /// <c>POST /api/router/fleet/hardware/{targetName}/probe</c>) with the given provenance
+    /// label ("local" / "ssh") and persists it. An explicit probe is AUTHORITATIVE: it
+    /// REPLACES whatever is stored for the target, including a "manual" profile (the
+    /// automatic peer refresh alone never overwrites manual entries).
+    /// </summary>
+    public Task<bool> StoreProbeProfileAsync(
+        string targetName,
+        NodeHardwareProfile profile,
+        string source,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(targetName) || profile is null)
+        {
+            return Task.FromResult(false);
+        }
+
+        var match = _options.CurrentValue.GetEffectiveTargets()
+            .FirstOrDefault(t => string.Equals(t.Name, targetName, StringComparison.OrdinalIgnoreCase));
+        if (match is null)
+        {
+            return Task.FromResult(false);
+        }
+
+        StoreProfile(match.Name!, profile, source, persist: true);
+        return Task.FromResult(true);
+    }
+
     // ------------------------------------------------------------------
     //  Peer probing
     // ------------------------------------------------------------------
@@ -372,7 +401,12 @@ public sealed class FleetHardwareService : IFleetHardwareService, IHostedService
     /// (case-insensitive) or its <c>Name</c> equals <c>"Local"</c> (case-insensitive) —
     /// the same rule as the <c>/api/router/fleet</c> endpoint.
     /// </summary>
-    private static bool IsLocalWorkstationTarget(OllamaTargetOptions target)
+    /// <summary>
+    /// The local-workstation rule shared with the task #143 probe endpoint: a target is the
+    /// local workstation when its Name is <c>"Local"</c> (case-insensitive) or its Url host is
+    /// 127.0.0.1 / localhost.
+    /// </summary>
+    internal static bool IsLocalWorkstationTarget(OllamaTargetOptions target)
     {
         if (string.Equals(target.Name, "Local", StringComparison.OrdinalIgnoreCase))
         {

@@ -206,23 +206,27 @@ public class HardwareProfileTests
     private static LocalHardwareProfileProvider CreateProvider(
         FakeProcessRunner processRunner,
         NodeHardwareProfile? testOverride = null,
-        IGpuVramProvider? gpuVramProvider = null,
-        Func<string, string?>? memInfoReader = null)
+        IGpuVramProvider? gpuVramProvider = null)
         => new(
             processRunner,
             gpuVramProvider ?? new Mock<IGpuVramProvider>().Object,
             NullLogger<LocalHardwareProfileProvider>.Instance,
-            testOverride: testOverride is null ? null : () => testOverride,
-            memInfoReader);
+            CreateProbeExecutor(processRunner),
+            testOverride: testOverride is null ? null : () => testOverride);
+
+    private static LinuxHardwareProbeExecutor CreateProbeExecutor(FakeProcessRunner processRunner) =>
+        new(processRunner, NullLogger<LinuxHardwareProbeExecutor>.Instance);
 
     [Fact]
     public async Task GetLocalProfile_CachesResult_ForProcessLifetime()
     {
         var probeCount = 0;
+        var processRunner = new FakeProcessRunner();
         var provider = new LocalHardwareProfileProvider(
-            new FakeProcessRunner(),
+            processRunner,
             new Mock<IGpuVramProvider>().Object,
             NullLogger<LocalHardwareProfileProvider>.Instance,
+            CreateProbeExecutor(processRunner),
             testOverride: () =>
             {
                 probeCount++;
@@ -244,16 +248,16 @@ public class HardwareProfileTests
     [Fact]
     public async Task GetLocalProfile_FailSoft_ReturnsProfileWhenAllProbesFail()
     {
-        // No test override: the provider runs the real OS probe against a FakeProcessRunner
-        // that fails every invocation, plus an explicit /proc/meminfo failure. Whatever the
-        // CI host is, the profile must ALWAYS be produced (fail-soft contract).
+        // No test override: the provider runs the real probe path against a FakeProcessRunner
+        // that fails every invocation. Whatever the CI host is, the profile must ALWAYS be
+        // produced (fail-soft contract: on Linux the bash probe script degrades to the
+        // unknowns/zeros profile, on Windows/macOS every tool probe degrades).
         var processRunner = new FakeProcessRunner();
         var provider = new LocalHardwareProfileProvider(
             processRunner,
             new Mock<IGpuVramProvider>().Object,
             NullLogger<LocalHardwareProfileProvider>.Instance,
-            testOverride: null,
-            memInfoReader: _ => null);
+            CreateProbeExecutor(processRunner));
 
         var profile = await provider.GetLocalProfileAsync();
 
@@ -268,7 +272,11 @@ public class HardwareProfileTests
     {
         var runner = new ProcessRunner();
         var gpu = new NvidiaSmiVramProvider(runner);
-        var provider = new LocalHardwareProfileProvider(runner, gpu, NullLogger<LocalHardwareProfileProvider>.Instance);
+        var provider = new LocalHardwareProfileProvider(
+            runner,
+            gpu,
+            NullLogger<LocalHardwareProfileProvider>.Instance,
+            new LinuxHardwareProbeExecutor(runner, NullLogger<LinuxHardwareProbeExecutor>.Instance));
 
         var profile = await provider.GetLocalProfileAsync();
 
@@ -287,27 +295,98 @@ public class HardwareProfileTests
     }
 
     [Fact]
-    public void GetLocalProfile_ThrowsWhenConstructorDepsMissing()
+    public async Task GetLocalProfile_Linux_SingleScriptBashDigestPath_NoDirectProcReads()
     {
-        Assert.Throws<ArgumentNullException>(() => new LocalHardwareProfileProvider(
-            (IProcessRunner?)null!,
-            new Mock<IGpuVramProvider>().Object,
-            NullLogger<LocalHardwareProfileProvider>.Instance));
+        if (!OperatingSystem.IsLinux())
+        {
+            return; // the script→bash→digest path is only taken on Linux hosts
+        }
+
+        // Canned frame exactly as the embedded script would emit it on a 64 GB dual-channel
+        // DDR5 machine with one RTX 4090.
+        var frame =
+            "===BEGIN_HW===\n" +
+            "HOSTNAME=digest-node\n" +
+            "ARCH=x86_64\n" +
+            "CPU=AMD Ryzen 9 7950X\n" +
+            "RAM_MB=65536\n" +
+            "---DMIDECODE_MEMORY---\n" +
+            "Handle 0x0101, DMI type 17, 40 bytes\n\tMemory Device\n\t\tLocator: DIMM_A1\n\t\tType: DDR5\n\t\tSize: 32 GB\n" +
+            "Handle 0x0102, DMI type 17, 40 bytes\n\tMemory Device\n\t\tLocator: DIMM_B1\n\t\tType: DDR5\n\t\tSize: 32 GB\n" +
+            "---NVIDIA_GPUS---\n" +
+            "NVIDIA GeForce RTX 4090, 24564\n" +
+            "---ROCM_GPUS---\n" +
+            "---LSPCI_GPUS---\n" +
+            "===END_HW===\n";
+        var runner = new FakeProcessRunner().Succeeds("bash", string.Empty, frame);
+        var provider = CreateProvider(runner);
+
+        var profile = await provider.GetLocalProfileAsync();
+
+        // The profile is the DIGEST of the frame (the single C# code path) — identical
+        // semantics to the pre-task local Linux probe for the same hardware.
+        Assert.Equal("digest-node", profile.NodeName);
+        Assert.Equal("linux", profile.Os);
+        Assert.Equal("x64", profile.Architecture);
+        Assert.Equal(65536, profile.SystemRamMB);
+        Assert.Equal(SystemRamType.Ddr5, profile.SystemRamType);
+        var gpu = Assert.Single(profile.Gpus);
+        Assert.Equal("Nvidia", gpu.Vendor);
+        Assert.Equal("GeForce RTX 4090", gpu.ModelName);
+        Assert.Equal(24564, gpu.VramMB);
+        Assert.Equal(24564, profile.TotalFastMemoryMB);
+
+        // EXACTLY ONE process launch (the script via bash over stdin) — no /proc file
+        // reads, no per-tool (dmidecode / nvidia-smi / rocm-smi / lspci) C# probing.
+        var invocation = Assert.Single(runner.GetInvocations());
+        Assert.Equal("bash", invocation.FileName);
+        Assert.Equal(string.Empty, invocation.Arguments);
+        Assert.Equal(LinuxHardwareProbeScript.ScriptText, invocation.StandardInput);
     }
 
     [Fact]
-    public async Task GetLocalProfile_InjectableMemInfoReader_IsUsedOnLinux()
+    public async Task GetLocalProfile_Linux_ProbeScriptFailure_DegradesToUnknownProfileWithoutFallbackTools()
     {
-        var fakeMeminfo = "MemTotal:        32768000 kB\nMemFree:        10000000 kB\n";
-        var provider = CreateProvider(new FakeProcessRunner(), memInfoReader: _ => fakeMeminfo);
+        if (!OperatingSystem.IsLinux())
+        {
+            return; // host-gated like the success path
+        }
+
+        var runner = new FakeProcessRunner().FailsWithStdErr("bash", string.Empty, 127, "bash: bad script");
+        var provider = CreateProvider(runner);
+
         var profile = await provider.GetLocalProfileAsync();
 
-        if (OperatingSystem.IsLinux())
-        {
-            // 32768000 kB / 1024 = 32000 MB.
-            Assert.Equal(32000, profile.SystemRamMB);
-        }
-        // On non-Linux CI hosts the /proc/meminfo reader is never consulted.
+        Assert.NotNull(profile);
+        Assert.Equal("linux", profile.Os);
+        Assert.Equal(Environment.MachineName, profile.NodeName);
+        Assert.Equal(0, profile.SystemRamMB);
+        Assert.Equal(SystemRamType.Unknown, profile.SystemRamType);
+        Assert.Empty(profile.Gpus);
+        // Still exactly one launch (bash) — the degraded path runs NO per-tool fallback.
+        Assert.Single(runner.GetInvocations());
+    }
+
+    [Fact]
+    public void GetLocalProfile_ThrowsWhenConstructorDepsMissing()
+    {
+        var processRunner = new FakeProcessRunner();
+        Assert.Throws<ArgumentNullException>(() => new LocalHardwareProfileProvider(
+            (IProcessRunner?)null!,
+            new Mock<IGpuVramProvider>().Object,
+            NullLogger<LocalHardwareProfileProvider>.Instance,
+            CreateProbeExecutor(processRunner)));
+    }
+
+    [Fact]
+    public void GetLocalProfile_ThrowsWhenProbeExecutorMissing()
+    {
+        var processRunner = new FakeProcessRunner();
+        Assert.Throws<ArgumentNullException>(() => new LocalHardwareProfileProvider(
+            processRunner,
+            new Mock<IGpuVramProvider>().Object,
+            NullLogger<LocalHardwareProfileProvider>.Instance,
+            (LinuxHardwareProbeExecutor?)null!));
     }
 
     // ------------------------------------------------------------------
@@ -679,6 +758,42 @@ public class HardwareProfileTests
         await File.WriteAllTextAsync(stateFile, "{ not valid json !!");
         var service3 = CreateService(state.Path);
         Assert.Null(service3.GetProfile("peer"));
+    }
+
+    [Fact]
+    public async Task StoreProbeProfile_IsAuthoritative_ReplacesManualEntry_AndPersistsProbeSource()
+    {
+        using var state = new TempStateDir();
+        var stateFile = Path.Combine(state.Path, "targets-hardware.json");
+        var service = CreateService(state.Path);
+
+        var manualProfile = new NodeHardwareProfile(
+            "manual-node", "linux", "x64", false, 32768, SystemRamType.Ddr5,
+            Array.Empty<GpuDeviceProfile>(), 32768, 38.4);
+        var probedProfile = new NodeHardwareProfile(
+            "probed-node", "linux", "x64", false, 65536, SystemRamType.Ddr5,
+            [new GpuDeviceProfile("Nvidia", "GeForce RTX 4090", 24564, "GDDR6X", 0, 468.0)],
+            24564, 468.0);
+
+        Assert.True(await service.UpsertProfileAsync("Peer", manualProfile));
+        Assert.Same(manualProfile, service.GetProfile("Peer"));
+
+        // An explicit probe is AUTHORITATIVE: it replaces the stored "manual" profile
+        // (the automatic peer refresh alone never overwrites manual — that rule is intact).
+        Assert.True(await service.StoreProbeProfileAsync("Peer", probedProfile, "ssh"));
+        Assert.Same(probedProfile, service.GetProfile("Peer"));
+
+        // Unknown targets are rejected without any state change.
+        Assert.False(await service.StoreProbeProfileAsync("NoSuchTarget", probedProfile, "local"));
+        Assert.Null(service.GetProfile("NoSuchTarget"));
+        Assert.Same(probedProfile, service.GetProfile("Peer"));
+
+        // The probe provenance is persisted (a later restart re-labels it "persisted",
+        // per the stored-profile reload semantics — peer TTL refresh may then update it).
+        var raw = await File.ReadAllTextAsync(stateFile);
+        Assert.Contains("ssh", raw, StringComparison.Ordinal);
+        var restarted = CreateService(state.Path);
+        Assert.Equal("probed-node", restarted.GetProfile("Peer")!.NodeName);
     }
 
     [Fact]

@@ -28,7 +28,10 @@ public sealed record RouterConfigResponse(
 /// and <c>apiKeyConfigured</c> — a BOOL flag; the raw or wrapped key is NEVER returned by any
 /// endpoint, log or telemetry. Task #84 appends <c>powerWatts</c> (number|null — the node
 /// power-draw override for the electricity-cost leg; null = unset ⇒ the resolution chain
-/// <c>Pricing:DefaultNodePowerWatts</c> → 150 W applies).
+/// <c>Pricing:DefaultNodePowerWatts</c> → 150 W applies). Task #143 appends the daemon-side
+/// hardware probe ssh credential <c>sshUser</c> (string|null — null = the target is not
+/// ssh-probeable; the App UI uses it to flag probeable rows) and <c>sshPort</c> (number|null,
+/// null = the default port 22).
 /// </summary>
 public sealed record RouterTargetConfigDto(
     [property: JsonPropertyName("name")] string Name,
@@ -42,7 +45,12 @@ public sealed record RouterTargetConfigDto(
     [property: JsonPropertyName("apiKeyConfigured")] bool ApiKeyConfigured = false,
     // Task #84: node power-draw override (watts; null = unset). Appended at the END to avoid
     // silently shifting the positional arguments at every construction site.
-    [property: JsonPropertyName("powerWatts")] double? PowerWatts = null);
+    [property: JsonPropertyName("powerWatts")] double? PowerWatts = null,
+    // Task #143: the ssh credential exposed so the UI can know which rows are ssh-probeable
+    // by the daemon-side explicit hardware probe endpoint (null = unset; the probe host is
+    // derived from the target url). Appended at the END for positional-compatibility.
+    [property: JsonPropertyName("sshUser")] string? SshUser = null,
+    [property: JsonPropertyName("sshPort")] int? SshPort = null);
 
 /// <summary>
 /// The cloud section of <c>GET /api/router/config</c> (task #19). Contains EXACTLY

@@ -97,11 +97,11 @@ public class AppleUnifiedMemoryVramProviderTests
 
         var invocations = runner.GetInvocations();
         Assert.Equal(
-            new[]
+            new (string, string, int, string?)[]
             {
-                ("sysctl", "-n hw.memsize", 5000),
-                ("sysctl", "-n iogpu.wired_limit_mb", 5000),
-                ("vm_stat", "", 5000)
+                ("sysctl", "-n hw.memsize", 5000, null),
+                ("sysctl", "-n iogpu.wired_limit_mb", 5000, null),
+                ("vm_stat", "", 5000, null)
             },
             invocations);
     }

@@ -191,6 +191,9 @@ public class ApiKeyAuthMiddlewareTests
     [InlineData("PUT", "/api/router/targets/Dummy", """{"enabled": false}""")]
     [InlineData("DELETE", "/api/router/targets/Dummy", null)]
     [InlineData("PUT", "/api/router/fleet/hardware/Dummy", """{"nodeName": "Dummy"}""")]
+    // Task #143: the daemon-side explicit hardware probe (key-protected in default mode; it
+    // launches an outbound ssh for remote targets).
+    [InlineData("POST", "/api/router/fleet/hardware/Dummy/probe", null)]
     [InlineData("POST", "/api/router/benchmark", "{}")]
     [InlineData("DELETE", "/api/router/benchmark/results", null)]
     [InlineData("GET", "/api/router/api-keys", null)]
