@@ -161,6 +161,41 @@ public sealed class SetupWizardViewModelsTests
         public int Delays { get; private set; }
     }
 
+    /// <summary>
+    /// Task #147 — hermetic <see cref="LocalOllamaConfigurator"/> for the root fixtures: every
+    /// OS seam is faked (no PATH scan, no process enumeration, no TCP probe) and every
+    /// <c>BinaryProbe</c> call (i.e. every detection) is counted so "the initial entry runs
+    /// exactly once" is assertable.
+    /// </summary>
+    private sealed class FakeEnvConfigurator
+    {
+        private int _probes;
+
+        public FakeEnvConfigurator(OllamaDetection detection)
+        {
+            Detection = detection;
+            Configurator = new LocalOllamaConfigurator
+            {
+                IsWindows = _ => true,
+                IsMacOS = _ => false,
+                BinaryProbe = _ =>
+                {
+                    Interlocked.Increment(ref _probes);
+                    return Detection;
+                },
+                ProcessNames = _ => [],
+                PortProbe = _ => false,
+                Delay = _ => Task.CompletedTask,
+            };
+        }
+
+        public LocalOllamaConfigurator Configurator { get; }
+        public OllamaDetection Detection { get; set; }
+
+        /// <summary>The number of detection probes performed so far.</summary>
+        public int Probes => Volatile.Read(ref _probes);
+    }
+
     private sealed record RootFixture(
         SetupWizardViewModel Root,
         WizardEnvironmentStepViewModel Env,
@@ -168,20 +203,31 @@ public sealed class SetupWizardViewModelsTests
         WizardBenchmarkStepViewModel Bench,
         WizardRecommendationsStepViewModel Rec,
         List<int> ExitCodes,
-        FakeRouterApiClient Fake);
+        FakeRouterApiClient Fake,
+        FakeEnvConfigurator EnvConfig,
+        FakeDaemonLauncher? Launcher);
 
-    private static RootFixture BuildRoot(FakeRouterApiClient fake)
+    private static RootFixture BuildRoot(
+        FakeRouterApiClient fake,
+        FakeDaemonLauncher? launcher = null,
+        OllamaDetection? detection = null,
+        Func<TimeSpan, CancellationToken, Task>? delay = null)
     {
         var exit = new List<int>();
-        var env = new WizardEnvironmentStepViewModel(new LocalOllamaConfigurator(), FakeConnection(fake));
+        // Task #147 hygiene: the wizard now runs the Step 1 detection at construction, so the
+        // env step must get a FAKE-SEAMS configurator here — never a real one (no PATH scans /
+        // process enumeration / TCP probes in unit tests).
+        var envConfig = new FakeEnvConfigurator(detection ?? new OllamaDetection(true, "/usr/local/bin/ollama", false));
+        var connection = FakeConnection(fake, launcher);
+        var env = new WizardEnvironmentStepViewModel(envConfig.Configurator, connection);
         WizardTargetsStepViewModel targets = null!;
-        targets = new WizardTargetsStepViewModel(() => fake, ct => targets.RefreshAsync(ct), GatedDelay);
+        targets = new WizardTargetsStepViewModel(() => fake, ct => targets.RefreshAsync(ct), delay ?? GatedDelay);
         WizardBenchmarkStepViewModel bench = null!;
-        bench = new WizardBenchmarkStepViewModel(() => fake, ct => bench.RefreshAsync(ct), GatedDelay);
+        bench = new WizardBenchmarkStepViewModel(() => fake, ct => bench.RefreshAsync(ct), delay ?? GatedDelay);
         SetupWizardViewModel root = null!;
         var rec = new WizardRecommendationsStepViewModel(() => fake, () => _ = root.GoToAsync(2));
-        root = new SetupWizardViewModel(FakeConnection(fake), env, targets, bench, rec, code => exit.Add(code));
-        return new RootFixture(root, env, targets, bench, rec, exit, fake);
+        root = new SetupWizardViewModel(connection, env, targets, bench, rec, code => exit.Add(code));
+        return new RootFixture(root, env, targets, bench, rec, exit, fake, envConfig, launcher);
     }
 
     // ==================================================================
@@ -293,6 +339,100 @@ public sealed class SetupWizardViewModelsTests
         await root.GoToAsync(2); // start benchmark poller
         await root.DisposeAsync();
         await root.DisposeAsync(); // idempotent
+    }
+
+    /// <summary>
+    /// Task #147 (AC1 + AC2): the initial Step 1 detection runs exactly ONCE at construction —
+    /// the false "Ollama not found" on a fresh start was the step's default state, because
+    /// <c>OnStepEnteredAsync</c> never fired for the initial step. After awaiting
+    /// <see cref="SetupWizardViewModel.InitialStepEntry"/>, Step 1 shows the real (faked)
+    /// detection and port state, and an explicit <c>GoToAsync(0)</c> is a guard no-op (no
+    /// double entry).
+    /// </summary>
+    [Fact]
+    public async Task Root_InitialStep_EntryRunsOnceAtConstruction_AndPopulatesStep1()
+    {
+        var fx = BuildRoot(
+            new FakeRouterApiClient(),
+            launcher: new FakeDaemonLauncher { Status = FakeDaemonLauncher.RunningStatus() },
+            detection: new OllamaDetection(true, "/fake/ollama", true));
+        var root = fx.Root;
+        await root.InitialStepEntry;
+
+        Assert.Equal(1, fx.EnvConfig.Probes);
+        Assert.True(fx.Env.OllamaInstalled);
+        Assert.True(fx.Env.OllamaRunning);
+        Assert.Equal("/fake/ollama", fx.Env.OllamaBinaryPath);
+        Assert.Equal(Port11434Status.RouterRunning, fx.Env.Port11434Status);
+
+        await root.GoToAsync(0); // already on step 0: guard no-op, no double entry
+        Assert.Equal(1, fx.EnvConfig.Probes);
+        await root.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Task #147 (AC3): navigating away and back re-enters step 0 normally (one
+    /// <c>OnStepLeft</c> + one <c>OnStepEntered</c>, no extra calls) — and the targets
+    /// poller is actually stopped after leaving (no further fleet ticks).
+    /// </summary>
+    [Fact]
+    public async Task Root_InitialStep_LeaveAndBackReentersStep0Once()
+    {
+        var fake = new FakeRouterApiClient { FleetResponse = new RouterFleetResponse([]) };
+        var fx = BuildRoot(fake, delay: SoftDelay); // soft ticks: the poller keep-tick is real
+        var root = fx.Root;
+        await root.InitialStepEntry;
+        Assert.Equal(1, fx.EnvConfig.Probes);
+
+        await root.GoToAsync(1); // leave step 0 — the targets poller starts ticking
+        await WaitUntilAsync(() => fake.Calls.Contains("GetFleetAsync"), "the targets fleet tick to run");
+        await root.GoToAsync(0); // back: OnStepLeft (stop poller) + OnStepEntered (+1 probe)
+        Assert.Equal(2, fx.EnvConfig.Probes);
+
+        // GoToAsync awaited OnStepLeftAsync (StopAsync) — the poller is fully stopped; let any
+        // in-flight work settle, then assert NO further fleet ticks (two stable samples).
+        for (var i = 0; i < 10_000; i++)
+        {
+            await Task.Yield();
+        }
+
+        var fleetCalls = fake.Calls.Count(c => c == "GetFleetAsync");
+        for (var i = 0; i < 10_000; i++)
+        {
+            await Task.Yield();
+        }
+
+        Assert.Equal(fleetCalls, fake.Calls.Count(c => c == "GetFleetAsync"));
+        await root.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Task #147 (AC1, remote mode): with no daemon launcher the port state stays Unknown with
+    /// the explanatory label after the initial entry.
+    /// </summary>
+    [Fact]
+    public async Task Root_InitialStep_NoLauncher_PortStaysUnknown()
+    {
+        var fx = BuildRoot(new FakeRouterApiClient()); // FakeConnection: DaemonLauncher = null
+        await fx.Root.InitialStepEntry;
+        Assert.Equal(Port11434Status.Unknown, fx.Env.Port11434Status);
+        Assert.Contains("Router launcher unavailable", fx.Env.RouterStatusLabel);
+        await fx.Root.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Task #147 (AC5): disposing while the initial entry is still in flight is safe — the
+    /// in-flight bounded detection self-completes harmlessly on the disposed view models (step 0
+    /// owns no poller/timer), and disposal stays idempotent.
+    /// </summary>
+    [Fact]
+    public async Task Root_Dispose_BeforeInitialEntryCompletes_IsSafe()
+    {
+        var fx = BuildRoot(new FakeRouterApiClient());
+        // Dispose WITHOUT awaiting the initial entry first.
+        await fx.Root.DisposeAsync();
+        await fx.Root.InitialStepEntry; // completes (detection failures are swallowed)
+        await fx.Root.DisposeAsync(); // idempotent
     }
 
     // ==================================================================

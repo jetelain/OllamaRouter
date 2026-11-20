@@ -10,6 +10,12 @@ namespace OllamaRouter.App.ViewModels.Wizard;
 /// Finish is the only hard gate), the Finish (exit 0) / Abandon (exit 1) exit signal, and the
 /// disposal of all four step view models.
 /// <para>
+/// Step 0's <c>OnStepEnteredAsync</c> fires exactly ONCE at construction — the wizard is the
+/// main window, so construction is the window-open moment (task #147: Step 1's Ollama/port
+/// detection must run immediately, not only on a manual Re-check). All later step entries and
+/// leaves are driven by <see cref="GoToAsync"/> per navigation.
+/// </para>
+/// <para>
 /// The exit-code contract (D2): <see cref="Finish"/> → exit <c>0</c>; <see cref="Abandon"/>
 /// (window closed without Finish) → exit <c>1</c>. The window code-behind wires
 /// <see cref="ExitSignal"/> to <c>IClassicDesktopStyleApplicationLifetime.TryShutdown(code)</c>.
@@ -39,6 +45,26 @@ public sealed partial class SetupWizardViewModel : ObservableObject, IAsyncDispo
         BackCommand = new AsyncRelayCommand(async () => await GoToAsync(SelectedStep - 1), () => SelectedStep > 0);
         NextCommand = new AsyncRelayCommand(async () => await GoToAsync(SelectedStep + 1), () => SelectedStep < 3);
         FinishCommand = new AsyncRelayCommand(async () => Finish(), () => SelectedStep == 3);
+
+        // Task #147: the wizard is the main window, so construction == window open. Fire step 0's
+        // entry ONCE here — GoToAsync alone never reaches it (its newStep == SelectedStep guard
+        // makes an explicit GoToAsync(0) while on step 0 a no-op), which left Step 1 showing its
+        // false "Ollama not found" defaults until a manual Re-check.
+        InitialStepEntry = EnterInitialStepAsync();
+    }
+
+    private async Task EnterInitialStepAsync()
+    {
+        try
+        {
+            await _steps[0].OnStepEnteredAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Detection failure must not crash app start-up: the step keeps its default state and
+            // the Re-check command remains the recovery path. Same tolerance as
+            // InstallModelWizardViewModel.RunStepEnteredAsync.
+        }
     }
 
     /// <summary>Step 1 — Local Ollama for the Router.</summary>
@@ -52,6 +78,13 @@ public sealed partial class SetupWizardViewModel : ObservableObject, IAsyncDispo
 
     /// <summary>Step 4 — Role Recommendations.</summary>
     public WizardRecommendationsStepViewModel RecommendationsStep { get; }
+
+    /// <summary>
+    /// The one-shot initial (step 0) entry — task #147. Awaits the Step 1 detection that runs as
+    /// soon as the wizard opens (fires exactly once at construction). Exposed so tests can
+    /// deterministically await the initial detection.
+    /// </summary>
+    internal Task InitialStepEntry { get; }
 
     /// <summary>The active step index (0–3).</summary>
     [ObservableProperty]
