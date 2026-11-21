@@ -188,6 +188,185 @@ public class LinuxHardwareDigestTests
     }
 
     // ------------------------------------------------------------------
+    //  AMD rocm-smi NEW schema (task #154: quoted byte strings per card)
+    // ------------------------------------------------------------------
+
+    /// <summary>The VERBATIM compact rocm-smi dump captured on aiserver (Strix Halo, 2026-11-21).</summary>
+    private const string RocmNewSchemaStrixHalo =
+        "{\"card0\": {\"VRAM Total Memory (B)\": \"536870912\", \"VRAM Total Used Memory (B)\": \"165527552\"}}\n";
+
+    /// <summary>Strix Halo lspci row, verbatim (vendor token + rev suffix intact).</summary>
+    private const string LspciStrixHalo =
+        "03:00.0 VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Strix Halo " +
+        "[Radeon Graphics / Radeon 8050S Graphics / Radeon 8060S Graphics] (rev c5)\n";
+
+    private const string StrixHaloExpectedModel =
+        "Strix Halo [Radeon Graphics / Radeon 8050S Graphics / Radeon 8060S Graphics]";
+
+    private const string DmidecodeLpDdr5Single =
+        "Handle 0x0101, DMI type 17, 40 bytes\n" +
+        "\tMemory Device\n" +
+        "\t\tLocator: Channel0-DIMM0\n" +
+        "\t\tType: LPDDR5\n" +
+        "\t\tSize: 32 GB\n";
+
+    [Fact]
+    public void TryBuildProfile_AmdRocmNewSchema_StrixHaloRealDump_SingleCrossReferencedEntry_UnifiedDerivation()
+    {
+        // The real aiserver frame (task #154): NEW rocm schema + exactly ONE AMD lspci row.
+        var profile = LinuxHardwareDigest.TryBuildProfile(BuildFrame(
+            hostname: "aiserver",
+            cpu: "AMD Ryzen AI Max+ 395",
+            ramMB: 93379,
+            dmidecode: DmidecodeLpDdr5Single,
+            rocm: RocmNewSchemaStrixHalo,
+            lspci: LspciStrixHalo));
+
+        Assert.NotNull(profile);
+        var gpu = Assert.Single(profile.Gpus); // NO lspci-fallback duplicate entry
+        Assert.Equal("AMD", gpu.Vendor);
+        Assert.Equal(StrixHaloExpectedModel, gpu.ModelName); // vendor token + (rev …) stripped
+        Assert.Equal(512, gpu.VramMB); // 536870912 B / 1048576 floor
+        Assert.Equal("Unknown", gpu.VramType); // 512 MB + no table hit
+        Assert.Equal(0, gpu.BandwidthGBs, precision: 1);
+
+        // Derivation untouched: 512 MB ≤ 2048 → still unified → RAM-derived profile
+        // identical to the pre-fix aiserver persisted profile.
+        Assert.True(profile.IsUnifiedMemory);
+        Assert.Equal(93379, profile.TotalFastMemoryMB);
+        Assert.Equal(341.2, profile.EffectiveBandwidthGBs, precision: 1); // LPDDR5X 4-channel (AMD Max rule)
+    }
+
+    [Fact]
+    public void TryBuildProfile_AmdRocmNewSchema_TwoAmdLspciRows_FallsBackToGenericName()
+    {
+        var profile = LinuxHardwareDigest.TryBuildProfile(BuildFrame(
+            rocm: RocmNewSchemaStrixHalo,
+            lspci: LspciStrixHalo +
+                   "04:00.0 3D controller: Advanced Micro Devices, Inc. [AMD/ATI] Navi 31 [Radeon RX 7900 XTX]\n"));
+
+        Assert.NotNull(profile);
+        var gpu = Assert.Single(profile.Gpus);
+        Assert.Equal("AMD GPU (rocm-smi)", gpu.ModelName); // ≥2 AMD rows → generic
+        Assert.Equal(512, gpu.VramMB); // the byte→MB value is unaffected
+    }
+
+    [Fact]
+    public void TryBuildProfile_AmdRocmNewSchema_ZeroAmdLspciRows_FallsBackToGenericName()
+    {
+        // Intel-only lspci rows → generic name …
+        var intelOnly = LinuxHardwareDigest.TryBuildProfile(BuildFrame(
+            rocm: RocmNewSchemaStrixHalo,
+            lspci: "02:00.0 VGA compatible controller: Intel Corporation Arc A770\n"));
+        Assert.NotNull(intelOnly);
+        var gpu = Assert.Single(intelOnly.Gpus);
+        Assert.Equal("AMD GPU (rocm-smi)", gpu.ModelName);
+        Assert.Equal(512, gpu.VramMB);
+
+        // … and an EMPTY lspci section → generic name as well.
+        var noLspci = LinuxHardwareDigest.TryBuildProfile(BuildFrame(rocm: RocmNewSchemaStrixHalo));
+        Assert.NotNull(noLspci);
+        gpu = Assert.Single(noLspci.Gpus);
+        Assert.Equal("AMD GPU (rocm-smi)", gpu.ModelName);
+        Assert.Equal(512, gpu.VramMB);
+    }
+
+    [Fact]
+    public void TryBuildProfile_AmdRocmNewSchema_MultiCard_OneEntryPerCardInJsonOrder()
+    {
+        var profile = LinuxHardwareDigest.TryBuildProfile(BuildFrame(
+            rocm:
+                "{\n" +
+                "    \"card0\": { \"VRAM Total Memory (B)\": \"536870912\" },\n" +
+                "    \"card1\": { \"VRAM Total Memory (B)\": \"25769803776\" }\n" +
+                "}\n"));
+
+        Assert.NotNull(profile);
+        Assert.Equal(2, profile.Gpus.Count);
+
+        var gpus = profile.Gpus;
+        Assert.Equal("AMD", gpus[0].Vendor);
+        Assert.Equal("AMD GPU (rocm-smi)", gpus[0].ModelName);
+        Assert.Equal(512, gpus[0].VramMB); // 536870912 B
+        Assert.Equal("Unknown", gpus[0].VramType);
+        Assert.Equal(0, gpus[0].BandwidthGBs, precision: 1);
+
+        Assert.Equal("AMD", gpus[1].Vendor);
+        Assert.Equal(24576, gpus[1].VramMB); // 25769803776 B
+        Assert.Equal("GDDR6", gpus[1].VramType); // ≥ 8192 MB → GDDR6 in the shared table
+        Assert.Equal(256.0, gpus[1].BandwidthGBs, precision: 1); // 512 * 0.5
+
+        // 24 GB card > 2048 MB → discrete → total fast memory = the per-GPU sum.
+        Assert.False(profile.IsUnifiedMemory);
+        Assert.Equal(512 + 24576, profile.TotalFastMemoryMB);
+    }
+
+    [Fact]
+    public void TryBuildProfile_AmdRocmNewSchema_NonRoundByteTotal_FloorsToMB()
+    {
+        var profile = LinuxHardwareDigest.TryBuildProfile(BuildFrame(
+            rocm: "{\"card0\": {\"VRAM Total Memory (B)\": \"500000000\"}}\n"));
+
+        Assert.NotNull(profile);
+        var gpu = Assert.Single(profile.Gpus);
+        Assert.Equal(476, gpu.VramMB); // 500000000 / 1048576 floor
+    }
+
+    [Fact]
+    public void TryBuildProfile_AmdRocmNewSchema_TruncatedJson_DegradesToLspciFallbackWithoutThrowing()
+    {
+        // Malformed / truncated NEW-schema JSON (no closing quote/braces) yields zero
+        // parseable cards → legacy regex yields nothing → the lspci fallback wins.
+        var profile = LinuxHardwareDigest.TryBuildProfile(BuildFrame(
+            ramMB: 32768,
+            rocm: "{\"card0\": {\"VRAM Total Memory (B)\": \"5368",
+            lspci: LspciStrixHalo));
+
+        Assert.NotNull(profile);
+        var gpu = Assert.Single(profile.Gpus);
+        Assert.Equal("AMD", gpu.Vendor);
+        // The lspci FALLBACK cleaner is untouched: raw model substring, vendor token kept.
+        Assert.Equal(
+            "Advanced Micro Devices, Inc. [AMD/ATI] Strix Halo [Radeon Graphics / Radeon 8050S Graphics / Radeon 8060S Graphics] (rev c5)",
+            gpu.ModelName);
+        Assert.Equal(0, gpu.VramMB); // lspci carries no VRAM — never fabricated
+    }
+
+    [Fact]
+    public void TryBuildProfile_AmdRocmNewSchema_TrailingCommasAndExtraKeys_Parse()
+    {
+        var profile = LinuxHardwareDigest.TryBuildProfile(BuildFrame(
+            rocm:
+                "{\n" +
+                "    \"card0\": {\n" +
+                "        \"VRAM Total Memory (B)\": \"536870912\",\n" +
+                "        \"VRAM Total Used Memory (B)\": \"165527552\",\n" +
+                "        \"Extra Key\": \"irrelevant\"\n" +
+                "    },\n" +
+                "},\n"));
+
+        Assert.NotNull(profile);
+        var gpu = Assert.Single(profile.Gpus);
+        Assert.Equal(512, gpu.VramMB);
+    }
+
+    [Fact]
+    public void TryBuildProfile_NvidiaRowsPresent_BeatsNewSchemaRocm()
+    {
+        // The chain order is unchanged: nvidia-smi rows win before the ROCM stage is consulted.
+        var profile = LinuxHardwareDigest.TryBuildProfile(BuildFrame(
+            nvidia: "NVIDIA GeForce RTX 4090, 24564\n",
+            rocm: RocmNewSchemaStrixHalo,
+            lspci: LspciStrixHalo));
+
+        Assert.NotNull(profile);
+        var gpu = Assert.Single(profile.Gpus);
+        Assert.Equal("Nvidia", gpu.Vendor);
+        Assert.Equal("GeForce RTX 4090", gpu.ModelName);
+        Assert.Equal(24564, gpu.VramMB);
+    }
+
+    // ------------------------------------------------------------------
     //  lspci-only fallback (GPU identity when no vendor CLI is installed)
     // ------------------------------------------------------------------
 

@@ -262,13 +262,17 @@ internal static class LinuxHardwareDigest
             return gpus;
         }
 
+        // The LSPCI section is hoisted BEFORE the ROCM stage: the new rocm-smi JSON schema
+        // carries no device name, so the ROCM parser cross-references the lspci rows for the
+        // GPU model name. The lspci FALLBACK stage below keeps its position and logic.
+        var lspciSection = ExtractSection(frameLines, LinuxHardwareProbeScript.SectionLspciGpus);
+
         var rocmSection = ExtractSection(frameLines, LinuxHardwareProbeScript.SectionRocmGpus);
-        if (rocmSection.Trim().Length > 0 && ParseRocmSection(rocmSection, gpus))
+        if (rocmSection.Trim().Length > 0 && ParseRocmSection(rocmSection, lspciSection, gpus))
         {
             return gpus;
         }
 
-        var lspciSection = ExtractSection(frameLines, LinuxHardwareProbeScript.SectionLspciGpus);
         if (lspciSection.Trim().Length > 0)
         {
             ParseLspciSection(lspciSection, gpus);
@@ -312,13 +316,28 @@ internal static class LinuxHardwareDigest
     }
 
     /// <summary>
-    /// Parses rocm-smi <c>--showmeminfo vram --json</c> output: one GPU entry per
-    /// <c>"vram_total": &lt;KB&gt;</c> match (KB → MB floor), named <c>AMD GPU (rocm-smi)</c> and
-    /// classified via <see cref="LocalHardwareProfileProvider.ClassifyAmdGpu"/> — the pre-task
-    /// local path, verbatim. Returns whether at least one GPU entry parsed.
+    /// Parses rocm-smi <c>--showmeminfo vram --json</c> output, supporting BOTH schemas:
+    /// the NEW per-card schema (one <c>"cardN"</c> object per GPU carrying
+    /// <c>"VRAM Total Memory (B)"</c> as a quoted byte STRING) first, then the LEGACY
+    /// <c>"vram_total": &lt;KB integer&gt;</c> fallback (KB → MB floor, generic
+    /// <c>AMD GPU (rocm-smi)</c> name — the pre-task local path, verbatim). New-schema entries
+    /// are named from a single AMD lspci row when the frame has exactly one (task #154),
+    /// classified via <see cref="LocalHardwareProfileProvider.ClassifyAmdGpu"/>, and
+    /// <c>busWidthBits</c> stays 0 (unknown). Values are rendered exactly as reported —
+    /// never fabricated. Returns whether at least one GPU entry parsed (neither schema →
+    /// <c>false</c> → the caller falls through to the lspci fallback; malformed JSON never
+    /// throws, it simply yields zero parseable cards).
     /// </summary>
-    private static bool ParseRocmSection(string section, List<GpuDeviceProfile> gpus)
+    private static bool ParseRocmSection(string section, string lspciSection, List<GpuDeviceProfile> gpus)
     {
+        // NEW schema (rocm-smi ≥ the JSON-string era): per-card quoted byte totals.
+        if (section.Contains("\"VRAM Total Memory (B)\"", StringComparison.Ordinal) &&
+            TryParseRocmNewSchema(section, lspciSection, gpus))
+        {
+            return true;
+        }
+
+        // LEGACY schema: "vram_total": <KB integer> (pre-task local path, verbatim).
         var any = false;
         foreach (Match match in Regex.Matches(section, "\"vram_total\"\\s*:\\s*(\\d+)"))
         {
@@ -334,6 +353,105 @@ internal static class LinuxHardwareDigest
         }
 
         return any;
+    }
+
+    /// <summary>
+    /// NEW rocm-smi schema (task #154): one GPU entry per top-level <c>"cardN"</c> object,
+    /// in JSON order of appearance, with the VRAM from the per-card quoted STRING byte value
+    /// <c>"VRAM Total Memory (B)": "&lt;bytes&gt;"</c> (bytes → MB floor — 536870912 → 512).
+    /// A card without a parseable total is SKIPPED (never fabricated; 0 = unknown). The model
+    /// name is the single AMD lspci row cross-referenced and cleaned
+    /// (<see cref="TryGetSingleAmdLspciModelName"/>) or the generic <c>AMD GPU (rocm-smi)</c>
+    /// when lspci does not yield exactly one AMD row. Returns whether ≥1 card parsed.
+    /// </summary>
+    private static bool TryParseRocmNewSchema(string section, string lspciSection, List<GpuDeviceProfile> gpus)
+    {
+        var name = TryGetSingleAmdLspciModelName(lspciSection) ?? "AMD GPU (rocm-smi)";
+        var any = false;
+
+        // Flat card objects ("card0": { … }, "card1": { … }, …) — the body carries no nested
+        // braces in the rocm-smi schema, so [^{}]* matches it exactly.
+        foreach (Match card in Regex.Matches(section, "\"card\\d+\"\\s*:\\s*\\{([^{}]*)\\}"))
+        {
+            var body = card.Groups[1].Value;
+            Match total = Regex.Match(body, "\"VRAM Total Memory \\(B\\)\"\\s*:\\s*\"(\\d+)\"");
+            if (!total.Success)
+            {
+                continue;
+            }
+
+            if (!long.TryParse(total.Groups[1].Value, out var totalBytes) || totalBytes < 0)
+            {
+                continue;
+            }
+
+            var vramMB = (int)Math.Max(0, totalBytes / 1024 / 1024);
+            var (vramType, bandwidth) = LocalHardwareProfileProvider.ClassifyAmdGpu(name, vramMB);
+            gpus.Add(new GpuDeviceProfile("AMD", name, vramMB, vramType, 0, bandwidth));
+            any = true;
+        }
+
+        return any;
+    }
+
+    /// <summary>
+    /// Returns the model substring of one lspci row: the substring after the FIRST
+    /// <c>": "</c> (the whole line when absent) — the single source of truth shared by the
+    /// lspci fallback stage and the rocm cross-reference cleaner.
+    /// </summary>
+    private static string GetLspciModelSubstring(string line)
+    {
+        var separator = line.IndexOf(": ", StringComparison.Ordinal);
+        return separator >= 0 ? line[(separator + 2)..] : line;
+    }
+
+    /// <summary>
+    /// Cross-reference helper for the NEW rocm-smi schema (task #154): returns the CLEANED
+    /// model name of the LSPCI section's AMD display-controller row ONLY when there is
+    /// EXACTLY ONE (zero or ≥2 rows → <c>null</c> → the caller keeps the generic
+    /// <c>AMD GPU (rocm-smi)</c> name).
+    /// </summary>
+    private static string? TryGetSingleAmdLspciModelName(string lspciSection)
+    {
+        if (string.IsNullOrWhiteSpace(lspciSection))
+        {
+            return null;
+        }
+
+        string? amdRow = null;
+        var amdCount = 0;
+        foreach (var rawLine in lspciSection.Split('\n'))
+        {
+            var line = rawLine.Trim();
+            if (line.Length == 0)
+            {
+                continue;
+            }
+
+            if (SniffLspciVendor(line) == "AMD")
+            {
+                amdCount++;
+                amdRow = line;
+            }
+        }
+
+        return amdCount == 1 ? CleanRocmCrossRefAmdName(amdRow!) : null;
+    }
+
+    /// <summary>
+    /// Cleans one AMD lspci row for the rocm cross-reference ONLY (task #154): model
+    /// substring after the first <c>": "</c> (shared rule with the lspci fallback), the leading
+    /// <c>Advanced Micro Devices, Inc. [AMD/ATI]</c> vendor token stripped, a trailing
+    /// <c>(rev …)</c> stripped, then the shared <see cref="LocalHardwareProfileProvider.CleanGpuModelName"/>
+    /// polish. Idempotent: a row that already lacks the vendor token/rev passes through
+    /// unchanged. The lspci FALLBACK path does NOT use this cleaner (stays byte-identical).
+    /// </summary>
+    private static string CleanRocmCrossRefAmdName(string line)
+    {
+        var model = GetLspciModelSubstring(line.Trim());
+        model = Regex.Replace(model, "^Advanced Micro Devices(?:, Inc\\.)?\\s*\\[(?:AMD/ATI|AMD)\\]\\s*", string.Empty, RegexOptions.IgnoreCase);
+        model = Regex.Replace(model, "\\s*\\(rev\\s+[0-9a-fA-F]+\\)\\s*$", string.Empty, RegexOptions.IgnoreCase);
+        return LocalHardwareProfileProvider.CleanGpuModelName("AMD", model);
     }
 
     /// <summary>
@@ -355,13 +473,7 @@ internal static class LinuxHardwareDigest
             }
 
             var vendor = SniffLspciVendor(line);
-            var model = line;
-            var separator = line.IndexOf(": ", StringComparison.Ordinal);
-            if (separator >= 0)
-            {
-                model = line[(separator + 2)..];
-            }
-
+            var model = GetLspciModelSubstring(line);
             var name = LocalHardwareProfileProvider.CleanGpuModelName(vendor, model);
             var (vramType, bandwidth) = vendor switch
             {

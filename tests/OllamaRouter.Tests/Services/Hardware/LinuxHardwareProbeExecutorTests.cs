@@ -103,6 +103,42 @@ public class LinuxHardwareProbeExecutorTests
     }
 
     [Fact]
+    public async Task ProbeLocalAsync_NewSchemaRocmFrame_DigestsTheCrossReferencedEntry()
+    {
+        // Task #154: the local bash path digests the NEW rocm-smi schema (quoted byte strings)
+        // via the shared digest — one cross-referenced Strix Halo entry, 512 MB, no lspci
+        // fallback duplicate. The remote ssh path ships the identical digest by construction.
+        const string newSchemaFrame =
+            "===BEGIN_HW===\n" +
+            "HOSTNAME=aiserver\n" +
+            "ARCH=x86_64\n" +
+            "CPU=AMD Ryzen AI Max+ 395\n" +
+            "RAM_MB=93379\n" +
+            "---DMIDECODE_MEMORY---\n" +
+            "---NVIDIA_GPUS---\n" +
+            "---ROCM_GPUS---\n" +
+            "{\"card0\": {\"VRAM Total Memory (B)\": \"536870912\", \"VRAM Total Used Memory (B)\": \"165527552\"}}\n" +
+            "---LSPCI_GPUS---\n" +
+            "03:00.0 VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Strix Halo [Radeon Graphics / Radeon 8050S Graphics / Radeon 8060S Graphics] (rev c5)\n" +
+            "===END_HW===\n";
+
+        var runner = new FakeProcessRunner().Succeeds("bash", string.Empty, newSchemaFrame);
+        var executor = CreateExecutor(runner);
+
+        var result = await executor.ProbeLocalAsync();
+
+        Assert.NotNull(result.Profile);
+        Assert.Null(result.Error);
+        Assert.Equal("aiserver", result.Profile!.NodeName);
+        var gpu = Assert.Single(result.Profile.Gpus);
+        Assert.Equal("AMD", gpu.Vendor);
+        Assert.Equal(
+            "Strix Halo [Radeon Graphics / Radeon 8050S Graphics / Radeon 8060S Graphics]",
+            gpu.ModelName);
+        Assert.Equal(512, gpu.VramMB);
+    }
+
+    [Fact]
     public async Task ProbeLocalAsync_LaunchFailure_ReturnsReadableError()
     {
         var runner = new FakeProcessRunner().FailsToStart("bash", string.Empty, "bash: command not found");
