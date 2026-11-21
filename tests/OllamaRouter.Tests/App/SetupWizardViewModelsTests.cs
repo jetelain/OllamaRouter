@@ -188,10 +188,15 @@ public sealed class SetupWizardViewModelsTests
                 OllamaHostReader = () => OllamaHostValue,
                 PortWaitBudget = TimeSpan.FromHours(1),
             };
+            // Task #157: platform-aware default — Windows presumes the tray app present (the
+            // builder probes WindowsTrayAppPath and equality-gates it); every test that needs
+            // a specific binary (or an absent one) still overrides this explicitly.
+            Detection = new OllamaDetection(
+                true, isWindows ? LocalOllamaConfigurator.WindowsTrayAppPath : "/usr/local/bin/ollama", false);
         }
 
         public LocalOllamaConfigurator Configurator { get; }
-        public OllamaDetection Detection { get; set; } = new(true, "/usr/local/bin/ollama", false);
+        public OllamaDetection Detection { get; set; } = new(true, "/usr/local/bin/ollama", false); // ctor overrides per platform
         public bool PortOpen { get; set; }
         /// <summary>Per-port probe results (task #150); falls back to <see cref="PortOpen"/>.</summary>
         public Dictionary<int, bool> PortMap { get; } = [];
@@ -545,12 +550,12 @@ public sealed class SetupWizardViewModelsTests
         Assert.All(h.QueriedNames, n => Assert.True(n is "ollama" or "ollama app"));
         Assert.Contains(("ollama", 111), h.Kills);
 
-        // The serve start: binary + "serve" + explicit env (no stale inheritance).
-        var serve = Assert.Single(h.Starts, s => s.FileName == "/usr/local/bin/ollama");
-        Assert.Contains("serve", serve.Arguments);
-        Assert.Equal("127.0.0.1:11435", serve.EnvironmentVariables["OLLAMA_HOST"]);
-        Assert.Equal("1", serve.EnvironmentVariables["OLLAMA_FLASH_ATTENTION"]);
-        Assert.Equal("q8_0", serve.EnvironmentVariables["OLLAMA_KV_CACHE_TYPE"]);
+        // The tray-app start (task #157): ollama app.exe + "--fast-startup hidden" + explicit env (no stale inheritance).
+        var app = Assert.Single(h.Starts, s => s.FileName == LocalOllamaConfigurator.WindowsTrayAppPath);
+        Assert.Equal("--fast-startup hidden", app.Arguments);
+        Assert.Equal("127.0.0.1:11435", app.EnvironmentVariables["OLLAMA_HOST"]);
+        Assert.Equal("1", app.EnvironmentVariables["OLLAMA_FLASH_ATTENTION"]);
+        Assert.Equal("q8_0", app.EnvironmentVariables["OLLAMA_KV_CACHE_TYPE"]);
 
         // Router started via the daemon launcher.
         Assert.Contains("StartAsync", launcher.Calls);
@@ -564,8 +569,8 @@ public sealed class SetupWizardViewModelsTests
         var result = await h.Configurator.ConfigureForRouterAsync(lanMesh: true, connection, CancellationToken.None);
         Assert.True(result.Success);
         Assert.Contains(("OLLAMA_HOST", "0.0.0.0:11435", EnvironmentVariableTarget.User), h.EnvWrites);
-        var serve = Assert.Single(h.Starts, s => s.FileName == "/usr/local/bin/ollama");
-        Assert.Equal("0.0.0.0:11435", serve.EnvironmentVariables["OLLAMA_HOST"]);
+        var app = Assert.Single(h.Starts, s => s.FileName == LocalOllamaConfigurator.WindowsTrayAppPath);
+        Assert.Equal("0.0.0.0:11435", app.EnvironmentVariables["OLLAMA_HOST"]);
     }
 
     [Fact]
@@ -626,7 +631,128 @@ public sealed class SetupWizardViewModelsTests
         Assert.False(result.OllamaStarted); // the port never opened ⇒ Ollama is not confirmed up
         Assert.False(result.RouterStarted);
         Assert.DoesNotContain("StartAsync", launcher.Calls);
-        Assert.Contains(h.Starts, s => s.FileName == "/usr/local/bin/ollama"); // the serve launch WAS attempted
+        Assert.Contains(h.Starts, s => s.FileName == LocalOllamaConfigurator.WindowsTrayAppPath); // the tray-app launch WAS attempted
+    }
+
+    // ==================================================================
+    //  Step 1 — task #157: Windows tray-app launch (parity with OllamaProcessLauncher)
+    // ==================================================================
+
+    /// <summary>AC1: the Windows start path launches the TRAY APP (not a bare `serve` child)
+    /// with the pinned argument string + the three explicit env vars; the success message,
+    /// the 11435 port-wait and the env-write/kill sequencing are unchanged.</summary>
+    [Theory]
+    [InlineData(false)] // loopback → 127.0.0.1:11435
+    [InlineData(true)]  // LAN mesh  → 0.0.0.0:11435
+    public async Task Step157_Windows_Start_TrayAppPresent_LaunchesTrayApp_ExplicitEnv(bool lanMesh)
+    {
+        var h = new ConfigHarness(isWindows: true, isMacOS: false) { PortOpen = true };
+        var result = await h.Configurator.StartOllamaOnlyAsync(lanMesh, CancellationToken.None);
+        var expectedHost = lanMesh ? "0.0.0.0:11435" : "127.0.0.1:11435";
+
+        Assert.True(result.Success);
+        Assert.True(result.OllamaStarted);
+        Assert.Equal($"Ollama is serving on {expectedHost}.", result.Message);
+
+        // The pinned launch shape (AC1).
+        var app = Assert.Single(h.Starts);
+        Assert.Equal(LocalOllamaConfigurator.WindowsTrayAppPath, app.FileName);
+        Assert.Equal("--fast-startup hidden", app.Arguments);
+        Assert.False(app.UseShellExecute);
+        Assert.Equal(expectedHost, app.EnvironmentVariables["OLLAMA_HOST"]);
+        Assert.Equal("1", app.EnvironmentVariables["OLLAMA_FLASH_ATTENTION"]);
+        Assert.Equal("q8_0", app.EnvironmentVariables["OLLAMA_KV_CACHE_TYPE"]);
+
+        // Port-wait on 11435 ran (probe happened, budget respected) and the tray path was probed last.
+        Assert.Contains(11435, h.ProbedPorts);
+        Assert.Equal([LocalOllamaConfigurator.WindowsTrayAppPath], h.ProbedPaths[^1]);
+
+        // The pre-launch sequencing (env writes + kills) is unchanged.
+        Assert.Equal(3, h.EnvWrites.Count);
+        Assert.Contains(("OLLAMA_HOST", expectedHost, EnvironmentVariableTarget.User), h.EnvWrites);
+        Assert.Contains(("ollama", 111), h.Kills);
+    }
+
+    /// <summary>AC2: tray app absent → readable failure naming the searched location; nothing is
+    /// launched, no `serve` fallback, no port-wait — but the env-write + stop sequencing before
+    /// the builder still ran.</summary>
+    [Fact]
+    public async Task Step157_Windows_Start_TrayAppAbsent_FailsReadably_NoLaunchNoPortWait()
+    {
+        var h = new ConfigHarness(isWindows: true, isMacOS: false)
+        {
+            Detection = new OllamaDetection(false, null, false),
+        };
+        var result = await h.Configurator.StartOllamaOnlyAsync(lanMesh: false, CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal(LocalOllamaConfigurator.OllamaNotFoundMessage(windows: true, afterUpdate: false), result.Message);
+        Assert.Contains(LocalOllamaConfigurator.WindowsTrayAppPath, result.Message);
+        Assert.Contains("start Ollama manually or reinstall it from ollama.com", result.Message);
+        Assert.Empty(h.Starts); // nothing launched — no serve fallback
+        Assert.Empty(h.ProbedPorts); // no port-wait (fail fast)
+        // The env-write + stop sequencing BEFORE the builder still ran.
+        Assert.Equal(3, h.EnvWrites.Count);
+        Assert.Contains(("ollama", 111), h.Kills);
+    }
+
+    /// <summary>AC2 edge: a bare `ollama.exe` found (e.g. via the PATH fallback in
+    /// DefaultBinaryProbe) while the tray app is absent must ALSO fail — the launch is
+    /// equality-gated on the probed path being the tray app itself (the bare binary does not
+    /// accept `--fast-startup hidden`).</summary>
+    [Fact]
+    public async Task Step157_Windows_BareBinaryOnly_NoServeFallback_Fails()
+    {
+        var h = new ConfigHarness(isWindows: true, isMacOS: false)
+        {
+            Detection = new OllamaDetection(true, @"C:\Program Files\Ollama\ollama.exe", false),
+        };
+        var result = await h.Configurator.StartOllamaOnlyAsync(lanMesh: false, CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal(LocalOllamaConfigurator.OllamaNotFoundMessage(windows: true, afterUpdate: false), result.Message);
+        Assert.Empty(h.Starts);
+        Assert.Empty(h.ProbedPorts);
+    }
+
+    /// <summary>AC5 (Update path): after a successful update script, tray app absent →
+    /// the after-update failure message; stop → script ran, but no restart, no port-wait.
+    /// </summary>
+    [Fact]
+    public async Task Step157_Windows_Update_TrayAppAbsent_FailsReadably_NoRestart()
+    {
+        var h = new ConfigHarness(isWindows: true, isMacOS: false)
+        {
+            Detection = new OllamaDetection(false, null, false),
+        };
+        var result = await h.Configurator.UpdateOllamaAsync(CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal(LocalOllamaConfigurator.OllamaNotFoundMessage(windows: true, afterUpdate: true), result.Message);
+        Assert.Equal(["kill:ollama:111", "script:powershell.exe"], h.Events);
+        Assert.Empty(h.Starts);
+        Assert.Empty(h.ProbedPorts);
+    }
+
+    /// <summary>AC5 (Fix-port path, VM-level): FixPort routes through the SAME builder —
+    /// tray app absent → the same readable failure (red message), no launch, no port-wait.
+    /// </summary>
+    [Fact]
+    public async Task Step157_Windows_FixPort_TrayAppAbsent_RedMessageNoLaunch()
+    {
+        var (vm, h, _) = BuildEnvStep();
+        h.Detection = new OllamaDetection(true, @"C:\Program Files\Ollama\ollama.exe", true); // bare binary, running
+        h.PortMap[11434] = true; // Ollama running on the WRONG port → Fix port enabled
+        await vm.RefreshAsync();
+        Assert.True(vm.FixPortCommand.CanExecute(null));
+
+        await vm.FixPortCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.True(vm.MessageIsError);
+        Assert.Equal(LocalOllamaConfigurator.OllamaNotFoundMessage(windows: true, afterUpdate: false), vm.Message);
+        Assert.Empty(h.Starts); // nothing launched — no serve fallback
+        Assert.DoesNotContain(h.Events, e => e.StartsWith("start:")); // the build step failed before any launch / port-wait
+        Assert.False(vm.IsBusy);
     }
 
     [Fact]
@@ -791,21 +917,21 @@ public sealed class SetupWizardViewModelsTests
         var h = new ConfigHarness(isWindows: true, isMacOS: false)
         {
             PortOpen = true, // the post-update restart port-wait succeeds immediately
-            Detection = new OllamaDetection(true, "/usr/local/bin/ollama", true),
+            Detection = new OllamaDetection(true, LocalOllamaConfigurator.WindowsTrayAppPath, true),
         };
         var result = await h.Configurator.UpdateOllamaAsync(CancellationToken.None);
 
         Assert.True(result.Success);
         Assert.True(result.OllamaStarted);
         Assert.Equal($"Ollama updated and serving on :{LocalOllamaConfigurator.OllamaPort}.", result.Message);
-        // Contractual ordering: kill → script → serve start.
-        Assert.Equal(["kill:ollama:111", "script:powershell.exe", "start:/usr/local/bin/ollama"], h.Events);
-        // The restart is the EXPLICIT-env serve form (no stale inheritance).
-        var serve = Assert.Single(h.Starts, s => s.FileName == "/usr/local/bin/ollama");
-        Assert.Contains("serve", serve.Arguments);
-        Assert.Equal("127.0.0.1:11435", serve.EnvironmentVariables["OLLAMA_HOST"]);
-        Assert.Equal("1", serve.EnvironmentVariables["OLLAMA_FLASH_ATTENTION"]);
-        Assert.Equal("q8_0", serve.EnvironmentVariables["OLLAMA_KV_CACHE_TYPE"]);
+        // Contractual ordering: kill → script → tray-app start.
+        Assert.Equal(["kill:ollama:111", "script:powershell.exe", $"start:{LocalOllamaConfigurator.WindowsTrayAppPath}"], h.Events);
+        // The restart is the tray app (task #157) with the EXPLICIT env (no stale inheritance).
+        var app = Assert.Single(h.Starts, s => s.FileName == LocalOllamaConfigurator.WindowsTrayAppPath);
+        Assert.Equal("--fast-startup hidden", app.Arguments);
+        Assert.Equal("127.0.0.1:11435", app.EnvironmentVariables["OLLAMA_HOST"]);
+        Assert.Equal("1", app.EnvironmentVariables["OLLAMA_FLASH_ATTENTION"]);
+        Assert.Equal("q8_0", app.EnvironmentVariables["OLLAMA_KV_CACHE_TYPE"]);
     }
 
     [Fact]
@@ -853,7 +979,7 @@ public sealed class SetupWizardViewModelsTests
         };
         var result = await h.Configurator.UpdateOllamaAsync(CancellationToken.None);
         Assert.False(result.Success);
-        Assert.Contains("No local Ollama installation was found after the update script", result.Message);
+        Assert.Equal(LocalOllamaConfigurator.OllamaNotFoundMessage(windows: true, afterUpdate: true), result.Message);
         Assert.Empty(h.Starts);
     }
 
@@ -1190,7 +1316,7 @@ public sealed class SetupWizardViewModelsTests
 
         Assert.Equal($"Ollama updated and serving on :{LocalOllamaConfigurator.OllamaPort}.", vm.Message);
         Assert.False(vm.MessageIsError);
-        Assert.Equal(["kill:ollama:111", "script:powershell.exe", "start:/usr/local/bin/ollama"], h.Events);
+        Assert.Equal(["kill:ollama:111", "script:powershell.exe", $"start:{LocalOllamaConfigurator.WindowsTrayAppPath}"], h.Events);
         Assert.Equal(probesBefore + 2, h.ProbedPaths.Count); // BuildOllamaStartInfo re-detect + the refresh
         Assert.False(vm.IsBusy);
     }
@@ -1199,7 +1325,7 @@ public sealed class SetupWizardViewModelsTests
     public async Task Step150_FixPort_StartOllamaOnlyPath_LoopbackHost()
     {
         var (vm, h, _) = BuildEnvStep();
-        h.Detection = new OllamaDetection(true, "/usr/local/bin/ollama", true);
+        h.Detection = new OllamaDetection(true, LocalOllamaConfigurator.WindowsTrayAppPath, true);
         h.PortMap[11434] = true; // Ollama running on the WRONG port
         await vm.RefreshAsync();
         Assert.True(vm.FixPortCommand.CanExecute(null));
@@ -1210,8 +1336,8 @@ public sealed class SetupWizardViewModelsTests
         Assert.Contains("serving on 127.0.0.1:11435", vm.Message!);
         Assert.False(vm.MessageIsError);
         Assert.Contains(("OLLAMA_HOST", "127.0.0.1:11435", EnvironmentVariableTarget.User), h.EnvWrites);
-        var serve = Assert.Single(h.Starts, s => s.FileName == "/usr/local/bin/ollama");
-        Assert.Equal("127.0.0.1:11435", serve.EnvironmentVariables["OLLAMA_HOST"]);
+        var app = Assert.Single(h.Starts, s => s.FileName == LocalOllamaConfigurator.WindowsTrayAppPath);
+        Assert.Equal("127.0.0.1:11435", app.EnvironmentVariables["OLLAMA_HOST"]);
         Assert.Equal(OllamaPortStatus.Ok, vm.OllamaPortStatus); // re-detect: fixed
     }
 
@@ -1219,7 +1345,7 @@ public sealed class SetupWizardViewModelsTests
     public async Task Step150_FixPort_LanMeshChecked_Uses0000Host()
     {
         var (vm, h, _) = BuildEnvStep();
-        h.Detection = new OllamaDetection(true, "/usr/local/bin/ollama", true);
+        h.Detection = new OllamaDetection(true, LocalOllamaConfigurator.WindowsTrayAppPath, true);
         h.PortMap[11434] = true;
         await vm.RefreshAsync();
         vm.LanMeshEnabled = true;
@@ -1228,8 +1354,8 @@ public sealed class SetupWizardViewModelsTests
         await vm.FixPortCommand.ExecuteAsync(CancellationToken.None);
 
         Assert.Contains(("OLLAMA_HOST", "0.0.0.0:11435", EnvironmentVariableTarget.User), h.EnvWrites);
-        var serve = Assert.Single(h.Starts, s => s.FileName == "/usr/local/bin/ollama");
-        Assert.Equal("0.0.0.0:11435", serve.EnvironmentVariables["OLLAMA_HOST"]);
+        var app = Assert.Single(h.Starts, s => s.FileName == LocalOllamaConfigurator.WindowsTrayAppPath);
+        Assert.Equal("0.0.0.0:11435", app.EnvironmentVariables["OLLAMA_HOST"]);
     }
 
     [Fact]

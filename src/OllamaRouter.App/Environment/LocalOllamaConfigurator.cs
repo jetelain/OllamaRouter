@@ -44,6 +44,13 @@ internal sealed record ProcessRunResult(int ExitCode, string OutputTail, string 
 /// restarts Ollama on <c>:11435</c> (explicit env — no stale inheritance), waits for the port
 /// and (for the full configure path) starts the router daemon on <c>:11434</c>.
 /// <para>
+/// Launch contract per OS (task #157 — parity with the daemon-side OllamaProcessLauncher):
+/// Windows → the TRAY APP (<c>ollama app.exe --fast-startup hidden</c>, explicit env — the
+/// spawned serve child binds <c>:11435</c>); macOS → <c>open -g --env … -a Ollama.app</c>;
+/// Linux (Update restart) → <c>&lt;binary&gt; serve</c> with the explicit env. Tray app absent on
+/// Windows → readable failure (no headless serve fallback — fail fast, no port wait).
+/// </para>
+/// <para>
 /// BCL-only; EVERY side effect is behind an injectable seam so tests are platform-independent
 /// and spawn nothing (no real processes, env writes, network or sleeps — the port-wait delay
 /// is a manual gate in tests).
@@ -59,6 +66,25 @@ internal sealed class LocalOllamaConfigurator
 
     /// <summary>The macOS Ollama.app bundle name (for <c>open -a</c>).</summary>
     internal const string OllamaAppBundle = "/Applications/Ollama.app";
+
+    /// <summary>The Windows Ollama tray-app executable (official installer location; same
+    /// convention as the daemon-side OllamaProcessLauncher auto-start).</summary>
+    internal static readonly string WindowsTrayAppPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "Programs", "Ollama", "ollama app.exe");
+
+    /// <summary>
+    /// The readable "Ollama not found" failure message (task #157): on Windows it names the
+    /// tray-app location searched + the recovery (no headless serve fallback); macOS/Linux keep
+    /// the existing not-installed wording (byte-identical to pre-#157).
+    /// </summary>
+    internal static string OllamaNotFoundMessage(bool windows, bool afterUpdate) => windows
+        ? $"The Ollama tray app was not found at '{WindowsTrayAppPath}'"
+          + (afterUpdate ? " after the update script" : string.Empty)
+          + " — start Ollama manually or reinstall it from ollama.com."
+        : afterUpdate
+            ? "No local Ollama installation was found after the update script — check the installer output."
+            : "No local Ollama installation was found — install Ollama and retry.";
 
     // -- Injectable seams (all default to real BCL behavior; tests replace them) ------
 
@@ -81,8 +107,8 @@ internal sealed class LocalOllamaConfigurator
     /// <summary>Process killer: (name, pid) → whether it was killed.</summary>
     internal Func<string, int, bool>? ProcessKiller { get; set; }
 
-    /// <summary>Process starter: launch (serve/open) → the child handle id (captured
-    /// <see cref="ProcessStartInfo"/> is what tests inspect).</summary>
+    /// <summary>Process starter: launch (tray app / serve / open) → the child handle id
+    /// (captured <see cref="ProcessStartInfo"/> is what tests inspect).</summary>
     internal Func<ProcessStartInfo, string>? ProcessStarter { get; set; }
 
     /// <summary>Port probe: (port) → whether a TCP connect to <c>127.0.0.1:port</c> opens.</summary>
@@ -226,14 +252,13 @@ internal sealed class LocalOllamaConfigurator
         }
 
         // 3. Re-detect (the script may have installed/moved the binary) + restart with EXPLICIT
-        //    env + port wait (the existing start-only path — on Linux this is <binary> serve
-        //    with the explicit env and NO persistent env write, per the M1 scope).
+        //    env + port wait (the existing start-only path — on Windows this is the tray app;
+        //    on Linux this is <binary> serve with the explicit env and NO persistent env write,
+        //    per the M1 scope).
         var startInfo = BuildOllamaStartInfo(win, host: OllamaHost(lanMesh: false), ct);
         if (startInfo is null)
         {
-            return new OllamaScriptResult(false,
-                "No local Ollama installation was found after the update script — check the installer output.",
-                false);
+            return new OllamaScriptResult(false, OllamaNotFoundMessage(win, afterUpdate: true), false);
         }
 
         (ProcessStarter ?? DefaultProcessStarter)(startInfo);
@@ -384,7 +409,7 @@ internal sealed class LocalOllamaConfigurator
             if (startInfo is null)
             {
                 return new LocalOllamaConfigResult(
-                    false, "No local Ollama installation was found — install Ollama and retry.", false, false);
+                    false, OllamaNotFoundMessage(win, afterUpdate: false), false, false);
             }
 
             (ProcessStarter ?? DefaultProcessStarter)(startInfo);
@@ -471,11 +496,40 @@ internal sealed class LocalOllamaConfigurator
     private ProcessStartInfo? BuildOllamaStartInfo(bool windows, string host, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
-        // Task #150 (M1): FULL platform path selection — previously windows vs macOS, so the
-        // Linux restart after an Update could never find the binary. The Linux non-.app branch
-        // produces <binary> serve with the EXPLICIT env (no persistent env write on Linux).
+        // Task #157: FULL platform path selection — Windows branches to the tray app (task
+        // #157, parity with OllamaProcessLauncher); the Linux non-.app branch produces
+        // <binary> serve with the EXPLICIT env (no persistent env write on Linux).
+        // (The `windows` parameter is vestigial — Platform() is authoritative.)
         var (win, mac) = Platform();
-        var paths = win ? WindowsBinarySearchPaths : mac ? MacBinarySearchPaths : LinuxBinarySearchPaths;
+        if (win)
+        {
+            // Task #157: launch the Ollama TRAY APP (parity with OllamaProcessLauncher). The
+            // spawned serve child inherits the explicit env below and binds :11435. Probe the
+            // tray path through the existing BinaryProbe seam and equality-gate: the default
+            // probe's PATH fallback could surface a bare ollama(.exe) that must NOT be launched
+            // with --fast-startup hidden (and no headless serve fallback is allowed — the
+            // caller emits the readable tray-app-not-found failure instead).
+            var tray = WindowsTrayAppPath;
+            var trayDetection = (BinaryProbe ?? DefaultBinaryProbe)([tray]);
+            if (!trayDetection.Installed ||
+                !string.Equals(trayDetection.BinaryPath, tray, StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+
+            var app = new ProcessStartInfo(tray, "--fast-startup hidden")
+            {
+                UseShellExecute = false, // required: honored only when false — the env below matters
+                CreateNoWindow = true, // no-op for the GUI tray app; preserves the "no window" intent
+                WorkingDirectory = Path.GetDirectoryName(tray)!,
+            };
+            app.EnvironmentVariables[HostEnvVar] = host;
+            app.EnvironmentVariables[FlashAttentionEnvVar] = "1";
+            app.EnvironmentVariables[KvCacheTypeEnvVar] = "q8_0";
+            return app;
+        }
+
+        var paths = mac ? MacBinarySearchPaths : LinuxBinarySearchPaths;
         var detection = (BinaryProbe ?? DefaultBinaryProbe)(paths);
         if (!detection.Installed || string.IsNullOrWhiteSpace(detection.BinaryPath))
         {
@@ -483,7 +537,7 @@ internal sealed class LocalOllamaConfigurator
         }
 
         var binary = detection.BinaryPath;
-        if (windows || !binary.EndsWith(".app", StringComparison.OrdinalIgnoreCase))
+        if (!binary.EndsWith(".app", StringComparison.OrdinalIgnoreCase))
         {
             // <binary> serve with EXPLICIT env (the child must not inherit a stale OLLAMA_HOST).
             var serve = new ProcessStartInfo(binary, "serve")
