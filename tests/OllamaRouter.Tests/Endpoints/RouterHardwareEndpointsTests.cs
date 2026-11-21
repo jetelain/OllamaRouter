@@ -598,7 +598,7 @@ public class RouterHardwareEndpointsTests
         Assert.Contains("-p 2222 ", invocation.Arguments, StringComparison.Ordinal);
         Assert.Contains("-o BatchMode=yes ", invocation.Arguments, StringComparison.Ordinal);
         Assert.Contains("ops@192.168.1.50 ", invocation.Arguments, StringComparison.Ordinal);
-        Assert.EndsWith("| base64 -d | bash'", invocation.Arguments, StringComparison.Ordinal);
+        Assert.EndsWith("| base64 -d | bash\"", invocation.Arguments, StringComparison.Ordinal);
         Assert.Equal(LinuxHardwareProbeExecutor.ProbeTimeoutMs, invocation.TimeoutMs);
 
         // Persisted with the ssh provenance.

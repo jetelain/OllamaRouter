@@ -1166,7 +1166,7 @@ public class OperationalCommandsTests
 
         Assert.Equal(0, exitCode);
         client.Verify(c => c.GetBenchmarkResultsAsync(It.IsAny<CancellationToken>()), Times.Exactly(2));
-        var lines = output.ToString().Split('\n');
+        var lines = output.ToString().ReplaceLineEndings("\n").Split('\n');
         Assert.Contains("benchmark: Local=Running Remote=Running", lines);
         Assert.Contains("benchmark: Local=Succeeded Remote=Succeeded", lines);
         Assert.Contains("benchmark: finished", lines);

@@ -521,7 +521,7 @@ internal sealed class LinuxHardwareProbeExecutor : ILinuxHardwareProbeExecutor
             $"-o KbdInteractiveAuthentication=no " +
             $"-o NumberOfPasswordPrompts=0 " +
             $"{user}@{host} " +
-            $"'echo {base64Script} | base64 -d | bash'";
+            $"\"echo {base64Script} | base64 -d | bash\"";
     }
 
     /// <summary>

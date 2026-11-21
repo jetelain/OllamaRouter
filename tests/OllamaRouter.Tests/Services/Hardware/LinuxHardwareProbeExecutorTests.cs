@@ -188,7 +188,7 @@ public class LinuxHardwareProbeExecutorTests
             "-o KbdInteractiveAuthentication=no " +
             "-o NumberOfPasswordPrompts=0 " +
             "ops@gpu-box " +
-            $"'echo {base64} | base64 -d | bash'",
+            $"\"echo {base64} | base64 -d | bash\"",
             args);
 
         // Hardening invariants: no prompts, bounded connect, no password auth.
@@ -255,9 +255,9 @@ public class LinuxHardwareProbeExecutorTests
         await executor.ProbeRemoteAsync(target);
 
         var args = runner.GetInvocations()[0].Arguments;
-        var marker = "'echo ";
+        var marker = "\"echo ";
         var start = args.IndexOf(marker, StringComparison.Ordinal) + marker.Length;
-        var end = args.IndexOf(" | base64 -d | bash'", start, StringComparison.Ordinal);
+        var end = args.IndexOf(" | base64 -d | bash\"", start, StringComparison.Ordinal);
         var base64 = args[start..end];
         var decoded = Encoding.UTF8.GetString(Convert.FromBase64String(base64));
         Assert.Equal(LinuxHardwareProbeScript.ScriptText, decoded);

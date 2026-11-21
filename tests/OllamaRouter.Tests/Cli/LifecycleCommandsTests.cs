@@ -310,7 +310,7 @@ public class LifecycleCommandsTests
         var exitCode = await command.ExecuteAsync(context, ["--lines", "2"], CancellationToken.None);
 
         Assert.Equal(0, exitCode);
-        var lines = output.ToString().Split("\n", StringSplitOptions.RemoveEmptyEntries);
+        var lines = output.ToString().ReplaceLineEndings("\n").Split("\n", StringSplitOptions.RemoveEmptyEntries);
         Assert.Equal(["new4", "new5"], lines);
     }
 
@@ -330,7 +330,7 @@ public class LifecycleCommandsTests
         var exitCode = await command.ExecuteAsync(context, [], CancellationToken.None);
 
         Assert.Equal(0, exitCode);
-        var lines = output.ToString().Split("\n", StringSplitOptions.RemoveEmptyEntries);
+        var lines = output.ToString().ReplaceLineEndings("\n").Split("\n", StringSplitOptions.RemoveEmptyEntries);
         Assert.Equal(50, lines.Length);
         Assert.Equal("line11", lines[0]);
         Assert.Equal("line60", lines[^1]);
@@ -387,7 +387,7 @@ public class LifecycleCommandsTests
         var exitCode = await command.ExecuteAsync(context, ["--follow"], cts.Token);
 
         Assert.Equal(0, exitCode);
-        var lines = output.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        var lines = output.ToString().ReplaceLineEndings("\n").Split('\n', StringSplitOptions.RemoveEmptyEntries);
         Assert.Equal(["first", "second", "third"], lines);
     }
 
@@ -421,7 +421,7 @@ public class LifecycleCommandsTests
         await writer;
 
         Assert.Equal(0, exitCode);
-        var lines = output.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        var lines = output.ToString().ReplaceLineEndings("\n").Split('\n', StringSplitOptions.RemoveEmptyEntries);
         Assert.Equal(["complete", "partial"], lines);
     }
 
