@@ -57,39 +57,130 @@ jobs:
           sudo apt-get install -y clang lldb zlib1g-dev libicu-dev libssl-dev \
             libx11-dev libx11-xcb-dev libxcb1-dev libxcb-dri3-dev libfontconfig1-dev
 
-      - name: Publish Native AOT binaries
+      - name: Publish Native AOT binaries & stage publish.ps1 layout
         shell: bash
+        env:
+          RID: ${{ matrix.rid }}
         run: |
-          dotnet publish src/OllamaRouter/OllamaRouter.csproj -c Release -r ${{ matrix.rid }} -o "dist/OllamaRouter-${{ matrix.rid }}"
-          dotnet publish src/OllamaRouter.Cli/OllamaRouter.Cli.csproj -c Release -r ${{ matrix.rid }} -o "dist/OllamaRouter-${{ matrix.rid }}"
-          dotnet publish src/OllamaRouter.App/OllamaRouter.App.csproj -c Release -r ${{ matrix.rid }} -o "dist/OllamaRouter-${{ matrix.rid }}"
+          set -euo pipefail
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            RAW_TAG="${{ github.ref_name }}"
+            VERSION="${RAW_TAG#v}"
+          else
+            VERSION=$(dotnet msbuild src/OllamaRouter/OllamaRouter.csproj -getProperty:Version 2>/dev/null || true)
+            VERSION=${VERSION:-1.0.0}
+          fi
 
-      - name: Add bundle metadata
-        shell: bash
-        run: |
-          version=$(dotnet msbuild src/OllamaRouter/OllamaRouter.csproj -getProperty:Version || true)
-          version=${version:-1.0.0}
-          printf '%s\n' "$version" > "dist/OllamaRouter-${{ matrix.rid }}/VERSION"
-          cp README.md "dist/OllamaRouter-${{ matrix.rid }}/"
-          cp LICENSE "dist/OllamaRouter-${{ matrix.rid }}/"
+          DIST_DIR="dist/OllamaRouter-${RID}"
+          mkdir -p "${DIST_DIR}" "${DIST_DIR}/bin" ./artifacts
 
-      - name: Archive bundle (Windows)
+          for proj in \
+            src/OllamaRouter/OllamaRouter.csproj \
+            src/OllamaRouter.Cli/OllamaRouter.Cli.csproj \
+            src/OllamaRouter.App/OllamaRouter.App.csproj
+          do
+            dotnet publish "${proj}" \
+              -c Release \
+              -r "${RID}" \
+              -p:PublishAot=true \
+              -p:StripSymbols=true \
+              -p:DebugType=none \
+              -p:DebugSymbols=false \
+              -p:Version="${VERSION}" \
+              -o "${DIST_DIR}"
+          done
+
+          find "${DIST_DIR}" -type f \( -name '*.pdb' -o -name '*.dbg' \) -delete
+
+          printf '%s\n' \
+            '{' \
+            '  "OllamaRouter": {' \
+            '    "StateDirectory": "state"' \
+            '  },' \
+            '  "Logging": {' \
+            '    "LogLevel": {' \
+            '      "Default": "Warning",' \
+            '      "OllamaRouter": "Information"' \
+            '    },' \
+            '    "LogsDirectory": "logs"' \
+            '  }' \
+            '}' \
+            > "${DIST_DIR}/appsettings.Production.json"
+
+          if [[ "${RID}" == win-* ]]; then
+            printf '@echo off\r\nsetlocal\r\ncd /d "%%~dp0"\r\n"%%~dp0ollamarouter.exe" %%*\r\n' > "${DIST_DIR}/ollamarouter.cmd"
+            printf '@echo off\r\nsetlocal\r\ncd /d "%%~dp0.."\r\n"%%~dp0..\\ollamarouter.exe" %%*\r\n' > "${DIST_DIR}/bin/ollamarouter.cmd"
+            printf '@echo off\r\nsetlocal\r\ncd /d "%%~dp0.."\r\n"%%~dp0..\\ollamarouter-app.exe" %%*\r\n' > "${DIST_DIR}/bin/ollamarouter-app.cmd"
+            printf '%s\n' \
+              '#!/usr/bin/env bash' \
+              'DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"' \
+              'cd "$DIR/.."' \
+              'if [ -f "$DIR/../ollamarouter.exe" ]; then' \
+              '    "$DIR/../ollamarouter.exe" "$@"' \
+              'elif [ -f "$DIR/../ollamarouter" ]; then' \
+              '    "$DIR/../ollamarouter" "$@"' \
+              'fi' \
+              > "${DIST_DIR}/bin/ollamarouter"
+          else
+            printf '%s\n' \
+              '#!/usr/bin/env bash' \
+              'DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"' \
+              'cd "$DIR/.."' \
+              'exec "$DIR/../ollamarouter" "$@"' \
+              > "${DIST_DIR}/bin/ollamarouter"
+            printf '%s\n' \
+              '#!/usr/bin/env bash' \
+              'DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"' \
+              'cd "$DIR/.."' \
+              'exec "$DIR/../ollamarouter-app" "$@"' \
+              > "${DIST_DIR}/bin/ollamarouter-app"
+            chmod +x \
+              "${DIST_DIR}/ollamarouter-server" \
+              "${DIST_DIR}/ollamarouter" \
+              "${DIST_DIR}/ollamarouter-app" \
+              "${DIST_DIR}/bin/ollamarouter" \
+              "${DIST_DIR}/bin/ollamarouter-app"
+          fi
+
+          printf '%s\n' "${VERSION}" > "${DIST_DIR}/VERSION"
+          cp README.md LICENSE "${DIST_DIR}/"
+
+      - name: Archive bundle & SHA256SUMS (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path "dist/OllamaRouter-${{ matrix.rid }}/*" -DestinationPath "OllamaRouter-${{ matrix.rid }}.zip"
+        env:
+          RID: ${{ matrix.rid }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = "./artifacts/OllamaRouter-$env:RID.zip"
+          Compress-Archive -Path "./dist/OllamaRouter-$env:RID/*" -DestinationPath $archive -Force
+          $hash = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          $name = [System.IO.Path]::GetFileName($archive)
+          [System.IO.File]::WriteAllLines("./artifacts/SHA256SUMS-$env:RID.txt", @("$hash  $name"), [System.Text.UTF8Encoding]::new($false))
 
-      - name: Archive bundle (macOS / Linux)
+      - name: Archive bundle & SHA256SUMS (macOS / Linux)
         if: runner.os != 'Windows'
         shell: bash
-        run: tar -czf "OllamaRouter-${{ matrix.rid }}.tar.gz" -C dist "OllamaRouter-${{ matrix.rid }}"
+        env:
+          RID: ${{ matrix.rid }}
+        run: |
+          set -euo pipefail
+          tar -czf "./artifacts/OllamaRouter-${RID}.tar.gz" -C "dist/OllamaRouter-${RID}" .
+          (
+            cd ./artifacts
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "OllamaRouter-${RID}.tar.gz" > "SHA256SUMS-${RID}.txt"
+            else
+              shasum -a 256 "OllamaRouter-${RID}.tar.gz" > "SHA256SUMS-${RID}.txt"
+            fi
+          )
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
           name: OllamaRouter-${{ matrix.rid }}
-          path: |
-            OllamaRouter-${{ matrix.rid }}.zip
-            OllamaRouter-${{ matrix.rid }}.tar.gz
+          path: ./artifacts/*
+          if-no-files-found: error
 
   release:
     needs: publish
@@ -101,7 +192,18 @@ jobs:
           path: release-artifacts
           merge-multiple: true
 
+      - name: Merge unified SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-artifacts
+          cat SHA256SUMS-*.txt > SHA256SUMS.txt
+          rm -f SHA256SUMS-*.txt
+          sort -k2 -o SHA256SUMS.txt SHA256SUMS.txt
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: release-artifacts/OllamaRouter-*
+          files: |
+            release-artifacts/OllamaRouter-*
+            release-artifacts/SHA256SUMS.txt
