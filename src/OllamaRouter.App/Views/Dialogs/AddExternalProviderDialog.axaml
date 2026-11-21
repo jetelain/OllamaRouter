@@ -1,0 +1,53 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:OllamaRouter.App.ViewModels"
+        xmlns:converters="using:OllamaRouter.App.Converters"
+        x:Class="OllamaRouter.App.Views.Dialogs.AddExternalProviderDialog"
+        x:DataType="vm:ExternalProviderAddFormViewModel"
+        Title="Add External Provider"
+        Width="640" Height="480"
+        WindowStartupLocation="CenterOwner">
+  <DockPanel Margin="8">
+    <TextBlock DockPanel.Dock="Top" Text="{Binding ValidationErrorMessage}" Foreground="#FF7B7B"
+               TextWrapping="Wrap" IsVisible="{Binding HasValidationError}" Margin="0,0,0,6"/>
+    <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
+      <Button Content="Cancel" Click="OnCancelClick" MinWidth="90"/>
+      <Button Content="Save" Click="OnSaveClick" MinWidth="90"/>
+    </StackPanel>
+
+    <ScrollViewer>
+      <StackPanel Spacing="8">
+        <!-- Preset chip row: prefill Base URL + provider label; the active chip is
+             highlighted (PresetChipConverter), Custom clears the prefills. -->
+        <StackPanel Orientation="Horizontal" Spacing="8">
+          <Button Content="OpenRouter" Command="{Binding ApplyPresetCommand}" CommandParameter="openrouter"
+                  Background="{Binding ActivePresetId, Converter={x:Static converters:PresetChipConverter.Instance}, ConverterParameter=openrouter}"/>
+          <Button Content="Groq" Command="{Binding ApplyPresetCommand}" CommandParameter="groq"
+                  Background="{Binding ActivePresetId, Converter={x:Static converters:PresetChipConverter.Instance}, ConverterParameter=groq}"/>
+          <Button Content="OpenAI" Command="{Binding ApplyPresetCommand}" CommandParameter="openai"
+                  Background="{Binding ActivePresetId, Converter={x:Static converters:PresetChipConverter.Instance}, ConverterParameter=openai}"/>
+          <Button Content="Custom" Command="{Binding ApplyPresetCommand}" CommandParameter=""
+                  Background="{Binding ActivePresetId, Converter={x:Static converters:PresetChipConverter.Instance}, ConverterParameter={x:Null}}"/>
+        </StackPanel>
+
+        <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto,Auto,Auto" RowSpacing="6" ColumnSpacing="8">
+          <TextBlock Grid.Row="0" Grid.Column="0" Text="Name:" VerticalAlignment="Center"/>
+          <TextBox Grid.Row="0" Grid.Column="1" Text="{Binding Name}"/>
+
+          <TextBlock Grid.Row="1" Grid.Column="0" Text="Base URL:" VerticalAlignment="Center"/>
+          <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding BaseUrl}" Watermark="https://host[:port] or host:port"/>
+
+          <TextBlock Grid.Row="2" Grid.Column="0" Text="API Key:" VerticalAlignment="Center"
+                     ToolTip.Tip="Upstream (masked) key — required for OpenAI-compatible providers. The key material is never displayed."/>
+          <TextBox Grid.Row="2" Grid.Column="1" Text="{Binding ApiKey}" PasswordChar="•"
+                   Watermark="required for OpenAI-compatible providers"/>
+
+          <TextBlock Grid.Row="3" Grid.Column="0" Text="Provider:" VerticalAlignment="Center"/>
+          <TextBox Grid.Row="3" Grid.Column="1" Text="{Binding Provider}"/>
+        </Grid>
+
+        <CheckBox IsChecked="{Binding TestConnectionFirst}" Content="Test the connection first (an immediate liveness probe runs before persisting)"/>
+      </StackPanel>
+    </ScrollViewer>
+  </DockPanel>
+</Window>

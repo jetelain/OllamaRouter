@@ -671,6 +671,20 @@ public sealed partial class FleetTargetsViewModel : RouterTabViewModel
     /// </summary>
     public TargetEditFormViewModel CreateEditForm(FleetTargetRow row) =>
         new(isEdit: true, existing: row ?? throw new ArgumentNullException(nameof(row)));
+
+    /// <summary>
+    /// Creates the dedicated "Add Ollama Node" form (task #149). The per-type add dialogs
+    /// replace the shared form's fleet-tab UI entry point; <see cref="CreateAddForm"/> stays
+    /// fully functional (tested) for the shared dialog's add-mode capability and reuse.
+    /// </summary>
+    public OllamaNodeAddFormViewModel CreateOllamaNodeAddForm() => new();
+
+    /// <summary>
+    /// Creates the dedicated "Add External Provider" form (task #149) for
+    /// OpenAI-compatible endpoints — also the reuse point for task #151's wizard Step 2,
+    /// which opens the SAME dedicated dialogs as the main app.
+    /// </summary>
+    public ExternalProviderAddFormViewModel CreateExternalProviderAddForm() => new();
 }
 
 /// <summary>
@@ -1050,41 +1064,21 @@ public sealed partial class TargetEditFormViewModel : ObservableObject
 
     private bool ValidateCommon(out string? error)
     {
-        if (string.IsNullOrWhiteSpace(Name))
+        // Task #149: the shared name / URL / maxParallel / ssh-credential rules moved to
+        // TargetFieldValidator (the dedicated per-type add dialogs reuse them); only the
+        // powerWatts check stays local — it is the only form with that field.
+        if (!TargetFieldValidator.ValidateName(Name, out error))
         {
-            error = "The target name must not be empty.";
             return false;
         }
 
-        var trimmed = Name.Trim();
-        if (trimmed.Length > 64)
+        if (!TargetFieldValidator.ValidateUrl(Url, out error))
         {
-            error = "The target name must be 64 characters or fewer.";
             return false;
         }
 
-        if (trimmed.Contains('/') || trimmed.Contains('\\') || trimmed.Contains(':'))
+        if (!TargetFieldValidator.ValidateMaxParallel(MaxParallel, out error))
         {
-            error = "The target name must not contain '/', '\\' or ':'.";
-            return false;
-        }
-
-        if (string.Equals(trimmed, "Cloud", System.StringComparison.OrdinalIgnoreCase))
-        {
-            error = "\"Cloud\" is reserved for the cloud overflow pseudo-target.";
-            return false;
-        }
-
-        if (!Uri.TryCreate(Url, UriKind.Absolute, out var uri) ||
-            (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
-        {
-            error = "The target URL must be an absolute http(s) URI.";
-            return false;
-        }
-
-        if (!int.TryParse(MaxParallel, out var maxParallel) || maxParallel < 1)
-        {
-            error = "maxParallel must be an integer of 1 or greater.";
             return false;
         }
 
@@ -1098,17 +1092,13 @@ public sealed partial class TargetEditFormViewModel : ObservableObject
 
         // Task #144: the daemon-side probe ssh credential (same charset the server enforces —
         // POSIX-ish, safe to interpolate into {user}@{host}).
-        if (!string.IsNullOrWhiteSpace(SshUser) &&
-            !System.Text.RegularExpressions.Regex.IsMatch(SshUser, "^[A-Za-z0-9._-]{1,64}$"))
+        if (!TargetFieldValidator.ValidateSshUser(SshUser, out error))
         {
-            error = "sshUser must be 1–64 characters of letters, digits, '.', '_' or '-' (or blank).";
             return false;
         }
 
-        if (!string.IsNullOrWhiteSpace(SshPort) &&
-            (!int.TryParse(SshPort, out var sshPort) || sshPort < 1 || sshPort > 65535))
+        if (!TargetFieldValidator.ValidateSshPort(SshPort, out error))
         {
-            error = "sshPort must be a port between 1 and 65535 (or blank).";
             return false;
         }
 
@@ -1116,8 +1106,7 @@ public sealed partial class TargetEditFormViewModel : ObservableObject
         return true;
     }
 
-    private string NormalizeUrl() =>
-        Url.Trim().TrimEnd('/');
+    private string NormalizeUrl() => TargetFieldValidator.NormalizeUrl(Url);
 
     private double? ParseWatts() =>
         string.IsNullOrWhiteSpace(PowerWatts)
@@ -1138,10 +1127,7 @@ public sealed partial class TargetEditFormViewModel : ObservableObject
 
     /// <summary>The ssh port wire value: blank → null (ADD: unset; EDIT: NO CHANGE — the
     /// port wire cannot clear), else the parsed port (validated 1–65535).</summary>
-    private int? ParseSshPort() =>
-        string.IsNullOrWhiteSpace(_sshPort)
-            ? null
-            : int.Parse(_sshPort, System.Globalization.CultureInfo.InvariantCulture);
+    private int? ParseSshPort() => TargetFieldValidator.ParseSshPort(_sshPort);
 
     private IReadOnlyList<TargetModelDto>? BuildModels()
     {

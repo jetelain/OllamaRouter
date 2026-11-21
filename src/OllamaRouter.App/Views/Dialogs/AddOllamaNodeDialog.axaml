@@ -1,0 +1,43 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:OllamaRouter.App.ViewModels"
+        x:Class="OllamaRouter.App.Views.Dialogs.AddOllamaNodeDialog"
+        x:DataType="vm:OllamaNodeAddFormViewModel"
+        Title="Add Ollama Node"
+        Width="640" Height="440"
+        WindowStartupLocation="CenterOwner">
+  <DockPanel Margin="8">
+    <TextBlock DockPanel.Dock="Top" Text="{Binding ValidationErrorMessage}" Foreground="#FF7B7B"
+               TextWrapping="Wrap" IsVisible="{Binding HasValidationError}" Margin="0,0,0,6"/>
+    <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
+      <Button Content="Cancel" Click="OnCancelClick" MinWidth="90"/>
+      <Button Content="Save" Click="OnSaveClick" MinWidth="90"/>
+    </StackPanel>
+
+    <ScrollViewer>
+      <StackPanel Spacing="8">
+        <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto" RowSpacing="6" ColumnSpacing="8">
+          <TextBlock Grid.Row="0" Grid.Column="0" Text="Name:" VerticalAlignment="Center"/>
+          <TextBox Grid.Row="0" Grid.Column="1" Text="{Binding Name}"/>
+
+          <TextBlock Grid.Row="1" Grid.Column="0" Text="URL:" VerticalAlignment="Center"/>
+          <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding Url}"/>
+
+          <TextBlock Grid.Row="2" Grid.Column="0" Text="Max Parallel:" VerticalAlignment="Center"/>
+          <TextBox Grid.Row="2" Grid.Column="1" Text="{Binding MaxParallel}"/>
+
+          <TextBlock Grid.Row="3" Grid.Column="0" Text="SSH User:" VerticalAlignment="Center"
+                     ToolTip.Tip="ssh user for the daemon-side hardware probe; the host is the target URL's host (key-based auth, no password)."/>
+          <TextBox Grid.Row="3" Grid.Column="1" Text="{Binding SshUser}"
+                   Watermark="e.g. gpuadmin — key-based auth; blank = unset"/>
+
+          <TextBlock Grid.Row="4" Grid.Column="0" Text="SSH Port:" VerticalAlignment="Center"
+                     ToolTip.Tip="ssh port of the daemon-side hardware probe; blank = the default port 22."/>
+          <TextBox Grid.Row="4" Grid.Column="1" Text="{Binding SshPort}" Watermark="default 22"/>
+        </Grid>
+
+        <CheckBox IsChecked="{Binding TestConnectionFirst}" Content="Test the connection first (an immediate liveness probe runs before persisting)"/>
+      </StackPanel>
+    </ScrollViewer>
+  </DockPanel>
+</Window>

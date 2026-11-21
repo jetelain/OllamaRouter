@@ -45,6 +45,53 @@ public sealed class FleetTargetsViewLayoutTests
             b => b.Content is string content && content == "Persist");
     }
 
+    // -- Task #149: the dedicated per-type add entry points ---------------------------
+
+    [Fact]
+    public void Toolbar_ExposesExactlyRefreshAndTheTwoDedicatedAddButtons()
+    {
+        var toolbar = GetToolbar();
+        var buttons = toolbar.Children.OfType<Button>().ToArray();
+
+        // EXACTLY three buttons: Refresh + the two dedicated add entry points (the single
+        // generic 'Add Target' button is gone).
+        Assert.Equal(new[] { "Refresh", "Add Ollama Node", "Add External Provider" },
+            buttons.Select(b => b.Content as string).ToArray());
+
+        // Refresh stays command-bound; the add buttons are code-behind handlers (they open
+        // the dedicated dialogs) and carry the primary style.
+        var refresh = buttons.Single(b => (string)b.Content! == "Refresh");
+        Assert.Equal("RefreshCommand", BindingPath(refresh, Button.CommandProperty));
+        var addOllama = buttons.Single(b => (string)b.Content! == "Add Ollama Node");
+        var addProvider = buttons.Single(b => (string)b.Content! == "Add External Provider");
+        Assert.Contains("Primary", addOllama.Classes);
+        Assert.Contains("Primary", addProvider.Classes);
+    }
+
+    [Fact]
+    public void Toolbar_NoAddTargetButton_AndNoOsProviderEntryAnywhere()
+    {
+        var view = new FleetTargetsView();
+        view.ApplyTemplate();
+        var (row, _, _) = LoadRowTemplate();
+
+        // The single generic 'Add Target' button must be gone (both trees: the view + the
+        // built row template), and there is NO UI path to create an osnative target
+        // (native OS inference providers are not implemented — backlog #63/#64).
+        Assert.DoesNotContain(
+            AllControls(view).Concat(AllControls(row)).OfType<Button>(),
+            b => b.Content is string content && content == "Add Target");
+
+        var texts = AllControls(view).Concat(AllControls(row))
+            .OfType<TextBlock>()
+            .Select(t => t.Text)
+            .Where(t => t is not null)
+            .Cast<string>();
+        Assert.DoesNotContain(texts, t =>
+            t.Contains("osnative", StringComparison.OrdinalIgnoreCase) ||
+            t.Contains("OS Provider", StringComparison.OrdinalIgnoreCase));
+    }
+
     [Fact]
     public void RowTemplate_IdentityRow_EnabledCluster_MirrorsMonitor()
     {
@@ -230,6 +277,20 @@ public sealed class FleetTargetsViewLayoutTests
         // The resident chip keeps its tooltip.
         Assert.Equal("Resident models",
             chips[^1].GetValue(ToolTip.TipProperty));
+    }
+
+    /// <summary>
+    /// The tab's toolbar <see cref="StackPanel"/>: <c>view.Content</c> →
+    /// <see cref="ScrollViewer"/> → root <see cref="StackPanel"/> → child 1 (child 0 is the
+    /// last-error banner TextBlock).
+    /// </summary>
+    private static StackPanel GetToolbar()
+    {
+        var view = new FleetTargetsView();
+        view.ApplyTemplate();
+        var scrollViewer = Assert.IsType<ScrollViewer>(view.Content);
+        var root = Assert.IsType<StackPanel>(scrollViewer.Content);
+        return Assert.IsType<StackPanel>(root.Children[1]);
     }
 
     private static (StackPanel Row, Grid Identity, Grid Endpoint) LoadRowTemplate()
