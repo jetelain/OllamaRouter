@@ -1913,12 +1913,29 @@ public sealed class SetupWizardViewModelsTests
     private static Mock<IOllamaRouterApiClient> MockClient()
     {
         var mock = new Mock<IOllamaRouterApiClient>();
+        // Q2 (task #152): the standalone hardware fetch is no longer Step-4-consumed — this
+        // setup stays as a harmless loose-mock default.
         mock.Setup(c => c.GetFleetHardwareAsync(It.IsAny<CancellationToken>()))
             .ReturnsAsync(new RouterFleetHardwareResponse([]));
+        // Task #152: the candidate plan loads once per step entry — a small non-empty default
+        // plan (one target, one selected candidate) so the Step-4 Run flow has something to
+        // benchmark; tests override with their own setup.
+        mock.Setup(c => c.GetBenchmarkCandidatesAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DefaultCandidates());
         mock.Setup(c => c.GetBenchmarkResultsAsync(It.IsAny<CancellationToken>()))
             .ReturnsAsync(new RouterBenchmarkResultsResponse([]));
         return mock;
     }
+
+    private static RouterBenchmarkCandidatesResponse DefaultCandidates() =>
+        new([new RouterBenchmarkCandidateTarget(
+            "Local", null,
+            [new RouterBenchmarkCandidateModel(
+                "llama3:8b", [UsageRole.BasicModel], "q4", "Dense",
+                8_000_000_000, null, 8_192, BenchmarkCandidateFit.Assumed, 8_192)])]);
+
+    private static RouterBenchmarkCandidateModel CandidateModel(string name, BenchmarkCandidateFit fit) =>
+        new(name, [UsageRole.BasicModel], "q4", "Dense", 8_000_000_000, null, 8_192, fit, 8_192);
 
     private static WizardBenchmarkStepViewModel BuildBenchmark(
         Mock<IOllamaRouterApiClient> mock,
@@ -1930,7 +1947,7 @@ public sealed class SetupWizardViewModelsTests
         new(model, role, ctx, 100, 1_000_000_000, tps, 500.0, viable, reason);
 
     [Fact]
-    public async Task Step3_Run_CapturesStartBenchmarkForAllTargetsAndRecordsQueue()
+    public async Task Step3_Run_AllSelected_SendsNullRequest()
     {
         var mock = MockClient();
         mock.Setup(c => c.StartBenchmarkAsync(null, It.IsAny<CancellationToken>()))
@@ -1939,8 +1956,198 @@ public sealed class SetupWizardViewModelsTests
         vm = BuildBenchmark(mock, ct => vm.RefreshAsync(ct), GatedDelay);
 
         await vm.RunBenchmarksCommand.ExecuteAsync(CancellationToken.None);
+        // D5: nothing unchecked → null request → the byte-identical absent-body POST.
         mock.Verify(c => c.StartBenchmarkAsync(null, It.IsAny<CancellationToken>()), Times.Once);
         Assert.Equal(["Local", "Remote"], vm.QueuedTargets);
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step3_Run_UncheckedModels_SendPerTargetExclusions()
+    {
+        var mock = MockClient();
+        mock.Setup(c => c.GetBenchmarkCandidatesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(
+            new RouterBenchmarkCandidatesResponse(
+            [
+                new RouterBenchmarkCandidateTarget("Local", null,
+                    [CandidateModel("model-a", BenchmarkCandidateFit.Fits),
+                     CandidateModel("model-b", BenchmarkCandidateFit.Fits)]),
+                new RouterBenchmarkCandidateTarget("Remote", null,
+                    [CandidateModel("model-a", BenchmarkCandidateFit.Assumed)]),
+            ]));
+        RouterBenchmarkRequest? captured = null;
+        mock.Setup(c => c.StartBenchmarkAsync(It.IsAny<RouterBenchmarkRequest?>(), It.IsAny<CancellationToken>()))
+            .Callback<RouterBenchmarkRequest?, CancellationToken>((request, _) => captured = request)
+            .ReturnsAsync(new RouterBenchmarkRunResponse(true, ["Local", "Remote"]));
+        WizardBenchmarkStepViewModel vm = null!;
+        vm = BuildBenchmark(mock, ct => vm.RefreshAsync(ct), GatedDelay);
+
+        await vm.OnStepEnteredAsync();
+        await WaitUntilAsync(() => vm.CandidateGroups.Count == 2, "both candidate groups");
+
+        // Uncheck ONE model on ONE target only ("Remote" stays fully selected).
+        vm.CandidateGroups.Single(g => g.Target == "Local").Models[0].IsSelected = false;
+
+        await vm.RunBenchmarksCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.NotNull(captured);
+        Assert.NotNull(captured!.ExcludedModels);
+        Assert.Single(captured.ExcludedModels!); // only the target with an unchecked model
+        Assert.Equal(["model-a"], captured.ExcludedModels["Local"].ToArray());
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step3_NothingSelected_RunDisabled_AndDirectExecuteNoops()
+    {
+        var mock = MockClient();
+        var startCalls = 0;
+        mock.Setup(c => c.StartBenchmarkAsync(It.IsAny<RouterBenchmarkRequest?>(), It.IsAny<CancellationToken>()))
+            .Callback<RouterBenchmarkRequest?, CancellationToken>((_, _) => startCalls++)
+            .ReturnsAsync(new RouterBenchmarkRunResponse(true, ["Local"]));
+        WizardBenchmarkStepViewModel vm = null!;
+        vm = BuildBenchmark(mock, ct => vm.RefreshAsync(ct), GatedDelay);
+
+        await vm.OnStepEnteredAsync();
+        await WaitUntilAsync(() => vm.CandidateGroups.Count == 1, "the candidate group");
+
+        // Uncheck EVERY model → Run is disabled (CanExecute false).
+        foreach (var row in vm.CandidateGroups[0].Models.ToList())
+        {
+            row.IsSelected = false;
+        }
+        Assert.False(vm.RunBenchmarksCommand.CanExecute(null));
+
+        // ExecuteAsync bypasses CanExecute — the flow must still no-op with the hint message.
+        await vm.RunBenchmarksCommand.ExecuteAsync(CancellationToken.None);
+        Assert.Equal(0, startCalls);
+        Assert.Equal("Select at least one candidate model to benchmark.", vm.Message);
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step3_PollerTicks_DoNotResetUserSelections()
+    {
+        var mock = MockClient();
+        int ticks = 0;
+        WizardBenchmarkStepViewModel vm = null!;
+        vm = BuildBenchmark(mock, async ct =>
+        {
+            await vm.RefreshAsync(ct);
+            Interlocked.Increment(ref ticks);
+        }, SoftDelay);
+
+        await vm.OnStepEnteredAsync();
+        await WaitUntilAsync(() => vm.CandidateGroups.Count == 1, "the candidate group");
+
+        // D7: unchecking survives the 2 s poll — the plan is never re-fetched mid-step.
+        var row = vm.CandidateGroups[0].Models[0];
+        row.IsSelected = false;
+        var before = Volatile.Read(ref ticks);
+        await WaitUntilAsync(() => Volatile.Read(ref ticks) >= before + 2, "two more poller ticks");
+
+        Assert.False(row.IsSelected); // same object, still unchecked
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step3_StepReEntry_ReDefaultsAllSelected()
+    {
+        var mock = MockClient();
+        WizardBenchmarkStepViewModel vm = null!;
+        vm = BuildBenchmark(mock, ct => vm.RefreshAsync(ct), GatedDelay);
+
+        await vm.OnStepEnteredAsync();
+        await WaitUntilAsync(() => vm.CandidateGroups.Count == 1, "the first-entry candidate group");
+        var fetchesBefore = mock.Invocations.Count(i => i.Method.Name == nameof(IOllamaRouterApiClient.GetBenchmarkCandidatesAsync));
+
+        vm.CandidateGroups[0].Models[0].IsSelected = false;
+        await vm.OnStepLeftAsync();
+        await vm.OnStepEnteredAsync(); // fresh entry = fresh run scope (D7)
+
+        // The entry re-fetches the plan and re-defaults EVERY checkbox to selected.
+        await WaitUntilAsync(
+            () => mock.Invocations.Count(i => i.Method.Name == nameof(IOllamaRouterApiClient.GetBenchmarkCandidatesAsync)) > fetchesBefore
+                && vm.CandidateGroups.Count == 1
+                && vm.CandidateGroups[0].Models.Count > 0
+                && vm.CandidateGroups[0].Models.All(m => m.IsSelected),
+            "the re-entry candidate re-fetch to re-default the selection");
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step3_CandidatesFetchFailure_RunDisabled_AndErrorShown()
+    {
+        var mock = MockClient();
+        mock.Setup(c => c.GetBenchmarkCandidatesAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new OllamaRouterApiException(HttpStatusCode.InternalServerError, "boom"));
+        int ticks = 0;
+        WizardBenchmarkStepViewModel vm = null!;
+        vm = BuildBenchmark(mock, async ct =>
+        {
+            await vm.RefreshAsync(ct);
+            Interlocked.Increment(ref ticks);
+        }, SoftDelay);
+
+        await vm.OnStepEnteredAsync();
+        await WaitUntilAsync(() => vm.Error is not null && vm.Error!.Contains("boom"),
+            "the candidate-load error to surface");
+        Assert.Empty(vm.CandidateGroups);
+        Assert.False(vm.RunBenchmarksCommand.CanExecute(null));
+
+        // The flag stays false: a later tick RETRIES the fetch.
+        var before = Volatile.Read(ref ticks);
+        await WaitUntilAsync(() => Volatile.Read(ref ticks) > before, "another poller tick");
+        Assert.True(
+            mock.Invocations.Count(i => i.Method.Name == nameof(IOllamaRouterApiClient.GetBenchmarkCandidatesAsync)) >= 2,
+            "a failed candidate load must be retried on the next tick");
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step3_Candidates_LoadOnStepEntry_DefaultAllSelected_AndHardwareAnnotated()
+    {
+        var mock = MockClient();
+        mock.Setup(c => c.GetBenchmarkCandidatesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(
+            new RouterBenchmarkCandidatesResponse(
+            [
+                new RouterBenchmarkCandidateTarget(
+                    "Local",
+                    new NodeHardwareProfile(
+                        "local", "linux", "x64", false, 32_000_000_000, SystemRamType.Ddr5,
+                        [new GpuDeviceProfile("nvidia", "RTX 4090", 24_576, "GDDR6X", 384, 1008)],
+                        24_576, 1008),
+                    [CandidateModel("llama3:8b", BenchmarkCandidateFit.Fits),
+                     new RouterBenchmarkCandidateModel(
+                         "qwen3.8:27b", [UsageRole.AgenticChat], "q4", "Dense",
+                         27_800_000_000, null, 131_072, BenchmarkCandidateFit.Pruned, 0)]),
+                new RouterBenchmarkCandidateTarget("Remote", null,
+                    [new RouterBenchmarkCandidateModel(
+                        "qwen3.8:27b", [UsageRole.AgenticChat], "q4", "Dense",
+                        27_800_000_000, null, 131_072, BenchmarkCandidateFit.Assumed, 131_072)]),
+            ]));
+        WizardBenchmarkStepViewModel vm = null!;
+        vm = BuildBenchmark(mock, ct => vm.RefreshAsync(ct), GatedDelay);
+
+        await vm.OnStepEnteredAsync(); // first tick loads the plan
+        await WaitUntilAsync(() => vm.CandidateGroups.Count == 2, "both candidate groups");
+
+        // Every checkbox defaults to selected (the run-scoped opt-out starts empty).
+        Assert.All(vm.CandidateGroups, g => Assert.All(g.Models, m => Assert.True(m.IsSelected)));
+
+        // The profiled group carries the hardware annotation (Q2: same strings as the
+        // pre-#152 hardware table); the unknown-profile group carries the note instead.
+        var local = vm.CandidateGroups.Single(g => g.Target == "Local");
+        Assert.Equal("RTX 4090", local.GpuName);
+        Assert.Equal("VRAM: 24576 MB", local.VramText);
+        Assert.Equal("BW: 1032192 MB/s", local.BandwidthText); // 1008 GB/s × 1024
+        Assert.Null(local.Note);
+        Assert.Equal("won't fit this node", local.Models.Single(m => m.Model == "qwen3.8:27b").FitText);
+        Assert.Contains("8192", local.Models.Single(m => m.Model == "llama3:8b").FitText);
+        var remote = vm.CandidateGroups.Single(g => g.Target == "Remote");
+        Assert.Equal("No hardware profile detected", remote.Note);
+        Assert.Equal("no profile (assumed)", remote.Models[0].FitText);
+        Assert.True(vm.RunBenchmarksCommand.CanExecute(null));
         await vm.DisposeAsync();
     }
 
@@ -1951,12 +2158,22 @@ public sealed class SetupWizardViewModelsTests
         var now = DateTimeOffset.UtcNow;
         mock.Setup(c => c.StartBenchmarkAsync(null, It.IsAny<CancellationToken>()))
             .ReturnsAsync(new RouterBenchmarkRunResponse(true, ["Local", "Remote"]));
-        mock.Setup(c => c.GetFleetHardwareAsync(It.IsAny<CancellationToken>())).ReturnsAsync(new RouterFleetHardwareResponse([
-            new FleetHardwareNode("Local", "detected", new NodeHardwareProfile(
-                "local", "linux", "x64", false, 32_000_000_000, SystemRamType.Ddr5,
-                [new GpuDeviceProfile("nvidia", "RTX 4090", 24576, "GDDR6X", 384, 1008)], 24576, 1008), true),
-            new FleetHardwareNode("Remote", "unknown", null, false),
-        ]));
+        // Task #152 (Q2): the candidate plan carries the hardware — the old per-tick
+        // GetFleetHardwareAsync fetch is gone; the assertions below are retargeted to the
+        // candidate groups' hardware annotation.
+        mock.Setup(c => c.GetBenchmarkCandidatesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(
+            new RouterBenchmarkCandidatesResponse(
+            [
+                new RouterBenchmarkCandidateTarget(
+                    "Local",
+                    new NodeHardwareProfile(
+                        "local", "linux", "x64", false, 32_000_000_000, SystemRamType.Ddr5,
+                        [new GpuDeviceProfile("nvidia", "RTX 4090", 24_576, "GDDR6X", 384, 1008)],
+                        24_576, 1008),
+                    [CandidateModel("llama3:8b", BenchmarkCandidateFit.Fits)]),
+                new RouterBenchmarkCandidateTarget("Remote", null,
+                    [CandidateModel("qwen2.5:7b", BenchmarkCandidateFit.Assumed)]),
+            ]));
         mock.Setup(c => c.GetBenchmarkResultsAsync(It.IsAny<CancellationToken>())).ReturnsAsync(new RouterBenchmarkResultsResponse([
             new BenchmarkTargetResult("Local", BenchmarkRunStatus.Running, now, null, [
                 Ctx("llama3:8b", UsageRole.BasicModel, 8192, 25.0, true),
@@ -1987,8 +2204,8 @@ public sealed class SetupWizardViewModelsTests
         // Stop the poller (awaited => the loop fully exits, no in-flight tick) so the observable
         // collections are stable, then assert their contents.
         await vm.OnStepLeftAsync();
-        Assert.Contains(vm.HardwareRows, r => r.GpuName == "RTX 4090");
-        Assert.Contains(vm.HardwareRows, r => r.Note is not null && r.Note.Contains("No hardware profile"));
+        Assert.Contains(vm.CandidateGroups, g => g.GpuName == "RTX 4090");
+        Assert.Contains(vm.CandidateGroups, g => g.Note is not null && g.Note.Contains("No hardware profile"));
         Assert.Contains(vm.ResultRows, r => r.DecodeTokensPerSecond >= 20 && r.Viable);
         Assert.Contains(vm.ResultRows, r => r.DecodeTokensPerSecond < 20 && !r.Viable);
         await vm.DisposeAsync();

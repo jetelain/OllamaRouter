@@ -467,7 +467,7 @@ public sealed class OllamaRouterApiClientTests : IDisposable
         Assert.Equal(8192, target.MaxContextCeiling);
     }
 
-    // ------------------------------------------------- 34-method route-table round-trip
+    // ------------------------------------------------- 36-method route-table round-trip
 
     [Theory]
     [InlineData("GetInfoAsync")]
@@ -492,6 +492,7 @@ public sealed class OllamaRouterApiClientTests : IDisposable
     [InlineData("ResetTargetStreakAsync")]
     [InlineData("ResetFleetStreaksAsync")]
     [InlineData("StartBenchmarkAsync")]
+    [InlineData("GetBenchmarkCandidatesAsync")]
     [InlineData("GetBenchmarkResultsAsync")]
     [InlineData("ClearBenchmarkResultsAsync")]
     [InlineData("GetSessionsAsync")]
@@ -532,6 +533,59 @@ public sealed class OllamaRouterApiClientTests : IDisposable
 
         Assert.Equal(route.ExpectedSessionHeader, request.SessionId);
         route.Validate(result);
+    }
+
+    [Fact]
+    public async Task StartBenchmarkAsync_WithExcludedModels_SerializesCamelCasePerTargetMap()
+    {
+        var handler = new FakeHttpMessageHandler(_ => JsonResponse((HttpStatusCode)202, BenchmarkRunJson));
+        WriteKeyFile(RouteTableKey);
+        using var client = CreateClient(handler, keyReader: KeyReader());
+
+        var response = await client.StartBenchmarkAsync(new RouterBenchmarkRequest(
+            ExcludedModels: new Dictionary<string, IReadOnlyList<string>>
+            {
+                ["Local"] = ["qwen3.8:27b", "gemma4:e4b"],
+                ["Peer"] = ["llama3:8b"]
+            }));
+
+        var request = Assert.Single(handler.Requests);
+        Assert.Equal("POST", request.Method);
+        Assert.Equal("/api/router/benchmark", request.PathAndQuery);
+        Assert.Equal("application/json", request.ContentType);
+        var body = JsonNode.Parse(request.Body!)!.AsObject()!;
+        // The run-scoped exclusion map travels camelCase, per-target, verbatim. The wizard
+        // flow sets only ExcludedModels — the unset request fields serialize as JSON nulls
+        // (the DTO's pre-existing convention; the server treats null == absent for all of
+        // them), while a NULL ExcludedModels is omitted from the body entirely (D5).
+        Assert.Equal(4, body.Count);
+        Assert.Null(body!["target"]);
+        Assert.Null(body["roles"]);
+        Assert.Null(body["model"]);
+        var excluded = body["excludedModels"]!.AsObject()!;
+        Assert.Equal(2, excluded.Count);
+        Assert.Equal(["qwen3.8:27b", "gemma4:e4b"], excluded!["Local"]!.AsArray().Select(n => n!.GetValue<string>()).ToArray());
+        Assert.Equal(["llama3:8b"], excluded["Peer"]!.AsArray().Select(n => n!.GetValue<string>()).ToArray());
+        Assert.True(response.Started);
+    }
+
+    [Fact]
+    public async Task StartBenchmarkAsync_NullRequest_PostsNoBody_AbsentBodyContractUnchanged()
+    {
+        var handler = new FakeHttpMessageHandler(_ => JsonResponse((HttpStatusCode)202, BenchmarkRunJson));
+        WriteKeyFile(RouteTableKey);
+        using var client = CreateClient(handler, keyReader: KeyReader());
+
+        var response = await client.StartBenchmarkAsync(null);
+
+        var request = Assert.Single(handler.Requests);
+        Assert.Equal("POST", request.Method);
+        Assert.Equal("/api/router/benchmark", request.PathAndQuery);
+        // D5: all-selected → null request → NO body at all (byte-identical to the pre-#152
+        // fleet-wide zero-config POST).
+        Assert.Null(request.Body);
+        Assert.Null(request.ContentType);
+        Assert.True(response.Started);
     }
 
     // ------------------------------------------------------------------ helpers
@@ -827,6 +881,31 @@ public sealed class OllamaRouterApiClientTests : IDisposable
                 var r = (RouterBenchmarkRunResponse)result!;
                 Assert.True(r.Started);
                 Assert.Equal(["Desktop", "Server"], r.QueuedTargets);
+            }),
+
+        ["GetBenchmarkCandidatesAsync"] = new(
+            "GET", "/api/router/benchmark/candidates", null, null, HttpStatusCode.OK, BenchmarkCandidatesJson,
+            async client => await client.GetBenchmarkCandidatesAsync(),
+            result =>
+            {
+                var r = (RouterBenchmarkCandidatesResponse)result!;
+                Assert.Equal(2, r.Targets.Count);
+                // Nested hardware + fit enum + null-hardware round-trip.
+                Assert.Equal("Local", r.Targets[0].Target);
+                Assert.NotNull(r.Targets[0].Hardware);
+                Assert.Equal("RTX 4090", r.Targets[0].Hardware!.Gpus[0].ModelName);
+                Assert.Equal(24_576, r.Targets[0].Hardware!.TotalFastMemoryMB);
+                Assert.Equal(1008.0, r.Targets[0].Hardware!.EffectiveBandwidthGBs, precision: 6);
+                Assert.Equal(2, r.Targets[0].Candidates.Count);
+                Assert.Equal(BenchmarkCandidateFit.Fits, r.Targets[0].Candidates[0].Fit);
+                Assert.Equal(65_536, r.Targets[0].Candidates[0].MaxFitsContext);
+                Assert.Equal([UsageRole.BasicModel], r.Targets[0].Candidates[0].Roles);
+                Assert.Null(r.Targets[0].Candidates[0].ActiveParams);
+                Assert.Equal(BenchmarkCandidateFit.Pruned, r.Targets[0].Candidates[1].Fit);
+                Assert.Equal(0, r.Targets[0].Candidates[1].MaxFitsContext);
+                Assert.Null(r.Targets[1].Hardware);
+                Assert.Equal(BenchmarkCandidateFit.Assumed, r.Targets[1].Candidates[0].Fit);
+                Assert.Equal(131_072, r.Targets[1].Candidates[0].MaxFitsContext);
             }),
 
         ["GetBenchmarkResultsAsync"] = new(
@@ -1174,6 +1253,28 @@ public sealed class OllamaRouterApiClientTests : IDisposable
         """;
 
     private const string BenchmarkClearedJson = """{"cleared":true}""";
+
+    private const string BenchmarkCandidatesJson = """
+        {"targets":[
+          {"target":"Local",
+           "hardware":{"nodeName":"local","os":"linux","architecture":"x64","isUnifiedMemory":false,
+            "systemRamMB":32768,"systemRamType":"Ddr5",
+            "gpus":[{"vendor":"nvidia","modelName":"RTX 4090","vramMB":24576,"vramType":"GDDR6X",
+             "busWidthBits":384,"bandwidthGBs":1008.0}],
+            "totalFastMemoryMB":24576,"effectiveBandwidthGBs":1008.0},
+           "candidates":[
+            {"model":"llama3:8b","roles":["BasicModel"],"quantization":"q4","architecture":"Dense",
+             "totalParams":8000000000,"activeParams":null,"nativeContext":131072,
+             "fit":"Fits","maxFitsContext":65536},
+            {"model":"qwen3.8:27b","roles":["AgenticChat","SeniorDeveloper"],"quantization":"q4",
+             "architecture":"Dense","totalParams":27800000000,"activeParams":null,"nativeContext":131072,
+             "fit":"Pruned","maxFitsContext":0}]},
+          {"target":"Remote","hardware":null,
+           "candidates":[
+            {"model":"llama3:8b","roles":["BasicModel"],"quantization":"q4","architecture":"Dense",
+             "totalParams":8000000000,"activeParams":null,"nativeContext":131072,
+             "fit":"Assumed","maxFitsContext":131072}]}]}
+        """;
 
     private const string RecommendationsJson = """
         {"generatedAt":"2026-11-10T12:00:00.000Z",

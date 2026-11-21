@@ -119,6 +119,12 @@ namespace OllamaRouter.Client;
 [JsonSerializable(typeof(RouterBenchmarkRunResponse))]
 [JsonSerializable(typeof(RouterBenchmarkResultsResponse))]
 [JsonSerializable(typeof(RouterBenchmarkClearedResponse))]
+// Benchmark candidate plan + per-target run-scoped exclusions (task #152).
+[JsonSerializable(typeof(RouterBenchmarkCandidatesResponse))]
+[JsonSerializable(typeof(RouterBenchmarkCandidateTarget))]
+[JsonSerializable(typeof(RouterBenchmarkCandidateModel))]
+[JsonSerializable(typeof(BenchmarkCandidateFit))]
+[JsonSerializable(typeof(IReadOnlyDictionary<string, IReadOnlyList<string>>))]
 [JsonSerializable(typeof(BenchmarkRunStatus))]
 [JsonSerializable(typeof(BenchmarkContextResult))]
 [JsonSerializable(typeof(BenchmarkTargetResult))]

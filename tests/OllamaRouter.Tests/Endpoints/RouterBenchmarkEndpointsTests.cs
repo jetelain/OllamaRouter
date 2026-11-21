@@ -9,20 +9,24 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Moq;
 using OllamaRouter.Endpoints;
+using OllamaRouter.Endpoints.RouterApi.Benchmark;
 using OllamaRouter.Extensions;
 using OllamaRouter.Options;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services.Benchmarking;
+using OllamaRouter.Services.Hardware;
 using OllamaRouter.Services.Routing;
 
 namespace OllamaRouter.Tests.Endpoints;
 
 /// <summary>
 /// Endpoint tests for the model-benchmarking API (task #28): the status-code matrix of
-/// POST /api/router/benchmark (202 / 404 / 409), GET /api/router/benchmark/results
-/// (including in-flight Running rows) and DELETE /api/router/benchmark/results. The runner
-/// is resolved from DI, so the tests replace the singleton with a stub — the real runner's
-/// behavior is covered by MicroBenchmarkRunnerTests.
+/// POST /api/router/benchmark (202 / 404 / 409), the per-target run-scoped exclusion map
+/// pass-through (task #152), the keyless GET /api/router/benchmark/candidates plan read
+/// (task #152), GET /api/router/benchmark/results (including in-flight Running rows) and
+/// DELETE /api/router/benchmark/results. The runner is resolved from DI, so the tests
+/// replace the singleton with a stub — the real runner's behavior is covered by
+/// MicroBenchmarkRunnerTests.
 /// </summary>
 public sealed class RouterBenchmarkEndpointsTests : IDisposable
 {
@@ -50,10 +54,15 @@ public sealed class RouterBenchmarkEndpointsTests : IDisposable
         private readonly bool _tryStartResult;
         public IReadOnlyList<BenchmarkTargetResult> Results { get; }
 
+        /// <summary>The plan <see cref="GetBenchmarkCandidates"/> returns (task #152).</summary>
+        public RouterBenchmarkCandidatesResponse CandidatesResponse { get; set; } =
+            new([]);
+
         public bool? LastClearKeepRunning { get; private set; }
         public RoutingTarget? LastTarget { get; private set; }
         public IReadOnlyList<UsageRole>? LastRoles { get; private set; }
         public string? LastModel { get; private set; }
+        public IReadOnlyDictionary<string, IReadOnlyList<string>>? LastExcludedModels { get; private set; }
         public int TryStartCalls { get; private set; }
 
         public StubRunner(
@@ -66,12 +75,17 @@ public sealed class RouterBenchmarkEndpointsTests : IDisposable
             Results = results;
         }
 
-        public bool TryStartRun(RoutingTarget? target, IEnumerable<UsageRole>? roles, string? model)
+        public bool TryStartRun(
+            RoutingTarget? target,
+            IEnumerable<UsageRole>? roles,
+            string? model,
+            IReadOnlyDictionary<string, IReadOnlyList<string>>? excludedModels = null)
         {
             TryStartCalls++;
             LastTarget = target;
             LastRoles = roles?.ToList();
             LastModel = model;
+            LastExcludedModels = excludedModels;
             return _tryStartResult;
         }
 
@@ -82,6 +96,8 @@ public sealed class RouterBenchmarkEndpointsTests : IDisposable
         public IReadOnlyList<BenchmarkTargetResult> GetAllResults() => Results;
 
         public IReadOnlyList<string> GetEffectiveTargetNames() => _targets;
+
+        public RouterBenchmarkCandidatesResponse GetBenchmarkCandidates() => CandidatesResponse;
 
         public void ClearResults(bool keepRunning = false)
         {
@@ -214,6 +230,53 @@ public sealed class RouterBenchmarkEndpointsTests : IDisposable
         Assert.Equal("benchmark run already in progress", body?["error"]?.GetValue<string>());
     }
 
+    [Fact]
+    public async Task Post_WithExcludedModels_PassesPerTargetMapThrough()
+    {
+        var runner = new StubRunner(["Local", "Peer"], true, []);
+        await using var harness = await CreateAppAsync(runner);
+
+        using var response = await PostJsonAsync(harness.Client, "/api/router/benchmark",
+            """{"excludedModels":{"Local":["qwen3.8:27b"]}}""");
+        Assert.Equal(System.Net.HttpStatusCode.Accepted, response.StatusCode);
+
+        Assert.Equal(1, runner.TryStartCalls);
+        Assert.Null(runner.LastTarget);
+        Assert.Null(runner.LastRoles);
+        Assert.Null(runner.LastModel);
+        Assert.NotNull(runner.LastExcludedModels);
+        Assert.Single(runner.LastExcludedModels!);
+        Assert.Equal(["qwen3.8:27b"], runner.LastExcludedModels["Local"].ToArray());
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("{}")]
+    [InlineData("""{"target":"Peer","roles":["AgenticChat"],"model":"qwen3.8:27b"}""")]
+    public async Task Post_WithoutExcludedModels_NullPassesThrough(string? body)
+    {
+        var runner = new StubRunner(["Local", "Peer"], true, []);
+        await using var harness = await CreateAppAsync(runner);
+
+        using var response = await PostJsonAsync(harness.Client, "/api/router/benchmark", body);
+        Assert.Equal(System.Net.HttpStatusCode.Accepted, response.StatusCode);
+
+        // No exclusion map on today's bodies → the runner sees null (no behavior change).
+        Assert.Null(runner.LastExcludedModels);
+    }
+
+    [Fact]
+    public async Task Post_MalformedExcludedModels_400_RunNotStarted()
+    {
+        var runner = new StubRunner(["Local"], true, []);
+        await using var harness = await CreateAppAsync(runner);
+
+        using var response = await PostJsonAsync(harness.Client, "/api/router/benchmark",
+            """{"excludedModels":{"Local":"not-a-list"}}""");
+        Assert.Equal(System.Net.HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal(0, runner.TryStartCalls);
+    }
+
     // ------------------------------------------------------------------
     //  GET /api/router/benchmark/results
     // ------------------------------------------------------------------
@@ -254,6 +317,78 @@ public sealed class RouterBenchmarkEndpointsTests : IDisposable
         Assert.Equal(2, targets.Count);
         Assert.Contains(targets.Select(t => t?["status"]?.GetValue<string>()), s => s == "Running");
         Assert.Contains(targets.Select(t => t?["status"]?.GetValue<string>()), s => s == "Succeeded");
+    }
+
+    // ------------------------------------------------------------------
+    //  GET /api/router/benchmark/candidates (task #152)
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task GetCandidates_ReturnsTheRunnerPlan_Keyless()
+    {
+        var profile = new NodeHardwareProfile(
+            "local", "linux", "x64", false, 32_768, SystemRamType.Ddr5,
+            [new GpuDeviceProfile("nvidia", "RTX 4090", 24_576, "GDDR6X", 384, 1008)],
+            24_576, 1008.0);
+        var runner = new StubRunner(["Local", "Peer"], true, [])
+        {
+            CandidatesResponse = new RouterBenchmarkCandidatesResponse(
+            [
+                new RouterBenchmarkCandidateTarget("Local", profile,
+                [
+                    new RouterBenchmarkCandidateModel(
+                        "qwen3.8:27b", [UsageRole.AgenticChat, UsageRole.SeniorDeveloper], "q4", "Dense",
+                        27_800_000_000, null, 131_072, BenchmarkCandidateFit.Fits, 65_536),
+                    new RouterBenchmarkCandidateModel(
+                        "gemma4:e4b", [UsageRole.BasicModel], "q4", "Dense",
+                        4_500_000_000, null, 131_072, BenchmarkCandidateFit.Pruned, 0),
+                ]),
+                new RouterBenchmarkCandidateTarget("Peer", null,
+                [
+                    new RouterBenchmarkCandidateModel(
+                        "qwen3.8:27b", [UsageRole.AgenticChat, UsageRole.SeniorDeveloper], "q4", "Dense",
+                        27_800_000_000, null, 131_072, BenchmarkCandidateFit.Assumed, 131_072),
+                ]),
+            ])
+        };
+        await using var harness = await CreateAppAsync(runner);
+
+        // D8: KEYLESS read — NO API key is sent and the response is 200.
+        using var response = await harness.Client.GetAsync("/api/router/benchmark/candidates");
+        Assert.Equal(System.Net.HttpStatusCode.OK, response.StatusCode);
+
+        var body = JsonNode.Parse(await response.Content.ReadAsStringAsync())!;
+        var targets = body!["targets"]!.AsArray()!;
+        Assert.Equal(2, targets.Count); // both targets, in order
+
+        // Group 1: full hardware annotation + both candidates (fit + maxFitsContext round-trip).
+        var first = targets[0]!.AsObject()!;
+        Assert.Equal("Local", first["target"]!.GetValue<string>());
+        var hardware = first["hardware"]!.AsObject()!;
+        Assert.Equal("RTX 4090", hardware!["gpus"]!.AsArray()![0]!["modelName"]!.GetValue<string>());
+        Assert.Equal(24_576, hardware!["totalFastMemoryMB"]!.GetValue<long>());
+        Assert.Equal(1008.0, hardware!["effectiveBandwidthGBs"]!.GetValue<double>(), precision: 6);
+        var firstCandidates = first["candidates"]!.AsArray()!;
+        Assert.Equal(2, firstCandidates.Count);
+        Assert.Equal("Fits", firstCandidates[0]!["fit"]!.GetValue<string>());
+        Assert.Equal(65_536, firstCandidates[0]!["maxFitsContext"]!.GetValue<int>());
+        Assert.Equal(["AgenticChat", "SeniorDeveloper"],
+            firstCandidates[0]!["roles"]!.AsArray().Select(r => r!.GetValue<string>()!).ToArray());
+        Assert.Equal(27_800_000_000, firstCandidates[0]!["totalParams"]!.GetValue<long>());
+        Assert.Null(firstCandidates[0]!["activeParams"]);
+        Assert.Equal("Pruned", firstCandidates[1]!["fit"]!.GetValue<string>());
+        Assert.Equal(0, firstCandidates[1]!["maxFitsContext"]!.GetValue<int>()); // Pruned → 0
+
+        // Group 2: unknown profile → hardware null (never a probe), still the same candidates.
+        var second = targets[1]!.AsObject()!;
+        Assert.Equal("Peer", second["target"]!.GetValue<string>());
+        // The key IS present, with a JSON null value (a null-valued property indexes as a null node).
+        Assert.True(second.ContainsKey("hardware"));
+        Assert.Null(second["hardware"]);
+        var secondCandidates = second["candidates"]!.AsArray()!;
+        Assert.Single(secondCandidates);
+        Assert.Equal("Assumed", secondCandidates[0]!["fit"]!.GetValue<string>());
+        Assert.Equal(131_072, secondCandidates[0]!["maxFitsContext"]!.GetValue<int>());
     }
 
     // ------------------------------------------------------------------

@@ -8,6 +8,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using MsOptions = Microsoft.Extensions.Options.Options;
+using OllamaRouter.Endpoints.RouterApi.Benchmark;
 using OllamaRouter.Options;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services.Benchmarking;
@@ -841,5 +842,298 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
         Assert.All(results.Results, r => Assert.Equal("basic:4b", r.Model));
         Assert.Equal(2, _handler.GenerateCallCount); // only basic:4b benchmarked
     }
-}
 
+    // ------------------------------------------------------------------
+    //  Run-scoped per-target model exclusions (task #152)
+    // ------------------------------------------------------------------
+
+    private static CandidateModel SmallModel() => new(
+        "small:4b", [UsageRole.BasicModel], "Dense",
+        TotalParams: 4_500_000_000, ActiveParams: null,
+        "q4", 4, Layers: 36, KvHeads: 8, HeadDim: 256,
+        NativeContext: 131_072, DefaultContext: 32_768);
+
+    private static CandidateModelCatalogOptions TwoModelCatalog() => new()
+    {
+        Models = [TestModel, SmallModel()],
+        // 64 GB fast memory: both models fit at both ladder rungs (full measurement).
+        BenchmarkContextLadder = [16_384, 32_768]
+    };
+
+    [Fact]
+    public async Task TryStartRun_ExcludedModel_IsNeverPulledNorBenchmarked()
+    {
+        var runner = CreateRunner(Profile(65_536), catalog: TwoModelCatalog(), modelPresent: false);
+        // Only small:4b is measured: warmup + 2 ladder rungs (3 generates).
+        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
+        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
+        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
+
+        Assert.True(runner.TryStartRun(target: null, roles: null, model: null,
+            excludedModels: new Dictionary<string, IReadOnlyList<string>>
+            {
+                [TargetName] = [TestModel.Name]
+            }));
+        await WaitUntilRunCompleteAsync(runner);
+
+        var results = runner.GetAllResults().Single();
+        Assert.Equal(BenchmarkRunStatus.Succeeded, results.Status);
+
+        // The excluded model (bench:27b) is invisible: no rows, no pull, no generate.
+        Assert.All(results.Results, r => Assert.Equal("small:4b", r.Model));
+        Assert.Equal(2, results.Results.Count);
+        Assert.All(results.Results, r => Assert.True(r.Viable));
+        Assert.Equal(1, _handler.PullCallCount); // small:4b only
+        Assert.Equal("small:4b", (JsonNode.Parse(_handler.FirstByPath("/api/pull")!.Body) as JsonObject)?["model"]?.GetValue<string>());
+        Assert.Equal(3, _handler.GenerateCallCount);
+        foreach (var request in _handler.RequestsByPath("/api/generate"))
+        {
+            var body = JsonNode.Parse(request.Body) as JsonObject;
+            Assert.Equal("small:4b", body?["model"]?.GetValue<string>());
+        }
+    }
+
+    [Fact]
+    public async Task TryStartRun_AllModelsExcluded_TargetEndsFailedWithNoRows_AndNoPulls()
+    {
+        // D6: a target whose models are ALL excluded is processed with zero candidates and
+        // ends Failed with empty results — the same treatment the runner gives an empty
+        // catalog. No new status is invented.
+        var runner = CreateRunner(Profile(65_536), catalog: TwoModelCatalog(), modelPresent: false);
+
+        Assert.True(runner.TryStartRun(target: null, roles: null, model: null,
+            excludedModels: new Dictionary<string, IReadOnlyList<string>>
+            {
+                [TargetName] = [TestModel.Name, "small:4b"]
+            }));
+        await WaitUntilRunCompleteAsync(runner);
+
+        var results = runner.GetAllResults().Single();
+        Assert.Equal(BenchmarkRunStatus.Failed, results.Status);
+        Assert.Empty(results.Results);
+        Assert.Equal(0, _handler.PullCallCount);
+        Assert.Equal(0, _handler.GenerateCallCount);
+    }
+
+    [Fact]
+    public async Task TryStartRun_EmptyExclusionDictionary_BehavesExactlyLikeAbsent()
+    {
+        var runner = CreateRunner(Profile(65_536), catalog: TwoModelCatalog(), modelPresent: false);
+        // Two models × (warmup + 2 rungs) = 6 generates, 2 pulls for a full run.
+        for (var i = 0; i < 12; i++)
+        {
+            _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
+        }
+
+        Assert.True(runner.TryStartRun(target: null, roles: null, model: null, excludedModels: null));
+        await WaitUntilRunCompleteAsync(runner);
+        var pullsAfterRun1 = _handler.PullCallCount;
+        var generatesAfterRun1 = _handler.GenerateCallCount;
+        var rowsAfterRun1 = runner.GetAllResults().Single().Results
+            .Select(r => (r.Model, r.NumCtx, r.DecodeTokensPerSecond, r.Viable, r.Reason))
+            .OrderBy(t => t.Model).ThenBy(t => t.NumCtx).ToArray();
+
+        Assert.True(pullsAfterRun1 > 0);
+        Assert.True(generatesAfterRun1 > 0);
+
+        // The EMPTY map is byte-for-byte the same run as an ABSENT one.
+        var pullsBeforeRun2 = _handler.PullCallCount;
+        var generatesBeforeRun2 = _handler.GenerateCallCount;
+        Assert.True(runner.TryStartRun(target: null, roles: null, model: null,
+            excludedModels: new Dictionary<string, IReadOnlyList<string>>()));
+        await WaitUntilRunCompleteAsync(runner);
+
+        Assert.Equal(pullsAfterRun1, _handler.PullCallCount - pullsBeforeRun2);
+        Assert.Equal(generatesAfterRun1, _handler.GenerateCallCount - generatesBeforeRun2);
+        var rowsAfterRun2 = runner.GetAllResults().Single().Results
+            .Select(r => (r.Model, r.NumCtx, r.DecodeTokensPerSecond, r.Viable, r.Reason))
+            .OrderBy(t => t.Model).ThenBy(t => t.NumCtx).ToArray();
+        Assert.Equal(rowsAfterRun1, rowsAfterRun2);
+    }
+
+    [Fact]
+    public async Task TryStartRun_ExclusionIsCaseInsensitive_AndSkipsBlankEntries()
+    {
+        var runner = CreateRunner(Profile(65_536), catalog: TwoModelCatalog(), modelPresent: false);
+        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // warmup
+        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // 16k
+        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // 32k
+
+        // Target key AND model name arrive upper-cased; the blank entries are dropped.
+        Assert.True(runner.TryStartRun(target: null, roles: null, model: null,
+            excludedModels: new Dictionary<string, IReadOnlyList<string>>
+            {
+                [TargetName.ToUpperInvariant()] = [TestModel.Name.ToUpperInvariant(), "  ", ""]
+            }));
+        await WaitUntilRunCompleteAsync(runner);
+
+        var results = runner.GetAllResults().Single();
+        Assert.All(results.Results, r => Assert.Equal("small:4b", r.Model));
+        Assert.Equal(3, _handler.GenerateCallCount); // small:4b fully benchmarked
+        Assert.Equal(0, _handler.RequestsByPath("/api/pull").Count(p =>
+            JsonNode.Parse(p.Body) is { } node &&
+            string.Equals((node as JsonObject)?["model"]?.GetValue<string>(), TestModel.Name, StringComparison.OrdinalIgnoreCase)));
+    }
+
+    // ------------------------------------------------------------------
+    //  GetBenchmarkCandidates (task #152): the endpoint uses the SAME derivation as the run loop
+    // ------------------------------------------------------------------
+
+    private static readonly IReadOnlyList<int> CandidateTestLadder = [8_192, 16_384, 32_768];
+
+    private static CandidateModel SmallDense() => new(
+        "small:2b", [UsageRole.BasicModel], "Dense",
+        TotalParams: 2_000_000_000, ActiveParams: null,
+        "q4", 4, Layers: 36, KvHeads: 8, HeadDim: 256,
+        NativeContext: 32_768, DefaultContext: 16_384);
+
+    private static CandidateModel BigDense() => new(
+        "big:27b", [UsageRole.AgenticChat], "Dense",
+        TotalParams: 27_800_000_000, ActiveParams: null,
+        "q4", 4, Layers: 64, KvHeads: 8, HeadDim: 128,
+        NativeContext: 16_384, DefaultContext: 16_384);
+
+    private static CandidateModel MoeModel() => new(
+        "moe:35b", [UsageRole.JuniorDeveloper], "MoE",
+        TotalParams: 35_000_000_000, ActiveParams: 3_300_000_000,
+        "q4", 4, Layers: 64, KvHeads: 8, HeadDim: 128,
+        NativeContext: 32_768, DefaultContext: 32_768);
+
+    private static CandidateModelCatalogOptions CandidateTestCatalog() => new()
+    {
+        Models = [SmallDense(), BigDense(), MoeModel()],
+        BenchmarkContextLadder = CandidateTestLadder
+    };
+
+    /// <summary>
+    /// The test-side recomputation of the expected per-model verdict via
+    /// <see cref="CandidateSizingCalculator.Evaluate"/> (the same inputs the run loop uses)
+    /// — the endpoint must agree with this, and with a real run.
+    /// </summary>
+    private static (BenchmarkCandidateFit Fit, int MaxFitsContext) ExpectedFit(
+        CandidateModel model,
+        NodeHardwareProfile? profile)
+    {
+        var assumed = profile is null || profile.TotalFastMemoryMB <= 0;
+        var anySurvived = false;
+        var maxSurviving = 0;
+        foreach (var ctx in CandidateTestLadder)
+        {
+            var estimate = CandidateSizingCalculator.Evaluate(model, ctx, profile);
+            if (estimate.Status is MemoryFitStatus.Fits or MemoryFitStatus.Assumed)
+            {
+                anySurvived = true;
+                if (ctx <= model.NativeContext && ctx > maxSurviving)
+                {
+                    maxSurviving = ctx;
+                }
+            }
+        }
+
+        var fit = assumed
+            ? BenchmarkCandidateFit.Assumed
+            : anySurvived
+                ? BenchmarkCandidateFit.Fits
+                : BenchmarkCandidateFit.Pruned;
+        return (fit, maxSurviving);
+    }
+
+    [Fact]
+    public async Task GetBenchmarkCandidates_MatchesTheRunLoopDerivation()
+    {
+        // (a) BIG-RAM profile: per-model Fits + the exact maxFitsContext (recomputed via
+        // CandidateSizingCalculator.Evaluate), including the nativeContext cap of big:27b
+        // (the 32k rung is above its 16k native context, so 16_384 even though it "fits").
+        var runner = CreateRunner(Profile(65_536), catalog: CandidateTestCatalog(), modelPresent: true);
+        var big = runner.GetBenchmarkCandidates();
+        Assert.Single(big.Targets);
+        var bigGroup = big.Targets[0];
+        Assert.Equal(TargetName, bigGroup.Target);
+        Assert.NotNull(bigGroup.Hardware);
+        Assert.Equal(3, bigGroup.Candidates.Count);
+        foreach (var candidate in new[] { SmallDense(), BigDense(), MoeModel() })
+        {
+            var row = bigGroup.Candidates.Single(c => c.Model == candidate.Name);
+            var (fit, maxCtx) = ExpectedFit(candidate, Profile(65_536));
+            Assert.Equal(fit, row.Fit);
+            Assert.Equal(maxCtx, row.MaxFitsContext);
+            Assert.Equal(candidate.Roles, row.Roles);
+            Assert.Equal(candidate.Architecture, row.Architecture);
+            Assert.Equal(candidate.TotalParams, row.TotalParams);
+            Assert.Equal(candidate.ActiveParams, row.ActiveParams);
+            Assert.Equal(candidate.NativeContext, row.NativeContext);
+        }
+        Assert.Equal(BenchmarkCandidateFit.Fits, bigGroup.Candidates[0].Fit);
+        Assert.Equal(32_768, bigGroup.Candidates[0].MaxFitsContext);
+        // The nativeContext cap: big:27b fits at 32k but its native context is 16k.
+        Assert.Equal(BenchmarkCandidateFit.Fits, bigGroup.Candidates[1].Fit);
+        Assert.Equal(16_384, bigGroup.Candidates[1].MaxFitsContext);
+
+        // (b) SMALL profile: the large dense model fully prunes (Pruned + maxFitsContext 0)
+        // and the endpoint's Pruned set EXACTLY matches the models that a real run only
+        // writes as sizing-pruned rows (never measured).
+        var smallProfile = Profile(8_192);
+        var runnerSmall = CreateRunner(smallProfile, catalog: CandidateTestCatalog(), modelPresent: false);
+        var small = runnerSmall.GetBenchmarkCandidates();
+        var smallGroup = small.Targets[0];
+        foreach (var candidate in new[] { SmallDense(), BigDense(), MoeModel() })
+        {
+            var row = smallGroup.Candidates.Single(c => c.Model == candidate.Name);
+            var (fit, maxCtx) = ExpectedFit(candidate, smallProfile);
+            Assert.Equal(fit, row.Fit);
+            Assert.Equal(maxCtx, row.MaxFitsContext);
+        }
+        Assert.Equal(BenchmarkCandidateFit.Pruned, smallGroup.Candidates[1].Fit);
+        Assert.Equal(0, smallGroup.Candidates[1].MaxFitsContext);
+        Assert.Equal(BenchmarkCandidateFit.Fits, smallGroup.Candidates[0].Fit);
+        Assert.Equal(BenchmarkCandidateFit.Fits, smallGroup.Candidates[2].Fit);
+
+        var expectedPrunedInRun = smallGroup.Candidates
+            .Where(c => c.Fit == BenchmarkCandidateFit.Pruned)
+            .Select(c => c.Model)
+            .ToArray();
+
+        // The real run on the same small profile: small:2b + moe:35b measure (warmup + 2
+        // rungs each = 6 generates); big:27b is sizing-pruned at every rung, never pulled.
+        for (var i = 0; i < 6; i++)
+        {
+            _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
+        }
+        Assert.True(runnerSmall.TryStartRun(target: null, roles: null, model: null));
+        await WaitUntilRunCompleteAsync(runnerSmall);
+        var runResults = runnerSmall.GetAllResults().Single();
+        var neverMeasured = runResults.Results
+            .GroupBy(r => r.Model, StringComparer.OrdinalIgnoreCase)
+            .Where(g => !g.Any(r => r.Reason is null))
+            .Select(g => g.Key)
+            .ToArray();
+        Assert.Equal(expectedPrunedInRun.OrderBy(s => s).ToArray(),
+            neverMeasured.OrderBy(s => s).ToArray());
+        Assert.Single(expectedPrunedInRun);
+        Assert.Equal(0, _handler.RequestsByPath("/api/pull").Count(p =>
+            JsonNode.Parse(p.Body) is { } node &&
+            string.Equals((node as JsonObject)?["model"]?.GetValue<string>(), BigDense().Name, StringComparison.OrdinalIgnoreCase)));
+
+        // (c) NO profile: every model is Assumed (fail-open) with the full ladder capped by
+        // the model's native context.
+        var runnerNoProfile = CreateRunner(profile: null, catalog: CandidateTestCatalog(), modelPresent: true);
+        var noProfile = runnerNoProfile.GetBenchmarkCandidates();
+        var noProfileGroup = noProfile.Targets[0];
+        Assert.Null(noProfileGroup.Hardware);
+        Assert.All(noProfileGroup.Candidates, c => Assert.Equal(BenchmarkCandidateFit.Assumed, c.Fit));
+        Assert.Equal(32_768, noProfileGroup.Candidates[0].MaxFitsContext);
+        Assert.Equal(16_384, noProfileGroup.Candidates[1].MaxFitsContext); // native cap
+        Assert.Equal(32_768, noProfileGroup.Candidates[2].MaxFitsContext);
+
+        // (d) A target with NO catalog models → an empty (never null) candidates array.
+        var runnerEmptyCatalog = CreateRunner(profile: null, catalog: new CandidateModelCatalogOptions
+        {
+            Models = [],
+            BenchmarkContextLadder = CandidateTestLadder
+        });
+        var empty = runnerEmptyCatalog.GetBenchmarkCandidates();
+        Assert.Single(empty.Targets);
+        Assert.NotNull(empty.Targets[0].Candidates);
+        Assert.Empty(empty.Targets[0].Candidates);
+    }
+}

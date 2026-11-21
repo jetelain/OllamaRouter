@@ -70,7 +70,8 @@ public static class RouterBenchmarkEndpoints
             var started = benchmarkRunner.TryStartRun(
                 target,
                 benchmarkRequest?.Roles,
-                benchmarkRequest?.Model);
+                benchmarkRequest?.Model,
+                benchmarkRequest?.ExcludedModels);
             if (!started)
             {
                 return Results.Json(
@@ -95,9 +96,26 @@ public static class RouterBenchmarkEndpoints
         .WithSummary("Queue a non-blocking model benchmark run (protected: API key required).")
         .WithDescription("A null/absent body is valid and benchmarks ALL effective non-Cloud targets (fleet-wide zero-config flow); "
             + "'target' names a single effective target (unknown → 404); 'roles'/'model' filter the catalog candidates "
-            + "(null/empty = all). 202 = accepted and queued non-blocking — the run loop drains the targets sequentially in the "
+            + "(null/empty = all). 'excludedModels' (task #152) is the optional per-target exclusion map (target name → "
+            + "model names, both case-insensitive): excluded models are skipped for THAT RUN ONLY — they produce no rows "
+            + "(no pull, no benchmark) and are never persisted (benchmarks.json / targets-speed.json / the catalog are "
+            + "untouched; a follow-up run or a router restart never remembers them). Unknown target keys and unknown "
+            + "model names are silently ignored as no-ops; an absent/empty map is exactly today's behavior. "
+            + "202 = accepted and queued non-blocking — the run loop drains the targets sequentially in the "
             + "background and this response never waits; 409 = a run is already in progress (single-flight); 400 = malformed body. "
             + "Protected by the API-key middleware (default protected set).");
+        app.MapGet("/api/router/benchmark/candidates", (IMicroBenchmarkRunner runner) =>
+            Results.Json(
+                runner.GetBenchmarkCandidates(),
+                OllamaRouterJsonSerializerContext.Default.RouterBenchmarkCandidatesResponse))
+            .WithName("GetRouterBenchmarkCandidates")
+            .WithTags("Benchmarking")
+            .WithSummary("List the per-target benchmark candidate plan (keyless read).")
+            .WithDescription("One row per effective non-Cloud target (configuration order): the stored fleet-hardware profile "
+                + "(GPU, VRAM, bandwidth; null when unknown — no probe is triggered) and the EXACT catalog candidate set the "
+                + "run loop would benchmark for that target, each with its pre-flight fit verdict (Fits / Pruned / Assumed) + "
+                + "the largest surviving ladder context (capped by the model's nativeContext; 0 when Pruned). "
+                + "Read-only, no network calls. Read-only — no key required in default mode.");
         app.MapGet("/api/router/benchmark/results", (IMicroBenchmarkRunner benchmarkRunner) =>
         {
             var response = new RouterBenchmarkResultsResponse(

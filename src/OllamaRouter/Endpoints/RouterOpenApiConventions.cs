@@ -29,7 +29,7 @@ namespace OllamaRouter.Endpoints;
 /// <c>HttpJsonOptions</c>) and is served at exactly <c>GET /api/router/openapi.json</c>
 /// (document name <see cref="DocumentName"/> + the <c>{documentName}</c> route parameter).
 /// <para>
-/// Scope: the 37 <c>/api/router/*</c> management operations ONLY (monitor, Ollama-compatible
+/// Scope: the 38 <c>/api/router/*</c> management operations ONLY (monitor, Ollama-compatible
 /// hybrid and YARP routes are excluded via <see cref="OpenApiOptions.ShouldInclude"/>, and the
 /// document endpoint's own template route is dropped). The security requirement is derived by
 /// calling the production <see cref="ApiSecurityPolicy.IsProtectedRoute"/> on each route
@@ -236,7 +236,7 @@ internal static class RouterOpenApiDocumentTransformer
         }
 
         // Security: derived from the PRODUCTION policy called with the route template (the
-        // single- and two-segment logic match their templates; exactly 20 of the 37 operations
+        // single- and two-segment logic match their templates; exactly 20 of the 38 operations
         // match). A 401 response is documented on exactly those operations.
         if (ApiSecurityPolicy.IsProtectedRoute(method, path))
         {
@@ -332,7 +332,13 @@ internal static class RouterOpenApiDocumentTransformer
                 requestDescription:
                     "Optional: a null/absent body is valid and benchmarks ALL effective non-Cloud " +
                     "targets. A malformed body → 400. 'target' null/absent = all effective targets; " +
-                    "'roles'/'model' filter the catalog candidates (null/empty = all).",
+                    "'roles'/'model' filter the catalog candidates (null/empty = all). " +
+                    "'excludedModels' (task #152) = the optional per-target run-scoped exclusion map " +
+                    "(target name → model names, both case-insensitive): excluded models are skipped for " +
+                    "THIS RUN ONLY (no rows, no pull, no benchmark) and are NEVER persisted (the persisted " +
+                    "results, targets-speed.json and the catalog are untouched; a follow-up run or a router " +
+                    "restart never remembers them). Unknown target keys and unknown model names are silently " +
+                    "ignored as no-ops; an absent/empty map is exactly the pre-#152 behavior.",
                 responses:
                 [
                     ("202", typeof(RouterBenchmarkRunResponse), "Accepted and queued (non-blocking — the run loop drains the targets sequentially in the background)."),
@@ -340,6 +346,9 @@ internal static class RouterOpenApiDocumentTransformer
                     ("404", typeof(OllamaErrorResponse), "target not found: {target}"),
                     ("409", typeof(OllamaErrorResponse), "benchmark run already in progress")
                 ]),
+
+            ["GET /api/router/benchmark/candidates"] = new(typeof(RouterBenchmarkCandidatesResponse),
+                [("200", typeof(RouterBenchmarkCandidatesResponse), "The per-target candidate plan (task #152): one row per effective non-Cloud target (configuration order) with the stored fleet-hardware profile (null when unknown — no probe triggered) and the EXACT catalog candidate set the run loop would benchmark, each with its pre-flight fit verdict (Fits / Pruned / Assumed) + the largest surviving ladder context (capped by nativeContext; 0 when Pruned). Read-only, keyless in default mode.")]),
 
             ["GET /api/router/benchmark/results"] = new(typeof(RouterBenchmarkResultsResponse),
                 [("200", typeof(RouterBenchmarkResultsResponse), "Every known target result (persisted or in-flight; in-flight rows carry status \"Running\").")]),

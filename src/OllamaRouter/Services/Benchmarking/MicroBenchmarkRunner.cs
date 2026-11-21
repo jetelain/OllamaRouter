@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using OllamaRouter.Endpoints.RouterApi.Benchmark;
 using OllamaRouter.Options;
 using OllamaRouter.Serialization;
 using OllamaRouter.Services.ContextSizing;
@@ -96,7 +97,11 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
     // ------------------------------------------------------------------
 
     /// <inheritdoc/>
-    public bool TryStartRun(RoutingTarget? target, IEnumerable<UsageRole>? roles, string? model)
+    public bool TryStartRun(
+        RoutingTarget? target,
+        IEnumerable<UsageRole>? roles,
+        string? model,
+        IReadOnlyDictionary<string, IReadOnlyList<string>>? excludedModels = null)
     {
         if (!_runGate.Wait(0))
         {
@@ -149,7 +154,7 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
             }
         }
 
-        _ = Task.Run(() => RunLoopAsync(selected, rolesList, model, cts.Token));
+        _ = Task.Run(() => RunLoopAsync(selected, rolesList, model, excludedModels, cts.Token));
 
         return true;
     }
@@ -197,6 +202,66 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
             .ToList();
 
     /// <inheritdoc/>
+    public RouterBenchmarkCandidatesResponse GetBenchmarkCandidates()
+    {
+        // The full deduplicated catalog — exactly the candidate set a run with no roles/model
+        // filter benchmarks for every target (sizing-pruned models included).
+        var candidates = FilterCandidates([], null);
+        var ladder = _catalogOptions.Value.BenchmarkContextLadder;
+
+        var groups = new List<RouterBenchmarkCandidateTarget>();
+        // Same effective non-Cloud derivation as TryStartRun (configuration order).
+        var effectiveTargets = _routerOptions.CurrentValue.GetEffectiveTargets(_logger)
+            .Where(t => !string.Equals(t.Name, "Cloud", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        foreach (var target in effectiveTargets)
+        {
+            var name = target.Name!;
+
+            // STORE read only (D1): IFleetHardwareService.GetProfile never probes a peer —
+            // the candidates read must stay network-free, so the call is fail-soft to null.
+            NodeHardwareProfile? profile = null;
+            try
+            {
+                profile = _fleetHardware.GetProfile(name);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Failed to get hardware profile for {Target}; reporting an unknown profile in the candidate plan.",
+                    name);
+            }
+
+            var rows = new List<RouterBenchmarkCandidateModel>();
+            foreach (var (candidate, _) in candidates)
+            {
+                // ONE shared derivation with the run loop (D2): the endpoint can never
+                // drift from what a run would actually do on this node.
+                var fit = EvaluateCandidateFit(candidate, ladder, profile);
+                var verdict = fit.AssumedSizing
+                    ? BenchmarkCandidateFit.Assumed
+                    : fit.AnySurvived
+                        ? BenchmarkCandidateFit.Fits
+                        : BenchmarkCandidateFit.Pruned;
+                rows.Add(new RouterBenchmarkCandidateModel(
+                    candidate.Name,
+                    candidate.Roles,
+                    candidate.Quantization,
+                    candidate.Architecture,
+                    candidate.TotalParams,
+                    candidate.ActiveParams,
+                    candidate.NativeContext,
+                    verdict,
+                    fit.MaxSurvivingCtx));
+            }
+
+            groups.Add(new RouterBenchmarkCandidateTarget(name, profile, rows));
+        }
+
+        return new RouterBenchmarkCandidatesResponse(groups);
+    }
+
+    /// <inheritdoc/>
     public void ClearResults(bool keepRunning = false)
     {
         lock (_stateGate)
@@ -233,6 +298,7 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
         List<OllamaTargetOptions> targets,
         List<UsageRole> roles,
         string? modelFilter,
+        IReadOnlyDictionary<string, IReadOnlyList<string>>? excludedModels,
         CancellationToken ct)
     {
         try
@@ -253,7 +319,7 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
                 // run or leave the target in "Running" forever.
                 try
                 {
-                    await RunTargetBenchmarkAsync(target, roles, modelFilter, ct).ConfigureAwait(false);
+                    await RunTargetBenchmarkAsync(target, roles, modelFilter, excludedModels, ct).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
@@ -336,14 +402,21 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
         OllamaTargetOptions target,
         List<UsageRole> roles,
         string? modelFilter,
+        IReadOnlyDictionary<string, IReadOnlyList<string>>? excludedModels,
         CancellationToken ct)
     {
         var name = target.Name!;
         var url = target.Url?.TrimEnd('/');
         var startedAt = DateTimeOffset.UtcNow;
 
-        // 1. Filter catalog candidates by roles/model.
-        var candidates = FilterCandidates(roles, modelFilter);
+        // 1. Filter catalog candidates by roles/model, then drop the run-scoped exclusions of
+        // THIS target (task #152): a case-insensitive name set (blank entries dropped; unknown
+        // keys never match). Excluded models produce no rows — no sizing, no /api/tags presence
+        // check, no /api/pull, no /api/show, no warmup, no generate.
+        var excludedForTarget = ExcludedModelNamesFor(name, excludedModels);
+        var candidates = FilterCandidates(roles, modelFilter)
+            .Where(c => !excludedForTarget.Contains(c.Candidate.Name))
+            .ToArray();
 
         // 2. Get the hardware profile for sizing.
         NodeHardwareProfile? profile = null;
@@ -371,25 +444,16 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
                 break;
             }
 
-            // Evaluate sizing for each ladder context.
-            var sizingByContext = new Dictionary<int, CandidateSizingEstimate>();
-            var anySurvived = false;
-            foreach (var ctx in ladder)
-            {
-                var estimate = CandidateSizingCalculator.Evaluate(candidate, ctx, profile);
-                sizingByContext[ctx] = estimate;
-                if (estimate.Status is MemoryFitStatus.Fits or MemoryFitStatus.Assumed)
-                {
-                    anySurvived = true;
-                }
-            }
+            // Evaluate sizing for each ladder context (ONE shared derivation with
+            // GetBenchmarkCandidates — the same map / AnySurvived values as before the
+            // task #152 extraction, so the run behavior is byte-identical).
+            var fit = EvaluateCandidateFit(candidate, ladder, profile);
 
             // If ALL contexts are pruned → record sizing-pruned rows, no pull.
-            if (!anySurvived)
+            if (!fit.AnySurvived)
             {
                 foreach (var ctx in ladder)
                 {
-                    var est = sizingByContext[ctx];
                     allResults.Add(new BenchmarkContextResult(
                         candidate.Name, role, ctx,
                         0, 0, 0, 0,
@@ -430,7 +494,7 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
 
             // 6. Warmup: one generate at the smallest non-pruned context.
             var warmupCtx = ladder.Where(ctx => ctx <= effectiveMaxCtx &&
-                sizingByContext[ctx].Status is MemoryFitStatus.Fits or MemoryFitStatus.Assumed)
+                fit.SizingByContext[ctx].Status is MemoryFitStatus.Fits or MemoryFitStatus.Assumed)
                 .FirstOrDefault();
             if (warmupCtx > 0)
             {
@@ -445,7 +509,7 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
                     break;
                 }
 
-                var est = sizingByContext[ctx];
+                var est = fit.SizingByContext[ctx];
 
                 // Pruned context: record the row, continue to next.
                 if (est.Status is MemoryFitStatus.PrunedWeights or MemoryFitStatus.PrunedKvCache)
@@ -572,6 +636,89 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
         }
 
         return deduped.ToArray();
+    }
+
+    /// <summary>
+    /// The per-ladder-context fit verdict of one catalog candidate on one node profile
+    /// (task #152): the per-context <see cref="CandidateSizingEstimate"/> map over the WHOLE
+    /// ladder, whether ANY context survives sizing (<see cref="AnySurvived"/> — the run loop's
+    /// pull / sizing-pruned decision), the largest surviving ladder context capped by the
+    /// model's <see cref="CandidateModel.NativeContext"/> (<see cref="MaxSurvivingCtx"/> — the
+    /// run loop's <c>effectiveMaxCtx</c> PRE the Modelfile cap; 0 when nothing survives) and
+    /// whether sizing ran fail-open (<see cref="AssumedSizing"/> — the run loop's
+    /// "assumed" sizing source rule: null profile or TotalFastMemoryMB <= 0).
+    /// <para>
+    /// ONE shared derivation: the run loop and <see cref="GetBenchmarkCandidates"/> both use
+    /// these exact values, so the published candidate plan can never drift from what a run
+    /// would actually do on the node.
+    /// </para>
+    /// </summary>
+    internal sealed record CandidateFitEvaluation(
+        Dictionary<int, CandidateSizingEstimate> SizingByContext,
+        bool AnySurvived,
+        int MaxSurvivingCtx,
+        bool AssumedSizing);
+
+    internal CandidateFitEvaluation EvaluateCandidateFit(
+        CandidateModel candidate,
+        IReadOnlyList<int> ladder,
+        NodeHardwareProfile? profile)
+    {
+        var sizingByContext = new Dictionary<int, CandidateSizingEstimate>();
+        var anySurvived = false;
+        var maxSurvivingCtx = 0;
+        foreach (var ctx in ladder)
+        {
+            var estimate = CandidateSizingCalculator.Evaluate(candidate, ctx, profile);
+            sizingByContext[ctx] = estimate;
+            if (estimate.Status is MemoryFitStatus.Fits or MemoryFitStatus.Assumed)
+            {
+                anySurvived = true;
+                // Cap by NativeContext: the run loop never measures a rung above the model's
+                // native context (effectiveMaxCtx = min(NativeContext, Modelfile cap ?? NativeContext)).
+                if (ctx <= candidate.NativeContext && ctx > maxSurvivingCtx)
+                {
+                    maxSurvivingCtx = ctx;
+                }
+            }
+        }
+
+        var assumedSizing = profile is null || profile.TotalFastMemoryMB <= 0;
+        return new CandidateFitEvaluation(sizingByContext, anySurvived, maxSurvivingCtx, assumedSizing);
+    }
+
+    /// <summary>
+    /// The run-scoped excluded model names of ONE target (task #152): the map is matched
+    /// case-insensitively by target key (a JSON-deserialized dictionary is ordinal, so the
+    /// keys are walked, not probed), blank model entries are dropped, unknown keys and model
+    /// names are no-ops by construction.
+    /// </summary>
+    private static HashSet<string> ExcludedModelNamesFor(
+        string targetName,
+        IReadOnlyDictionary<string, IReadOnlyList<string>>? excludedModels)
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (excludedModels is null)
+        {
+            return set;
+        }
+
+        foreach (var (key, names) in excludedModels)
+        {
+            if (!string.Equals(key, targetName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            foreach (var name in names)
+            {
+                if (!string.IsNullOrWhiteSpace(name))
+                {
+                    set.Add(name);
+                }
+            }
+        }
+
+        return set;
     }
 
     // ------------------------------------------------------------------

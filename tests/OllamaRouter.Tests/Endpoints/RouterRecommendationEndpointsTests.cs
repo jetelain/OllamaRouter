@@ -8,6 +8,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using OllamaRouter.Endpoints;
+using OllamaRouter.Endpoints.RouterApi.Benchmark;
 using OllamaRouter.Extensions;
 using OllamaRouter.Options;
 using OllamaRouter.Serialization;
@@ -54,10 +55,15 @@ public sealed class RouterRecommendationEndpointsTests : IDisposable
         private readonly IReadOnlyList<BenchmarkTargetResult> _results;
         public StubRunner(IReadOnlyList<BenchmarkTargetResult> results) => _results = results;
 
-        public bool TryStartRun(RoutingTarget? target, IEnumerable<UsageRole>? roles, string? model) => true;
+        public bool TryStartRun(
+            RoutingTarget? target,
+            IEnumerable<UsageRole>? roles,
+            string? model,
+            IReadOnlyDictionary<string, IReadOnlyList<string>>? excludedModels = null) => true;
         public Task<BenchmarkTargetResult?> GetStatusAsync(RoutingTarget target) => Task.FromResult<BenchmarkTargetResult?>(null);
         public IReadOnlyList<BenchmarkTargetResult> GetAllResults() => _results;
         public IReadOnlyList<string> GetEffectiveTargetNames() => ["Desktop", "Aiserver"];
+        public RouterBenchmarkCandidatesResponse GetBenchmarkCandidates() => new([]);
         public void ClearResults(bool keepRunning = false) { }
     }
 

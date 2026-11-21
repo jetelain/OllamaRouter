@@ -186,9 +186,23 @@ public interface IOllamaRouterApiClient
     /// <summary>
     /// <c>POST /api/router/benchmark</c> (202): queues a benchmark run.
     /// <paramref name="request"/> may be null (an absent body is valid → all effective targets).
+    /// <see cref="RouterBenchmarkRequest.ExcludedModels"/> (task #152) is the per-target
+    /// run-scoped model exclusion map: excluded models are skipped for THAT RUN ONLY (they
+    /// produce no rows) and are never persisted; a null request — sent when nothing is
+    /// unchecked — is a byte-identical absent-body POST (the pre-#152 wire contract).
     /// </summary>
     Task<RouterBenchmarkRunResponse> StartBenchmarkAsync(
         RouterBenchmarkRequest? request = null, CancellationToken ct = default);
+
+    /// <summary>
+    /// <c>GET /api/router/benchmark/candidates</c> (task #152): the per-target benchmark
+    /// candidate plan — one row per effective non-Cloud target (configuration order) with the
+    /// stored fleet-hardware profile (null when unknown — no probe is triggered) and the EXACT
+    /// catalog candidate set the run loop would benchmark, each with its pre-flight fit
+    /// verdict (<c>Fits</c> / <c>Pruned</c> / <c>Assumed</c> + the largest surviving ladder
+    /// context, capped by the model's nativeContext). Read-only, keyless in default mode.
+    /// </summary>
+    Task<RouterBenchmarkCandidatesResponse> GetBenchmarkCandidatesAsync(CancellationToken ct = default);
 
     /// <summary><c>GET /api/router/benchmark/results</c>: every known target result (persisted or in-flight).</summary>
     Task<RouterBenchmarkResultsResponse> GetBenchmarkResultsAsync(CancellationToken ct = default);
@@ -683,6 +697,11 @@ public sealed class OllamaRouterApiClient : IOllamaRouterApiClient, IDisposable
             OllamaRouterClientJsonContext.Default.RouterBenchmarkRequest,
             OllamaRouterClientJsonContext.Default.RouterBenchmarkRunResponse,
             ct);
+
+    /// <inheritdoc />
+    public Task<RouterBenchmarkCandidatesResponse> GetBenchmarkCandidatesAsync(CancellationToken ct = default) =>
+        SendAsync(HttpMethod.Get, "api/router/benchmark/candidates",
+            OllamaRouterClientJsonContext.Default.RouterBenchmarkCandidatesResponse, ct);
 
     /// <inheritdoc />
     public Task<RouterBenchmarkResultsResponse> GetBenchmarkResultsAsync(CancellationToken ct = default) =>

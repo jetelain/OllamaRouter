@@ -7,24 +7,39 @@
     <StackPanel Spacing="12">
       <TextBlock Text="Step 4 — Micro-Benchmark" FontSize="18" FontWeight="Bold"/>
       <TextBlock TextWrapping="Wrap"
-                 Text="Benchmark every active node's candidate models. A context is viable when it decodes at 20 tokens/s or faster."/>
+                 Text="Benchmark the selected candidate models on every active node. A context is viable when it decodes at 20 tokens/s or faster. Unchecking a model skips it for the next run only — a fresh step entry selects all again."/>
 
       <StackPanel Orientation="Horizontal" Spacing="8">
-        <Button Content="Run benchmarks (all nodes)" Command="{Binding RunBenchmarksCommand}"/>
+        <Button Content="Run benchmarks" Command="{Binding RunBenchmarksCommand}"/>
         <Button Content="Clear results" Command="{Binding ClearResultsCommand}"/>
       </StackPanel>
 
-      <!-- Per-node hardware -->
-      <TextBlock Text="Node hardware" FontWeight="SemiBold"/>
-      <ItemsControl ItemsSource="{Binding HardwareRows}">
+      <!-- Candidate models grouped by target (task #152): the per-target hardware + the
+           full candidate set with per-model fit verdicts + the run-scoped opt-out. -->
+      <TextBlock Text="Candidate models" FontWeight="SemiBold"/>
+      <ItemsControl ItemsSource="{Binding CandidateGroups}">
         <ItemsControl.ItemTemplate>
-          <DataTemplate x:DataType="vm:BenchmarkHardwareRow">
-            <StackPanel Orientation="Horizontal" Spacing="10" Margin="0,2">
-              <TextBlock Text="{Binding Target}" Width="130" FontWeight="SemiBold"/>
-              <TextBlock Text="{Binding GpuName}" Width="220"/>
-              <TextBlock Text="{Binding VramText}" Width="150"/>
-              <TextBlock Text="{Binding BandwidthText}" Width="150"/>
-              <TextBlock Text="{Binding Note}" Foreground="#FFB74D"/>
+          <DataTemplate x:DataType="vm:BenchmarkCandidateGroupRow">
+            <StackPanel Spacing="2" Margin="0,2">
+              <StackPanel Orientation="Horizontal" Spacing="10">
+                <TextBlock Text="{Binding Target}" Width="130" FontWeight="SemiBold"/>
+                <TextBlock Text="{Binding GpuName}" Width="220"/>
+                <TextBlock Text="{Binding VramText}" Width="150"/>
+                <TextBlock Text="{Binding BandwidthText}" Width="150"/>
+                <TextBlock Text="{Binding Note}" Foreground="#FFB74D"/>
+              </StackPanel>
+              <ItemsControl ItemsSource="{Binding Models}">
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate x:DataType="vm:BenchmarkCandidateRow">
+                    <StackPanel Orientation="Horizontal" Spacing="10" Margin="16,1,0,1">
+                      <CheckBox IsChecked="{Binding IsSelected}" VerticalAlignment="Center"/>
+                      <TextBlock Text="{Binding Model}" Width="150" VerticalAlignment="Center"/>
+                      <TextBlock Text="{Binding RolesText}" Width="150" VerticalAlignment="Center"/>
+                      <TextBlock Text="{Binding FitText}" VerticalAlignment="Center"/>
+                    </StackPanel>
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
             </StackPanel>
           </DataTemplate>
         </ItemsControl.ItemTemplate>

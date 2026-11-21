@@ -765,6 +765,8 @@ public sealed class OllamaRouterDaemonLauncherTests : IDisposable
             => Unavailable<ResetFleetStreaksResponse>();
         public Task<RouterBenchmarkRunResponse> StartBenchmarkAsync(RouterBenchmarkRequest? request = null, CancellationToken ct = default)
             => Unavailable<RouterBenchmarkRunResponse>();
+        public Task<RouterBenchmarkCandidatesResponse> GetBenchmarkCandidatesAsync(CancellationToken ct = default)
+            => Unavailable<RouterBenchmarkCandidatesResponse>();
         public Task<RouterBenchmarkResultsResponse> GetBenchmarkResultsAsync(CancellationToken ct = default) => Unavailable<RouterBenchmarkResultsResponse>();
         public Task<RouterBenchmarkClearedResponse> ClearBenchmarkResultsAsync(CancellationToken ct = default) => Unavailable<RouterBenchmarkClearedResponse>();
         public Task<RouterSessionUsageListResponse> GetSessionsAsync(CancellationToken ct = default) => Unavailable<RouterSessionUsageListResponse>();

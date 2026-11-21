@@ -103,6 +103,12 @@ namespace OllamaRouter.Serialization;
 [JsonSerializable(typeof(RouterBenchmarkRunResponse))]
 [JsonSerializable(typeof(RouterBenchmarkResultsResponse))]
 [JsonSerializable(typeof(RouterBenchmarkClearedResponse))]
+// Benchmark candidate plan + per-target run-scoped exclusions (task #152).
+[JsonSerializable(typeof(RouterBenchmarkCandidatesResponse))]
+[JsonSerializable(typeof(RouterBenchmarkCandidateTarget))]
+[JsonSerializable(typeof(RouterBenchmarkCandidateModel))]
+[JsonSerializable(typeof(BenchmarkCandidateFit))]
+[JsonSerializable(typeof(IReadOnlyDictionary<string, IReadOnlyList<string>>))]
 // Native role recommendations + node context ceilings DTOs (task #66): the
 // <state>/recommended.json round-trip shape + the generate/apply response records.
 [JsonSerializable(typeof(NodeRoleProfile))]

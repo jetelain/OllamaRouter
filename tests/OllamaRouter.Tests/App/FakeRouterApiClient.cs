@@ -144,6 +144,24 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
     /// task #125: the install wizard's assisted mode reads it best-effort).</summary>
     public RouterBenchmarkResultsResponse BenchmarkResults { get; set; } = new([]);
 
+    /// <summary>The <c>GET /api/router/benchmark/candidates</c> response (task #152 — the
+    /// Step-4 candidate plan; empty by default, scriptable per test).</summary>
+    public RouterBenchmarkCandidatesResponse CandidatesResponse { get; set; } = new([]);
+
+    /// <summary>An exception thrown by <c>GetBenchmarkCandidatesAsync</c> (the Step-4
+    /// candidate-load failure + retry path; cleared after the first throw).</summary>
+    public Exception? CandidatesException { get; set; }
+
+    /// <summary>The ordered log of <c>StartBenchmarkAsync</c> requests (task #152 — the
+    /// run-scoped exclusion-map assertion surface; null = the absent-body all-targets POST).
+    /// </summary>
+    public List<RouterBenchmarkRequest?> StartBenchmarkCalls { get; } = [];
+
+    /// <summary>The <c>POST /api/router/benchmark</c> response (task #152 — started with no
+    /// queued targets by default; scriptable per test).</summary>
+    public RouterBenchmarkRunResponse StartBenchmarkResponse { get; set; } =
+        new(true, []);
+
     /// <summary>The <c>GET /api/router/models/{name}</c> response (null by default — the
     /// fake then throws the 404 <c>model not found</c>, the NORMAL first-install case the
     /// install wizard treats as a hint, not an error).</summary>
@@ -772,8 +790,30 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
 
     /// <inheritdoc />
     public Task<RouterBenchmarkRunResponse> StartBenchmarkAsync(
-        RouterBenchmarkRequest? request, CancellationToken ct = default) =>
-        NotImplemented<RouterBenchmarkRunResponse>(nameof(StartBenchmarkAsync));
+        RouterBenchmarkRequest? request, CancellationToken ct = default)
+    {
+        Log(nameof(StartBenchmarkAsync));
+        lock (_gate)
+        {
+            StartBenchmarkCalls.Add(request);
+        }
+
+        return Task.FromResult(StartBenchmarkResponse);
+    }
+
+    /// <inheritdoc />
+    public Task<RouterBenchmarkCandidatesResponse> GetBenchmarkCandidatesAsync(CancellationToken ct = default)
+    {
+        Log(nameof(GetBenchmarkCandidatesAsync));
+        var exception = CandidatesException;
+        if (exception is not null)
+        {
+            CandidatesException = null;
+            throw exception;
+        }
+
+        return Task.FromResult(CandidatesResponse);
+    }
 
     /// <inheritdoc />
     public Task<RouterBenchmarkResultsResponse> GetBenchmarkResultsAsync(CancellationToken ct = default)
