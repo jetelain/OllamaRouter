@@ -411,6 +411,23 @@ public sealed class FleetTargetsViewModelTests : IAsyncLifetime
     }
 
     [Fact]
+    public void Row_HasHardwareProfile_MirrorsProfilePresence()
+    {
+        var without = new FleetTargetRow { Name = "Plain" };
+        Assert.False(without.HasHardwareProfile);
+
+        var with = new FleetTargetRow
+        {
+            Name = "GpuBox",
+            HardwareProfile = new NodeHardwareProfile(
+                "Profiled", "Linux", "x64", false, 16384, SystemRamType.Ddr5,
+                [new GpuDeviceProfile("NVIDIA", "RTX 3090", 24576, "GDDR6X", 384, 936)],
+                24576, 936),
+        };
+        Assert.True(with.HasHardwareProfile);
+    }
+
+    [Fact]
     public void BuildAddRequest_SshFields_ValidateUsernameCharsetAndPortRange()
     {
         var form = new TargetEditFormViewModel(isEdit: false);

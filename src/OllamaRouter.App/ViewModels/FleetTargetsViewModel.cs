@@ -169,6 +169,11 @@ public sealed partial class FleetTargetRow : ObservableObject
     /// <summary>The hardware profile GPU devices (null when the profile is unknown).</summary>
     public IReadOnlyList<GpuDeviceProfile>? Gpus => HardwareProfile?.Gpus;
 
+    /// <summary>Whether a hardware profile is present (drives the always-expanded hardware
+    /// section's value lines vs. the "no hardware profile yet" placeholder). Rows are
+    /// rebuilt wholesale every poll tick, so no change notification is needed.</summary>
+    public bool HasHardwareProfile => HardwareProfile is not null;
+
     /// <summary>The ssh credential label of the row info strip (null when unset).</summary>
     public string? SshLabel => SshUser is null ? null : $"ssh: {SshUser}@(port {SshPort ?? 22})";
 
