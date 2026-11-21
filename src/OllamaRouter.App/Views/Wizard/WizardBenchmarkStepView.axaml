@@ -5,7 +5,7 @@
              x:DataType="vm:WizardBenchmarkStepViewModel">
   <ScrollViewer Padding="12">
     <StackPanel Spacing="12">
-      <TextBlock Text="Step 3 — Micro-Benchmark" FontSize="18" FontWeight="Bold"/>
+      <TextBlock Text="Step 4 — Micro-Benchmark" FontSize="18" FontWeight="Bold"/>
       <TextBlock TextWrapping="Wrap"
                  Text="Benchmark every active node's candidate models. A context is viable when it decodes at 20 tokens/s or faster."/>
 

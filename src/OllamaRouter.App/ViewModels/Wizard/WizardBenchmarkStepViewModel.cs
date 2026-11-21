@@ -10,7 +10,7 @@ using OllamaRouter.Services.Hardware;
 namespace OllamaRouter.App.ViewModels.Wizard;
 
 /// <summary>
-/// One node hardware row of Step 3 (task #103, spec §3.5): from <c>GET
+/// One node hardware row of Step 4 (task #103, spec §3.5; renumbered by task #151): from <c>GET
 /// /api/router/fleet/hardware</c> — the GPU detail, the fast-memory total and the estimated
 /// bandwidth, plus a note when no hardware profile was detected.
 /// </summary>
@@ -31,7 +31,7 @@ public sealed class BenchmarkHardwareRow
 }
 
 /// <summary>
-/// One target's benchmark-run row of Step 3 (task #103): the lifecycle status and the
+/// One target's benchmark-run row of Step 4 (task #103): the lifecycle status and the
 /// start/finish stamps.
 /// </summary>
 public sealed class BenchmarkRow
@@ -45,7 +45,7 @@ public sealed class BenchmarkRow
 }
 
 /// <summary>
-/// One (target × model × context) result row of Step 3 (task #103): the measured decode
+/// One (target × model × context) result row of Step 4 (task #103): the measured decode
 /// throughput, the viability decision (≥ <c>20</c> t/s) and the non-viable reason.
 /// </summary>
 public sealed class BenchmarkResultRow
@@ -63,7 +63,7 @@ public sealed class BenchmarkResultRow
 }
 
 /// <summary>
-/// Step 3 — Micro-Benchmark (task #103, spec §3.5): the per-node hardware table, the benchmark
+/// Step 4 — Micro-Benchmark (task #103, spec §3.5; renumbered by task #151): the per-node hardware table, the benchmark
 /// trigger (<c>POST /api/router/benchmark</c> with <c>null</c> = all active non-Cloud targets) and
 /// the live 2 s results poll (per-context tokens/s + viability), self-stopping when every queued
 /// target is terminal.

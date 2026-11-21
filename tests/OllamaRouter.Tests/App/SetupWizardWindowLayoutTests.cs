@@ -11,12 +11,15 @@ using OllamaRouter.Endpoints.RouterApi.Fleet;
 namespace OllamaRouter.Tests.App;
 
 /// <summary>
-/// Setup Wizard window layout contract tests (task #150): the branding header (logo +
-/// "OllamaRouter") must be the FIRST top-docked child of the wizard window — directly ABOVE
-/// the 4-step strip — and the Step 1 view must declare both section cards ("Ollama",
-/// "Configuration for router") with the state-driven action buttons, each carrying a
-/// non-null Command binding, the LAN-mesh checkbox and the Linux manual block. Structural
-/// assertions only — no measure/arrange, because the test project never bootstraps fonts.
+/// Setup Wizard window layout contract tests (task #150, extended by task #151): the
+/// branding header (logo + "OllamaRouter") must be the FIRST top-docked child of the wizard
+/// window — directly ABOVE the 5-step strip — and the Step 1 view must declare both section
+/// cards ("Ollama", "Configuration for router") with the state-driven action buttons, each
+/// carrying a non-null Command binding, the LAN-mesh checkbox and the Linux manual block.
+/// Task #151 reworks the Step 2 pane (fleet table with hardware headers + the main app's
+/// dedicated add-dialog buttons, the remote form gone) and adds the Step 3 pane ("Ollama
+/// Cloud" + "Other providers" cards). Structural assertions only — no measure/arrange,
+/// because the test project never bootstraps fonts.
 /// <see cref="SetupWizardWindow"/> is a <see cref="Window"/>, so construction and the
 /// assertions are dispatched on a headless Avalonia session (Avalonia controls are
 /// dispatcher-affine) — the same pattern as <c>PreloadDialogLayoutTests</c>. Reuses the
@@ -53,7 +56,7 @@ public sealed class SetupWizardWindowLayoutTests : IClassFixture<SetupWizardWind
     }
 
     [Fact]
-    public async Task Root_StepStrip_DirectlyBelowHeader_KeepsFourStepLabels()
+    public async Task Root_StepStrip_DirectlyBelowHeader_KeepsFiveStepLabels()
     {
         await _fixture.DispatchAsync(() =>
         {
@@ -64,8 +67,88 @@ public sealed class SetupWizardWindowLayoutTests : IClassFixture<SetupWizardWind
             Assert.Equal(Dock.Top, DockPanel.GetDock(strip));
             var labels = Assert.IsType<StackPanel>(strip.Child).Children.OfType<TextBlock>().ToArray();
             Assert.Equal(
-                ["1 · Local Ollama", "2 · Fleet Targets", "3 · Micro-Benchmark", "4 · Recommendations"],
+                ["1 · Local Ollama", "2 · Fleet Targets", "3 · Cloud & Providers", "4 · Micro-Benchmark", "5 · Recommendations"],
                 labels.Select(t => t.Text));
+        });
+    }
+
+    /// <summary>
+    /// Task #151 Step 2 pane: the fleet table header declares the hardware columns (GPU /
+    /// VRAM / Bandwidth), the add buttons are EXACTLY the main app's dedicated dialog
+    /// buttons ("Add Ollama Node" / "Add Provider"), and the removed controls (the
+    /// "Add Local node" button, the "Toggle Cloud" checkbox, the remote-form TextBoxes) are
+    /// gone.
+    /// </summary>
+    [Fact]
+    public async Task Step2_FleetTable_HardwareHeaders_AndDialogButtonsOnly()
+    {
+        await _fixture.DispatchAsync(() =>
+        {
+            var stepView = GetStep2View();
+            var texts = stepView.GetLogicalDescendants().OfType<TextBlock>().Select(t => t.Text).ToArray();
+
+            // The hardware table header labels (task #151).
+            Assert.Contains("Name", texts);
+            Assert.Contains("URL", texts);
+            Assert.Contains("GPU", texts);
+            Assert.Contains("VRAM", texts);
+            Assert.Contains("Bandwidth", texts);
+            Assert.Contains("Liveness", texts);
+            Assert.Contains("Enabled", texts);
+
+            // EXACTLY the two dedicated main-app dialog buttons (depth-first document
+            // order) — the removed "Add Local node" / "Toggle Cloud" buttons are gone.
+            var buttons = stepView.GetLogicalDescendants().OfType<Button>()
+                .Select(b => (string?)b.Content)
+                .ToArray();
+            Assert.Equal(["Add Ollama Node", "Add Provider"], buttons);
+
+            // The removed inline remote form: no TextBoxes; the removed cloud-overflow
+            // toggle: no CheckBox on this step.
+            Assert.Empty(stepView.GetLogicalDescendants().OfType<TextBox>());
+            Assert.Empty(stepView.GetLogicalDescendants().OfType<CheckBox>());
+        });
+    }
+
+    /// <summary>
+    /// Task #151 Step 3 pane: the "Ollama Cloud" card (the fleet-tab "Enabled" convention —
+    /// label + state CheckBox + command-bound "Toggle Cloud" button — and the cloud-model
+    /// dropdown bound to CloudModels/SelectedCloudModel) and the "Other providers" card
+    /// with its "Add Provider" button.
+    /// </summary>
+    [Fact]
+    public async Task Step3_CloudAndProvidersCards_DeclareToggleDropdownAndAddProvider()
+    {
+        await _fixture.DispatchAsync(() =>
+        {
+            var (stepView, root) = GetStep3View();
+            var cards = stepView.GetLogicalDescendants().OfType<Border>()
+                .Where(b => GetSectionHeader(b) is "Ollama Cloud" or "Other providers")
+                .ToList();
+            // Each header appears exactly once (Assert.Single below) — two cards in total.
+
+            // Card "Ollama Cloud" (task #151).
+            var cloudCard = Assert.Single(cards, c => GetSectionHeader(c) == "Ollama Cloud");
+            Assert.Contains(
+                cloudCard.GetLogicalDescendants().OfType<TextBlock>().Select(t => t.Text),
+                t => t == "Enabled");
+            Assert.Single(cloudCard.GetLogicalDescendants().OfType<CheckBox>()); // the state CheckBox
+            var toggle = Assert.Single(
+                cloudCard.GetLogicalDescendants().OfType<Button>(),
+                b => (string?)b.Content == "Toggle Cloud");
+            Assert.NotNull(BindingOperations.GetBindingExpressionBase(toggle, Button.CommandProperty));
+            var combo = Assert.Single(cloudCard.GetLogicalDescendants().OfType<ComboBox>());
+            // The dropdown's source contract (task #151): a live binding exists and its
+            // resolved value IS the step view model's cloud-model collection (the fleet
+            // catalog's cloud models — not some other list).
+            Assert.NotNull(BindingOperations.GetBindingExpressionBase(combo, ComboBox.ItemsSourceProperty));
+            Assert.Same(root.CloudStep.CloudModels, combo.GetValue(ComboBox.ItemsSourceProperty));
+            Assert.NotNull(BindingOperations.GetBindingExpressionBase(combo, ComboBox.SelectedItemProperty));
+
+            // Card "Other providers": the main app's dedicated provider-dialog button.
+            var providersCard = Assert.Single(cards, c => GetSectionHeader(c) == "Other providers");
+            var addProvider = Assert.Single(providersCard.GetLogicalDescendants().OfType<Button>());
+            Assert.Equal("Add Provider", (string?)addProvider.Content);
         });
     }
 
@@ -147,11 +230,15 @@ public sealed class SetupWizardWindowLayoutTests : IClassFixture<SetupWizardWind
 
         WizardTargetsStepViewModel targets = null!;
         targets = new WizardTargetsStepViewModel(() => fake, ct => targets.RefreshAsync(ct), GatedDelay);
+        // Task #151: the new Step 3 (Cloud & External Providers) — entry-refresh only (no
+        // poller), so no self-referential tick wiring.
+        var cloud = new WizardCloudStepViewModel(() => fake);
         WizardBenchmarkStepViewModel bench = null!;
         bench = new WizardBenchmarkStepViewModel(() => fake, ct => bench.RefreshAsync(ct), GatedDelay);
         SetupWizardViewModel root = null!;
-        var rec = new WizardRecommendationsStepViewModel(() => fake, () => _ = root.GoToAsync(2));
-        root = new SetupWizardViewModel(connection, environment, targets, bench, rec);
+        // Task #151: the micro-benchmark is now step index 3 (Step 4).
+        var rec = new WizardRecommendationsStepViewModel(() => fake, () => _ = root.GoToAsync(3));
+        root = new SetupWizardViewModel(connection, environment, targets, cloud, bench, rec);
         return root;
     }
 
@@ -164,6 +251,29 @@ public sealed class SetupWizardWindowLayoutTests : IClassFixture<SetupWizardWind
         var bodyGrid = Assert.IsType<Grid>(dock.Children[^1]);
         var step1Pane = Assert.IsType<Border>(bodyGrid.Children[0]);
         return Assert.IsType<WizardEnvironmentStepView>(step1Pane.Child);
+    }
+
+    private static WizardTargetsStepView GetStep2View()
+    {
+        var window = new SetupWizardWindow { DataContext = BuildRootViewModel() };
+        var dock = Assert.IsType<DockPanel>(window.Content);
+        // The step body is the LAST DockPanel child (fill); child 1 of its Grid is the
+        // Step 2 (Fleet Targets) pane.
+        var bodyGrid = Assert.IsType<Grid>(dock.Children[^1]);
+        var step2Pane = Assert.IsType<Border>(bodyGrid.Children[1]);
+        return Assert.IsType<WizardTargetsStepView>(step2Pane.Child);
+    }
+
+    private static (WizardCloudStepView View, SetupWizardViewModel Root) GetStep3View()
+    {
+        var root = BuildRootViewModel();
+        var window = new SetupWizardWindow { DataContext = root };
+        var dock = Assert.IsType<DockPanel>(window.Content);
+        // The step body is the LAST DockPanel child (fill); child 2 of its Grid is the
+        // Step 3 (Cloud & External Providers) pane (task #151).
+        var bodyGrid = Assert.IsType<Grid>(dock.Children[^1]);
+        var step3Pane = Assert.IsType<Border>(bodyGrid.Children[2]);
+        return (Assert.IsType<WizardCloudStepView>(step3Pane.Child), root);
     }
 
     private static List<Border> FindSectionCards(Avalonia.Visual root)

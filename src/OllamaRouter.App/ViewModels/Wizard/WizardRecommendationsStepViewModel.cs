@@ -9,7 +9,7 @@ using OllamaRouter.Services.Recommendations;
 namespace OllamaRouter.App.ViewModels.Wizard;
 
 /// <summary>
-/// One node row of a role's recommendation of Step 4 (task #103): the per-target context
+/// One node row of a role's recommendation of Step 5 (task #103): the per-target context
 /// ceiling, the measured throughput and the VRAM.
 /// </summary>
 public sealed class RecommendationNodeRow
@@ -21,9 +21,9 @@ public sealed class RecommendationNodeRow
 }
 
 /// <summary>
-/// One role's recommendation row of Step 4 (task #103). <see cref="Benchmarked"/> is
+/// One role's recommendation row of Step 5 (task #103). <see cref="Benchmarked"/> is
 /// <c>false</c> when the role is ABSENT from the matrix (no viable candidate benchmarked yet) —
-/// the UI then shows the "run Step 3 benchmark" hint.
+/// the UI then shows the "run Step 4 benchmark" hint.
 /// </summary>
 public sealed class RecommendationRoleRow
 {
@@ -41,7 +41,7 @@ public sealed class RecommendationRoleRow
 }
 
 /// <summary>
-/// One native-model row of the Step 4 models index (task #103): architecture, native context,
+/// One native-model row of the Step 5 models index (task #103): architecture, native context,
 /// quantization and the node count.
 /// </summary>
 public sealed class RecommendationModelRow
@@ -56,7 +56,7 @@ public sealed class RecommendationModelRow
 }
 
 /// <summary>
-/// Step 4 — Role Recommendations (task #103, spec §3.5): the live matrix read, the generate
+/// Step 5 — Role Recommendations (task #103, spec §3.5; renumbered by task #151): the live matrix read, the generate
 /// (<c>POST .../generate</c>, 409 ⇒ "benchmark first" hint) and the idempotent apply
 /// (<c>POST .../apply</c>) — all through the shared client SDK.
 /// </summary>
@@ -166,7 +166,7 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
         }
         catch (OllamaRouterApiException ex) when (ex.Status == HttpStatusCode.Conflict)
         {
-            Message = "No benchmark results available — run the Step 3 micro-benchmark first";
+            Message = "No benchmark results available — run the Step 4 micro-benchmark first";
             _canGoToBenchmark = true;
             GoToBenchmarkCommand.NotifyCanExecuteChanged();
         }
@@ -222,8 +222,8 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
     }
 
     /// <summary>
-    /// Jumps back to Step 3 (the micro-benchmark) after a generate/apply 409 — bound to
-    /// <c>SetupWizardViewModel.SelectedStep = 2</c> by the composition root.
+    /// Jumps back to Step 4 (the micro-benchmark; renumbered by task #151) after a generate/apply
+    /// 409 — bound to <c>SetupWizardViewModel.SelectedStep = 3</c> by the composition root.
     /// </summary>
     [RelayCommand(CanExecute = nameof(CanGoToBenchmark))]
     private void GoToBenchmark() => _goToBenchmark?.Invoke();
@@ -264,7 +264,7 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
                     Role = role,
                     Model = null,
                     RecommendedContextWindow = null,
-                    Description = "Not benchmarked yet — run the Step 3 micro-benchmark.",
+                    Description = "Not benchmarked yet — run the Step 4 micro-benchmark.",
                     Benchmarked = false,
                     Nodes = [],
                 });

@@ -1,0 +1,59 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:OllamaRouter.App.ViewModels.Wizard"
+             x:Class="OllamaRouter.App.Views.Wizard.WizardCloudStepView"
+             x:DataType="vm:WizardCloudStepViewModel">
+  <ScrollViewer Padding="12">
+    <StackPanel Spacing="12">
+      <TextBlock Text="Step 3 — Cloud &amp; External Providers" FontSize="18" FontWeight="Bold"/>
+      <TextBlock TextWrapping="Wrap"
+                 Text="Configure the built-in Ollama Cloud (ollama.com) overflow — the cloud switch and the default cloud model — and add external (OpenAI-compatible) providers."/>
+
+      <!-- Card 1: Ollama Cloud — the fleet-tab "Enabled" convention (label + state CheckBox,
+           OneWay/non-hit-testable + Toggle button). -->
+      <Border Padding="10" CornerRadius="6" Background="#1E1E2A">
+        <StackPanel Spacing="8">
+          <TextBlock Text="Ollama Cloud" FontSize="15" FontWeight="Bold"/>
+          <StackPanel Orientation="Horizontal" Spacing="4">
+            <TextBlock Text="Enabled" FontSize="11" FontWeight="SemiBold" Foreground="#9AA0B5"
+                       VerticalAlignment="Center"/>
+            <CheckBox IsChecked="{Binding CloudEnabled, Mode=OneWay}" IsHitTestVisible="False"
+                      VerticalAlignment="Center"/>
+            <Button Content="Toggle Cloud" Command="{Binding ToggleCloudCommand}"
+                    Padding="8,2" FontSize="11" VerticalAlignment="Center"/>
+          </StackPanel>
+          <StackPanel Orientation="Horizontal" Spacing="12">
+            <TextBlock Text="Default cloud model" VerticalAlignment="Center"/>
+            <!-- The Avalonia 12 ComboBox has no Command property: the view drives the VM's
+                 SelectCloudModelCommand from the SelectionChanged event (see code-behind). -->
+            <ComboBox ItemsSource="{Binding CloudModels}"
+                      SelectedItem="{Binding SelectedCloudModel}"
+                      IsEnabled="{Binding CanSelectCloudModel}"
+                      Width="360"
+                      SelectionChanged="OnCloudModelSelectionChanged"/>
+          </StackPanel>
+          <TextBlock TextWrapping="Wrap" Foreground="#9AA0B5" IsVisible="{Binding ShowEmptyModelsNote}"
+                     Text="No cloud models in the fleet catalog — enable cloud overflow and/or set per-model CloudModel entries to populate this list."/>
+          <TextBlock TextWrapping="Wrap" Foreground="#FFB74D" IsVisible="{Binding ShowConfiguredNote}"
+                     Text="{Binding ConfiguredDefaultNote}"/>
+          <TextBlock TextWrapping="Wrap" Foreground="#9AA0B5" IsVisible="{Binding !CloudOverflowConfigured}"
+                     Text="Cloud relay needs an ollama.com sign-in on a fleet node."/>
+          <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4"/>
+          <TextBlock Text="{Binding Message}" TextWrapping="Wrap" Foreground="#8BC34A"/>
+          <TextBlock Text="{Binding Error}" TextWrapping="Wrap" Foreground="#FF7B7B"/>
+        </StackPanel>
+      </Border>
+
+      <!-- Card 2: Other providers — the main app's dedicated provider dialog (opened
+           view-side; modal ownership needs the Window top level). -->
+      <Border Padding="10" CornerRadius="6" Background="#1E1E2A">
+        <StackPanel Spacing="8">
+          <TextBlock Text="Other providers" FontSize="15" FontWeight="Bold"/>
+          <Button Content="Add Provider" Click="OnAddProviderClick"/>
+          <TextBlock TextWrapping="Wrap" Foreground="#9AA0B5"
+                     Text="External (OpenAI-compatible) providers use the main app's provider dialog and appear in the Step 2 fleet table."/>
+        </StackPanel>
+      </Border>
+    </StackPanel>
+  </ScrollViewer>
+</UserControl>

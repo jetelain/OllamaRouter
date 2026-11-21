@@ -5,10 +5,10 @@ using OllamaRouter.App.Connection;
 namespace OllamaRouter.App.ViewModels.Wizard;
 
 /// <summary>
-/// The root view model of the 4-step Setup Wizard (task #103, spec §3.5): the step index,
-/// Back / Next navigation (steps are freely navigable/skippable — validation is per-step and
-/// Finish is the only hard gate), the Finish (exit 0) / Abandon (exit 1) exit signal, and the
-/// disposal of all four step view models.
+/// The root view model of the 5-step Setup Wizard (task #103, spec §3.5; task #151 adds Step 3
+/// "Cloud &amp; External Providers"): the step index, Back / Next navigation (steps are freely
+/// navigable/skippable — validation is per-step and Finish is the only hard gate), the Finish
+/// (exit 0) / Abandon (exit 1) exit signal, and the disposal of all five step view models.
 /// <para>
 /// Step 0's <c>OnStepEnteredAsync</c> fires exactly ONCE at construction — the wizard is the
 /// main window, so construction is the window-open moment (task #147: Step 1's Ollama/port
@@ -30,6 +30,7 @@ public sealed partial class SetupWizardViewModel : ObservableObject, IAsyncDispo
         IAppConnectionService connection,
         WizardEnvironmentStepViewModel environmentStep,
         WizardTargetsStepViewModel targetsStep,
+        WizardCloudStepViewModel cloudStep,
         WizardBenchmarkStepViewModel benchmarkStep,
         WizardRecommendationsStepViewModel recommendationsStep,
         Action<int>? exitSignal = null)
@@ -37,14 +38,15 @@ public sealed partial class SetupWizardViewModel : ObservableObject, IAsyncDispo
         _ = connection ?? throw new ArgumentNullException(nameof(connection));
         EnvironmentStep = environmentStep ?? throw new ArgumentNullException(nameof(environmentStep));
         TargetsStep = targetsStep ?? throw new ArgumentNullException(nameof(targetsStep));
+        CloudStep = cloudStep ?? throw new ArgumentNullException(nameof(cloudStep));
         BenchmarkStep = benchmarkStep ?? throw new ArgumentNullException(nameof(benchmarkStep));
         RecommendationsStep = recommendationsStep ?? throw new ArgumentNullException(nameof(recommendationsStep));
-        _steps = [EnvironmentStep, TargetsStep, BenchmarkStep, RecommendationsStep];
+        _steps = [EnvironmentStep, TargetsStep, CloudStep, BenchmarkStep, RecommendationsStep];
         ExitSignal = exitSignal;
 
         BackCommand = new AsyncRelayCommand(async () => await GoToAsync(SelectedStep - 1), () => SelectedStep > 0);
-        NextCommand = new AsyncRelayCommand(async () => await GoToAsync(SelectedStep + 1), () => SelectedStep < 3);
-        FinishCommand = new AsyncRelayCommand(async () => Finish(), () => SelectedStep == 3);
+        NextCommand = new AsyncRelayCommand(async () => await GoToAsync(SelectedStep + 1), () => SelectedStep < 4);
+        FinishCommand = new AsyncRelayCommand(async () => Finish(), () => SelectedStep == 4);
 
         // Task #147: the wizard is the main window, so construction == window open. Fire step 0's
         // entry ONCE here — GoToAsync alone never reaches it (its newStep == SelectedStep guard
@@ -73,10 +75,13 @@ public sealed partial class SetupWizardViewModel : ObservableObject, IAsyncDispo
     /// <summary>Step 2 — Fleet Targets.</summary>
     public WizardTargetsStepViewModel TargetsStep { get; }
 
-    /// <summary>Step 3 — Micro-Benchmark.</summary>
+    /// <summary>Step 3 — Cloud &amp; External Providers (task #151).</summary>
+    public WizardCloudStepViewModel CloudStep { get; }
+
+    /// <summary>Step 4 — Micro-Benchmark.</summary>
     public WizardBenchmarkStepViewModel BenchmarkStep { get; }
 
-    /// <summary>Step 4 — Role Recommendations.</summary>
+    /// <summary>Step 5 — Role Recommendations.</summary>
     public WizardRecommendationsStepViewModel RecommendationsStep { get; }
 
     /// <summary>
@@ -86,7 +91,7 @@ public sealed partial class SetupWizardViewModel : ObservableObject, IAsyncDispo
     /// </summary>
     internal Task InitialStepEntry { get; }
 
-    /// <summary>The active step index (0–3).</summary>
+    /// <summary>The active step index (0–4).</summary>
     [ObservableProperty]
     private int _selectedStep;
 
@@ -106,11 +111,11 @@ public sealed partial class SetupWizardViewModel : ObservableObject, IAsyncDispo
     /// <summary>Whether Back is available (not on step 0).</summary>
     public bool CanGoBack => SelectedStep > 0;
 
-    /// <summary>Whether Next is available (not on the last step, 3).</summary>
-    public bool CanGoNext => SelectedStep < 3;
+    /// <summary>Whether Next is available (not on the last step, 4).</summary>
+    public bool CanGoNext => SelectedStep < 4;
 
-    /// <summary>Whether Finish is available (only on the last step, 3).</summary>
-    public bool CanFinish => SelectedStep == 3;
+    /// <summary>Whether Finish is available (only on the last step, 4).</summary>
+    public bool CanFinish => SelectedStep == 4;
 
     /// <summary>Completes the wizard: marks it finished and signals exit code <c>0</c>.</summary>
     public void Finish()
@@ -144,7 +149,7 @@ public sealed partial class SetupWizardViewModel : ObservableObject, IAsyncDispo
     /// </summary>
     public async Task GoToAsync(int newStep)
     {
-        if (newStep < 0 || newStep > 3 || newStep == SelectedStep)
+        if (newStep < 0 || newStep > 4 || newStep == SelectedStep)
         {
             return;
         }

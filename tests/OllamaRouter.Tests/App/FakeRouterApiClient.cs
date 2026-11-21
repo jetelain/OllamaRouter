@@ -162,6 +162,16 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
         new RouterPricingConfigDto(null, null, null, "$", null, null, null),
         new ApiSecurityConfigDto(false, 24));
 
+    /// <summary>The <c>GET /api/router/models</c> fleet catalog (task #151 — the Setup
+    /// Wizard's Step 3 cloud-model dropdown is fed by this merged catalog; empty by
+    /// default).</summary>
+    public RouterModelsResponse ModelsResponse { get; set; } = new([]);
+
+    /// <summary>Sticky <c>GET /api/router/models</c> failure (thrown on every models call
+    /// until cleared — router-down scripting of the models fetch; mirrors the
+    /// <see cref="InfoException"/> precedent).</summary>
+    public OllamaRouterApiException? ModelsException { get; set; }
+
     /// <summary>The <c>GET /api/router/cartography</c> response (empty by default).</summary>
     public RouterCartographyResponse CartographyResponse { get; set; } = new([], [], []);
 
@@ -440,8 +450,16 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
     }
 
     /// <inheritdoc />
-    public Task<RouterModelsResponse> GetModelsAsync(CancellationToken ct = default) =>
-        NotImplemented<RouterModelsResponse>(nameof(GetModelsAsync));
+    public Task<RouterModelsResponse> GetModelsAsync(CancellationToken ct = default)
+    {
+        Log(nameof(GetModelsAsync));
+        if (ModelsException is { } modelsException)
+        {
+            throw modelsException;
+        }
+
+        return Task.FromResult(ModelsResponse);
+    }
 
     /// <inheritdoc />
     public Task<RouterModelDetailResponse> GetModelDetailAsync(
@@ -590,6 +608,10 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
 
         UpdateConfigCalls.Add(request);
 
+        // STATEFUL (task #151): mirrors the router's live options — the PUT mutates the
+        // scripted ConfigResponse (the target-store precedent of AddTargetAsync), so a
+        // subsequent GetConfigAsync echoes the updated section (the real router re-reads
+        // the now-updated live options for its echo).
         var current = ConfigResponse;
         var updated = new RouterConfigResponse(
             current.Targets,
@@ -607,6 +629,7 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
             request.Resilience ?? current.Resilience,
             request.Pricing ?? current.Pricing,
             current.ApiSecurity);
+        ConfigResponse = updated;
         return Task.FromResult(new UpdateRouterConfigResponse(true, "configuration updated", updated));
     }
 

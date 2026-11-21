@@ -14,7 +14,10 @@ internal sealed class DashboardPoller : IAsyncDisposable
     private readonly Func<CancellationToken, Task> _tick;
     private readonly TimeSpan _interval;
     private readonly Func<TimeSpan, CancellationToken, Task> _delay;
-    private readonly CancellationTokenSource _cts = new();
+    // Task #151: NOT readonly — a fresh source per start (see StartAsync): StopAsync cancels
+    // the current source, so reusing it would let the next loop observe the stale
+    // cancellation and exit without ever ticking (stale data on step re-entry).
+    private CancellationTokenSource _cts = new();
     private Task? _loop;
 
     /// <summary>
@@ -36,7 +39,13 @@ internal sealed class DashboardPoller : IAsyncDisposable
         _delay = delay ?? ((span, ct) => Task.Delay(span, ct));
     }
 
-    /// <summary>Starts the loop (a no-op when already running). The first tick runs immediately.</summary>
+    /// <summary>
+    /// Starts the loop (a no-op when already running). The first tick runs immediately.
+    /// A stop/start cycle reuses this poller (the wizard steps, the router tab): each start
+    /// gets a FRESH cancellation source, because <see cref="StopAsync"/> cancels the current
+    /// one — reusing a cancelled source would make the new loop exit before its first tick
+    /// (task #151: stale fleet/benchmark data on step re-entry).
+    /// </summary>
     public Task StartAsync()
     {
         if (_loop is not null)
@@ -44,6 +53,8 @@ internal sealed class DashboardPoller : IAsyncDisposable
             return Task.CompletedTask;
         }
 
+        _cts.Dispose();
+        _cts = new CancellationTokenSource();
         _loop = Task.Run(RunLoopAsync);
         return Task.CompletedTask;
     }

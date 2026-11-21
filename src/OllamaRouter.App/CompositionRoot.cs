@@ -72,15 +72,20 @@ internal static class CompositionRoot
         WizardTargetsStepViewModel targetsStep = null!;
         targetsStep = new WizardTargetsStepViewModel(connection.GetClient, ct => targetsStep.RefreshAsync(ct));
 
+        // Task #151: the new Step 3 (Cloud & External Providers) — entry-refresh only (no
+        // poller), so it needs no self-referential tick wiring.
+        var cloudStep = new WizardCloudStepViewModel(connection.GetClient);
+
         WizardBenchmarkStepViewModel benchmarkStep = null!;
         benchmarkStep = new WizardBenchmarkStepViewModel(connection.GetClient, ct => benchmarkStep.RefreshAsync(ct));
 
         SetupWizardViewModel root = null!;
+        // Task #151: the micro-benchmark is now step index 3 (Step 4).
         var recommendationsStep = new WizardRecommendationsStepViewModel(
-            connection.GetClient, goToBenchmark: () => _ = root.GoToAsync(2));
+            connection.GetClient, goToBenchmark: () => _ = root.GoToAsync(3));
 
         root = new SetupWizardViewModel(
-            connection, environmentStep, targetsStep, benchmarkStep, recommendationsStep,
+            connection, environmentStep, targetsStep, cloudStep, benchmarkStep, recommendationsStep,
             exitSignal: code => lifetime.TryShutdown(code));
 
         return new SetupWizardWindow { DataContext = root };

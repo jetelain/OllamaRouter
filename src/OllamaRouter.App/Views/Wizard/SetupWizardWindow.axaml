@@ -19,17 +19,19 @@
       </StackPanel>
     </Border>
 
-    <!-- 4-step progress header: all titles visible, the active step is bold -->
+    <!-- 5-step progress header (task #151): all titles visible, the active step is bold -->
     <Border DockPanel.Dock="Top" Padding="12,10" BorderBrush="#333" BorderThickness="0,0,0,1">
       <StackPanel Orientation="Horizontal" Spacing="18">
         <TextBlock Text="1 · Local Ollama"
                    FontWeight="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToFontWeightConverter.Instance}, ConverterParameter=0}"/>
         <TextBlock Text="2 · Fleet Targets"
                    FontWeight="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToFontWeightConverter.Instance}, ConverterParameter=1}"/>
-        <TextBlock Text="3 · Micro-Benchmark"
+        <TextBlock Text="3 · Cloud &amp; Providers"
                    FontWeight="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToFontWeightConverter.Instance}, ConverterParameter=2}"/>
-        <TextBlock Text="4 · Recommendations"
+        <TextBlock Text="4 · Micro-Benchmark"
                    FontWeight="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToFontWeightConverter.Instance}, ConverterParameter=3}"/>
+        <TextBlock Text="5 · Recommendations"
+                   FontWeight="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToFontWeightConverter.Instance}, ConverterParameter=4}"/>
       </StackPanel>
     </Border>
 
@@ -42,7 +44,7 @@
       </StackPanel>
     </Border>
 
-    <!-- Step body: all four overlap; visibility driven by SelectedStep -->
+    <!-- Step body: all five overlap (task #151); visibility driven by SelectedStep -->
     <Grid>
       <Border IsVisible="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToVisibilityConverter.Instance}, ConverterParameter=0}">
         <views:WizardEnvironmentStepView DataContext="{Binding EnvironmentStep}"/>
@@ -51,9 +53,12 @@
         <views:WizardTargetsStepView DataContext="{Binding TargetsStep}"/>
       </Border>
       <Border IsVisible="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToVisibilityConverter.Instance}, ConverterParameter=2}">
-        <views:WizardBenchmarkStepView DataContext="{Binding BenchmarkStep}"/>
+        <views:WizardCloudStepView DataContext="{Binding CloudStep}"/>
       </Border>
       <Border IsVisible="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToVisibilityConverter.Instance}, ConverterParameter=3}">
+        <views:WizardBenchmarkStepView DataContext="{Binding BenchmarkStep}"/>
+      </Border>
+      <Border IsVisible="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToVisibilityConverter.Instance}, ConverterParameter=4}">
         <views:WizardRecommendationsStepView DataContext="{Binding RecommendationsStep}"/>
       </Border>
     </Grid>

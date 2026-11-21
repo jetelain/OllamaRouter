@@ -10,9 +10,11 @@ using OllamaRouter.App.Connection;
 using OllamaRouter.App.ViewModels.Wizard;
 using OllamaRouter.Client;
 using OllamaRouter.Client.Process;
+using OllamaRouter.Endpoints.RouterApi.ApiKeys;
 using OllamaRouter.Endpoints.RouterApi.Benchmark;
 using OllamaRouter.Endpoints.RouterApi.Config;
 using OllamaRouter.Endpoints.RouterApi.Fleet;
+using OllamaRouter.Endpoints.RouterApi.Models;
 using OllamaRouter.Endpoints.RouterApi.Recommendations;
 using OllamaRouter.Endpoints.RouterApi.Targets;
 using OllamaRouter.Options;
@@ -58,12 +60,29 @@ public sealed class SetupWizardViewModelsTests
     /// self-describing failure (task #130 addendum) — a silent timeout previously produced
     /// misleading downstream errors (e.g. an <c>IndexOutOfRangeException</c> on an empty
     /// collection). The budget is generous (200 k beats) so a lagging fire-and-forget poller
-    /// tick under parallel load still lands in time — no real sleep.
+    /// tick under parallel load still lands in time — no real sleep. A transient
+    /// <see cref="InvalidOperationException"/> from the condition (enumerating an
+    /// <c>ObservableCollection</c> while a VM rebuilds it on a thread-pool thread — no Avalonia
+    /// dispatcher in tests) is treated as "not yet" and re-polled (task #148/#150 flake
+    /// lesson); the FINAL assertion stays unguarded.
     /// </summary>
     private static async Task WaitUntilAsync(Func<bool> condition, string what, int maxBeats = 200_000)
     {
-        for (var i = 0; i < maxBeats && !condition(); i++)
+        for (var i = 0; i < maxBeats; i++)
         {
+            try
+            {
+                if (condition())
+                {
+                    return;
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                // Collection mid-rebuild (the VM mutates it on a thread-pool thread; production
+                // marshals to the UI thread, so the race is test-host-only): treat as not yet.
+            }
+
             await Task.Yield();
         }
 
@@ -248,6 +267,7 @@ public sealed class SetupWizardViewModelsTests
         SetupWizardViewModel Root,
         WizardEnvironmentStepViewModel Env,
         WizardTargetsStepViewModel Targets,
+        WizardCloudStepViewModel Cloud,
         WizardBenchmarkStepViewModel Bench,
         WizardRecommendationsStepViewModel Rec,
         List<int> ExitCodes,
@@ -270,12 +290,16 @@ public sealed class SetupWizardViewModelsTests
         var env = new WizardEnvironmentStepViewModel(envConfig.Configurator, connection);
         WizardTargetsStepViewModel targets = null!;
         targets = new WizardTargetsStepViewModel(() => fake, ct => targets.RefreshAsync(ct), delay ?? GatedDelay);
+        // Task #151: the new Step 3 (Cloud & External Providers) — entry-refresh only (no
+        // poller), so no self-referential tick wiring.
+        var cloud = new WizardCloudStepViewModel(() => fake);
         WizardBenchmarkStepViewModel bench = null!;
         bench = new WizardBenchmarkStepViewModel(() => fake, ct => bench.RefreshAsync(ct), delay ?? GatedDelay);
         SetupWizardViewModel root = null!;
-        var rec = new WizardRecommendationsStepViewModel(() => fake, () => _ = root.GoToAsync(2));
-        root = new SetupWizardViewModel(connection, env, targets, bench, rec, code => exit.Add(code));
-        return new RootFixture(root, env, targets, bench, rec, exit, fake, envConfig, launcher);
+        // Task #151: the micro-benchmark is now step index 3 (Step 4).
+        var rec = new WizardRecommendationsStepViewModel(() => fake, () => _ = root.GoToAsync(3));
+        root = new SetupWizardViewModel(connection, env, targets, cloud, bench, rec, code => exit.Add(code));
+        return new RootFixture(root, env, targets, cloud, bench, rec, exit, fake, envConfig, launcher);
     }
 
     // ==================================================================
@@ -298,7 +322,7 @@ public sealed class SetupWizardViewModelsTests
     }
 
     [Fact]
-    public async Task Root_Next_StepsTo3_FinishEnabled()
+    public async Task Root_Next_StepsTo4_FinishEnabled()
     {
         var fx = BuildRoot(new FakeRouterApiClient());
         var root = fx.Root;
@@ -308,6 +332,8 @@ public sealed class SetupWizardViewModelsTests
         Assert.Equal(2, root.SelectedStep);
         await root.NextCommand.ExecuteAsync(CancellationToken.None);
         Assert.Equal(3, root.SelectedStep);
+        await root.NextCommand.ExecuteAsync(CancellationToken.None);
+        Assert.Equal(4, root.SelectedStep);
         Assert.False(root.NextCommand.CanExecute(null));
         Assert.True(root.CanGoNext == false);
         Assert.True(root.FinishCommand.CanExecute(null));
@@ -320,7 +346,9 @@ public sealed class SetupWizardViewModelsTests
     {
         var fx = BuildRoot(new FakeRouterApiClient());
         var root = fx.Root;
-        await root.GoToAsync(3);
+        await root.GoToAsync(4);
+        await root.BackCommand.ExecuteAsync(CancellationToken.None);
+        Assert.Equal(3, root.SelectedStep);
         await root.BackCommand.ExecuteAsync(CancellationToken.None);
         Assert.Equal(2, root.SelectedStep);
         await root.BackCommand.ExecuteAsync(CancellationToken.None);
@@ -336,7 +364,7 @@ public sealed class SetupWizardViewModelsTests
     {
         var fx = BuildRoot(new FakeRouterApiClient());
         var root = fx.Root;
-        await root.GoToAsync(3);
+        await root.GoToAsync(4);
         root.Finish();
         Assert.True(root.Finished);
         Assert.Equal([0], fx.ExitCodes);
@@ -359,7 +387,7 @@ public sealed class SetupWizardViewModelsTests
     {
         var fx = BuildRoot(new FakeRouterApiClient());
         var root = fx.Root;
-        await root.GoToAsync(3);
+        await root.GoToAsync(4);
         root.Finish();
         root.Abandon(); // must be a no-op now
         Assert.Equal([0], fx.ExitCodes);
@@ -383,8 +411,9 @@ public sealed class SetupWizardViewModelsTests
     {
         var fx = BuildRoot(new FakeRouterApiClient { FleetResponse = new RouterFleetResponse([]) });
         var root = fx.Root;
-        await root.GoToAsync(1); // start targets poller
-        await root.GoToAsync(2); // start benchmark poller
+        await root.GoToAsync(1); // start targets poller (+ auto-Local)
+        await root.GoToAsync(2); // enter cloud (entry refresh, no poller)
+        await root.GoToAsync(3); // start benchmark poller
         await root.DisposeAsync();
         await root.DisposeAsync(); // idempotent
     }
@@ -1326,21 +1355,118 @@ public sealed class SetupWizardViewModelsTests
             new RouterTargetExecution(2, "llama3:8b", "4k")),
     ]);
 
+    /// <summary>
+    /// Task #151 headline dedup regression (Explorer bug #7): a command-side
+    /// <c>RefreshAsync</c> overlapping the in-flight 2 s poller tick must NOT interleave with
+    /// it — the two <c>Rows.Clear()/Add</c> rebuilds serialize on the view model's single-writer
+    /// gate (the task #130 addendum bug class), so the final <c>Rows</c> contains every non-Cloud
+    /// fleet target EXACTLY ONCE (payload 2's, as it completes last).
+    /// </summary>
     [Fact]
-    public async Task Step2_AddLocal_CapturesLocalTargetRequest()
+    public async Task Step2_OverlapPollerAndCommand_Refresh_NoDuplicateRows()
     {
-        var fake = new FakeRouterApiClient { FleetResponse = new RouterFleetResponse([]) };
+        var noHardware = new RouterTargetHardware("nvidia", [], null, 1, null);
+        var noExec = new RouterTargetExecution(0, null, "none");
+        var payload1 = new RouterFleetResponse([
+            new RouterTargetItem("Node1", "http://node1", true, "Online", 1, "local", noHardware, noExec),
+            new RouterTargetItem("Cloud", null, true, "Online", null, "cloud", noHardware, noExec),
+        ]);
+        var payload2 = new RouterFleetResponse([
+            new RouterTargetItem("Node1", "http://node1", true, "Online", 1, "local", noHardware, noExec),
+            new RouterTargetItem("Node2", "http://node2", true, "Online", 2, "remote", noHardware, noExec),
+            new RouterTargetItem("Cloud", null, true, "Online", null, "cloud", noHardware, noExec),
+        ]);
+
+        var gate1 = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gate2 = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var fake = new FakeRouterApiClient
+        {
+            // Per-call FIFO: the poller tick (call 1) serves payload1 / blocks on gate1;
+            // the command refresh (call 2) serves payload2 / blocks on gate2.
+            FleetResponses = new Queue<RouterFleetResponse>([payload1, payload2]),
+            FleetFetchBlocks = new Queue<Task>([gate1.Task, gate2.Task]),
+        };
         var vm = BuildTargets(fake);
-        await vm.AddLocalCommand.ExecuteAsync(CancellationToken.None);
+        await vm.OnStepEnteredAsync(); // auto-Local + poller start: the first tick is in flight on gate1.
+        await WaitUntilAsync(
+            () => fake.Calls.Count(c => c == "GetFleetAsync") >= 1,
+            "the poller's first tick to start its fleet read (in flight on the gate)");
+
+        // The command-side refresh (UI thread in production): it must queue BEHIND the
+        // in-flight tick on the single-writer gate, never interleave with its rebuild.
+        var commandRefresh = vm.RefreshAsync(CancellationToken.None);
+        // Skewed release order: gate2 first (no-op yet — the command refresh still waits for
+        // the gate the tick holds), then gate1 (tick rebuilds payload1 and releases; the
+        // command refresh then enters and rebuilds payload2 immediately).
+        gate2.SetResult();
+        gate1.SetResult();
+        await WaitUntilAsync(
+            () => fake.Calls.Count(c => c == "GetFleetAsync") >= 2,
+            "the command-side refresh to reach its fleet read");
+        await commandRefresh;
+        await vm.OnStepLeftAsync();
+
+        // The final state is the LAST completed rebuild (payload 2, Cloud excluded): every
+        // non-Cloud target exactly once — no duplicates from interleaved Clear()/Add.
+        Assert.Equal(["Node1", "Node2"], vm.Rows.Select(r => r.Name));
+        Assert.DoesNotContain(vm.Rows, r => r.Name == "Cloud");
+        await vm.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Task #151: entering Step 2 with NO <c>Local</c> target in the config auto-adds it
+    /// EXACTLY ONCE — <c>Local</c> @ <c>http://127.0.0.1:11435</c> with the server-side
+    /// connection probe (<c>testConnectionFirst</c>) — and the rows show it.
+    /// </summary>
+    [Fact]
+    public async Task Step2_Entry_AutoAddsLocal_WhenAbsent()
+    {
+        var fake = new FakeRouterApiClient { FleetResponse = OneTargetFleet() };
+        var vm = BuildTargets(fake);
+        await vm.OnStepEnteredAsync();
+
         var req = Assert.Single(fake.AddTargetCalls);
         Assert.Equal("Local", req.Name);
         Assert.Equal("http://127.0.0.1:11435", req.Url);
         Assert.True(req.TestConnectionFirst);
+        Assert.Equal("Local node added.", vm.Message);
+
+        await WaitUntilAsync(() => vm.Rows.Count == 1, "the poller tick to populate the target rows");
+        Assert.Equal("Local", Assert.Single(vm.Rows).Name);
+        await vm.OnStepLeftAsync();
         await vm.DisposeAsync();
     }
 
+    /// <summary>
+    /// Task #151 idempotency: re-entering the step with <c>Local</c> already present (any URL)
+    /// is a silent no-op — exactly ONE add across enter/leave/enter, and no duplicate rows.
+    /// </summary>
     [Fact]
-    public async Task Step2_AddLocal_ConflictSurfacesAlreadyExists()
+    public async Task Step2_Reentry_SingleAdd_NoDuplicates()
+    {
+        var fake = new FakeRouterApiClient { FleetResponse = OneTargetFleet() };
+        var vm = BuildTargets(fake);
+
+        await vm.OnStepEnteredAsync(); // entry 1: Local absent → added
+        await WaitUntilAsync(() => vm.Rows.Count == 1, "the first entry's fleet tick to run");
+        await vm.OnStepLeftAsync();
+        await vm.OnStepEnteredAsync(); // entry 2: Local present in the config → no-op
+        // The re-entry's poller must TICK AGAIN (a fresh cancellation source per start —
+        // the DashboardPoller stop/start contract) and rebuild the same single row.
+        await WaitUntilAsync(
+            () => fake.Calls.Count(c => c == "GetFleetAsync") >= 2 && vm.Rows.Count == 1,
+            "the re-entry's fleet tick to rebuild the rows");
+        await vm.OnStepLeftAsync();
+
+        Assert.Single(fake.AddTargetCalls); // exactly ONE add across both entries
+        Assert.Equal(["Local"], vm.Rows.Select(r => r.Name)); // no duplicate rows
+        await vm.DisposeAsync();
+    }
+
+    /// <summary>Task #151: the concurrent-add race (409 Conflict) is readable, never fatal
+    /// and never a duplicate.</summary>
+    [Fact]
+    public async Task Step2_Local_Conflict_ReadableMessage()
     {
         var fake = new FakeRouterApiClient
         {
@@ -1348,13 +1474,15 @@ public sealed class SetupWizardViewModelsTests
             AddTargetError = (HttpStatusCode.Conflict, "target already exists: Local"),
         };
         var vm = BuildTargets(fake);
-        await vm.AddLocalCommand.ExecuteAsync(CancellationToken.None);
-        Assert.Contains("already exists", vm.Message);
+        await vm.OnStepEnteredAsync(); // must not throw
+        Assert.Equal("A target named 'Local' already exists — left unchanged.", vm.Message);
+        await vm.OnStepLeftAsync();
         await vm.DisposeAsync();
     }
 
+    /// <summary>Task #151: a 422 (Local Ollama unreachable) surfaces the fix-Step-1 hint.</summary>
     [Fact]
-    public async Task Step2_AddLocal_UnreachableShowsHint()
+    public async Task Step2_Local_Unreachable422_FixStep1Hint()
     {
         var fake = new FakeRouterApiClient
         {
@@ -1362,53 +1490,123 @@ public sealed class SetupWizardViewModelsTests
             AddTargetError = (HttpStatusCode.UnprocessableEntity, "could not connect"),
         };
         var vm = BuildTargets(fake);
-        await vm.AddLocalCommand.ExecuteAsync(CancellationToken.None);
+        await vm.OnStepEnteredAsync(); // must not throw
         Assert.Contains("unreachable", vm.Message);
+        Assert.Contains("fix Step 1 and retry", vm.Message);
+        await vm.OnStepLeftAsync();
         await vm.DisposeAsync();
     }
 
+    /// <summary>
+    /// Task #151: with the router DOWN (the canonical first-run state before Step 1 has
+    /// started it), the step entry — auto-Local PLUS the first poll tick — surfaces a readable
+    /// message and does NOT throw: an exception escaping the entry path would fault the
+    /// async-void command bridge and crash the wizard (the task #103 regression, kept).
+    /// </summary>
     [Fact]
-    public async Task Step2_AddRemote_CapturesCustomNameAndUrl()
+    public async Task Step2_RouterDown_EntryMessage_NoThrow()
     {
-        var fake = new FakeRouterApiClient { FleetResponse = new RouterFleetResponse([]) };
+        var mock = new Mock<IOllamaRouterApiClient>();
+        mock.Setup(c => c.GetFleetAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new System.Net.Http.HttpRequestException("connection refused"));
+        mock.Setup(c => c.GetConfigAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new System.Net.Http.HttpRequestException("connection refused"));
+        WizardTargetsStepViewModel vm = null!;
+        vm = new WizardTargetsStepViewModel(() => mock.Object, ct => vm.RefreshAsync(ct), GatedDelay);
+
+        await vm.OnStepEnteredAsync(); // auto-Local + poller start: must not throw
+        Assert.Contains("Connection failed", vm.Message);
+        await vm.OnStepLeftAsync();
+        await vm.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Task #151: the fleet table EXCLUDES the Cloud pseudo-target row (the server always
+    /// appends it last) and maps the hardware columns (GPU name / VRAM / bandwidth) from
+    /// <c>GET /api/router/fleet</c> — including the empty-text form for nodes without a
+    /// hardware profile.
+    /// </summary>
+    [Fact]
+    public async Task Step2_Refresh_ExcludesCloudRow_MapsHardwareColumns()
+    {
+        var fake = new FakeRouterApiClient
+        {
+            FleetResponse = new RouterFleetResponse([
+                new RouterTargetItem(
+                    "gpu-box", "http://192.168.1.50:11435", true, "Online", 15, "remote",
+                    new RouterTargetHardware(
+                        "nvidia", ["GPU 0"], 24576, 4, null,
+                        GpuName: "NVIDIA GeForce RTX 4090", BandwidthGBs: 1.5),
+                    new RouterTargetExecution(0, null, "none")),
+                new RouterTargetItem(
+                    "cpu-node", "http://cpu:11435", true, "Offline", null, "remote",
+                    new RouterTargetHardware("none", [], null, 1, null),
+                    new RouterTargetExecution(0, null, "none")),
+                // The server ALWAYS appends this last — the view model must drop it.
+                new RouterTargetItem(
+                    "Cloud", null, true, "Online", null, "cloud",
+                    new RouterTargetHardware("nvidia", [], null, 1, null),
+                    new RouterTargetExecution(0, null, "none")),
+            ]),
+        };
         var vm = BuildTargets(fake);
-        vm.RemoteName = "gpu-box";
-        vm.RemoteUrl = "http://192.168.1.50:11435";
-        await vm.AddRemoteCommand.ExecuteAsync(CancellationToken.None);
+        await vm.RefreshAsync();
+
+        Assert.Equal(["gpu-box", "cpu-node"], vm.Rows.Select(r => r.Name));
+        Assert.DoesNotContain(vm.Rows, r => r.Name == "Cloud");
+
+        var gpu = vm.Rows.Single(r => r.Name == "gpu-box");
+        Assert.Equal("NVIDIA GeForce RTX 4090", gpu.GpuName);
+        Assert.Equal(24576, gpu.VramMb);
+        Assert.Equal("24576 MB", gpu.VramText);
+        Assert.Equal(1.5, gpu.BandwidthGBs);
+        Assert.Equal("1.5 GB/s", gpu.BandwidthText);
+        Assert.Equal("Online", gpu.Liveness);
+        Assert.Equal(15, gpu.LatencyMs);
+        Assert.True(gpu.Enabled);
+
+        var cpu = vm.Rows.Single(r => r.Name == "cpu-node");
+        Assert.Equal(string.Empty, cpu.VramText); // no hardware → empty text (never "null")
+        Assert.Equal(string.Empty, cpu.BandwidthText);
+        await vm.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Task #151: the dialog-backed add command captures the request (the main app's form
+    /// builds it — see <c>WizardDialogLauncher</c>), surfaces the readable success message and
+    /// refreshes the fleet table so the new target appears on the next poll.
+    /// </summary>
+    [Fact]
+    public async Task Step2_AddTarget_CapturesRequest_MessagesAndRefreshes()
+    {
+        var fake = new FakeRouterApiClient { FleetResponse = OneTargetFleet() };
+        var vm = BuildTargets(fake);
+        await vm.AddTargetCommand.ExecuteAsync(new AddTargetRequest("gpu-box", "http://192.168.1.50:11435"));
+
         var req = Assert.Single(fake.AddTargetCalls);
         Assert.Equal("gpu-box", req.Name);
         Assert.Equal("http://192.168.1.50:11435", req.Url);
-        Assert.True(req.TestConnectionFirst);
+        Assert.Equal("Target 'gpu-box' added.", vm.Message);
+        Assert.Contains("GetFleetAsync", fake.Calls); // the post-add refresh
         await vm.DisposeAsync();
     }
 
+    /// <summary>
+    /// Task #151: add errors map to the SHARED readable messages
+    /// (<c>WizardTargetErrors.MapAddTarget</c> — the single source of truth Step 3 reuses):
+    /// 409 → already exists, 422 → unreachable with the Step 1 hint.
+    /// </summary>
     [Fact]
-    public async Task Step2_ToggleCloud_SendsEnabledTrueAndReflectsResponse()
+    public async Task Step2_AddTarget_ErrorMaps_ToSharedReadableMessages()
     {
-        var fake = new FakeRouterApiClient { FleetResponse = new RouterFleetResponse([]) };
+        var fake = new FakeRouterApiClient
+        {
+            FleetResponse = new RouterFleetResponse([]),
+            AddTargetError = (HttpStatusCode.Conflict, "target already exists: gpu-box"),
+        };
         var vm = BuildTargets(fake);
-        vm.CloudEnabled = false;
-        await vm.ToggleCloudCommand.ExecuteAsync(CancellationToken.None);
-        var req = Assert.Single(fake.UpdateConfigCalls);
-        Assert.True(req.Cloud!.Enabled);
-        Assert.True(vm.CloudEnabled); // reflected from the echo
-        await vm.DisposeAsync();
-    }
-
-    [Fact]
-    public async Task Step2_OpenRouterPreset_AddsOpenAiTarget()
-    {
-        var fake = new FakeRouterApiClient { FleetResponse = new RouterFleetResponse([]) };
-        var vm = BuildTargets(fake);
-        vm.UseOpenRouterCommand.Execute(null);
-        vm.RemoteApiKey = "sk-123";
-        await vm.AddRemoteCommand.ExecuteAsync(CancellationToken.None);
-        var req = Assert.Single(fake.AddTargetCalls);
-        Assert.Equal("OpenRouter", req.Name);
-        Assert.Equal("openai", req.Type);
-        Assert.Equal("OpenRouter", req.Provider);
-        Assert.Equal("sk-123", req.ApiKey);
-        Assert.Equal("https://openrouter.ai/api", req.Url);
+        await vm.AddTargetCommand.ExecuteAsync(new AddTargetRequest("gpu-box", "http://192.168.1.50:11435"));
+        Assert.Equal("Target already exists.", vm.Message);
         await vm.DisposeAsync();
     }
 
@@ -1425,43 +1623,12 @@ public sealed class SetupWizardViewModelsTests
         await vm.DisposeAsync();
     }
 
-    /// <summary>
-    /// Regression (task #103 review): with the daemon DOWN (the canonical first-run state
-    /// before Step 1 has started the router), a failed refresh must surface a message and NOT
-    /// throw. The fleet read used to be unguarded: the exception escaped the <c>AddLocal</c>
-    /// command (via its post-action refresh), faulted the async-void command bridge
-    /// (<c>AsyncRelayCommand</c> rethrows on the dispatcher) and crashed the wizard.
-    /// </summary>
-    [Fact]
-    public async Task Step2_DaemonDown_RefreshAndAddLocal_SurfaceMessage_DoesNotThrow()
-    {
-        var mock = new Mock<IOllamaRouterApiClient>();
-        mock.Setup(c => c.GetFleetAsync(It.IsAny<CancellationToken>()))
-            .ThrowsAsync(new System.Net.Http.HttpRequestException("connection refused"));
-        mock.Setup(c => c.GetConfigAsync(It.IsAny<CancellationToken>()))
-            .ThrowsAsync(new System.Net.Http.HttpRequestException("connection refused"));
-        mock.Setup(c => c.AddTargetAsync(It.IsAny<AddTargetRequest>(), It.IsAny<CancellationToken>()))
-            .ThrowsAsync(new System.Net.Http.HttpRequestException("connection refused"));
-        WizardTargetsStepViewModel vm = null!;
-        vm = new WizardTargetsStepViewModel(() => mock.Object, ct => Task.CompletedTask, GatedDelay);
-
-        await vm.RefreshAsync(); // must not throw
-        Assert.Contains("Connection failed", vm.Message);
-
-        // The original crash scenario: the full AddLocal command must complete, not fault.
-        await vm.AddLocalCommand.ExecuteAsync(CancellationToken.None); // must not throw
-        Assert.Contains("Connection failed", vm.Message);
-        await vm.DisposeAsync();
-    }
-
     /// <summary>Step 2 refresh with a router API error surfaces the error text (loop survives).</summary>
     [Fact]
     public async Task Step2_Refresh_ApiError_SurfacesMessage_DoesNotThrow()
     {
         var mock = new Mock<IOllamaRouterApiClient>();
         mock.Setup(c => c.GetFleetAsync(It.IsAny<CancellationToken>()))
-            .ThrowsAsync(new OllamaRouterApiException(HttpStatusCode.InternalServerError, "boom"));
-        mock.Setup(c => c.GetConfigAsync(It.IsAny<CancellationToken>()))
             .ThrowsAsync(new OllamaRouterApiException(HttpStatusCode.InternalServerError, "boom"));
         WizardTargetsStepViewModel vm = null!;
         vm = new WizardTargetsStepViewModel(() => mock.Object, ct => Task.CompletedTask, GatedDelay);
@@ -1473,7 +1640,274 @@ public sealed class SetupWizardViewModelsTests
     }
 
     // ==================================================================
-    //  Step 3 — WizardBenchmarkStepViewModel
+    //  Step 3 — WizardCloudStepViewModel (task #151)
+    // ==================================================================
+
+    /// <summary>The fake's default <c>GET /api/router/config</c> shape (mirrors
+    /// <c>FakeRouterApiClient.ConfigResponse</c>) — tests re-derive the cloud section via
+    /// <c>with</c>.</summary>
+    private static RouterConfigResponse DefaultConfig() => new(
+        [],
+        new RouterCloudConfigDto(false, null, "Local", false),
+        new RouterDynamicContextConfigDto(true, true, 10, 300),
+        new RouterRecordingConfigDto(false, null),
+        new RouterResilienceConfigDto(3, 4000),
+        new RouterPricingConfigDto(null, null, null, "$", null, null, null),
+        new ApiSecurityConfigDto(false, 24));
+
+    private static RouterModelSummary Model(string name) =>
+        new(name, "Dense", null, 8192, 8192, true);
+
+    [Theory]
+    [InlineData("glm-5.3-flash:cloud", true)]
+    [InlineData("glm-4.6:cloud", true)]
+    [InlineData("deepseek-v3.1:671b-cloud", true)]
+    [InlineData("GLM-5.3-FLASH:CLOUD", true)] // OrdinalIgnoreCase
+    [InlineData("llama3:8b", false)]
+    [InlineData("qwen2.5:7b-instruct", false)]
+    [InlineData("gemma2:2b", false)]
+    [InlineData("nomodel", false)]            // no colon at all
+    [InlineData("foo:", false)]               // empty tag
+    public void Step3_IsCloudModelName_RecognizesCloudTagConvention(string name, bool expected)
+        => Assert.Equal(expected, WizardCloudStepViewModel.IsCloudModelName(name));
+
+    /// <summary>
+    /// Task #151: on entry the step reflects the ACTUAL current cloud configuration (enabled
+    /// + DefaultModel from <c>GET /api/router/config</c>) and the dropdown lists ONLY the
+    /// fleet catalog's cloud models (catalog order), defaulting to the current
+    /// <c>DefaultModel</c> — with zero config writes on a pure read.
+    /// </summary>
+    [Fact]
+    public async Task Step3_Entry_PopulatesCloudModelsFromCatalog_DefaultSelection()
+    {
+        var fake = new FakeRouterApiClient
+        {
+            ConfigResponse = DefaultConfig() with
+            {
+                Cloud = new RouterCloudConfigDto(true, "glm-5.3-flash:cloud", "Local", true),
+            },
+            ModelsResponse = new RouterModelsResponse([
+                Model("llama3:8b"), Model("glm-5.3-flash:cloud"),
+                Model("deepseek-v3.1:671b-cloud"), Model("qwen2.5:7b"),
+            ]),
+        };
+        var vm = new WizardCloudStepViewModel(() => fake);
+        await vm.OnStepEnteredAsync();
+
+        Assert.True(vm.CloudEnabled);
+        Assert.Equal("glm-5.3-flash:cloud", vm.CloudDefaultModel);
+        Assert.True(vm.CloudOverflowConfigured);
+        Assert.Equal(["glm-5.3-flash:cloud", "deepseek-v3.1:671b-cloud"], vm.CloudModels);
+        Assert.Equal("glm-5.3-flash:cloud", vm.SelectedCloudModel);
+        Assert.False(vm.ShowEmptyModelsNote);
+        Assert.False(vm.ShowConfiguredNote);
+        Assert.Empty(fake.UpdateConfigCalls); // entry is a pure read
+        await vm.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Task #151: the expected state while the cloud switch is OFF (the fleet catalog only
+    /// carries cloud syntheses while cloud is enabled) — empty dropdown with the empty-state
+    /// note, and the configured default surfaced as a note when it is absent from the
+    /// catalog.
+    /// </summary>
+    [Fact]
+    public async Task Step3_Entry_CloudDisabled_EmptyDropdown_AndConfiguredNote()
+    {
+        var fake = new FakeRouterApiClient
+        {
+            ConfigResponse = DefaultConfig() with
+            {
+                Cloud = new RouterCloudConfigDto(false, "glm-5.3-flash:cloud", "Local", false),
+            },
+            ModelsResponse = new RouterModelsResponse([Model("llama3:8b"), Model("qwen2.5:7b")]),
+        };
+        var vm = new WizardCloudStepViewModel(() => fake);
+        await vm.OnStepEnteredAsync();
+
+        Assert.False(vm.CloudEnabled);
+        Assert.False(vm.CloudOverflowConfigured);
+        Assert.Empty(vm.CloudModels);
+        Assert.True(vm.ShowEmptyModelsNote);
+        Assert.Null(vm.SelectedCloudModel);
+        Assert.True(vm.ShowConfiguredNote);
+        Assert.Contains("glm-5.3-flash:cloud", vm.ConfiguredDefaultNote);
+        await vm.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Task #151: the toggle PUTs the cloud <c>enabled</c> flip, reflects the (stateful
+    /// fake's) response — NO optimistic flip — and re-fetches the config + catalog so the
+    /// dropdown re-populates/empties with the switch.
+    /// </summary>
+    [Fact]
+    public async Task Step3_ToggleCloud_PutsEnabled_ReflectsResponse_RefetchesCatalog()
+    {
+        var fake = new FakeRouterApiClient
+        {
+            ConfigResponse = DefaultConfig() with
+            {
+                Cloud = new RouterCloudConfigDto(false, null, "Local", true),
+            },
+            ModelsResponse = new RouterModelsResponse([Model("llama3:8b"), Model("glm-5.3-flash:cloud")]),
+        };
+        var vm = new WizardCloudStepViewModel(() => fake);
+        await vm.OnStepEnteredAsync();
+        await vm.ToggleCloudCommand.ExecuteAsync(CancellationToken.None);
+
+        var req = Assert.Single(fake.UpdateConfigCalls);
+        Assert.True(req.Cloud!.Enabled);
+        Assert.True(vm.CloudEnabled); // reflected from the response, not optimistically
+        Assert.Contains("enabled", vm.Message!);
+        // The catalog GAINS the cloud syntheses with the switch: a post-toggle refetch
+        // repopulates the dropdown.
+        Assert.Equal(2, fake.Calls.Count(c => c == "GetModelsAsync")); // entry + post-toggle
+        Assert.Contains("glm-5.3-flash:cloud", vm.CloudModels);
+        await vm.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Task #151: a failed toggle PUT surfaces the error, leaves <c>CloudEnabled</c>
+    /// UNCHANGED (no optimistic flip) and does not throw.
+    /// </summary>
+    [Fact]
+    public async Task Step3_ToggleCloud_ApiError_StateUnchanged_NoThrow()
+    {
+        var fake = new FakeRouterApiClient
+        {
+            ConfigResponse = DefaultConfig() with
+            {
+                Cloud = new RouterCloudConfigDto(false, null, "Local", true),
+            },
+            UpdateConfigError = (HttpStatusCode.InternalServerError, "boom"),
+        };
+        var vm = new WizardCloudStepViewModel(() => fake);
+        await vm.OnStepEnteredAsync();
+        await vm.ToggleCloudCommand.ExecuteAsync(CancellationToken.None); // must not throw
+
+        Assert.False(vm.CloudEnabled); // unchanged — the PUT failed
+        Assert.Contains("500", vm.Error!);
+        Assert.Contains("boom", vm.Error);
+        Assert.Empty(fake.UpdateConfigCalls);
+        await vm.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Task #151: selecting a different cloud model PUTs the cloud <c>defaultModel</c> (the
+    /// current switch preserved), reflects the success and updates the persisted default.
+    /// </summary>
+    [Fact]
+    public async Task Step3_ModelChange_PutsDefaultModel()
+    {
+        var fake = new FakeRouterApiClient
+        {
+            ConfigResponse = DefaultConfig() with
+            {
+                Cloud = new RouterCloudConfigDto(true, "glm-5.3-flash:cloud", "Local", true),
+            },
+            ModelsResponse = new RouterModelsResponse(
+                [Model("glm-5.3-flash:cloud"), Model("deepseek-v3.1:671b-cloud")]),
+        };
+        var vm = new WizardCloudStepViewModel(() => fake);
+        await vm.OnStepEnteredAsync();
+        // The ComboBox drives SelectedCloudModel BEFORE its SelectionChanged handler runs
+        // the command — mirror that order so the command sees the user's new selection.
+        vm.SelectedCloudModel = "deepseek-v3.1:671b-cloud";
+        await vm.SelectCloudModelCommand.ExecuteAsync("deepseek-v3.1:671b-cloud");
+
+        var req = Assert.Single(fake.UpdateConfigCalls);
+        Assert.Equal("deepseek-v3.1:671b-cloud", req.Cloud!.DefaultModel);
+        Assert.True(req.Cloud.Enabled); // the current switch is preserved on the wire
+        Assert.Equal("deepseek-v3.1:671b-cloud", vm.CloudDefaultModel);
+        Assert.Equal("deepseek-v3.1:671b-cloud", vm.SelectedCloudModel); // kept (no revert on success)
+        Assert.Contains("set to 'deepseek-v3.1:671b-cloud'", vm.Message!);
+        await vm.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Task #151: a failed model-selection PUT surfaces the error and REVERTS the dropdown
+    /// to the previous persisted default (the UI never desyncs from the config).
+    /// </summary>
+    [Fact]
+    public async Task Step3_ModelChange_ApiError_RevertsSelection()
+    {
+        var fake = new FakeRouterApiClient
+        {
+            ConfigResponse = DefaultConfig() with
+            {
+                Cloud = new RouterCloudConfigDto(true, "glm-5.3-flash:cloud", "Local", true),
+            },
+            ModelsResponse = new RouterModelsResponse(
+                [Model("glm-5.3-flash:cloud"), Model("deepseek-v3.1:671b-cloud")]),
+            UpdateConfigError = (HttpStatusCode.InternalServerError, "boom"),
+        };
+        var vm = new WizardCloudStepViewModel(() => fake);
+        await vm.OnStepEnteredAsync();
+        // The ComboBox drives SelectedCloudModel BEFORE its SelectionChanged handler runs
+        // the command — mirror that order so the revert is a real state change to observe.
+        vm.SelectedCloudModel = "deepseek-v3.1:671b-cloud";
+        await vm.SelectCloudModelCommand.ExecuteAsync("deepseek-v3.1:671b-cloud"); // must not throw
+
+        Assert.Contains("500", vm.Error!);
+        Assert.Equal("glm-5.3-flash:cloud", vm.SelectedCloudModel); // reverted to the previous default
+        Assert.Equal("glm-5.3-flash:cloud", vm.CloudDefaultModel);
+        Assert.Empty(fake.UpdateConfigCalls);
+        await vm.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Task #151: with the router DOWN, the entry refresh surfaces the readable
+    /// connection-failed error and does not throw (the refresh is awaited by the root
+    /// navigation command — an escaping exception would crash the wizard).
+    /// </summary>
+    [Fact]
+    public async Task Step3_RouterDown_RefreshMessage_NoThrow()
+    {
+        var mock = new Mock<IOllamaRouterApiClient>();
+        mock.Setup(c => c.GetConfigAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new System.Net.Http.HttpRequestException("connection refused"));
+        var vm = new WizardCloudStepViewModel(() => mock.Object);
+
+        await vm.RefreshAsync(); // must not throw
+        Assert.Contains("Connection failed — start the router in Step 1 first.", vm.Error!);
+        Assert.Empty(vm.CloudModels);
+        await vm.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Task #151: the dialog-backed provider add captures the request, names the Step 2
+    /// fleet table in the success message and re-fetches the config + catalog (the catalog
+    /// can grow with the new provider's models).
+    /// </summary>
+    [Fact]
+    public async Task Step3_AddTarget_CapturesRequest_MessageNamesStep2_AndRefreshesCatalog()
+    {
+        var fake = new FakeRouterApiClient
+        {
+            ConfigResponse = DefaultConfig() with
+            {
+                Cloud = new RouterCloudConfigDto(true, null, "Local", true),
+            },
+            ModelsResponse = new RouterModelsResponse([Model("glm-5.3-flash:cloud")]),
+        };
+        var vm = new WizardCloudStepViewModel(() => fake);
+        await vm.OnStepEnteredAsync();
+        var modelsCallsBefore = fake.Calls.Count(c => c == "GetModelsAsync");
+
+        await vm.AddTargetCommand.ExecuteAsync(new AddTargetRequest(
+            "OpenRouter", "https://openrouter.ai/api", Type: "openai", ApiKey: "sk-123", Provider: "OpenRouter"));
+
+        var req = Assert.Single(fake.AddTargetCalls);
+        Assert.Equal("OpenRouter", req.Name);
+        Assert.Equal("https://openrouter.ai/api", req.Url);
+        Assert.Contains("Provider 'OpenRouter' added", vm.Message!);
+        Assert.Contains("Step 2", vm.Message);
+        Assert.Equal(modelsCallsBefore + 1, fake.Calls.Count(c => c == "GetModelsAsync")); // post-add refetch
+        await vm.DisposeAsync();
+    }
+
+    // ==================================================================
+    //  Step 4 — WizardBenchmarkStepViewModel (renumbered by task #151)
     // ==================================================================
 
     private static Mock<IOllamaRouterApiClient> MockClient()
@@ -1629,7 +2063,7 @@ public sealed class SetupWizardViewModelsTests
     }
 
     // ==================================================================
-    //  Step 4 — WizardRecommendationsStepViewModel
+    //  Step 5 — WizardRecommendationsStepViewModel (renumbered by task #151)
     // ==================================================================
 
     [Fact]
@@ -1653,7 +2087,7 @@ public sealed class SetupWizardViewModelsTests
         bool goTo = false;
         var vm = new WizardRecommendationsStepViewModel(() => fake, () => goTo = true);
         await vm.GenerateCommand.ExecuteAsync(CancellationToken.None);
-        Assert.Contains("run the Step 3 micro-benchmark", vm.Message);
+        Assert.Contains("run the Step 4 micro-benchmark", vm.Message);
         Assert.False(goTo);
         Assert.True(vm.GoToBenchmarkCommand.CanExecute(null));
         vm.GoToBenchmarkCommand.Execute(null);
@@ -1703,7 +2137,7 @@ public sealed class SetupWizardViewModelsTests
     }
 
     /// <summary>
-    /// Regression (task #103 review): with the daemon DOWN, entering Step 4 (root
+    /// Regression (task #103 review): with the daemon DOWN, entering Step 5 (root
     /// <c>GoToAsync</c> → <c>OnStepEnteredAsync</c> → <c>RefreshAsync</c>) must surface a message
     /// and NOT throw — the unguarded <c>GetRecommendationsAsync</c> read used to escape the
     /// navigation command, fault the async-void command bridge and crash the wizard.
