@@ -148,7 +148,8 @@ public sealed class MeshRouter : IAsyncDisposable
         TimeSpan? onlineCacheTtl = null,
         TimeSpan? probeTimeout = null,
         Action<WebApplication>? configurePipeline = null,
-        Action<OllamaRouterOptions>? configureOptions = null)
+        Action<OllamaRouterOptions>? configureOptions = null,
+        Action<IServiceCollection>? configureServices = null)
     {
         var targets = daemons
             .Select(d => new OllamaTargetOptions
@@ -184,6 +185,7 @@ public sealed class MeshRouter : IAsyncDisposable
             reprobeInterval: reprobeInterval ?? TimeSpan.FromSeconds(1),
             onlineCacheTtl: onlineCacheTtl ?? TimeSpan.FromSeconds(2),
             probeTimeout: probeTimeout ?? TimeSpan.FromMilliseconds(1500));
+        configureServices?.Invoke(builder.Services);
 
         var app = builder.Build();
         configurePipeline?.Invoke(app);

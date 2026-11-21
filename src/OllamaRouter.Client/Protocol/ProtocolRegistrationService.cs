@@ -133,7 +133,7 @@ public static class ProtocolRegistrationService
         var present = probe("xdg-mime");
         return new LinuxProtocolRegistration
         {
-            DesktopEntryPath = Path.Combine(homeDirectory, ".local", "share", "applications", DesktopEntryFileName),
+            DesktopEntryPath = Path.Combine(homeDirectory, ".local", "share", "applications", DesktopEntryFileName).Replace('\\', '/'),
             DesktopEntryContent = BuildDesktopEntryContent(appExecutablePath),
             MimeType = MimeType,
             XdgMimeCommand = present ? $"xdg-mime default {DesktopEntryFileName} {MimeType}" : null,

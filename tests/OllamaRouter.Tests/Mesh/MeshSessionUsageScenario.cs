@@ -1,6 +1,10 @@
+using System.Globalization;
 using System.Net;
 using System.Text.Json.Nodes;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using OllamaRouter.Options;
+using OllamaRouter.Services.Monitoring;
 
 namespace OllamaRouter.Tests.Mesh;
 
@@ -36,6 +40,12 @@ public class MeshSessionUsageScenario
         CachedPromptPricePerMillion = 0.05
     };
 
+    public MeshSessionUsageScenario()
+    {
+        Thread.CurrentThread.CurrentCulture = new CultureInfo("en-US");
+        Thread.CurrentThread.CurrentUICulture = new CultureInfo("en-US");
+    }
+
     [Fact]
     public async Task SessionedChats_AccumulatePerSession_WithMonitorParityCosts_HeaderlessCreatesNoEntry()
     {
@@ -56,7 +66,12 @@ public class MeshSessionUsageScenario
             "R-session-usage",
             [desktop, server],
             cloudEnabled: false,
-            configureOptions: options => options.Pricing = ScenarioPricing());
+            configureOptions: options => options.Pricing = ScenarioPricing(),
+            // Task #106 resolves untagged loopback callers to `process:<Name>` in production;
+            // replace the resolver so this scenario deterministically tests the anonymous/headerless
+            // no-entry contract across Windows, Linux, and macOS.
+            configureServices: services => services.Replace(
+                ServiceDescriptor.Singleton<ILocalClientIdentityResolver>(new NullLocalClientIdentityResolver())));
 
         Assert.True(await MeshTestHelpers.WaitAllOnlineAsync(router, TimeSpan.FromSeconds(10)),
             "both daemons must come Online before the requests are sent");
@@ -213,5 +228,10 @@ public class MeshSessionUsageScenario
         }
 
         return false;
+    }
+
+    private sealed class NullLocalClientIdentityResolver : ILocalClientIdentityResolver
+    {
+        public string? TryResolveClientIdentity(IPAddress? remoteIp, int remotePort, int localPort) => null;
     }
 }

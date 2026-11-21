@@ -1,3 +1,4 @@
+using System.Globalization;
 using OllamaRouter.App.ViewModels.InstallModelWizard;
 using OllamaRouter.Client;
 using OllamaRouter.Endpoints.RouterApi.Benchmark;
@@ -62,6 +63,12 @@ public sealed class InstallModelWizardViewModelTests
         await WaitUntilAsync(() => !step.IsFetching && step.Rows.Count > 0);
         Assert.Equal(stepIndex, vm.SelectedStep);
         return vm;
+    }
+
+    public InstallModelWizardViewModelTests()
+    {
+        Thread.CurrentThread.CurrentCulture = new CultureInfo("en-US");
+        Thread.CurrentThread.CurrentUICulture = new CultureInfo("en-US");
     }
 
     // ------------------------------------------------------------------

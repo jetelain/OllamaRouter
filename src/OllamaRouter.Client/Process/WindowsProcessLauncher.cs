@@ -36,7 +36,7 @@ internal static class WindowsProcessLauncher
     private const int StdOutputHandle = -11;
     private const int StdErrorHandle = -12;
 
-    private const int HandleFlagInherit = 0x80;
+    private const int HandleFlagInherit = 0x00000001;
 
     private static readonly IntPtr InvalidHandleValue = new(-1);
 
@@ -116,7 +116,7 @@ internal static class WindowsProcessLauncher
 
                 foreach (var (handle, originalFlags) in OriginalFlags)
                 {
-                    SetHandleInformation(handle, -1, originalFlags); // best-effort exact restore
+                    SetHandleInformation(handle, HandleFlagInherit, originalFlags & HandleFlagInherit); // best-effort exact restore
                 }
 
                 OriginalFlags.Clear();

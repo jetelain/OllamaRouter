@@ -1,3 +1,4 @@
+using System.Globalization;
 using OllamaRouter.App.ViewModels;
 
 namespace OllamaRouter.Tests.App;
@@ -9,6 +10,12 @@ namespace OllamaRouter.Tests.App;
 /// </summary>
 public sealed class MonitorUsageRatioTests
 {
+    public MonitorUsageRatioTests()
+    {
+        Thread.CurrentThread.CurrentCulture = new CultureInfo("en-US");
+        Thread.CurrentThread.CurrentUICulture = new CultureInfo("en-US");
+    }
+
     [Fact]
     public void FormattedTooltip_PartialShare_MatchesTheWebMonitorFormat()
     {

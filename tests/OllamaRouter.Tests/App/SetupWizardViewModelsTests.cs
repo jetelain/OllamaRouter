@@ -1,12 +1,13 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using Avalonia.Data.Converters;
 using Moq;
 using OllamaRouter.App;
 using OllamaRouter.App.Bootstrap;
-using OllamaRouter.App.Converters;
 using OllamaRouter.App.Connection;
+using OllamaRouter.App.Converters;
 using OllamaRouter.App.ViewModels.Wizard;
 using OllamaRouter.Client;
 using OllamaRouter.Client.Process;
@@ -300,6 +301,12 @@ public sealed class SetupWizardViewModelsTests
         var rec = new WizardRecommendationsStepViewModel(() => fake, () => _ = root.GoToAsync(3));
         root = new SetupWizardViewModel(connection, env, targets, cloud, bench, rec, code => exit.Add(code));
         return new RootFixture(root, env, targets, cloud, bench, rec, exit, fake, envConfig, launcher);
+    }
+
+    public SetupWizardViewModelsTests()
+    {
+        Thread.CurrentThread.CurrentCulture = new CultureInfo("en-US");
+        Thread.CurrentThread.CurrentUICulture = new CultureInfo("en-US");
     }
 
     // ==================================================================
