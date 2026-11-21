@@ -2,7 +2,7 @@
   "profiles": {
     "OllamaRouter": {
       "commandName": "Project",
-      "launchBrowser": false,
+      "workingDirectory": "$(LOCALAPPDATA)\\OllamaRouter",
       "environmentVariables": {
         "ASPNETCORE_ENVIRONMENT": "Development"
       },
