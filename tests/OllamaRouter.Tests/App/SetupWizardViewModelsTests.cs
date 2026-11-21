@@ -1505,10 +1505,13 @@ public sealed class SetupWizardViewModelsTests
     }
 
     /// <summary>
-    /// Task #151: with the router DOWN (the canonical first-run state before Step 1 has
-    /// started it), the step entry — auto-Local PLUS the first poll tick — surfaces a readable
-    /// message and does NOT throw: an exception escaping the entry path would fault the
-    /// async-void command bridge and crash the wizard (the task #103 regression, kept).
+    /// Task #158: with the router DOWN (the canonical first-run state before Step 1 has
+    /// started it), the step entry — auto-Local PLUS the first poll tick — surfaces the
+    /// SHARED actionable daemon-down message (byte-exact) and does NOT throw: an exception
+    /// escaping the entry path would fault the async-void command bridge and crash the
+    /// wizard (the task #103 regression, kept). No <c>Local</c> row is added and the raw
+    /// transport text never leaks (the old <c>Connection failed: {ex.Message}</c> / <c
+    /// >Connection failed — start the router in Step 1 first.</c> strings are retired).
     /// </summary>
     [Fact]
     public async Task Step2_RouterDown_EntryMessage_NoThrow()
@@ -1522,9 +1525,175 @@ public sealed class SetupWizardViewModelsTests
         vm = new WizardTargetsStepViewModel(() => mock.Object, ct => vm.RefreshAsync(ct), GatedDelay);
 
         await vm.OnStepEnteredAsync(); // auto-Local + poller start: must not throw
-        Assert.Contains("Connection failed", vm.Message);
+        Assert.Equal(
+            "The OllamaRouter daemon is not reachable on 127.0.0.1:11434 — go back to Step 1 and click 'Start router'.",
+            vm.Message);
+        Assert.Empty(vm.Rows); // no Local row added while the daemon is down
+        mock.Verify(c => c.AddTargetAsync(It.IsAny<AddTargetRequest>(), It.IsAny<CancellationToken>()), Moq.Times.Never);
         await vm.OnStepLeftAsync();
         await vm.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Task #158 (AC1 + AC6 — the headline no-churn guarantee): across ≥ 3 consecutive
+    /// FAILED refreshes (the exact <c>RefreshCoreAsync</c> path the 2 s poller tick runs,
+    /// plus the entry auto-add attempt) the daemon-down message stays BYTE-IDENTICAL (no
+    /// flicker between variants) and <c>PropertyChanged("Message")</c> fires EXACTLY ONCE for
+    /// the whole down-state (first set only — the <c>SetFailureMessage</c> guard). The REAL
+    /// Windows-style transport text is fed to the mock, proving it never leaks (no
+    /// "actively refused" text, no bare parenthesized "(127.0.0.1:11434)" fragment). A NEW
+    /// failure type (a later <c>Router error 500</c>) still overwrites the stable text and
+    /// fires <c>PropertyChanged</c> again.
+    /// </summary>
+    [Fact]
+    public async Task Step2_Poll_DaemonDown_MessageStable_NoChurnAcrossTicks()
+    {
+        // The REAL Windows HttpRequestException text (connection refused):
+        const string rawWindowsText = "Connection refused (127.0.0.1:11434): actively refused it. (127.0.0.1:11434)";
+        var mock = new Mock<IOllamaRouterApiClient>();
+        mock.Setup(c => c.GetFleetAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new System.Net.Http.HttpRequestException(rawWindowsText));
+        mock.Setup(c => c.GetConfigAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new System.Net.Http.HttpRequestException(rawWindowsText));
+        WizardTargetsStepViewModel vm = null!;
+        vm = new WizardTargetsStepViewModel(() => mock.Object, ct => vm.RefreshAsync(ct), GatedDelay);
+
+        var messageChanges = 0;
+        vm.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(WizardTargetsStepViewModel.Message))
+            {
+                messageChanges++;
+            }
+        };
+
+        // The persistent down-state: entry auto-add attempt, then stop the poller (deterministic
+        // count — the GatedDelay loop cannot be cooperatively scheduled from this test thread
+        // under parallel load), then 3 consecutive failed poll-tick refreshes (RefreshAsync is
+        // exactly the tick's entry point: the same RefreshCoreAsync transport catch).
+        await vm.OnStepEnteredAsync(); // attempt 1 (EnsureLocalAsync transport catch) + poller start
+        await vm.OnStepLeftAsync(); // stop the poller: no background ticks racing the count
+        await vm.RefreshAsync(); // failed poll tick 1
+        await vm.RefreshAsync(); // failed poll tick 2
+        await vm.RefreshAsync(); // failed poll tick 3
+
+        // AC1: the message is the SHARED daemon-down text — byte-exact, raw transport text never leaks.
+        const string expected =
+            "The OllamaRouter daemon is not reachable on 127.0.0.1:11434 — go back to Step 1 and click 'Start router'.";
+        Assert.Equal(expected, vm.Message);
+        Assert.DoesNotContain("actively refused", vm.Message);
+        Assert.DoesNotContain("(127.0.0.1:11434)", vm.Message); // the bare parenthesized fragment never appears
+        Assert.Equal(1, CountOccurrences(vm.Message!, "127.0.0.1:11434")); // ! : Assert.Equal above proves non-null; the port appears only in that one sentence
+
+        // AC6: over the WHOLE down-state window (entry attempt + 3 failed ticks), the first
+        // set fired PropertyChanged exactly once; every subsequent identical re-set was a
+        // no-op (no flicker, no churn).
+        Assert.Equal(1, messageChanges);
+
+        // AC6 (new-failure-type still wins): once the daemon comes back with an API error,
+        // the DIFFERENT message overwrites the stable daemon-down text and fires again.
+        mock.Setup(c => c.GetFleetAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new OllamaRouterApiException(HttpStatusCode.InternalServerError, "boom"));
+        await vm.RefreshAsync(); // the daemon responded now — a NEW failure type
+        Assert.Equal("Router error 500: boom", vm.Message);
+        Assert.Equal(2, messageChanges); // the first set + the new failure type, nothing else
+        await vm.DisposeAsync();
+    }
+
+    private static int CountOccurrences(string haystack, string needle)
+    {
+        var count = 0;
+        for (var i = haystack.IndexOf(needle, StringComparison.Ordinal); i >= 0; i = haystack.IndexOf(needle, i + needle.Length, StringComparison.Ordinal))
+        {
+            count++;
+        }
+
+        return count;
+    }
+
+    /// <summary>
+    /// Task #158 (AC5): a MANUAL add while the daemon is down (Step 2 <c
+    /// >AddTargetCommand</c>, via <c>WizardTargetErrors.MapAddTarget</c>'s transport arm) is the
+    /// SAME root cause as the poll/auto-add — it surfaces the single daemon-down message, never
+    /// the old raw <c>Connection failed: {http.Message}</c> leak.
+    /// </summary>
+    [Fact]
+    public async Task Step2_ManualAdd_DaemonDown_UsesSharedMessage()
+    {
+        var mock = new Mock<IOllamaRouterApiClient>();
+        mock.Setup(c => c.AddTargetAsync(It.IsAny<AddTargetRequest>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new System.Net.Http.HttpRequestException(
+                "Connection refused (127.0.0.1:11434): actively refused it. (127.0.0.1:11434)"));
+        // The post-add refresh (finally block) hits the same down daemon.
+        mock.Setup(c => c.GetFleetAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new System.Net.Http.HttpRequestException("actively refused it. (127.0.0.1:11434)"));
+        WizardTargetsStepViewModel vm = null!;
+        vm = new WizardTargetsStepViewModel(() => mock.Object, ct => vm.RefreshAsync(ct), GatedDelay);
+
+        await vm.AddTargetCommand.ExecuteAsync(new AddTargetRequest("gpu-box", "http://192.168.1.50:11435"));
+
+        Assert.Equal(
+            "The OllamaRouter daemon is not reachable on 127.0.0.1:11434 — go back to Step 1 and click 'Start router'.",
+            vm.Message);
+        Assert.DoesNotContain("actively refused", vm.Message);
+        await vm.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Task #158 (AC7): the daemon endpoint in the message derives from the connection-profile
+    /// base URL (the new <c>daemonBaseUrl</c> ctor seam) — a non-default profile URL
+    /// (<c>http://127.0.0.1:9999/</c>) renders <c>127.0.0.1:9999</c> in the same sentence.
+    /// </summary>
+    [Fact]
+    public async Task Step2_DaemonDownMessage_EndpointFromProfileBaseUrl()
+    {
+        var mock = new Mock<IOllamaRouterApiClient>();
+        mock.Setup(c => c.GetFleetAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new System.Net.Http.HttpRequestException("actively refused it. (127.0.0.1:9999)"));
+        mock.Setup(c => c.GetConfigAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new System.Net.Http.HttpRequestException("actively refused it. (127.0.0.1:9999)"));
+        WizardTargetsStepViewModel vm = null!;
+        vm = new WizardTargetsStepViewModel(
+            () => mock.Object, ct => vm.RefreshAsync(ct), GatedDelay,
+            daemonBaseUrl: () => new Uri("http://127.0.0.1:9999/"));
+
+        await vm.OnStepEnteredAsync();
+
+        Assert.Equal(
+            "The OllamaRouter daemon is not reachable on 127.0.0.1:9999 — go back to Step 1 and click 'Start router'.",
+            vm.Message);
+        await vm.OnStepLeftAsync();
+        await vm.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Task #158: direct unit test of the shared internal mapper
+    /// (<c>WizardTargetErrors.MapAddTarget</c> — the single source of truth Step 3 reuses):
+    /// transport → the daemon-down message (default endpoint); the 409 / 422 / 400 / other-API
+    /// arms and the non-http non-api fallback are byte-identical to pre-task #158.
+    /// </summary>
+    [Fact]
+    public void WizardTargetErrors_MapAddTarget_Transport_IsDaemonDownMessage_AndApiArmsUnchanged()
+    {
+        const string expected =
+            "The OllamaRouter daemon is not reachable on 127.0.0.1:11434 — go back to Step 1 and click 'Start router'.";
+
+        // Transport → the SHARED daemon-down message (the raw leak is gone).
+        Assert.Equal(expected, WizardTargetErrors.MapAddTarget(new System.Net.Http.HttpRequestException("actively refused it. (127.0.0.1:11434)")));
+        // A non-default daemon base URL flows through the optional parameter.
+        Assert.Equal(
+            "The OllamaRouter daemon is not reachable on 127.0.0.1:9999 — go back to Step 1 and click 'Start router'.",
+            WizardTargetErrors.MapAddTarget(
+                new System.Net.Http.HttpRequestException("nope"), daemonBaseUrl: new Uri("http://127.0.0.1:9999/")));
+
+        // API arms — byte-identical to pre-task #158.
+        Assert.Equal("Target already exists.", WizardTargetErrors.MapAddTarget(new OllamaRouterApiException(HttpStatusCode.Conflict, "dup")));
+        Assert.Equal("unreachable — fix Step 1 and retry", WizardTargetErrors.MapAddTarget(new OllamaRouterApiException(HttpStatusCode.UnprocessableEntity, "nope")));
+        Assert.Equal("bad request body", WizardTargetErrors.MapAddTarget(new OllamaRouterApiException(HttpStatusCode.BadRequest, "bad request body")));
+        Assert.Equal("Router error 500: boom", WizardTargetErrors.MapAddTarget(new OllamaRouterApiException(HttpStatusCode.InternalServerError, "boom")));
+
+        // The non-http non-api fallback is the plain exception message.
+        Assert.Equal("kaboom", WizardTargetErrors.MapAddTarget(new InvalidOperationException("kaboom")));
     }
 
     /// <summary>

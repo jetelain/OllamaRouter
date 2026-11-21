@@ -4,6 +4,7 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using OllamaRouter.App.ViewModels;
 using OllamaRouter.Client;
+using OllamaRouter.Client.Process;
 using OllamaRouter.Endpoints.RouterApi.Targets;
 
 namespace OllamaRouter.App.ViewModels.Wizard;
@@ -47,6 +48,7 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
     private const string CloudPseudoTargetName = "Cloud";
 
     private readonly Func<IOllamaRouterApiClient> _clientAccessor;
+    private readonly Func<Uri> _daemonBaseUrl;
     private readonly DashboardPoller _poller;
     // Single-writer gate (task #151 — the task #130 addendum bug class, Explorer bug #7): the
     // poller tick (thread pool) and the command-side refreshes (UI thread — after an add, a
@@ -59,11 +61,39 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
     public WizardTargetsStepViewModel(
         Func<IOllamaRouterApiClient> clientAccessor,
         Func<CancellationToken, Task> pollerTick,
-        Func<TimeSpan, CancellationToken, Task>? pollerDelay = null)
+        Func<TimeSpan, CancellationToken, Task>? pollerDelay = null,
+        Func<Uri>? daemonBaseUrl = null)
     {
         _clientAccessor = clientAccessor ?? throw new ArgumentNullException(nameof(clientAccessor));
+        // The connection-profile daemon base URL (task #158) — a Func (not a snapshot), so a
+        // later SwitchConnectionAsync profile swap is reflected at failure time without
+        // rebuilding the view model (the same accessor pattern as _clientAccessor).
+        _daemonBaseUrl = daemonBaseUrl ?? (() => OllamaRouterDaemonLauncher.DefaultBaseUrl);
         _poller = new DashboardPoller(pollerTick ?? throw new ArgumentNullException(nameof(pollerTick)),
             TimeSpan.FromSeconds(2), pollerDelay);
+    }
+
+    /// <summary>
+    /// The single actionable daemon-down message of Step 2 (task #158 — the shared text of
+    /// the fleet poll, the Local auto-add and the add-target transport failures), with the
+    /// endpoint derived from the connection profile at failure time.
+    /// </summary>
+    private string DaemonDownMessage() => WizardTargetErrors.DaemonDownMessage(_daemonBaseUrl());
+
+    /// <summary>
+    /// The no-churn failure-message guard (task #158 — sub-task 3): assigns <see cref="Message"/>
+    /// ONLY when it differs from the current value, so the 2 s poll re-setting the SAME
+    /// daemon-down text is a no-op (no <c>PropertyChanged("Message")</c>, no UI flicker) while
+    /// a NEW failure type (a different string) always wins. (The generated setter equality
+    /// guard already prevents redundant raises; this makes the invariant explicit and
+    /// directly unit-testable.)
+    /// </summary>
+    private void SetFailureMessage(string message)
+    {
+        if (!string.Equals(Message, message, StringComparison.Ordinal))
+        {
+            Message = message;
+        }
     }
 
     /// <summary>The live fleet rows (the Cloud pseudo-target excluded; refreshed from
@@ -95,11 +125,11 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
         }
         catch (OllamaRouterApiException ex)
         {
-            Message = WizardTargetErrors.MapAddTarget(ex);
+            SetFailureMessage(WizardTargetErrors.MapAddTarget(ex, _daemonBaseUrl()));
         }
         catch (System.Net.Http.HttpRequestException ex)
         {
-            Message = WizardTargetErrors.MapAddTarget(ex);
+            SetFailureMessage(WizardTargetErrors.MapAddTarget(ex, _daemonBaseUrl()));
         }
         finally
         {
@@ -176,9 +206,12 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
         {
             Message = $"Router error {(int)ex.Status}: {ex.Error ?? "(no error body)"}";
         }
-        catch (System.Net.Http.HttpRequestException ex)
+        catch (System.Net.Http.HttpRequestException)
         {
-            Message = $"Connection failed: {ex.Message}";
+            // The router is DOWN (the canonical first-run state before Step 1 has started
+            // it): the shared actionable daemon-down message (task #158) — never the raw
+            // transport text (which leaked "…actively refused it. (127.0.0.1:11434)").
+            SetFailureMessage(DaemonDownMessage());
         }
     }
 
@@ -193,8 +226,10 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
     /// <item>409 Conflict — the concurrent-add race: a "Local" appeared between the config
     /// check and the add; left unchanged.</item>
     /// <item>422 — Local Ollama is unreachable (fix Step 1 and retry).</item>
-    /// <item>any other router error / transport failure — the router-down first-run state;
-    /// the next step entry retries.</item>
+    /// <item>transport failure — the router is DOWN (the canonical first-run state): the
+    /// shared daemon-down message (task #158); the next step entry retries.</item>
+    /// <item>any other router error — the daemon responded (not a down-state): the legacy
+    /// actionable text (unchanged by task #158); the next step entry retries.</item>
     /// </list>
     /// </summary>
     private async Task EnsureLocalAsync(CancellationToken ct)
@@ -227,13 +262,16 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
             }
             catch (OllamaRouterApiException)
             {
+                // The daemon RESPONDED with a router error (not a down-state): the legacy
+                // actionable text (unchanged by task #158).
                 Message = "Connection failed — start the router in Step 1 first.";
             }
             catch (System.Net.Http.HttpRequestException)
             {
                 // The router is DOWN (the canonical first-run state before Step 1 has
-                // started it): no throw, the next step entry retries.
-                Message = "Connection failed — start the router in Step 1 first.";
+                // started it): the shared actionable daemon-down message (task #158),
+                // identical to the fleet poll's — no throw, the next step entry retries.
+                SetFailureMessage(DaemonDownMessage());
             }
         }
         finally

@@ -70,7 +70,10 @@ internal static class CompositionRoot
         var environmentStep = new WizardEnvironmentStepViewModel(configurator, connection);
 
         WizardTargetsStepViewModel targetsStep = null!;
-        targetsStep = new WizardTargetsStepViewModel(connection.GetClient, ct => targetsStep.RefreshAsync(ct));
+        targetsStep = new WizardTargetsStepViewModel(
+            connection.GetClient,
+            ct => targetsStep.RefreshAsync(ct),
+            daemonBaseUrl: () => connection.Profile.BaseUrl);
 
         // Task #151: the new Step 3 (Cloud & External Providers) — entry-refresh only (no
         // poller), so it needs no self-referential tick wiring.
