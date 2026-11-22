@@ -222,6 +222,15 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
     /// <summary>Scripted <c>PUT /api/router/config</c> failure.</summary>
     public (HttpStatusCode Status, string Error)? UpdateConfigError { get; set; }
 
+    /// <summary>If set, <c>PUT /api/router/config</c> calls await this before responding
+    /// (busy-guard scripting — mirrors the <see cref="UninstallBlock"/> precedent).</summary>
+    public Task? UpdateConfigBlock { get; set; }
+
+    /// <summary>Invoked synchronously by <c>UpdateConfigAsync</c> AT THE WIRE CALL (right
+    /// after the call log, before error/response handling) — the deterministic seam for
+    /// asserting view-model state at the moment of the call (task #161).</summary>
+    public Action<UpdateRouterConfigRequest>? UpdateConfigRequestObserver { get; set; }
+
     /// <summary>The <c>GET /api/router/recommendations</c> matrix (stable empty shape by default).</summary>
     public FleetRecommendations Recommendations { get; set; } = new(
         null, new Dictionary<string, RoleRecommendation>(), new Dictionary<string, ModelNodeProfile>());
@@ -615,10 +624,16 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
     }
 
     /// <inheritdoc />
-    public Task<UpdateRouterConfigResponse> UpdateConfigAsync(
+    public async Task<UpdateRouterConfigResponse> UpdateConfigAsync(
         UpdateRouterConfigRequest request, CancellationToken ct = default)
     {
         Log(nameof(UpdateConfigAsync));
+        UpdateConfigRequestObserver?.Invoke(request);
+        if (UpdateConfigBlock is { } blockTask)
+        {
+            await blockTask;
+        }
+
         if (UpdateConfigError is { } error)
         {
             throw new OllamaRouterApiException(error.Status, error.Error);
@@ -648,7 +663,7 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
             request.Pricing ?? current.Pricing,
             current.ApiSecurity);
         ConfigResponse = updated;
-        return Task.FromResult(new UpdateRouterConfigResponse(true, "configuration updated", updated));
+        return new UpdateRouterConfigResponse(true, "configuration updated", updated);
     }
 
     /// <inheritdoc />

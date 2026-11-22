@@ -2571,9 +2571,10 @@ public sealed class SetupWizardViewModelsTests
     }
 
     /// <summary>
-    /// Task #151: the toggle PUTs the cloud <c>enabled</c> flip, reflects the (stateful
-    /// fake's) response — NO optimistic flip — and re-fetches the config + catalog so the
-    /// dropdown re-populates/empties with the switch.
+    /// Task #161 (was task #151): the toggle flips <c>CloudEnabled</c> OPTIMISTICALLY before
+    /// the wire call, PUTs the cloud <c>enabled</c> flip, reflects the (stateful fake's)
+    /// response, and re-fetches the config + catalog so the dropdown re-populates/empties
+    /// with the switch.
     /// </summary>
     [Fact]
     public async Task Step3_ToggleCloud_PutsEnabled_ReflectsResponse_RefetchesCatalog()
@@ -2592,7 +2593,7 @@ public sealed class SetupWizardViewModelsTests
 
         var req = Assert.Single(fake.UpdateConfigCalls);
         Assert.True(req.Cloud!.Enabled);
-        Assert.True(vm.CloudEnabled); // reflected from the response, not optimistically
+        Assert.True(vm.CloudEnabled); // the optimistic flip was confirmed by the response
         Assert.Contains("enabled", vm.Message!);
         // The catalog GAINS the cloud syntheses with the switch: a post-toggle refetch
         // repopulates the dropdown.
@@ -2602,11 +2603,13 @@ public sealed class SetupWizardViewModelsTests
     }
 
     /// <summary>
-    /// Task #151: a failed toggle PUT surfaces the error, leaves <c>CloudEnabled</c>
-    /// UNCHANGED (no optimistic flip) and does not throw.
+    /// Task #161: a failed toggle PUT flips <c>CloudEnabled</c> optimistically and then
+    /// REVERTS it to the previous value — the exact PropertyChanged sequence <c>[true, false]</c>
+    /// (flip-then-revert is what distinguishes the optimistic path from the old no-flip
+    /// behavior) — and surfaces the error without throwing.
     /// </summary>
     [Fact]
-    public async Task Step3_ToggleCloud_ApiError_StateUnchanged_NoThrow()
+    public async Task Step3_ToggleCloud_ApiError_RevertsOptimisticFlip_NoThrow()
     {
         var fake = new FakeRouterApiClient
         {
@@ -2618,12 +2621,126 @@ public sealed class SetupWizardViewModelsTests
         };
         var vm = new WizardCloudStepViewModel(() => fake);
         await vm.OnStepEnteredAsync();
+
+        var sequence = new List<bool>();
+        vm.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(WizardCloudStepViewModel.CloudEnabled))
+            {
+                sequence.Add(vm.CloudEnabled);
+            }
+        };
         await vm.ToggleCloudCommand.ExecuteAsync(CancellationToken.None); // must not throw
 
-        Assert.False(vm.CloudEnabled); // unchanged — the PUT failed
+        Assert.Equal([true, false], sequence); // optimistic flip, then the gated revert
+        Assert.False(vm.CloudEnabled); // reverted — the PUT failed
         Assert.Contains("500", vm.Error!);
         Assert.Contains("boom", vm.Error);
         Assert.Empty(fake.UpdateConfigCalls);
+        await vm.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Task #161: a connection failure (transport-level) reverts the optimistic flip to the
+    /// previous value with the same flip-then-revert sequence and the existing
+    /// "Connection failed" error wording.
+    /// </summary>
+    [Fact]
+    public async Task Step3_ToggleCloud_ConnectionError_RevertsOptimisticFlip_NoThrow()
+    {
+        var fake = new FakeRouterApiClient
+        {
+            ConfigResponse = DefaultConfig() with
+            {
+                Cloud = new RouterCloudConfigDto(false, null, "Local", true),
+            },
+        };
+        var vm = new WizardCloudStepViewModel(() => fake);
+        await vm.OnStepEnteredAsync();
+        // Armed AFTER the entry refresh (the one-shot exception is consumed by the next
+        // wire call — the toggle's PUT).
+        fake.NextCallException = new HttpRequestException("connection reset");
+
+        var sequence = new List<bool>();
+        vm.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(WizardCloudStepViewModel.CloudEnabled))
+            {
+                sequence.Add(vm.CloudEnabled);
+            }
+        };
+        await vm.ToggleCloudCommand.ExecuteAsync(CancellationToken.None); // must not throw
+
+        Assert.Equal([true, false], sequence); // optimistic flip, then the gated revert
+        Assert.False(vm.CloudEnabled); // reverted to the previous value
+        Assert.StartsWith("Connection failed", vm.Error!);
+        Assert.Empty(fake.UpdateConfigCalls);
+        await vm.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Task #161: the optimistic flip strictly PRECEDES the wire call — at the moment the
+    /// fake receives the PUT, the request already carries the new value AND the view-model
+    /// state already shows it.
+    /// </summary>
+    [Fact]
+    public async Task Step3_ToggleCloud_FlipsBeforeTheWireCall()
+    {
+        var fake = new FakeRouterApiClient
+        {
+            ConfigResponse = DefaultConfig() with
+            {
+                Cloud = new RouterCloudConfigDto(false, null, "Local", true),
+            },
+        };
+        var vm = new WizardCloudStepViewModel(() => fake);
+        await vm.OnStepEnteredAsync();
+
+        (bool RequestEnabled, bool StateAtCall)? captured = null;
+        fake.UpdateConfigRequestObserver = req =>
+            captured = (req.Cloud?.Enabled ?? false, vm.CloudEnabled);
+        await vm.ToggleCloudCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.NotNull(captured);
+        Assert.True(captured!.Value.RequestEnabled, "the PUT must carry the flipped value");
+        Assert.True(captured.Value.StateAtCall, "the state must already be flipped at the wire call");
+        Assert.True(vm.CloudEnabled);
+        await vm.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Task #161: while the toggle is in flight (the fake holds the wire call), the
+    /// optimistic flip is visible AND the command is gated by <c>CanAct</c>/
+    /// <c>IsBusy</c> (the auto-disable source of the view's interactive CheckBox); after
+    /// completion the command re-enables with the confirmed state.
+    /// </summary>
+    [Fact]
+    public async Task Step3_ToggleCloud_BusyWhileInFlight_CommandGated()
+    {
+        var fake = new FakeRouterApiClient
+        {
+            ConfigResponse = DefaultConfig() with
+            {
+                Cloud = new RouterCloudConfigDto(false, null, "Local", true),
+            },
+        };
+        var blocker = new TaskCompletionSource();
+        fake.UpdateConfigBlock = blocker.Task;
+        var vm = new WizardCloudStepViewModel(() => fake);
+        await vm.OnStepEnteredAsync();
+
+        Assert.True(vm.ToggleCloudCommand.CanExecute(null));
+        var running = vm.ToggleCloudCommand.ExecuteAsync(CancellationToken.None);
+        // In flight: the optimistic flip is visible before the response, and the command
+        // is gated (IsBusy → CanAct false → the CheckBox auto-disables).
+        Assert.False(running.IsCompleted, "the in-flight wire call must keep the command running");
+        Assert.True(vm.CloudEnabled);
+        Assert.False(vm.ToggleCloudCommand.CanExecute(null));
+
+        blocker.SetResult();
+        await running;
+        Assert.True(vm.ToggleCloudCommand.CanExecute(null));
+        Assert.True(vm.CloudEnabled);
         await vm.DisposeAsync();
     }
 

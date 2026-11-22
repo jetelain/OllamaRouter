@@ -15,8 +15,10 @@ namespace OllamaRouter.Tests.App;
 /// content), the header and row grids declare byte-identical <see cref="Grid.ColumnDefinitions"/>,
 /// and every table's rendered total (Σ fixed pixel widths + (n−1)×8) fits the 896px budget of
 /// the 960px minimum window (the outer ScrollViewer's horizontal scrollbar is disabled, so
-/// nothing may be clipped). Also pins the ENABLED column's display-only <see cref="CheckBox"/>
-/// + <c>Toggle</c> button contract, the Fleet TARGET cell's URL tooltip (the URL column was
+/// nothing may be clipped). Also pins the ENABLED column's single interactive
+/// <see cref="CheckBox"/> (task #161 — the retired display-only CheckBox + "Toggle" button
+/// contract: the cell IS the CheckBox, OneWay <c>IsChecked</c> on "Enabled" + command-bound),
+/// the Fleet TARGET cell's URL tooltip (the URL column was
 /// removed), the uniform TARGET (120) / MODEL (150) widths across the In-Progress / Recent /
 /// Statistics tables, and the In-Progress star SESSION + fixed-100 AGENT layout.
 /// </summary>
@@ -75,28 +77,34 @@ public sealed class MonitorViewLayoutTests
     }
 
     [Fact]
-    public void FleetRow_EnabledColumn_ContainsDisplayOnlyCheckBoxAndToggleButton()
+    public void FleetRow_EnabledColumn_IsOneInteractiveCheckBox()
     {
         var tables = LoadTables();
         var enabledColumn = HeaderColumn(tables.FleetHeader, "ENABLED");
 
+        // Task #161: the ENABLED cell IS the interactive CheckBox (no wrapper panel) — the
+        // retired display-only CheckBox + "Toggle" button convention. The "ENABLED" column
+        // header carries the label, so the CheckBox is bare (no Content).
         var cell = tables.FleetRow.Children.Single(c => Grid.GetColumn(c) == enabledColumn);
+        var checkBox = Assert.IsType<CheckBox>(cell);
+        Assert.True(checkBox.IsHitTestVisible,
+            "the ENABLED CheckBox must be interactive (IsHitTestVisible=true)");
+        Assert.True(checkBox.Content as string is null, "the Monitor ENABLED CheckBox must be bare (header carries the label)");
 
-        // The ENABLED cell is a horizontal StackPanel holding the display-only indicator and the
-        // interactive Toggle button (inner Spacing=8, button Padding=8,2 — both preserved).
-        var panel = Assert.IsType<StackPanel>(cell);
-        var checkBox = AllControls(cell).OfType<CheckBox>().Single();
-        Assert.False(checkBox.IsHitTestVisible, "ENABLED CheckBox must stay display-only (IsHitTestVisible=false)");
+        // The state is a OneWay binding to the row's Enabled; the click runs ToggleCommand
+        // (the command owns the optimistic flip / revert) with the row as the parameter.
+        Assert.Equal("Enabled", BindingPath(checkBox, CheckBox.IsCheckedProperty));
+        Assert.True(BindingOperations.GetBindingExpressionBase(checkBox, Button.CommandProperty) is not null,
+            "the ENABLED CheckBox lost its Command binding");
+        Assert.Equal("ToggleCommand", BindingPath(checkBox, Button.CommandProperty));
+        Assert.True(BindingOperations.GetBindingExpressionBase(checkBox, Button.CommandParameterProperty) is not null,
+            "the ENABLED CheckBox lost its CommandParameter binding");
 
-        // CheckBox derives from ButtonBase (not Button) in Avalonia 12; the defensive filter
-        // keeps this robust if the hierarchy ever changes.
-        var button = AllControls(cell).OfType<Button>().Single(b => b is not CheckBox);
-        Assert.Equal("Toggle", button.Content as string);
-        // The command is a binding (ToggleCommand), evaluated only against a DataContext — assert
-        // the binding is attached rather than the (pre-databinding) resolved value.
-        var commandBinding = Avalonia.Data.BindingOperations.GetBindingExpressionBase(button, Button.CommandProperty);
-        Assert.True(commandBinding is not null, "Toggle button lost its Command binding");
-        Assert.Equal("ToggleCommand", BindingPath(button, Button.CommandProperty));
+        // The separate "Toggle" button is gone (the CheckBox's internal template Button is
+        // filtered by Content — layout-test robustness precedent).
+        Assert.DoesNotContain(
+            AllControls(tables.FleetRow).OfType<Button>(),
+            b => b.Content is string content && content == "Toggle");
     }
 
     [Fact]

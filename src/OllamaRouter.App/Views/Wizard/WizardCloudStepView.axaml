@@ -9,19 +9,17 @@
       <TextBlock TextWrapping="Wrap"
                  Text="Configure the built-in Ollama Cloud (ollama.com) overflow — the cloud switch and the default cloud model — and add external (OpenAI-compatible) providers."/>
 
-      <!-- Card 1: Ollama Cloud — the fleet-tab "Enabled" convention (label + state CheckBox,
-           OneWay/non-hit-testable + Toggle button). -->
+      <!-- Card 1: Ollama Cloud (task #161): ONE interactive CheckBox — the retired
+           label + display-only CheckBox + "Toggle Cloud" button convention. The click runs
+           ToggleCloudCommand (optimistic flip + wire confirm); while IsBusy the command's
+           CanExecute gating auto-disables the CheckBox. -->
       <Border Padding="10" CornerRadius="6" Background="#1E1E2A">
         <StackPanel Spacing="8">
           <TextBlock Text="Ollama Cloud" FontSize="15" FontWeight="Bold"/>
-          <StackPanel Orientation="Horizontal" Spacing="4">
-            <TextBlock Text="Enabled" FontSize="11" FontWeight="SemiBold" Foreground="#9AA0B5"
-                       VerticalAlignment="Center"/>
-            <CheckBox IsChecked="{Binding CloudEnabled, Mode=OneWay}" IsHitTestVisible="False"
-                      VerticalAlignment="Center"/>
-            <Button Content="Toggle Cloud" Command="{Binding ToggleCloudCommand}"
-                    Padding="8,2" FontSize="11" VerticalAlignment="Center"/>
-          </StackPanel>
+          <CheckBox Content="Use Ollama Cloud when all local GPU are busy"
+                    IsChecked="{Binding CloudEnabled, Mode=OneWay}"
+                    Command="{Binding ToggleCloudCommand}"
+                    VerticalAlignment="Center"/>
           <StackPanel Orientation="Horizontal" Spacing="12">
             <TextBlock Text="Default cloud model" VerticalAlignment="Center"/>
             <!-- The Avalonia 12 ComboBox has no Command property: the view drives the VM's

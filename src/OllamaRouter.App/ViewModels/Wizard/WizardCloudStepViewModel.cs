@@ -11,8 +11,9 @@ namespace OllamaRouter.App.ViewModels.Wizard;
 
 /// <summary>
 /// Step 3 — Cloud &amp; External Providers (task #151): the Ollama Cloud (ollama.com)
-/// overflow configuration — the cloud switch (a REMOTE state, never optimistically flipped),
-/// the default cloud model dropdown (fed by the cloud models visible in the fleet catalog,
+/// overflow configuration — the cloud switch (task #161: an OPTIMISTIC click flip that the
+/// wire response confirms and a failed toggle reverts to the previous value), the default
+/// cloud model dropdown (fed by the cloud models visible in the fleet catalog,
 /// <c>GET /api/router/models</c>, the ONLY wire surface that exposes cloud model names) and
 /// the relay sign-in hint — plus the main app's dedicated "Add Provider" dialog for
 /// external (OpenAI-compatible) providers.
@@ -48,8 +49,9 @@ public sealed partial class WizardCloudStepViewModel : ObservableObject, IWizard
     /// <summary>The cloud-model dropdown items (fleet-catalog order, deduped).</summary>
     public ObservableCollection<string> CloudModels { get; } = [];
 
-    /// <summary>The router's actual cloud-overflow switch (remote state, NOT optimistically
-    /// flipped — the wire response is the source of truth).</summary>
+    /// <summary>The router's cloud-overflow switch (task #161: flipped OPTIMISTICALLY by the
+    /// toggle click, then confirmed by the wire response — a failed toggle reverts to the
+    /// previous value under the single-writer gate).</summary>
     [ObservableProperty]
     private bool _cloudEnabled;
 
@@ -211,28 +213,33 @@ public sealed partial class WizardCloudStepViewModel : ObservableObject, IWizard
     }
 
     /// <summary>
-    /// Flips the router's cloud-overflow switch and reflects the response (NO optimistic
-    /// flip — the wire response is the source of truth), then re-fetches the config +
-    /// catalog: the fleet catalog GAINS/LOSES the cloud syntheses with the switch (they are
-    /// appended only while cloud is enabled), so the dropdown must re-populate/empty
-    /// accordingly. On failure the <see cref="CloudEnabled"/> stays UNCHANGED and the error
-    /// is surfaced.
+    /// Flips the router's cloud-overflow switch OPTIMISTICALLY (the interactive CheckBox's
+    /// click flips <see cref="CloudEnabled"/> before the wire call), POSTs the new value,
+    /// reflects the response (the wire response is the source of truth for the confirmed
+    /// state) and re-fetches the config + catalog: the fleet catalog GAINS/LOSES the cloud
+    /// syntheses with the switch (they are appended only while cloud is enabled), so the
+    /// dropdown must re-populate/empty accordingly. On failure the optimistic flip is
+    /// CONDITIONALLY reverted (only while the state still equals the optimistic value — a
+    /// concurrent refresh's fresh remote value wins) and the error is surfaced.
     /// </summary>
     [RelayCommand(CanExecute = nameof(CanAct))]
     private async Task ToggleCloud()
     {
+        var previous = CloudEnabled;
+        var next = !previous;
         IsBusy = true;
         try
         {
-            _logger.Information("Wizard step 3: cloud overflow → {Enabled}", CloudEnabled ? "off" : "on");
+            _logger.Information("Wizard step 3: cloud overflow → {Enabled}", next ? "on" : "off");
+            CloudEnabled = next; // OPTIMISTIC flip (UI thread, BEFORE the wire call)
             var response = await _clientAccessor().UpdateConfigAsync(
-                    new UpdateRouterConfigRequest(Cloud: new UpdateCloudConfigRequest(Enabled: !CloudEnabled)))
+                    new UpdateRouterConfigRequest(Cloud: new UpdateCloudConfigRequest(Enabled: next)))
                 .ConfigureAwait(false);
 
             await _refreshGate.WaitAsync().ConfigureAwait(false);
             try
             {
-                CloudEnabled = response.Config?.Cloud.Enabled ?? !CloudEnabled;
+                CloudEnabled = response.Config?.Cloud.Enabled ?? next;
                 CloudDefaultModel = response.Config?.Cloud.DefaultModel ?? CloudDefaultModel;
                 Error = null;
                 Message = $"Cloud overflow (ollama.com) {(CloudEnabled ? "enabled" : "disabled")}.";
@@ -251,15 +258,41 @@ public sealed partial class WizardCloudStepViewModel : ObservableObject, IWizard
         {
             Error = $"Router error {(int)ex.Status}: {ex.Error ?? "(no error body)"}";
             _logger.Warning("Wizard step 3: cloud toggle failed: {Error}", Error);
+            await RevertCloudFlipAsync(previous, next).ConfigureAwait(false);
         }
         catch (System.Net.Http.HttpRequestException ex)
         {
             Error = $"Connection failed: {ex.Message}";
             _logger.Warning("Wizard step 3: cloud toggle failed: {Error}", Error);
+            await RevertCloudFlipAsync(previous, next).ConfigureAwait(false);
         }
         finally
         {
             IsBusy = false;
+        }
+    }
+
+    /// <summary>
+    /// The single-writer-gated CONDITIONAL revert of a failed optimistic cloud toggle
+    /// (task #130 gate invariant): restores <paramref name="previous"/> ONLY while the state
+    /// still equals the optimistic <paramref name="next"/> — if a concurrent refresh reflected
+    /// a fresh remote value in the meantime, that fresh value wins. The assignment takes the
+    /// same <see cref="_refreshGate"/> as the success-path reflection and is always
+    /// <c>await</c>ed (never a blocking <c>Wait()</c> on the UI thread).
+    /// </summary>
+    private async Task RevertCloudFlipAsync(bool previous, bool next)
+    {
+        await _refreshGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (CloudEnabled == next)
+            {
+                CloudEnabled = previous;
+            }
+        }
+        finally
+        {
+            _refreshGate.Release();
         }
     }
 

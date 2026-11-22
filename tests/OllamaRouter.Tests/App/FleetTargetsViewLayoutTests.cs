@@ -10,15 +10,16 @@ namespace OllamaRouter.Tests.App;
 /// Fleet &amp; Cloud Targets tab layout contract tests (task #148, re-baselined by the clean-card
 /// restructure and by the task #153 card streamline — the 'Update hardware' busy-state contract
 /// dates to task #144): the row DataTemplate is split into an IDENTITY row (name / liveness /
-/// Monitor-parity enabled cluster / action column with 'Update hardware' BEFORE Edit) and a
+/// ONE interactive 'Enabled' CheckBox (task #161 — the retired label + display-only CheckBox +
+/// 'Toggle' button convention) / action column with 'Update hardware' BEFORE Edit) and a
 /// FIVE-CELL endpoint row (location tag / type / provider / URL in the single star column,
 /// ellipsizing with a full-URL tooltip / ssh label — the 'key: …' cell is gone). The effective
 /// values strip is a WrapPanel with EXACTLY five chips (MaxParallel / HardwareHint / Power /
 /// KeepAliveLabel / VramOverrideLabel), and the hardware profile section is ALWAYS EXPANDED
 /// (no Expander) with one line per topic (OS / RAM+VRAM+bandwidth / GPU) — the cryptic chips
-/// (SpeedFactor / MaxVramMB / Resident) and the 'Declared models' row appear nowhere. The
-/// enablement cluster carries an 'Enabled' label + display-only CheckBox + 'Toggle' button
-/// (the word 'Persist' appears nowhere). Structural assertions only —
+/// (SpeedFactor / MaxVramMB / Resident) and the 'Declared models' row appear nowhere.
+/// The enablement cluster is exactly one interactive CheckBox with Content "Enabled" (the
+/// word 'Persist' appears nowhere). Structural assertions only —
 /// <see cref="FleetTargetsView"/> is a <see cref="UserControl"/>, so construction needs no
 /// windowing platform (the <see cref="MonitorViewLayoutTests"/> precedent).
 /// </summary>
@@ -95,38 +96,37 @@ public sealed class FleetTargetsViewLayoutTests
     }
 
     [Fact]
-    public void RowTemplate_IdentityRow_EnabledCluster_MirrorsMonitor()
+    public void RowTemplate_IdentityRow_EnabledCluster_IsOneInteractiveCheckBox()
     {
-        var (_, identity, _) = LoadRowTemplate();
+        var (row, identity, _) = LoadRowTemplate();
 
-        // The identity grid's enabled cluster (Grid.Column 2): 'Enabled' label + display-only
-        // state CheckBox + 'Toggle' button — verbatim Monitor & Savings parity (D1).
-        var cluster = Assert.IsType<StackPanel>(
+        // Task #161: the identity grid's enablement cluster (Grid.Column 2) is ONE interactive
+        // CheckBox with Content "Enabled" (clicking the box or its label toggles) — the
+        // retired label + display-only CheckBox + 'Toggle' button convention.
+        var cluster = Assert.IsType<CheckBox>(
             identity.Children.Single(c => Grid.GetColumn(c) == 2));
+        Assert.Equal("Enabled", cluster.Content as string);
+        Assert.True(cluster.IsHitTestVisible,
+            "the enabled CheckBox must be interactive (IsHitTestVisible=true)");
 
-        // Label: the literal 'Enabled' caption in the monitor table-header style.
-        var label = cluster.Children.OfType<TextBlock>().Single(tb => tb.Text == "Enabled");
-        Assert.Equal(11.0, label.FontSize);
-        Assert.Equal(Avalonia.Media.FontWeight.SemiBold, label.FontWeight);
-
-        // State display: the CheckBox binds 'Enabled' and stays display-only (not hit-testable,
-        // so it can never steal the toggle click — same as the Monitor ENABLED column).
-        var checkBox = cluster.Children.OfType<CheckBox>().Single();
-        Assert.Equal("Enabled", BindingPath(checkBox, CheckBox.IsCheckedProperty));
-        Assert.False(checkBox.IsHitTestVisible,
-            "the enabled-state CheckBox must stay display-only (IsHitTestVisible=false)");
-
-        // Interactive toggle: literal 'Toggle' content, the row as Tag, the persisted-flag
-        // tooltip, and monitor-parity sizing (Padding 8,2 / FontSize 11). CheckBox derives
-        // from ButtonBase (not Button) in Avalonia 12; the defensive filter keeps this robust.
-        var toggle = cluster.Children.OfType<Button>().Single(b => b is not CheckBox);
-        Assert.Equal("Toggle", toggle.Content as string);
-        Assert.NotNull(BindingOperations.GetBindingExpressionBase(toggle, Control.TagProperty));
+        // The state is a OneWay binding to the row's Enabled; the click runs the UNCHANGED
+        // code-behind OnTogglePersistedClick handler (e.Source IS the CheckBox — verified
+        // for Avalonia 12's Click pipeline) with the row as Tag.
+        Assert.Equal("Enabled", BindingPath(cluster, CheckBox.IsCheckedProperty));
+        // The Tag is a bare {Binding} — Avalonia 12 exposes the path-less CompiledBinding's
+        // Description as the EMPTY string (not "DataContext").
+        Assert.Equal(string.Empty, BindingPath(cluster, Control.TagProperty));
         Assert.Equal(
             "Toggle the persisted (config) enablement flag",
-            toggle.GetValue(ToolTip.TipProperty));
-        Assert.Equal(11.0, toggle.FontSize);
-        Assert.Equal(new Avalonia.Thickness(8, 2, 8, 2), toggle.Padding);
+            cluster.GetValue(ToolTip.TipProperty));
+
+        // The retired pieces are gone from the whole row: no "Toggle" button and no
+        // standalone "Enabled" TextBlock (the label is the CheckBox's Content). The CheckBox's
+        // internal template Button is filtered by Content (layout-test robustness precedent).
+        Assert.DoesNotContain(
+            AllControls(row).OfType<Button>(),
+            b => b.Content is string content && content == "Toggle");
+        Assert.DoesNotContain(AllControls(row).OfType<TextBlock>(), tb => tb.Text == "Enabled");
     }
 
     [Fact]

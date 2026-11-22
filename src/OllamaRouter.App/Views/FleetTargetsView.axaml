@@ -29,15 +29,13 @@
                                FontWeight="Bold" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
                   </StackPanel>
                   <TextBlock Grid.Column="1" Text="{Binding Liveness}" VerticalAlignment="Center"/>
-                  <!-- Monitor-parity enabled cluster: label + state checkbox + Toggle button -->
-                  <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center">
-                    <TextBlock Text="Enabled" FontSize="11" FontWeight="SemiBold"
-                               Foreground="{DynamicResource SemiColorText2}" VerticalAlignment="Center"/>
-                    <CheckBox IsChecked="{Binding Enabled, Mode=OneWay}" IsHitTestVisible="False" VerticalAlignment="Center"/>
-                    <Button Content="Toggle" Click="OnTogglePersistedClick" Tag="{Binding}"
+                  <!-- Enabled toggle (task #161): ONE interactive CheckBox (clicking the box or
+                       its label toggles) — the retired label + display-only CheckBox +
+                       "Toggle" button convention. -->
+                  <CheckBox Grid.Column="2" Content="Enabled" IsChecked="{Binding Enabled, Mode=OneWay}"
+                            Click="OnTogglePersistedClick" Tag="{Binding}"
                             ToolTip.Tip="Toggle the persisted (config) enablement flag"
-                            Padding="8,2" FontSize="11" VerticalAlignment="Center"/>
-                  </StackPanel>
+                            VerticalAlignment="Center"/>
                   <StackPanel Grid.Column="3" Orientation="Horizontal" Spacing="6">
                     <Button Content="{Binding UpdateHardwareButtonContent}" IsEnabled="{Binding CanUpdateHardware}"
                             Click="OnUpdateHardwareClick" Tag="{Binding}"

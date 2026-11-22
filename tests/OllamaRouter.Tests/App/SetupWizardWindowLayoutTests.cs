@@ -112,10 +112,12 @@ public sealed class SetupWizardWindowLayoutTests : IClassFixture<SetupWizardWind
     }
 
     /// <summary>
-    /// Task #151 Step 3 pane: the "Ollama Cloud" card (the fleet-tab "Enabled" convention —
-    /// label + state CheckBox + command-bound "Toggle Cloud" button — and the cloud-model
-    /// dropdown bound to CloudModels/SelectedCloudModel) and the "Other providers" card
-    /// with its "Add Provider" button.
+    /// Task #151 Step 3 pane (re-baselined by task #161): the "Ollama Cloud" card holds ONE
+    /// interactive CheckBox labeled byte-exact "Use Ollama Cloud when all local GPU are busy"
+    /// (OneWay <c>IsChecked</c> on CloudEnabled + command-bound to ToggleCloudCommand — the
+    /// retired label + display-only CheckBox + "Toggle Cloud" button convention) and the
+    /// cloud-model dropdown bound to CloudModels/SelectedCloudModel, plus the "Other
+    /// providers" card with its "Add Provider" button.
     /// </summary>
     [Fact]
     public async Task Step3_CloudAndProvidersCards_DeclareToggleDropdownAndAddProvider()
@@ -128,16 +130,24 @@ public sealed class SetupWizardWindowLayoutTests : IClassFixture<SetupWizardWind
                 .ToList();
             // Each header appears exactly once (Assert.Single below) — two cards in total.
 
-            // Card "Ollama Cloud" (task #151).
+            // Card "Ollama Cloud" (task #161): the cloud switch is ONE interactive CheckBox
+            // whose label IS the switch caption (the "Enabled" caption TextBlock is gone).
             var cloudCard = Assert.Single(cards, c => GetSectionHeader(c) == "Ollama Cloud");
-            Assert.Contains(
-                cloudCard.GetLogicalDescendants().OfType<TextBlock>().Select(t => t.Text),
-                t => t == "Enabled");
-            Assert.Single(cloudCard.GetLogicalDescendants().OfType<CheckBox>()); // the state CheckBox
-            var toggle = Assert.Single(
+            var cloudCheckBox = Assert.Single(cloudCard.GetLogicalDescendants().OfType<CheckBox>());
+            Assert.Equal("Use Ollama Cloud when all local GPU are busy", cloudCheckBox.Content as string);
+            Assert.True(cloudCheckBox.IsHitTestVisible,
+                "the cloud CheckBox must be interactive (IsHitTestVisible=true)");
+            Assert.Equal("CloudEnabled", BindingPath(cloudCheckBox, CheckBox.IsCheckedProperty));
+            Assert.Equal("ToggleCloudCommand", BindingPath(cloudCheckBox, Button.CommandProperty));
+            // The retired pieces are gone from the card: no "Toggle Cloud" button (filtered
+            // by Content for robustness against template-internal Buttons) and no standalone
+            // "Enabled" caption.
+            Assert.DoesNotContain(
                 cloudCard.GetLogicalDescendants().OfType<Button>(),
                 b => (string?)b.Content == "Toggle Cloud");
-            Assert.NotNull(BindingOperations.GetBindingExpressionBase(toggle, Button.CommandProperty));
+            Assert.DoesNotContain(
+                cloudCard.GetLogicalDescendants().OfType<TextBlock>(),
+                t => t.Text == "Enabled");
             var combo = Assert.Single(cloudCard.GetLogicalDescendants().OfType<ComboBox>());
             // The dropdown's source contract (task #151): a live binding exists and its
             // resolved value IS the step view model's cloud-model collection (the fleet
@@ -338,6 +348,18 @@ public sealed class SetupWizardWindowLayoutTests : IClassFixture<SetupWizardWind
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Returns the XAML path of the binding on <paramref name="property"/>, or null when the
+    /// property carries no binding. Avalonia 12's concrete <c>BindingExpression</c> type is
+    /// internal, so the human-readable <c>Description</c> is read reflectively (the
+    /// <see cref="MonitorViewLayoutTests"/> precedent).
+    /// </summary>
+    private static string? BindingPath(Control element, AvaloniaProperty property)
+    {
+        var expression = BindingOperations.GetBindingExpressionBase(element, property);
+        return expression?.GetType().GetProperty("Description")?.GetValue(expression) as string;
     }
 
     /// <summary>
