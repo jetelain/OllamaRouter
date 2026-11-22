@@ -26,29 +26,44 @@
         </StackPanel>
       </Border>
 
-      <!-- Section 2: Configuration for router — LAN mesh + Ollama port check + :11434 router row. -->
+      <!-- Section 2: Configuration for router — unified row grid (task #160). -->
       <Border Padding="10" CornerRadius="6" Background="#1E1E2A">
         <StackPanel Spacing="6">
           <TextBlock Text="Configuration for router" FontSize="15" FontWeight="Bold"/>
-          <CheckBox IsChecked="{Binding LanMeshEnabled}"
-                    Content="Expose local Ollama on the LAN (0.0.0.0:11435) instead of loopback"/>
-          <TextBlock Text="{Binding OllamaPortLabel}" Foreground="#8BC34A" FontWeight="Bold"
-                     TextWrapping="Wrap" IsVisible="{Binding ShowPortOk}"/>
-          <StackPanel Spacing="4" IsVisible="{Binding ShowPortWrong}">
-            <TextBlock Text="{Binding OllamaPortLabel}" Foreground="#FFB74D" TextWrapping="Wrap"/>
-            <Button Content="Fix port" IsVisible="{Binding ShowFixPortButton}" Command="{Binding FixPortCommand}"/>
-          </StackPanel>
-          <TextBlock Text="{Binding OllamaPortLabel}" Foreground="#9E9E9E" TextWrapping="Wrap"
-                     IsVisible="{Binding ShowPortNotRunning}"/>
-          <TextBlock Text="{Binding OllamaPortLabel}" Foreground="#9E9E9E" TextWrapping="Wrap"
-                     IsVisible="{Binding ShowPortNotDetected}"/>
-          <TextBlock Text="{Binding OllamaPortLabel}" Foreground="#9E9E9E" TextWrapping="Wrap"
-                     IsVisible="{Binding ShowPortUnknown}"/>
-          <StackPanel Orientation="Horizontal" Spacing="8">
-            <TextBlock Text="{Binding RouterStatusLabel}" FontWeight="Bold" TextWrapping="Wrap"
-                       VerticalAlignment="Center"/>
-            <Button Content="Start router" IsVisible="{Binding ShowStartRouterButton}" Command="{Binding StartRouterCommand}"/>
-          </StackPanel>
+          <!-- Row 1: LAN exposure (hidden on Linux + when Ollama is not installed). -->
+          <Grid ColumnDefinitions="*,Auto" IsVisible="{Binding ShowLanRow}">
+            <TextBlock Grid.Column="0" Text="{Binding LanRowLabel}" TextWrapping="Wrap" VerticalAlignment="Center"/>
+            <Button Grid.Column="1" Content="{Binding LanToggleText}" Command="{Binding ToggleLanCommand}"
+                    IsVisible="{Binding ShowLanToggle}" VerticalAlignment="Center"/>
+          </Grid>
+          <!-- Row 2: effective Ollama port (✓ when Ok / Change port when WrongPort / nothing else). -->
+          <Grid ColumnDefinitions="*,Auto">
+            <StackPanel Grid.Column="0" VerticalAlignment="Center">
+              <TextBlock Text="{Binding OllamaPortLabel}" Foreground="#8BC34A" FontWeight="Bold"
+                         TextWrapping="Wrap" IsVisible="{Binding ShowPortOk}"/>
+              <TextBlock Text="{Binding OllamaPortLabel}" Foreground="#FFB74D"
+                         TextWrapping="Wrap" IsVisible="{Binding ShowPortWrong}"/>
+              <TextBlock Text="{Binding OllamaPortLabel}" Foreground="#9E9E9E"
+                         TextWrapping="Wrap" IsVisible="{Binding ShowPortNotRunning}"/>
+              <TextBlock Text="{Binding OllamaPortLabel}" Foreground="#9E9E9E"
+                         TextWrapping="Wrap" IsVisible="{Binding ShowPortNotDetected}"/>
+              <TextBlock Text="{Binding OllamaPortLabel}" Foreground="#9E9E9E"
+                         TextWrapping="Wrap" IsVisible="{Binding ShowPortUnknown}"/>
+            </StackPanel>
+            <TextBlock Grid.Column="1" Text="✓" FontWeight="Bold" Foreground="#8BC34A"
+                       IsVisible="{Binding ShowPortOk}" VerticalAlignment="Center"/>
+            <Button Grid.Column="1" Content="Change port" Command="{Binding ChangePortCommand}"
+                    IsVisible="{Binding ShowChangePortButton}" VerticalAlignment="Center"/>
+          </Grid>
+          <!-- Row 3: router :11434 (✓ when running / Start router when free / nothing else). -->
+          <Grid ColumnDefinitions="*,Auto">
+            <TextBlock Grid.Column="0" Text="{Binding RouterStatusLabel}" FontWeight="Bold"
+                       TextWrapping="Wrap" VerticalAlignment="Center"/>
+            <TextBlock Grid.Column="1" Text="✓" FontWeight="Bold" Foreground="#8BC34A"
+                       IsVisible="{Binding ShowRouterRunningCheck}" VerticalAlignment="Center"/>
+            <Button Grid.Column="1" Content="Start router" Command="{Binding StartRouterCommand}"
+                    IsVisible="{Binding ShowStartRouterButton}" VerticalAlignment="Center"/>
+          </Grid>
         </StackPanel>
       </Border>
 

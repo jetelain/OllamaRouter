@@ -11,15 +11,16 @@ using OllamaRouter.Endpoints.RouterApi.Fleet;
 namespace OllamaRouter.Tests.App;
 
 /// <summary>
-/// Setup Wizard window layout contract tests (task #150, extended by task #151): the
-/// branding header (logo + "OllamaRouter") must be the FIRST top-docked child of the wizard
-/// window — directly ABOVE the 5-step strip — and the Step 1 view must declare both section
-/// cards ("Ollama", "Configuration for router") with the state-driven action buttons, each
-/// carrying a non-null Command binding, the LAN-mesh checkbox and the Linux manual block.
-/// Task #151 reworks the Step 2 pane (fleet table with hardware headers + the main app's
-/// dedicated add-dialog buttons, the remote form gone) and adds the Step 3 pane ("Ollama
-/// Cloud" + "Other providers" cards). Structural assertions only — no measure/arrange,
-/// because the test project never bootstraps fonts.
+/// Setup Wizard window layout contract tests (task #150, extended by task #151):
+/// the branding header (logo + "OllamaRouter") must be the FIRST top-docked child of the
+/// wizard window — directly ABOVE the 5-step strip — and the Step 1 view must declare both
+/// section cards ("Ollama", "Configuration for router"). Task #160 unifies Step 1 Section 2
+/// into an aligned row grid — every row = label left + ✓-state/action button right (the
+/// detected LAN-exposure row, the Ollama port row, the :11434 router row) — with NO CheckBox
+/// anywhere in Step 1, plus the Linux manual block. Task #151 reworks the Step 2 pane (fleet
+/// table with hardware headers + the main app's dedicated add-dialog buttons, the remote form
+/// gone) and adds the Step 3 pane ("Ollama Cloud" + "Other providers" cards). Structural
+/// assertions only — no measure/arrange, because the test project never bootstraps fonts.
 /// <see cref="SetupWizardWindow"/> is a <see cref="Window"/>, so construction and the
 /// assertions are dispatched on a headless Avalonia session (Avalonia controls are
 /// dispatcher-affine) — the same pattern as <c>PreloadDialogLayoutTests</c>. Reuses the
@@ -152,15 +153,25 @@ public sealed class SetupWizardWindowLayoutTests : IClassFixture<SetupWizardWind
         });
     }
 
+    /// <summary>
+    /// Task #160 Step 1 Section 2: the unified row grid — exactly three aligned rows
+    /// (label left + right cell), each right cell holding exactly one of a green ✓, an action
+    /// button or nothing; the old LAN-mesh CheckBox is GONE from the whole Step 1 view.
+    /// Row order: LAN exposure (bound label + bound toggle button), Ollama port
+    /// (5 bound state labels + ✓ / Change port), router :11434 (bound label + ✓ / Start router).
+    /// </summary>
     [Fact]
-    public async Task Step1_BothSectionCards_DeclareAllActionButtonsWithCommands_LanCheckboxAndLinuxBlock()
+    public async Task Step1_Section2_UnifiedRowGrid_NoCheckBox_LanPortRouterRows()
     {
         await _fixture.DispatchAsync(() =>
         {
             var stepView = GetStep1View();
-            var cards = FindSectionCards(stepView);
+
+            // AC1: NO CheckBox anywhere in Step 1 (the LAN-mesh checkbox is removed).
+            Assert.Empty(stepView.GetLogicalDescendants().OfType<CheckBox>());
 
             // Section 1 "Ollama": Install / Start / Update / Re-check, each command-bound.
+            var cards = FindSectionCards(stepView);
             var section1 = cards.Single(c => GetSectionHeader(c) == "Ollama");
             var section1Buttons = section1.GetLogicalDescendants().OfType<Button>().ToArray();
             Assert.Equal(
@@ -169,23 +180,52 @@ public sealed class SetupWizardWindowLayoutTests : IClassFixture<SetupWizardWind
             Assert.All(section1Buttons, b =>
                 Assert.NotNull(BindingOperations.GetBindingExpressionBase(b, Button.CommandProperty)));
 
-            // Section 2 "Configuration for router": Fix port + Start router (command-bound),
-            // the LAN-mesh checkbox, the port-state labels and the :11434 router label.
-            // (The CheckBox's internal toggle Button is filtered out.)
-            var section2 = cards.Single(c => GetSectionHeader(c) == "Configuration for router");
-            var section2Buttons = section2.GetLogicalDescendants().OfType<Button>()
-                .Where(b => b.Content is "Fix port" or "Start router")
-                .ToArray();
-            Assert.Equal(["Fix port", "Start router"], section2Buttons.Select(b => (string?)b.Content));
-            Assert.All(section2Buttons, b =>
-                Assert.NotNull(BindingOperations.GetBindingExpressionBase(b, Button.CommandProperty)));
-            var lanCheckbox = Assert.Single(section2.GetLogicalDescendants().OfType<CheckBox>());
-            Assert.Contains("0.0.0.0:11435", (string?)lanCheckbox.Content);
+            // The unified row grid (task #160): exactly three 2-column rows — label column
+            // star, right-cell column auto — across the whole Step 1 view.
+            var rows = stepView.GetLogicalDescendants().OfType<Grid>()
+                .Where(g => g.ColumnDefinitions.Count == 2
+                    && g.ColumnDefinitions[0].Width.IsStar && g.ColumnDefinitions[1].Width.IsAuto)
+                .ToList();
+            Assert.Equal(3, rows.Count);
 
-            // Port-state labels (5 bound to OllamaPortLabel) + the :11434 router label
-            // (bound to RouterStatusLabel): 6 bound TextBlocks besides the section header.
-            var textBlocks = section2.GetLogicalDescendants().OfType<TextBlock>().ToArray();
-            Assert.Equal(6, textBlocks.Count(t =>
+            // Row identification by right-cell content.
+            var portRow = Assert.Single(rows, g => g.GetLogicalDescendants().OfType<Button>()
+                .Any(b => (string?)b.Content == "Change port"));
+            var routerRow = Assert.Single(rows, g => g.GetLogicalDescendants().OfType<Button>()
+                .Any(b => (string?)b.Content == "Start router"));
+            var lanRow = Assert.Single(rows, g => !ReferenceEquals(g, portRow) && !ReferenceEquals(g, routerRow));
+
+            // Row 1 (LAN): the bound label + the toggle button — its Content is LIVE-bound
+            // to LanToggleText (no static text: the state drives it) and Command-bound.
+            Assert.Contains(lanRow.GetLogicalDescendants().OfType<TextBlock>(), t =>
+                BindingOperations.GetBindingExpressionBase(t, TextBlock.TextProperty) is not null);
+            var lanToggle = Assert.Single(lanRow.GetLogicalDescendants().OfType<Button>());
+            Assert.NotNull(BindingOperations.GetBindingExpressionBase(lanToggle, Button.CommandProperty));
+            Assert.NotNull(BindingOperations.GetBindingExpressionBase(lanToggle, Button.ContentProperty));
+
+            // Rows 2+3: the action buttons are command-bound.
+            Assert.All(
+                portRow.GetLogicalDescendants().OfType<Button>()
+                    .Concat(routerRow.GetLogicalDescendants().OfType<Button>()),
+                b => Assert.NotNull(BindingOperations.GetBindingExpressionBase(b, Button.CommandProperty)));
+
+            // The two green ✓ right cells (port row + router row): text + #8BC34A foreground.
+            var checks = stepView.GetLogicalDescendants().OfType<TextBlock>()
+                .Where(t => t.Text == "✓")
+                .ToArray();
+            Assert.Equal(2, checks.Length);
+            Assert.All(checks, t =>
+            {
+                // Avalonia 12 parses XAML brush strings into IMMUTABLE brushes — assert via
+                // the ISolidColorBrush interface (works for both mutable and immutable).
+                var brush = Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(t.Foreground);
+                Assert.Equal(Avalonia.Media.Color.Parse("#8BC34A"), brush.Color);
+            });
+
+            // Exactly 7 TextBlocks in Section 2 carry a LIVE Text binding: 1 LanRowLabel +
+            // 5 OllamaPortLabel state variants + 1 RouterStatusLabel (the ✓s are literal).
+            var section2 = cards.Single(c => GetSectionHeader(c) == "Configuration for router");
+            Assert.Equal(7, section2.GetLogicalDescendants().OfType<TextBlock>().Count(t =>
                 BindingOperations.GetBindingExpressionBase(t, TextBlock.TextProperty) is not null));
 
             // The Linux manual-instructions block (wording: install/update are one-click).
@@ -223,6 +263,11 @@ public sealed class SetupWizardWindowLayoutTests : IClassFixture<SetupWizardWind
             PortProbe = _ => false,
             Delay = _ => Task.CompletedTask,
             OllamaHostReader = () => null,
+            // Task #160: the new LAN-state seams MUST be faked (hermeticity) — window
+            // construction can never touch DNS/sockets/launchctl through the refresh.
+            NonLoopbackLocalAddresses = () => [],
+            LanBindProbe = (_, _) => null,
+            LaunchctlGetenv = _ => null,
         };
         var environment = new WizardEnvironmentStepViewModel(configurator, connection);
 

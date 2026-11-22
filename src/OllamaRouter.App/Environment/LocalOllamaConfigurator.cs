@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Net;
 using System.Net.Sockets;
 using OllamaRouter.App.Connection;
 
@@ -26,10 +27,25 @@ internal sealed record LocalOllamaConfigResult(bool Success, string Message, boo
 internal sealed record OllamaScriptResult(bool Success, string Message, bool OllamaStarted);
 
 /// <summary>
-/// The outcome of an effective-Ollama-port check (task #150): whether Ollama is running and
-/// the port it is serving on (null = running but no candidate port opened).
+/// The LAN-exposure state of the local Ollama as surfaced by Step 1 (task #160):
+/// <see cref="Lan"/> = OLLAMA_HOST binds all interfaces (<c>0.0.0.0</c> — usable from other
+/// computers on the network); <see cref="Loopback"/> = bound to <c>127.0.0.1</c> only (Ollama's
+/// default); <see cref="Unknown"/> = undeterminable (the UI shows the Re-check hint).
 /// </summary>
-internal sealed record OllamaPortCheck(bool OllamaRunning, int? DetectedPort);
+public enum OllamaLanState
+{
+    Unknown,
+    Loopback,
+    Lan,
+}
+
+/// <summary>
+/// The outcome of an effective-Ollama-port check (task #150; extended by task #160): whether
+/// Ollama is running, the port it is serving on (null = running but no candidate port opened)
+/// and the detected LAN-exposure state — computed INSIDE this same detection pass so a Step 1
+/// refresh stays exactly one binary detection (the task #147 invariant).
+/// </summary>
+internal sealed record OllamaPortCheck(bool OllamaRunning, int? DetectedPort, OllamaLanState LanState);
 
 /// <summary>
 /// The captured outcome of a script process run (task #150): the exit code plus the last
@@ -137,6 +153,30 @@ internal sealed class LocalOllamaConfigurator
     internal Func<string?>? OllamaHostReader { get; set; }
 
     /// <summary>
+    /// Non-loopback IPv4 addresses of this machine (task #160): empty when undeterminable
+    /// (e.g. an offline machine) — the detection then falls through to the persisted-env
+    /// rule instead of probing.
+    /// </summary>
+    internal Func<IReadOnlyList<IPAddress>>? NonLoopbackLocalAddresses { get; set; }
+
+    /// <summary>
+    /// LAN bind connect probe (task #160): (ip, port) → <c>true</c> = a TCP connect to the
+    /// given address:port SUCCEEDED (Ollama is bound to all interfaces — LAN), <c>false</c> =
+    /// the connect was REFUSED or did not complete within the probe window (loopback-only),
+    /// <c>null</c> = probe ERROR (a socket exception — the caller falls through to the
+    /// persisted-env rule).
+    /// </summary>
+    internal Func<string, int, bool?>? LanBindProbe { get; set; }
+
+    /// <summary>
+    /// macOS <c>launchctl getenv &lt;name&gt;</c> output capture (task #160): name → the trimmed
+    /// stdout value, or null when unset/empty/failed. <see cref="ProcessStarter"/> returns a
+    /// pid only, so this is the new output-capturing seam (the DefaultScriptRunner pattern).
+    /// Invoked on macOS only (the persisted-env rule's platform branch).
+    /// </summary>
+    internal Func<string, string?>? LaunchctlGetenv { get; set; }
+
+    /// <summary>
     /// Candidate ports probed (in order, 11435 first) when the persisted-env read yields
     /// nothing confirmed (task #150). Documented heuristic: the FIRST open candidate is
     /// assumed to be Ollama's; a non-Ollama listener on 11435 would mask a drifted Ollama
@@ -222,12 +262,17 @@ internal sealed class LocalOllamaConfigurator
     }
 
     /// <summary>
-    /// One-click UPDATE (task #150 — all three OSes). The ordering is contractual: STOP
-    /// Ollama → run the official script → RESTART Ollama (explicit env + port wait). On a
-    /// script failure Ollama is honestly left STOPPED: the message says so and names the
-    /// recovery (retry Update / manual start) — no restart is attempted after a failed script.
+    /// One-click UPDATE (task #150 — all three OSes; task #160 preserves the detected
+    /// LAN bind). The ordering is contractual: STOP Ollama → run the official script →
+    /// (on Windows: persist the detected bind to the User env — the post-reboot source of
+    /// truth) → RESTART Ollama (explicit env + port wait) with the SAME OLLAMA_HOST bind
+    /// the caller detected (<paramref name="lanMesh"/>: true = <c>0.0.0.0</c>, false =
+    /// loopback) — the update must NOT silently reset a LAN-configured Ollama to loopback.
+    /// On a script failure (or a failing persisted-env write) Ollama is honestly left
+    /// STOPPED: the message says so and names the recovery (retry Update / manual start) —
+    /// no restart is attempted after a failed step.
     /// </summary>
-    public async Task<OllamaScriptResult> UpdateOllamaAsync(CancellationToken ct)
+    public async Task<OllamaScriptResult> UpdateOllamaAsync(bool lanMesh, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
         var (win, _) = Platform();
@@ -251,11 +296,31 @@ internal sealed class LocalOllamaConfigurator
                 OutputTailsText(run) + " Retry Update, or start Ollama again manually.", false);
         }
 
-        // 3. Re-detect (the script may have installed/moved the binary) + restart with EXPLICIT
-        //    env + port wait (the existing start-only path — on Windows this is the tray app;
-        //    on Linux this is <binary> serve with the explicit env and NO persistent env write,
-        //    per the M1 scope).
-        var startInfo = BuildOllamaStartInfo(win, host: OllamaHost(lanMesh: false), ct);
+        // 3. Re-detect (the script may have installed/moved the binary) + restart with
+        //    EXPLICIT env + port wait (the existing start-only path — on Windows this is the
+        //    tray app; on Linux this is <binary> serve with the explicit env and NO persistent
+        //    env write, per the M1 scope). Task #160 decision 5 (bind-config preservation):
+        //    on Windows the detected bind is ALSO persisted to the User env — the
+        //    post-reboot source of truth — so the update never silently resets a
+        //    LAN-configured Ollama to loopback.
+        if (win)
+        {
+            try
+            {
+                WriteEnvironment(windows: true, host: OllamaHost(lanMesh), ct);
+            }
+            catch (Exception ex)
+            {
+                // A failing persisted-env write is a READABLE failure (the ConfigureAsync
+                // convention): Ollama is already stopped — say so and name the recovery.
+                return new OllamaScriptResult(false,
+                    $"Ollama was stopped and the update failed: the OLLAMA_HOST environment " +
+                    $"variable could not be persisted ({ex.Message}). " +
+                    "Retry Update, or start Ollama again manually.", false);
+            }
+        }
+
+        var startInfo = BuildOllamaStartInfo(win, host: OllamaHost(lanMesh), ct);
         if (startInfo is null)
         {
             return new OllamaScriptResult(false, OllamaNotFoundMessage(win, afterUpdate: true), false);
@@ -273,14 +338,17 @@ internal sealed class LocalOllamaConfigurator
     }
 
     /// <summary>
-    /// Effective-Ollama-port detection (task #150 — read-only, non-throwing by design):
-    /// Ollama not running → <c>(false, null)</c> with ZERO port probes; a CONFIRMED persisted
-    /// OLLAMA_HOST (its own probe open) wins — e.g. <c>0.0.0.0:11434</c> detected even though
-    /// the probes hit loopback; otherwise the first OPEN candidate port (11435 first — the
-    /// common case is a single probe). Running but nothing open → <c>(true, null)</c> (the UI
-    /// shows the Re-check hint). The Step 1 view model reuses its own detection pass through
-    /// the <c>(detection, ct)</c> overload so one refresh performs exactly ONE binary
-    /// detection (task #147 "the initial entry runs exactly once" invariant).
+    /// Effective-Ollama-port + LAN-state detection (task #150; task #160 — read-only, non-
+    /// throwing by design): Ollama not running → <c>(false, null, …)</c> with ZERO port
+    /// probes (the LAN state comes from the persisted env); a CONFIRMED persisted OLLAMA_HOST
+    /// (its own probe open) wins — e.g. <c>0.0.0.0:11434</c> detected even though the probes
+    /// hit loopback; otherwise the first OPEN candidate port (11435 first — the common case
+    /// is a single probe). Running but nothing open → <c>(true, null, …)</c> (the UI shows the
+    /// Re-check hint). The LAN state itself is socket-probe / persisted-env derived INSIDE
+    /// this same pass — no extra binary detection. The Step 1 view model reuses its own
+    /// detection pass through the <c>(detection, ct)</c> overload so one refresh performs
+    /// exactly ONE binary detection (task #147 "the initial entry runs exactly once"
+    /// invariant).
     /// </summary>
     public async Task<OllamaPortCheck> DetectPortAsync(CancellationToken ct)
     {
@@ -291,23 +359,29 @@ internal sealed class LocalOllamaConfigurator
         }
         catch
         {
-            return new OllamaPortCheck(false, null);
+            // A failing binary detection is treated as "not running" with an undeterminable
+            // (Unknown) LAN state — read-only by design, never a throw.
+            return new OllamaPortCheck(false, null, OllamaLanState.Unknown);
         }
 
         return await DetectPortAsync(detection, ct).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// The port-detection core over a PROVIDED detection (task #150): avoids a second binary
-    /// probe for callers that already ran <see cref="DetectAsync"/> — the Step 1 refresh uses
-    /// this so each refresh stays exactly one detection (task #147 invariant).
+    /// The port-detection core over a PROVIDED detection (task #150; extended by task #160):
+    /// avoids a second binary probe for callers that already ran <see cref="DetectAsync"/> —
+    /// the Step 1 refresh uses this so each refresh stays exactly one detection (task #147
+    /// invariant). The LAN state is computed INSIDE this same pass (socket probe against a
+    /// non-loopback address when running, persisted-env rule otherwise — NEVER an additional
+    /// binary probe).
     /// </summary>
     internal Task<OllamaPortCheck> DetectPortAsync(OllamaDetection detection, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
         if (!detection.ProcessRunning)
         {
-            return Task.FromResult(new OllamaPortCheck(false, null)); // no probes for a stopped Ollama
+            // no port probes for a stopped Ollama — the LAN state comes from the persisted env
+            return Task.FromResult(new OllamaPortCheck(false, null, LanStateFromPersistedEnv()));
         }
 
         var probe = PortProbe ?? DefaultPortProbe;
@@ -330,7 +404,7 @@ internal sealed class LocalOllamaConfigurator
             {
                 if (probe(envPort.Value))
                 {
-                    return Task.FromResult(new OllamaPortCheck(true, envPort));
+                    return Task.FromResult(new OllamaPortCheck(true, envPort, LanStateForRunning(envPort.Value)));
                 }
             }
             catch
@@ -346,7 +420,7 @@ internal sealed class LocalOllamaConfigurator
             {
                 if (probe(port))
                 {
-                    return Task.FromResult(new OllamaPortCheck(true, port));
+                    return Task.FromResult(new OllamaPortCheck(true, port, LanStateForRunning(port)));
                 }
             }
             catch
@@ -355,7 +429,117 @@ internal sealed class LocalOllamaConfigurator
             }
         }
 
-        return Task.FromResult(new OllamaPortCheck(true, null)); // running but undetectable
+        // 3. Running but nothing open → the persisted-env rule (the UI shows the Re-check hint).
+        return Task.FromResult(new OllamaPortCheck(true, null, LanStateFromPersistedEnv()));
+    }
+
+    /// <summary>
+    /// The LAN state for a RUNNING Ollama (task #160): a decisive LAN-bind probe against one
+    /// of this machine's non-loopback IPv4 addresses wins — true = connect succeeded (bound
+    /// to all interfaces → LAN), false = refused or probe-window timeout (loopback-only);
+    /// a probe ERROR or the ABSENCE of a non-loopback IPv4 (offline machine) falls through
+    /// to the persisted-env rule. Socket probes only — this never touches the binary probe.
+    /// </summary>
+    private OllamaLanState LanStateForRunning(int port)
+    {
+        try
+        {
+            var addresses = (NonLoopbackLocalAddresses ?? DefaultNonLoopbackAddresses)();
+            if (addresses.Count > 0)
+            {
+                try
+                {
+                    var result = (LanBindProbe ?? DefaultLanBindProbe)(addresses[0].ToString(), port);
+                    if (result is true)
+                    {
+                        return OllamaLanState.Lan;
+                    }
+
+                    if (result is false)
+                    {
+                        return OllamaLanState.Loopback;
+                    }
+                }
+                catch
+                {
+                    // A throwing probe is treated as a probe error (fall through to the env rule).
+                }
+            }
+        }
+        catch
+        {
+            // A throwing address resolver is treated as "no addresses" (fall through).
+        }
+
+        return LanStateFromPersistedEnv();
+    }
+
+    /// <summary>
+    /// The LAN state from the PERSISTED OLLAMA_HOST (task #160): Windows reads the User
+    /// environment (the existing <see cref="OllamaHostReader"/> seam), macOS reads
+    /// <c>launchctl getenv OLLAMA_HOST</c> through the new <see cref="LaunchctlGetenv"/>
+    /// output-capturing seam, Linux → the loopback default (no GUI-readable persisted value).
+    /// Each reader failure degrades to null → the parser's loopback default.
+    /// </summary>
+    private OllamaLanState LanStateFromPersistedEnv()
+    {
+        var (win, mac) = Platform();
+        string? host;
+        try
+        {
+            host = win
+                ? (OllamaHostReader ?? DefaultOllamaHostReader)()
+                : mac
+                    ? (LaunchctlGetenv ?? DefaultLaunchctlGetenv)(HostEnvVar)
+                    : null; // Linux: no GUI-readable persisted value → the loopback default
+        }
+        catch
+        {
+            host = null; // a failing reader is treated as "no persisted value"
+        }
+
+        return TryParseOllamaHostLanState(host);
+    }
+
+    /// <summary>
+    /// Pure OLLAMA_HOST LAN-state parser (task #160 — unit-testable). The host part is the
+    /// trimmed text before the LAST ':' (so <c>"[::]:11435"</c> yields <c>::</c>), with
+    /// surrounding square brackets stripped; <c>0.0.0.0</c> / <c>::</c> / <c>*</c> →
+    /// <see cref="OllamaLanState.Lan"/>, <c>127.0.0.1</c> / <c>localhost</c> / a hostless
+    /// value (<c>":11435"</c> / a bare port) → <see cref="OllamaLanState.Loopback"/>
+    /// (Ollama's default bind); null / empty → Loopback; anything else (e.g.
+    /// <c>"192.168.1.5"</c>) → <see cref="OllamaLanState.Unknown"/>.
+    /// </summary>
+    internal static OllamaLanState TryParseOllamaHostLanState(string? host)
+    {
+        if (string.IsNullOrWhiteSpace(host))
+        {
+            return OllamaLanState.Loopback; // unset → Ollama's default bind (loopback)
+        }
+
+        var trimmed = host.Trim();
+        var colon = trimmed.LastIndexOf(':');
+        if (colon < 0)
+        {
+            // A bare value has no host component: a (in-range) port is Ollama's bare-port form
+            // whose host defaults to loopback; anything else is junk → Unknown.
+            return TryParseOllamaHostPort(trimmed) is not null
+                ? OllamaLanState.Loopback
+                : OllamaLanState.Unknown;
+        }
+
+        var hostPart = trimmed[..colon];
+        if (hostPart.Length >= 2 && hostPart[0] == '[' && hostPart[^1] == ']')
+        {
+            hostPart = hostPart[1..^1]; // bracketed IPv6: "[::]" → "::"
+        }
+
+        return hostPart switch
+        {
+            "" or "127.0.0.1" or "localhost" => OllamaLanState.Loopback,
+            "0.0.0.0" or "::" or "*" => OllamaLanState.Lan,
+            _ => OllamaLanState.Unknown,
+        };
     }
 
     /// <summary>
@@ -822,6 +1006,90 @@ internal sealed class LocalOllamaConfigurator
         catch (Exception)
         {
             return false;
+        }
+    }
+
+    /// <summary>
+    /// The default non-loopback-address resolver (task #160): this machine's IPv4 addresses
+    /// that are NOT loopback (<see cref="Dns.GetHostAddresses"/filtered), empty on any failure
+    /// (e.g. DNS failure on an offline machine) so the detection falls through to the
+    /// persisted-env rule.
+    /// </summary>
+    private static IReadOnlyList<IPAddress> DefaultNonLoopbackAddresses()
+    {
+        try
+        {
+            return Array.FindAll(
+                Dns.GetHostAddresses(Dns.GetHostName()),
+                address => address.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(address));
+        }
+        catch (Exception)
+        {
+            return []; // a failing resolver degrades to "no addresses" (never throws)
+        }
+    }
+
+    /// <summary>
+    /// The default LAN bind connect probe (task #160): (ip, port) → <c>true</c> when a connect
+    /// to the given address:port SUCCEEDS (Ollama is bound to all interfaces), <c>false</c>
+    /// when the connect is REFUSED or does not complete within the 500 ms probe window
+    /// (same window as <see cref="DefaultPortProbe"/> — a timeout means loopback-only), and
+    /// <c>null</c> on any OTHER exception (a probe error — the caller falls through to the
+    /// persisted-env rule). Internal static so the bounded real-socket unit test can cover
+    /// the real default (the <see cref="DefaultPortProbe"/> convention).
+    /// </summary>
+    internal static bool? DefaultLanBindProbe(string ip, int port)
+    {
+        try
+        {
+            using var client = new TcpClient();
+            var connect = client.BeginConnect(ip, port, null, null);
+            if (!connect.AsyncWaitHandle.WaitOne(TimeSpan.FromMilliseconds(500)))
+            {
+                return false; // the connect did not complete within the probe window ⇒ loopback-only
+            }
+
+            try
+            {
+                client.EndConnect(connect); // throws when the connect FAILED
+                return true;
+            }
+            catch (SocketException socketException) when (
+                socketException.SocketErrorCode is SocketError.ConnectionRefused or SocketError.ConnectionReset)
+            {
+                return false; // refused/reset ⇒ loopback-only
+            }
+        }
+        catch (Exception)
+        {
+            return null; // a probe ERROR (any other exception) ⇒ the caller uses the env rule
+        }
+    }
+
+    /// <summary>
+    /// The default macOS <c>launchctl getenv</c> reader (task #160 — the DefaultScriptRunner
+    /// pattern): runs <c>launchctl getenv &lt;name&gt;</c> with a redirected stdout and returns
+    /// the trimmed value, or null when the output is empty, the process cannot be started
+    /// (not on macOS) or anything else goes wrong — never throws.
+    /// </summary>
+    private static string? DefaultLaunchctlGetenv(string name)
+    {
+        try
+        {
+            using var process = Process.Start(new ProcessStartInfo("launchctl", $"getenv {name}")
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+            }) ?? throw new InvalidOperationException($"Failed to start 'launchctl'.");
+
+            var output = process.StandardOutput.ReadToEnd().Trim();
+            process.WaitForExit(); // `launchctl getenv` exits instantly; the read drained it
+            return string.IsNullOrWhiteSpace(output) ? null : output;
+        }
+        catch (Exception)
+        {
+            return null; // missing launchctl / spawn failure → "no persisted value"
         }
     }
 

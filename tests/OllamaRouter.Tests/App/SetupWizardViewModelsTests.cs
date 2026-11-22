@@ -186,6 +186,19 @@ public sealed class SetupWizardViewModelsTests
                     return Task.FromResult(NextScriptResult);
                 },
                 OllamaHostReader = () => OllamaHostValue,
+                // Task #160: the LAN-state seams are fully faked (hermeticity) — no real DNS
+                // or LAN socket probes, ever.
+                NonLoopbackLocalAddresses = () => LanAddresses,
+                LanBindProbe = (ip, port) =>
+                {
+                    LanProbeCalls.Add((ip, port));
+                    return LanProbeResult;
+                },
+                LaunchctlGetenv = name =>
+                {
+                    LaunchctlReads.Add(name);
+                    return LaunchctlEnvValue;
+                },
                 PortWaitBudget = TimeSpan.FromHours(1),
             };
             // Task #157: platform-aware default — Windows presumes the tray app present (the
@@ -224,6 +237,27 @@ public sealed class SetupWizardViewModelsTests
         /// <summary>The persisted OLLAMA_HOST value served by the (fake) reader.</summary>
         public string? OllamaHostValue { get; set; }
 
+        // -- Task #160: the LAN-state seams -------------------------------------------------
+
+        /// <summary>The non-loopback IPv4 addresses served by the fake resolver (empty =
+        /// the persisted-env fallback, e.g. an offline machine).</summary>
+        public List<IPAddress> LanAddresses { get; set; } = [];
+
+        /// <summary>The scripted LAN-bind probe result (null = probe ERROR → env fallback).
+        /// Mutating it inside the fake <c>ProcessStarter</c> scripts the mid-command
+        /// re-detection flip (the Step150_Install_BusyDuringScript pattern).</summary>
+        public bool? LanProbeResult { get; set; }
+
+        /// <summary>The (ip, port) pairs passed to the fake LAN-bind probe, in order.</summary>
+        public List<(string Ip, int Port)> LanProbeCalls { get; } = [];
+
+        /// <summary>The env var names read through the fake macOS <c>launchctl getenv</c>
+        /// seam, in order.</summary>
+        public List<string> LaunchctlReads { get; } = [];
+
+        /// <summary>The value served by the fake macOS <c>launchctl getenv</c> reader.</summary>
+        public string? LaunchctlEnvValue { get; set; }
+
         /// <summary>
         /// The shared ordered side-effect log (task #150): <c>kill:{name}:{pid}</c> /
         /// <c>script:{fileName}</c> / <c>start:{fileName}</c> — the contractual
@@ -259,6 +293,10 @@ public sealed class SetupWizardViewModelsTests
                 Delay = _ => Task.CompletedTask,
                 // Hermetic (task #150): never read the real persisted OLLAMA_HOST in tests.
                 OllamaHostReader = () => null,
+                // Hermetic (task #160): the LAN-state seams never touch DNS/sockets/launchctl.
+                NonLoopbackLocalAddresses = () => [],
+                LanBindProbe = (_, _) => null,
+                LaunchctlGetenv = _ => null,
             };
         }
 
@@ -725,7 +763,7 @@ public sealed class SetupWizardViewModelsTests
         {
             Detection = new OllamaDetection(false, null, false),
         };
-        var result = await h.Configurator.UpdateOllamaAsync(CancellationToken.None);
+        var result = await h.Configurator.UpdateOllamaAsync(lanMesh: false, CancellationToken.None);
 
         Assert.False(result.Success);
         Assert.Equal(LocalOllamaConfigurator.OllamaNotFoundMessage(windows: true, afterUpdate: true), result.Message);
@@ -734,19 +772,19 @@ public sealed class SetupWizardViewModelsTests
         Assert.Empty(h.ProbedPorts);
     }
 
-    /// <summary>AC5 (Fix-port path, VM-level): FixPort routes through the SAME builder —
+    /// <summary>AC5 (change-port path, VM-level): ChangePort routes through the SAME builder —
     /// tray app absent → the same readable failure (red message), no launch, no port-wait.
     /// </summary>
     [Fact]
-    public async Task Step157_Windows_FixPort_TrayAppAbsent_RedMessageNoLaunch()
+    public async Task Step157_Windows_ChangePort_TrayAppAbsent_RedMessageNoLaunch()
     {
         var (vm, h, _) = BuildEnvStep();
         h.Detection = new OllamaDetection(true, @"C:\Program Files\Ollama\ollama.exe", true); // bare binary, running
-        h.PortMap[11434] = true; // Ollama running on the WRONG port → Fix port enabled
+        h.PortMap[11434] = true; // Ollama running on the WRONG port → Change port enabled
         await vm.RefreshAsync();
-        Assert.True(vm.FixPortCommand.CanExecute(null));
+        Assert.True(vm.ChangePortCommand.CanExecute(null));
 
-        await vm.FixPortCommand.ExecuteAsync(CancellationToken.None);
+        await vm.ChangePortCommand.ExecuteAsync(CancellationToken.None);
 
         Assert.True(vm.MessageIsError);
         Assert.Equal(LocalOllamaConfigurator.OllamaNotFoundMessage(windows: true, afterUpdate: false), vm.Message);
@@ -777,8 +815,8 @@ public sealed class SetupWizardViewModelsTests
         Assert.True(vm.IsLinux);
         Assert.False(vm.ShowStartButton);
         Assert.False(vm.StartOllamaCommand.CanExecute(null));
-        Assert.False(vm.ShowFixPortButton);
-        Assert.False(vm.FixPortCommand.CanExecute(null));
+        Assert.False(vm.ShowChangePortButton);
+        Assert.False(vm.ChangePortCommand.CanExecute(null));
         Assert.True(vm.ShowUpdateButton);
         Assert.True(vm.UpdateOllamaCommand.CanExecute(null));
         Assert.True(vm.ShowRunningCheck == false);
@@ -919,7 +957,7 @@ public sealed class SetupWizardViewModelsTests
             PortOpen = true, // the post-update restart port-wait succeeds immediately
             Detection = new OllamaDetection(true, LocalOllamaConfigurator.WindowsTrayAppPath, true),
         };
-        var result = await h.Configurator.UpdateOllamaAsync(CancellationToken.None);
+        var result = await h.Configurator.UpdateOllamaAsync(lanMesh: false, CancellationToken.None);
 
         Assert.True(result.Success);
         Assert.True(result.OllamaStarted);
@@ -941,7 +979,7 @@ public sealed class SetupWizardViewModelsTests
         {
             NextScriptResult = new ProcessRunResult(1, string.Empty, "boom"),
         };
-        var result = await h.Configurator.UpdateOllamaAsync(CancellationToken.None);
+        var result = await h.Configurator.UpdateOllamaAsync(lanMesh: false, CancellationToken.None);
         Assert.False(result.Success);
         Assert.False(result.OllamaStarted);
         Assert.Contains("Ollama was stopped and the update failed", result.Message);
@@ -959,7 +997,7 @@ public sealed class SetupWizardViewModelsTests
         {
             ScriptException = new InvalidOperationException("spawn /bin/sh failed"),
         };
-        var result = await h.Configurator.UpdateOllamaAsync(CancellationToken.None);
+        var result = await h.Configurator.UpdateOllamaAsync(lanMesh: false, CancellationToken.None);
         Assert.False(result.Success);
         Assert.Contains("Ollama was stopped and the update failed", result.Message);
         Assert.Contains("could not be started", result.Message);
@@ -977,7 +1015,7 @@ public sealed class SetupWizardViewModelsTests
         {
             Detection = new OllamaDetection(false, null, false), // the script removed/moved the binary
         };
-        var result = await h.Configurator.UpdateOllamaAsync(CancellationToken.None);
+        var result = await h.Configurator.UpdateOllamaAsync(lanMesh: false, CancellationToken.None);
         Assert.False(result.Success);
         Assert.Equal(LocalOllamaConfigurator.OllamaNotFoundMessage(windows: true, afterUpdate: true), result.Message);
         Assert.Empty(h.Starts);
@@ -991,7 +1029,7 @@ public sealed class SetupWizardViewModelsTests
             PortOpen = true,
             Detection = new OllamaDetection(true, "/usr/local/bin/ollama", true),
         };
-        var result = await h.Configurator.UpdateOllamaAsync(CancellationToken.None);
+        var result = await h.Configurator.UpdateOllamaAsync(lanMesh: false, CancellationToken.None);
         Assert.True(result.Success);
         Assert.True(result.OllamaStarted);
         // The re-detection used the LINUX search paths (the task #150 path-selection fix).
@@ -1011,7 +1049,7 @@ public sealed class SetupWizardViewModelsTests
     {
         var h = new ConfigHarness(isWindows: true, isMacOS: false) { PortOpen = false };
         h.Configurator.PortWaitBudget = TimeSpan.Zero; // elapses immediately
-        var result = await h.Configurator.UpdateOllamaAsync(CancellationToken.None);
+        var result = await h.Configurator.UpdateOllamaAsync(lanMesh: false, CancellationToken.None);
         Assert.False(result.Success);
         Assert.False(result.OllamaStarted);
         Assert.Contains("did not open port 11435", result.Message);
@@ -1115,6 +1153,196 @@ public sealed class SetupWizardViewModelsTests
         Assert.Equal(expected, LocalOllamaConfigurator.TryParseOllamaHostPort(host));
     }
 
+    // ==================================================================
+    //  Step 1 — task #160: LAN-state detection (inside the single detection pass)
+    // ==================================================================
+
+    /// <summary>Running + a decisive LAN-bind probe: the socket probe ALONE decides the state
+    /// (true = connect succeeded → bound to 0.0.0.0 → Lan; false = refused/timeout →
+    /// loopback-only), against exactly one non-loopback address at the detected port.
+    /// No additional binary probes (the task #147 invariant — socket probes only).</summary>
+    [Theory]
+    [InlineData(true)]  // connect succeeded → Lan
+    [InlineData(false)] // refused/timeout  → Loopback
+    public async Task Step160_DetectLanState_RunningProbeDecisive(bool lanProbeResult)
+    {
+        var h = new ConfigHarness(isWindows: true, isMacOS: false)
+        {
+            PortMap = { [11435] = true },
+            Detection = new OllamaDetection(true, "/x", true),
+            LanAddresses = [IPAddress.Parse("192.168.1.10")],
+            LanProbeResult = lanProbeResult,
+        };
+        var check = await h.Configurator.DetectPortAsync(CancellationToken.None);
+        Assert.True(check.OllamaRunning);
+        Assert.Equal(11435, check.DetectedPort);
+        Assert.Equal(lanProbeResult ? OllamaLanState.Lan : OllamaLanState.Loopback, check.LanState);
+        Assert.Equal([("192.168.1.10", 11435)], h.LanProbeCalls); // exactly one decisive socket probe
+    }
+
+    /// <summary>Probe ERROR (null) → falls through to the persisted-env rule.
+    /// </summary>
+    [Fact]
+    public async Task Step160_DetectLanState_ProbeErrorFallsBackToPersistedEnv()
+    {
+        var h = new ConfigHarness(isWindows: true, isMacOS: false)
+        {
+            PortMap = { [11435] = true },
+            Detection = new OllamaDetection(true, "/x", true),
+            LanAddresses = [IPAddress.Parse("192.168.1.10")],
+            LanProbeResult = null, // probe ERROR → env fallback
+            OllamaHostValue = "0.0.0.0:11435",
+        };
+        var check = await h.Configurator.DetectPortAsync(CancellationToken.None);
+        Assert.Equal(11435, check.DetectedPort);
+        Assert.Equal(OllamaLanState.Lan, check.LanState);
+        Assert.Equal([("192.168.1.10", 11435)], h.LanProbeCalls); // the probe WAS attempted (and errored)
+    }
+
+    /// <summary>No non-loopback IPv4 (offline machine) → NO socket probe at all; the
+    /// persisted-env rule decides (0.0.0.0 → Lan; unset → Ollama's loopback default).
+    /// </summary>
+    [Theory]
+    [InlineData(true)]  // persisted 0.0.0.0 → Lan
+    [InlineData(false)] // no persisted value → Loopback
+    public async Task Step160_DetectLanState_NoNonLoopbackAddressFallsBackToEnv(bool envIsLan)
+    {
+        var h = new ConfigHarness(isWindows: true, isMacOS: false)
+        {
+            PortMap = { [11435] = true },
+            Detection = new OllamaDetection(true, "/x", true),
+            LanAddresses = [], // offline machine → no addresses → env rule
+            OllamaHostValue = envIsLan ? "0.0.0.0:11435" : null,
+        };
+        var check = await h.Configurator.DetectPortAsync(CancellationToken.None);
+        Assert.Equal(11435, check.DetectedPort);
+        Assert.Equal(envIsLan ? OllamaLanState.Lan : OllamaLanState.Loopback, check.LanState);
+        Assert.Empty(h.LanProbeCalls); // never probed: no non-loopback address to probe
+    }
+
+    /// <summary>Stopped Ollama → the persisted-env rule decides with ZERO port probes AND
+    /// zero LAN socket probes (the task #150 zero-probe contract kept).</summary>
+    [Theory]
+    [InlineData("0.0.0.0:11435", OllamaLanState.Lan)]
+    [InlineData("127.0.0.1:11435", OllamaLanState.Loopback)]
+    [InlineData(null, OllamaLanState.Loopback)]
+    [InlineData("192.168.1.5:11435", OllamaLanState.Unknown)]
+    public async Task Step160_DetectLanState_Stopped_UsesPersistedEnv_ZeroProbes(string? env, OllamaLanState expected)
+    {
+        var h = new ConfigHarness(isWindows: true, isMacOS: false)
+        {
+            OllamaHostValue = env,
+        };
+        var check = await h.Configurator.DetectPortAsync(CancellationToken.None); // stopped (harness default)
+        Assert.False(check.OllamaRunning);
+        Assert.Null(check.DetectedPort);
+        Assert.Equal(expected, check.LanState);
+        Assert.Empty(h.ProbedPorts); // zero PORT probes (the contract kept)
+        Assert.Empty(h.LanProbeCalls); // zero LAN socket probes
+    }
+
+    /// <summary>macOS: the launchctl seam is the persisted-env SOURCE (the Windows
+    /// OllamaHostReader is ignored on macOS) — exactly one <c>launchctl getenv OLLAMA_HOST</c>
+    /// read, and its value wins.
+    /// </summary>
+    [Fact]
+    public async Task Step160_DetectLanState_MacOS_LaunchctlGetenvReader()
+    {
+        var h = new ConfigHarness(isWindows: false, isMacOS: true)
+        {
+            OllamaHostValue = "127.0.0.1:11435", // the Windows reader value: IGNORED on macOS
+            LaunchctlEnvValue = "0.0.0.0:11435", // the launchctl value: the macOS source
+        };
+        var check = await h.Configurator.DetectPortAsync(CancellationToken.None); // stopped (harness default)
+        Assert.Equal(OllamaLanState.Lan, check.LanState);
+        Assert.Equal([LocalOllamaConfigurator.HostEnvVar], h.LaunchctlReads); // exactly one read, by name
+    }
+
+    /// <summary>Pure OLLAMA_HOST LAN-state parser (task #160 — byte-pinned matrix).
+    /// </summary>
+    [Theory]
+    [InlineData("0.0.0.0:11435", OllamaLanState.Lan)]
+    [InlineData(":::11435", OllamaLanState.Lan)]
+    [InlineData("[::]:11435", OllamaLanState.Lan)]
+    [InlineData("*:11435", OllamaLanState.Lan)]
+    [InlineData("127.0.0.1:11435", OllamaLanState.Loopback)]
+    [InlineData("localhost:11435", OllamaLanState.Loopback)]
+    [InlineData(":11435", OllamaLanState.Loopback)]
+    [InlineData("11435", OllamaLanState.Loopback)]
+    [InlineData(null, OllamaLanState.Loopback)]
+    [InlineData("", OllamaLanState.Loopback)]
+    [InlineData("banana:11435", OllamaLanState.Unknown)]
+    [InlineData("192.168.1.5:11435", OllamaLanState.Unknown)]
+    public void Step160_TryParseOllamaHostLanState_PureParser(string? host, OllamaLanState expected)
+    {
+        Assert.Equal(expected, LocalOllamaConfigurator.TryParseOllamaHostLanState(host));
+    }
+
+    /// <summary>AC9: the explicit <c>lanMesh</c> parameter flows into BOTH the env write and
+    /// the tray-app restart env (no hard-coded loopback anymore — the AC5 defect).
+    /// </summary>
+    [Fact]
+    public async Task Step160_UpdateOllamaAsync_LanMeshTrue_WritesAndStarts0000Host()
+    {
+        var h = new ConfigHarness(isWindows: true, isMacOS: false)
+        {
+            PortOpen = true,
+            Detection = new OllamaDetection(true, LocalOllamaConfigurator.WindowsTrayAppPath, true),
+        };
+        var result = await h.Configurator.UpdateOllamaAsync(lanMesh: true, CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.True(result.OllamaStarted);
+        Assert.Contains(("OLLAMA_HOST", "0.0.0.0:11435", EnvironmentVariableTarget.User), h.EnvWrites);
+        var app = Assert.Single(h.Starts, s => s.FileName == LocalOllamaConfigurator.WindowsTrayAppPath);
+        Assert.Equal("0.0.0.0:11435", app.EnvironmentVariables["OLLAMA_HOST"]);
+    }
+
+    /// <summary>
+    /// Task #160 regression (never-throw contract): the Windows update path's NEW
+    /// persisted-env write is the one step that can throw (a locked-down User env).
+    /// It must surface a READABLE failure (Ollama left stopped, recovery named) — never
+    /// escape the command as an unobserved exception (the sibling ConfigureAsync path
+    /// already wraps the same write).
+    /// </summary>
+    [Fact]
+    public async Task Step160_Update_WindowsEnvWriteFailure_ReadableFailure_LeftStopped()
+    {
+        var h = new ConfigHarness(isWindows: true, isMacOS: false)
+        {
+            PortOpen = true,
+            Detection = new OllamaDetection(true, LocalOllamaConfigurator.WindowsTrayAppPath, true),
+        };
+        // Force the persisted-env write to throw (the SetEnvironmentVariable access-denied case).
+        h.Configurator.EnvWriter = (_, _, _) => throw new UnauthorizedAccessException("access denied");
+
+        var result = await h.Configurator.UpdateOllamaAsync(lanMesh: true, CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.False(result.OllamaStarted); // Ollama was stopped FIRST and is left stopped
+        Assert.Contains("Ollama was stopped and the update failed", result.Message);
+        Assert.Contains("could not be persisted", result.Message);
+        Assert.Empty(h.Starts); // no restart is attempted after the failed env write
+    }
+
+    /// <summary>
+    /// AC10: the DEFAULT LAN bind probe against real loopback sockets (the same bounded
+    /// convention as <c>Step1_DefaultPortProbe_…</c>): a refused port → false (loopback-only),
+    /// a genuinely listening port → true (bound). The only bounded real-socket test for the
+    /// new seam — everything else goes through the fakes.
+    /// </summary>
+    [Fact]
+    public void Step160_DefaultLanBindProbe_RealLoopback_ListenTrue_RefusedFalse()
+    {
+        // Port 1 on loopback: nothing listens there — the connect is refused (and completes).
+        Assert.False(LocalOllamaConfigurator.DefaultLanBindProbe("127.0.0.1", 1));
+
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        Assert.True(LocalOllamaConfigurator.DefaultLanBindProbe("127.0.0.1", port));
+    }
+
     // ------------------------------------------------------------------
     //  Step 1 — view model: state machine, port states, commands (task #150)
     // ------------------------------------------------------------------
@@ -1182,7 +1410,7 @@ public sealed class SetupWizardViewModelsTests
     }
 
     [Fact]
-    public async Task Step150_State_Linux_InstallAndUpdateOneClick_StartAndFixPortDisabled()
+    public async Task Step150_State_Linux_InstallAndUpdateOneClick_StartAndChangePortDisabled()
     {
         var (vm, h, _) = BuildEnvStep(isWindows: false, isMacOS: false);
         Assert.True(vm.IsLinux);
@@ -1200,8 +1428,11 @@ public sealed class SetupWizardViewModelsTests
         Assert.False(vm.StartOllamaCommand.CanExecute(null));
         Assert.Equal(OllamaPortStatus.WrongPort, vm.OllamaPortStatus);
         Assert.True(vm.ShowPortWrong);
-        Assert.False(vm.ShowFixPortButton); // Linux: no persistent env path (M1)
-        Assert.False(vm.FixPortCommand.CanExecute(null));
+        Assert.False(vm.ShowChangePortButton); // Linux: no persistent env path (M1)
+        Assert.False(vm.ChangePortCommand.CanExecute(null));
+        Assert.False(vm.ShowLanRow); // task #160: the LAN row is hidden on Linux
+        Assert.False(vm.ShowLanToggle);
+        Assert.False(vm.ToggleLanCommand.CanExecute(null));
     }
 
     [Fact]
@@ -1215,13 +1446,14 @@ public sealed class SetupWizardViewModelsTests
         Assert.Equal(OllamaPortStatus.Ok, vm.OllamaPortStatus);
         Assert.True(vm.ShowPortOk);
         Assert.Equal(11435, vm.OllamaDetectedPort);
-        Assert.Equal("Ollama is serving on :11435 ✓", vm.OllamaPortLabel);
-        Assert.False(vm.ShowFixPortButton);
-        Assert.False(vm.FixPortCommand.CanExecute(null));
+        // Task #160: byte-pinned — the ✓ moved OUT of the text into the row's right cell.
+        Assert.Equal("Ollama is listening on 11435", vm.OllamaPortLabel);
+        Assert.False(vm.ShowChangePortButton);
+        Assert.False(vm.ChangePortCommand.CanExecute(null));
     }
 
     [Fact]
-    public async Task Step150_Port_WrongPort_WarningNamesPort_FixPortEnabledOnWindows()
+    public async Task Step150_Port_WrongPort_WarningNamesPort_ChangePortEnabledOnWindows()
     {
         var (vm, h, _) = BuildEnvStep();
         h.Detection = new OllamaDetection(true, "/x", true);
@@ -1231,9 +1463,10 @@ public sealed class SetupWizardViewModelsTests
         Assert.Equal(OllamaPortStatus.WrongPort, vm.OllamaPortStatus);
         Assert.True(vm.ShowPortWrong);
         Assert.Equal(11434, vm.OllamaDetectedPort);
-        Assert.Equal("Ollama is serving on :11434 — the router expects :11435", vm.OllamaPortLabel);
-        Assert.True(vm.ShowFixPortButton);
-        Assert.True(vm.FixPortCommand.CanExecute(null));
+        // Task #160: byte-pinned (the drift now names the port that should be freed).
+        Assert.Equal("Ollama is listening on 11434, but this port should be freed for the router.", vm.OllamaPortLabel);
+        Assert.True(vm.ShowChangePortButton);
+        Assert.True(vm.ChangePortCommand.CanExecute(null));
     }
 
     [Fact]
@@ -1322,17 +1555,21 @@ public sealed class SetupWizardViewModelsTests
     }
 
     [Fact]
-    public async Task Step150_FixPort_StartOllamaOnlyPath_LoopbackHost()
+    public async Task Step160_ChangePort_DetectedLoopback_Uses127001Host()
     {
         var (vm, h, _) = BuildEnvStep();
         h.Detection = new OllamaDetection(true, LocalOllamaConfigurator.WindowsTrayAppPath, true);
         h.PortMap[11434] = true; // Ollama running on the WRONG port
+        h.LanAddresses = [IPAddress.Parse("192.168.1.10")];
+        h.LanProbeResult = false; // decisive LAN-bind probe → detected LOOPBACK
         await vm.RefreshAsync();
-        Assert.True(vm.FixPortCommand.CanExecute(null));
+        Assert.Equal(OllamaLanState.Loopback, vm.OllamaLanState);
+        Assert.True(vm.ChangePortCommand.CanExecute(null));
         h.PortOpen = true; // the port-wait succeeds after the restart
 
-        await vm.FixPortCommand.ExecuteAsync(CancellationToken.None);
+        await vm.ChangePortCommand.ExecuteAsync(CancellationToken.None);
 
+        // Task #160: the DETECTED bind is preserved (loopback → 127.0.0.1:11435).
         Assert.Contains("serving on 127.0.0.1:11435", vm.Message!);
         Assert.False(vm.MessageIsError);
         Assert.Contains(("OLLAMA_HOST", "127.0.0.1:11435", EnvironmentVariableTarget.User), h.EnvWrites);
@@ -1342,17 +1579,20 @@ public sealed class SetupWizardViewModelsTests
     }
 
     [Fact]
-    public async Task Step150_FixPort_LanMeshChecked_Uses0000Host()
+    public async Task Step160_ChangePort_DetectedLan_Uses0000Host()
     {
         var (vm, h, _) = BuildEnvStep();
         h.Detection = new OllamaDetection(true, LocalOllamaConfigurator.WindowsTrayAppPath, true);
         h.PortMap[11434] = true;
+        h.LanAddresses = [IPAddress.Parse("192.168.1.10")];
+        h.LanProbeResult = true; // decisive LAN-bind probe → detected LAN
         await vm.RefreshAsync();
-        vm.LanMeshEnabled = true;
+        Assert.Equal(OllamaLanState.Lan, vm.OllamaLanState);
         h.PortOpen = true;
 
-        await vm.FixPortCommand.ExecuteAsync(CancellationToken.None);
+        await vm.ChangePortCommand.ExecuteAsync(CancellationToken.None);
 
+        // Task #160: the DETECTED LAN bind is preserved (→ 0.0.0.0:11435, no checkbox needed).
         Assert.Contains(("OLLAMA_HOST", "0.0.0.0:11435", EnvironmentVariableTarget.User), h.EnvWrites);
         var app = Assert.Single(h.Starts, s => s.FileName == LocalOllamaConfigurator.WindowsTrayAppPath);
         Assert.Equal("0.0.0.0:11435", app.EnvironmentVariables["OLLAMA_HOST"]);
@@ -1406,15 +1646,18 @@ public sealed class SetupWizardViewModelsTests
     [Fact]
     public async Task Step150_StartRouter_DisabledWhenRunningForeignOrNoLauncher()
     {
-        // Router already running: no button.
+        // Router already running: no button — the ✓ lives in the row's RIGHT cell (task #160).
         var running = new FakeDaemonLauncher { Status = FakeDaemonLauncher.RunningStatus() };
         var (vmRunning, _, _) = BuildEnvStep(launcher: running);
         await vmRunning.RefreshAsync();
         Assert.Equal(Port11434Status.RouterRunning, vmRunning.Port11434Status);
+        Assert.Equal("Router is running on :11434", vmRunning.RouterStatusLabel); // no ✓ in the text
+        Assert.True(vmRunning.ShowRouterRunningCheck);
         Assert.False(vmRunning.ShowStartRouterButton);
         Assert.False(vmRunning.StartRouterCommand.CanExecute(null));
 
-        // Foreign service on :11434: the warning label, no button.
+        // Foreign service on :11434: the reworded warning label (task #160: the port row with
+        // "Change port" is now ABOVE — no more "below"), no button.
         var foreign = new FakeDaemonLauncher
         {
             Status = new RouterDaemonStatus(RouterDaemonState.PortOccupiedByOtherService, null, "occupied"),
@@ -1422,7 +1665,10 @@ public sealed class SetupWizardViewModelsTests
         var (vmForeign, _, _) = BuildEnvStep(launcher: foreign);
         await vmForeign.RefreshAsync();
         Assert.Equal(Port11434Status.ForeignService, vmForeign.Port11434Status);
-        Assert.Contains("Raw Ollama occupies", vmForeign.RouterStatusLabel);
+        Assert.Equal(
+            "Raw Ollama occupies :11434 — free it for the router with \"Change port\" above.",
+            vmForeign.RouterStatusLabel);
+        Assert.DoesNotContain("below", vmForeign.RouterStatusLabel);
         Assert.False(vmForeign.ShowStartRouterButton);
 
         // No launcher (remote mode): the existing "unavailable" label, no button.
@@ -1458,7 +1704,8 @@ public sealed class SetupWizardViewModelsTests
         Assert.False(vm.InstallOllamaCommand.CanExecute(null));
         Assert.False(vm.StartOllamaCommand.CanExecute(null));
         Assert.False(vm.UpdateOllamaCommand.CanExecute(null));
-        Assert.False(vm.FixPortCommand.CanExecute(null));
+        Assert.False(vm.ChangePortCommand.CanExecute(null));
+        Assert.False(vm.ToggleLanCommand.CanExecute(null));
         Assert.False(vm.StartRouterCommand.CanExecute(null));
         Assert.False(vm.RecheckCommand.CanExecute(null)); // no concurrent actions while busy
 
@@ -1468,6 +1715,292 @@ public sealed class SetupWizardViewModelsTests
         Assert.False(vm.IsBusy);
         Assert.True(vm.InstallOllamaCommand.CanExecute(null));
         Assert.True(vm.RecheckCommand.CanExecute(null));
+    }
+
+    // ==================================================================
+    //  Step 1 — task #160: the detected LAN-exposure row + unified row grid (VM level)
+    // ==================================================================
+
+    [Fact]
+    public async Task Step160_LanRow_HiddenWhenNotInstalled_AndWhenLinux()
+    {
+        // Windows, NOT installed: the row is hidden, the toggle too, the command disabled.
+        var (vm, h, _) = BuildEnvStep();
+        h.Detection = new OllamaDetection(false, null, false);
+        await vm.RefreshAsync();
+        Assert.False(vm.ShowLanRow);
+        Assert.False(vm.ShowLanToggle);
+        Assert.False(vm.ToggleLanCommand.CanExecute(null));
+
+        // Linux, installed: the row is hidden as well (no GUI-readable persisted env there).
+        var (vmLinux, _, _) = BuildEnvStep(isWindows: false, isMacOS: false);
+        await vmLinux.RefreshAsync(); // harness default: installed, not running
+        Assert.True(vmLinux.OllamaInstalled);
+        Assert.True(vmLinux.IsLinux);
+        Assert.False(vmLinux.ShowLanRow);
+        Assert.False(vmLinux.ShowLanToggle);
+        Assert.False(vmLinux.ToggleLanCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task Step160_LanRow_LoopbackState_PinnedLabelAndExposeButton()
+    {
+        var (vm, _, _) = BuildEnvStep(); // installed, stopped, no persisted env → Loopback
+        await vm.RefreshAsync();
+        Assert.Equal(OllamaLanState.Loopback, vm.OllamaLanState);
+        Assert.Equal(
+            "Ollama is configured to listen only on loopback. To use it from another computer " +
+            "on the network, allow listening on the LAN.",
+            vm.LanRowLabel);
+        Assert.Equal("Expose on the LAN", vm.LanToggleText);
+        Assert.True(vm.ShowLanRow);
+        Assert.True(vm.ShowLanToggle);
+        Assert.True(vm.ToggleLanCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task Step160_LanRow_LanState_PinnedLabelAndRestrictButton()
+    {
+        var (vm, h, _) = BuildEnvStep();
+        h.OllamaHostValue = "0.0.0.0:11435"; // stopped + persisted LAN → Lan
+        await vm.RefreshAsync();
+        Assert.Equal(OllamaLanState.Lan, vm.OllamaLanState);
+        Assert.Equal(
+            "Ollama is configured to listen on LAN, and can be used by other computers " +
+            "on the network.",
+            vm.LanRowLabel);
+        Assert.Equal("Restrict to localhost", vm.LanToggleText);
+        Assert.True(vm.ShowLanRow);
+        Assert.True(vm.ShowLanToggle);
+        Assert.True(vm.ToggleLanCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task Step160_LanRow_UnknownState_PinnedLabel_NoButton()
+    {
+        var (vm, h, _) = BuildEnvStep();
+        h.OllamaHostValue = "banana:11435"; // undeterminable host → Unknown
+        await vm.RefreshAsync();
+        Assert.Equal(OllamaLanState.Unknown, vm.OllamaLanState);
+        Assert.Equal("Ollama's LAN configuration could not be determined — try Re-check.", vm.LanRowLabel);
+        Assert.True(vm.ShowLanRow); // the row itself stays visible (installed + Windows)
+        Assert.False(vm.ShowLanToggle); // …but the Unknown state shows NO button
+        Assert.False(vm.ToggleLanCommand.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task Step160_ToggleLan_LoopbackToLan_Writes0000_Restarts_AndRedetectsFlips()
+    {
+        var (vm, h, _) = BuildEnvStep();
+        h.Detection = new OllamaDetection(true, LocalOllamaConfigurator.WindowsTrayAppPath, true);
+        h.PortMap[11435] = true;
+        h.LanAddresses = [IPAddress.Parse("192.168.1.10")];
+        h.LanProbeResult = false; // decisive probe → detected LOOPBACK
+        await vm.RefreshAsync();
+        Assert.Equal(OllamaLanState.Loopback, vm.OllamaLanState);
+        Assert.Equal("Expose on the LAN", vm.LanToggleText);
+        Assert.True(vm.ToggleLanCommand.CanExecute(null));
+
+        // Mid-command flip: the re-detection (inside the command) must see the NEW bind.
+        Func<ProcessStartInfo, string> original = h.Configurator.ProcessStarter!;
+        h.Configurator.ProcessStarter = info =>
+        {
+            Assert.True(vm.IsBusy); // busy DURING the restart
+            Assert.Contains("Exposing Ollama on the LAN", vm.Message!); // the busy message
+            h.LanProbeResult = true; // the restarted Ollama binds 0.0.0.0
+            h.PortOpen = true;       // the port-wait succeeds
+            return original(info);
+        };
+
+        await vm.ToggleLanCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.Contains("serving on 0.0.0.0:11435", vm.Message!);
+        Assert.False(vm.MessageIsError);
+        Assert.Contains(("OLLAMA_HOST", "0.0.0.0:11435", EnvironmentVariableTarget.User), h.EnvWrites);
+        var app = Assert.Single(h.Starts, s => s.FileName == LocalOllamaConfigurator.WindowsTrayAppPath);
+        Assert.Equal("0.0.0.0:11435", app.EnvironmentVariables["OLLAMA_HOST"]);
+        // The auto re-detect flipped the row to the Lan label/button set.
+        Assert.Equal(OllamaLanState.Lan, vm.OllamaLanState);
+        Assert.Equal(
+            "Ollama is configured to listen on LAN, and can be used by other computers " +
+            "on the network.",
+            vm.LanRowLabel);
+        Assert.Equal("Restrict to localhost", vm.LanToggleText);
+        Assert.True(vm.ShowLanToggle);
+        Assert.False(vm.IsBusy);
+    }
+
+    [Fact]
+    public async Task Step160_ToggleLan_LanToLoopback_Writes127001_Restarts_AndRedetectsFlips()
+    {
+        var (vm, h, _) = BuildEnvStep();
+        h.Detection = new OllamaDetection(true, LocalOllamaConfigurator.WindowsTrayAppPath, true);
+        h.PortMap[11435] = true;
+        h.LanAddresses = [IPAddress.Parse("192.168.1.10")];
+        h.LanProbeResult = true; // decisive probe → detected LAN
+        await vm.RefreshAsync();
+        Assert.Equal(OllamaLanState.Lan, vm.OllamaLanState);
+        Assert.Equal("Restrict to localhost", vm.LanToggleText);
+        Assert.True(vm.ToggleLanCommand.CanExecute(null));
+
+        Func<ProcessStartInfo, string> original = h.Configurator.ProcessStarter!;
+        h.Configurator.ProcessStarter = info =>
+        {
+            Assert.True(vm.IsBusy);
+            Assert.Contains("Restricting Ollama to localhost", vm.Message!); // the busy message
+            h.LanProbeResult = false; // the restarted Ollama binds 127.0.0.1
+            h.PortOpen = true;
+            return original(info);
+        };
+
+        await vm.ToggleLanCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.Contains("serving on 127.0.0.1:11435", vm.Message!);
+        Assert.False(vm.MessageIsError);
+        Assert.Contains(("OLLAMA_HOST", "127.0.0.1:11435", EnvironmentVariableTarget.User), h.EnvWrites);
+        var app = Assert.Single(h.Starts, s => s.FileName == LocalOllamaConfigurator.WindowsTrayAppPath);
+        Assert.Equal("127.0.0.1:11435", app.EnvironmentVariables["OLLAMA_HOST"]);
+        // The auto re-detect flipped the row back to the Loopback label/button set.
+        Assert.Equal(OllamaLanState.Loopback, vm.OllamaLanState);
+        Assert.Equal(
+            "Ollama is configured to listen only on loopback. To use it from another computer " +
+            "on the network, allow listening on the LAN.",
+            vm.LanRowLabel);
+        Assert.Equal("Expose on the LAN", vm.LanToggleText);
+        Assert.True(vm.ShowLanToggle);
+        Assert.False(vm.IsBusy);
+    }
+
+    [Fact]
+    public async Task Step160_ToggleLan_FromStopped_StartsOllama()
+    {
+        // Decision 3: the toggle works while Ollama is STOPPED — it starts Ollama.
+        var (vm, h, _) = BuildEnvStep();
+        h.Detection = new OllamaDetection(true, LocalOllamaConfigurator.WindowsTrayAppPath, false); // installed, STOPPED
+        h.OllamaHostValue = "0.0.0.0:11435"; // persisted LAN → state Lan even while stopped
+        await vm.RefreshAsync();
+        Assert.Equal(OllamaLanState.Lan, vm.OllamaLanState);
+        Assert.Equal(OllamaPortStatus.NotRunning, vm.OllamaPortStatus);
+        Assert.Equal("Restrict to localhost", vm.LanToggleText);
+        Assert.True(vm.ToggleLanCommand.CanExecute(null));
+        h.PortOpen = true; // the start's port-wait succeeds
+
+        await vm.ToggleLanCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.Contains("serving on 127.0.0.1:11435", vm.Message!);
+        Assert.False(vm.MessageIsError);
+        Assert.Contains(("OLLAMA_HOST", "127.0.0.1:11435", EnvironmentVariableTarget.User), h.EnvWrites);
+        var app = Assert.Single(h.Starts, s => s.FileName == LocalOllamaConfigurator.WindowsTrayAppPath);
+        Assert.Equal("127.0.0.1:11435", app.EnvironmentVariables["OLLAMA_HOST"]);
+        Assert.Contains(11435, h.ProbedPorts); // the port-wait ran (start confirmed)
+        Assert.False(vm.IsBusy);
+    }
+
+    [Fact]
+    public async Task Step160_ToggleLan_PortWaitFailure_RedMessage_NoCrash_CommandAvailableAgain()
+    {
+        var (vm, h, _) = BuildEnvStep();
+        h.Detection = new OllamaDetection(true, LocalOllamaConfigurator.WindowsTrayAppPath, true);
+        h.LanAddresses = [IPAddress.Parse("192.168.1.10")];
+        h.LanProbeResult = false; // running, port undetectable → env rule (null) → Loopback
+        await vm.RefreshAsync();
+        Assert.Equal(OllamaLanState.Loopback, vm.OllamaLanState);
+        Assert.True(vm.ToggleLanCommand.CanExecute(null));
+        h.Configurator.PortWaitBudget = TimeSpan.Zero; // the wait budget elapses immediately
+        // PortOpen stays false → the restart never opens the port.
+
+        await vm.ToggleLanCommand.ExecuteAsync(CancellationToken.None); // must not throw
+
+        Assert.True(vm.MessageIsError);
+        Assert.Contains("did not open port 11435", vm.Message!);
+        Assert.False(vm.IsBusy);
+        Assert.True(vm.ToggleLanCommand.CanExecute(null)); // the toggle is retryable
+    }
+
+    [Fact]
+    public async Task Step160_StartOllama_PreservesDetectedLanBind()
+    {
+        // Detected LAN (stopped + persisted 0.0.0.0) → Start keeps 0.0.0.0:11435.
+        var (vm, h, _) = BuildEnvStep();
+        h.Detection = new OllamaDetection(true, LocalOllamaConfigurator.WindowsTrayAppPath, false);
+        h.OllamaHostValue = "0.0.0.0:11435";
+        h.PortOpen = true;
+        await vm.RefreshAsync();
+        Assert.Equal(OllamaLanState.Lan, vm.OllamaLanState);
+        Assert.True(vm.StartOllamaCommand.CanExecute(null));
+
+        await vm.StartOllamaCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.Contains(("OLLAMA_HOST", "0.0.0.0:11435", EnvironmentVariableTarget.User), h.EnvWrites);
+        var app = Assert.Single(h.Starts, s => s.FileName == LocalOllamaConfigurator.WindowsTrayAppPath);
+        Assert.Equal("0.0.0.0:11435", app.EnvironmentVariables["OLLAMA_HOST"]);
+
+        // Unknown → loopback (decision 3: Unknown is treated as loopback for the start).
+        var (vm2, h2, _) = BuildEnvStep();
+        h2.Detection = new OllamaDetection(true, LocalOllamaConfigurator.WindowsTrayAppPath, false);
+        h2.OllamaHostValue = "banana:11435"; // undeterminable host → Unknown
+        h2.PortOpen = true;
+        await vm2.RefreshAsync();
+        Assert.Equal(OllamaLanState.Unknown, vm2.OllamaLanState);
+        Assert.True(vm2.StartOllamaCommand.CanExecute(null));
+
+        await vm2.StartOllamaCommand.ExecuteAsync(CancellationToken.None);
+
+        var app2 = Assert.Single(h2.Starts, s => s.FileName == LocalOllamaConfigurator.WindowsTrayAppPath);
+        Assert.Equal("127.0.0.1:11435", app2.EnvironmentVariables["OLLAMA_HOST"]);
+    }
+
+    [Fact]
+    public async Task Step160_Update_PreservesDetectedLanBind()
+    {
+        // AC5 regression: the update no longer silently resets a LAN-configured Ollama to
+        // loopback — the restart uses the DETECTED bind.
+        var (vm, h, _) = BuildEnvStep();
+        h.Detection = new OllamaDetection(true, LocalOllamaConfigurator.WindowsTrayAppPath, true);
+        h.PortMap[11435] = true;
+        h.LanAddresses = [IPAddress.Parse("192.168.1.10")];
+        h.LanProbeResult = true; // decisive probe → detected LAN
+        h.PortOpen = true; // the restart port-wait succeeds
+        await vm.RefreshAsync();
+        Assert.Equal(OllamaLanState.Lan, vm.OllamaLanState);
+        Assert.True(vm.UpdateOllamaCommand.CanExecute(null));
+
+        await vm.UpdateOllamaCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.Contains($"Ollama updated and serving on :{LocalOllamaConfigurator.OllamaPort}", vm.Message!);
+        Assert.False(vm.MessageIsError);
+        Assert.Contains(("OLLAMA_HOST", "0.0.0.0:11435", EnvironmentVariableTarget.User), h.EnvWrites);
+        var app = Assert.Single(h.Starts, s => s.FileName == LocalOllamaConfigurator.WindowsTrayAppPath);
+        Assert.Equal("0.0.0.0:11435", app.EnvironmentVariables["OLLAMA_HOST"]);
+    }
+
+    [Fact]
+    public async Task Step160_RouterRow_Running_CheckInRightCell_NoButton()
+    {
+        var (vm, _, _) = BuildEnvStep(launcher: new FakeDaemonLauncher { Status = FakeDaemonLauncher.RunningStatus() });
+        await vm.RefreshAsync();
+        Assert.Equal(Port11434Status.RouterRunning, vm.Port11434Status);
+        Assert.Equal("Router is running on :11434", vm.RouterStatusLabel); // no ✓ in the text
+        Assert.True(vm.ShowRouterRunningCheck); // the ✓ is the right cell
+        Assert.False(vm.ShowStartRouterButton); // …and the button is gone
+    }
+
+    [Fact]
+    public async Task Step160_RouterRow_ForeignService_RewordedLabel_EmptyRightCell()
+    {
+        var (vm, _, _) = BuildEnvStep(launcher: new FakeDaemonLauncher
+        {
+            Status = new RouterDaemonStatus(RouterDaemonState.PortOccupiedByOtherService, null, "occupied"),
+        });
+        await vm.RefreshAsync();
+        Assert.Equal(Port11434Status.ForeignService, vm.Port11434Status);
+        // Task #160 rewording (byte-pinned): the "Change port" row is now ABOVE.
+        Assert.Equal(
+            "Raw Ollama occupies :11434 — free it for the router with \"Change port\" above.",
+            vm.RouterStatusLabel);
+        Assert.DoesNotContain("below", vm.RouterStatusLabel);
+        Assert.False(vm.ShowRouterRunningCheck); // the right cell is EMPTY
+        Assert.False(vm.ShowStartRouterButton);
     }
 
     // ==================================================================
