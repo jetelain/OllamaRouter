@@ -31,6 +31,11 @@ public sealed partial class WizardCloudStepViewModel : ObservableObject, IWizard
     // and WizardBenchmarkStepViewModel do (task #130 addendum bug class). The gate wait is
     // deliberately NON-CANCELLABLE (the endpoint reads inside the gate are what get cancelled).
     private readonly SemaphoreSlim _refreshGate = new(1, 1);
+    // Task #163 (audit fix): the CloudModels rebuild is additionally marshaled to the UI
+    // thread via RunOnUiAsync INSIDE the gate (the FleetTargetsViewModel pattern) — the gate
+    // alone serializes the VM's OWN writers but cannot stop the UI thread's ComboBox/
+    // ItemsControl enumeration from racing a thread-pool rebuild (missed Clear()s
+    // accumulate duplicate items).
     // Set while a refresh/toggle applies REMOTE values to the dropdown/flags: suppresses the
     // selection-change persist (the binding re-seeds SelectedCloudModel after every refresh).
     private bool _applyingRemoteState;
@@ -171,11 +176,17 @@ public sealed partial class WizardCloudStepViewModel : ObservableObject, IWizard
                 }
             }
 
-            CloudModels.Clear();
-            foreach (var name in cloudModels)
+            // Task #163: marshal the Clear()/Add rebuild to the UI thread INSIDE the gate
+            // (the FleetTargetsViewModel pattern). The scalar assignments below STAY exactly
+            // where they are (byte-identical ordering with the _applyingRemoteState guard).
+            await RunOnUiAsync(() =>
             {
-                CloudModels.Add(name);
-            }
+                CloudModels.Clear();
+                foreach (var name in cloudModels)
+                {
+                    CloudModels.Add(name);
+                }
+            });
 
             _applyingRemoteState = true;
             try
@@ -209,6 +220,25 @@ public sealed partial class WizardCloudStepViewModel : ObservableObject, IWizard
         finally
         {
             _refreshGate.Release();
+        }
+    }
+
+    private static async Task RunOnUiAsync(Action action)
+    {
+        try
+        {
+            if (Avalonia.Application.Current is null || Avalonia.Threading.Dispatcher.UIThread.CheckAccess())
+            {
+                action();
+            }
+            else
+            {
+                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(action);
+            }
+        }
+        catch
+        {
+            action();
         }
     }
 

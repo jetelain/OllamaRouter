@@ -57,6 +57,10 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
     // step re-entry) both rebuild Rows via Clear()/Add; without serialization the overlapping
     // rebuilds interleave and DUPLICATE rows. Same pattern as
     // WizardBenchmarkStepViewModel._refreshGate / RouterTabViewModel._refreshGate.
+    // Task #163: on TOP of the gate, the Rows rebuild is marshaled to the UI thread via
+    // RunOnUiAsync (the gate alone serializes the VM's OWN writers but cannot stop the UI
+    // thread's ItemsControl from enumerating Rows while a thread-pool tick mutates it —
+    // missed Clear()s accumulate stale rows). Same pattern as FleetTargetsViewModel.
     private readonly SemaphoreSlim _refreshGate = new(1, 1);
     // Task #159 (D8): the daemon-reachability transition gate for the 2 s fleet poll
     // (null = not yet observed): the poll logs STATE CHANGES only — persistent identical
@@ -162,7 +166,10 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
     /// The poller tick / on-demand refresh (task #151): re-reads the fleet (live liveness +
     /// hardware) and rebuilds the rows — the Cloud pseudo-target is EXCLUDED. Single-writer
     /// (task #151 / the task #130 addendum): overlapping refreshes serialize on
-    /// <c>_refreshGate</c> so the row Clear()/Add rebuilds never interleave. The gate wait is
+    /// <c>_refreshGate</c> so the row Clear()/Add rebuilds never interleave; the rebuild
+    /// itself additionally runs on the UI thread inside the gate (task #163,
+    /// <c>RunOnUiAsync</c> — the UI's ItemsControl enumeration must never race the
+    /// thread-pool rebuild). The gate wait is
     /// deliberately NON-CANCELLABLE: a self-stopped tick's cancellation cancels the endpoint
     /// reads INSIDE the gate, not the serialization wait (a cancellable wait drops the first
     /// tick out before it ever runs). The router may be DOWN (the canonical first-run state
@@ -214,11 +221,17 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
                 });
             }
 
-            Rows.Clear();
-            foreach (var row in rows)
+            // Task #163: marshal the Clear()/Add rebuild to the UI thread INSIDE the gate
+            // (the FleetTargetsViewModel pattern) — the UI's ItemsControl enumeration must
+            // never race a thread-pool rebuild (missed Clear()s accumulate duplicate rows).
+            await RunOnUiAsync(() =>
             {
-                Rows.Add(row);
-            }
+                Rows.Clear();
+                foreach (var row in rows)
+                {
+                    Rows.Add(row);
+                }
+            });
 
             LogReachabilityTransition(true, null);
         }
@@ -255,6 +268,25 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
         var now = reachable ? "reachable" : $"unreachable ({reason ?? "no reason recorded"})";
         _logger.Information("Wizard step 2: fleet poll — daemon {Was} → {Now}", was, now);
         _daemonReachable = reachable;
+    }
+
+    private static async Task RunOnUiAsync(Action action)
+    {
+        try
+        {
+            if (Avalonia.Application.Current is null || Avalonia.Threading.Dispatcher.UIThread.CheckAccess())
+            {
+                action();
+            }
+            else
+            {
+                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(action);
+            }
+        }
+        catch
+        {
+            action();
+        }
     }
 
     /// <summary>

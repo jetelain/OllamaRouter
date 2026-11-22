@@ -2079,6 +2079,95 @@ public sealed class SetupWizardViewModelsTests
         await vm.DisposeAsync();
     }
 
+    private static RouterFleetResponse ThreeNodePlusCloudFleet() =>
+        new([
+            new RouterTargetItem("Local", "http://127.0.0.1:11435", true, "Online", 5, "local",
+                new RouterTargetHardware("nvidia", [], null, 1, null), new RouterTargetExecution(0, null, "none")),
+            new RouterTargetItem("Remote", "http://192.168.1.50:11435", true, "Online", 20, "remote",
+                new RouterTargetHardware("nvidia", [], null, 1, null), new RouterTargetExecution(0, null, "none")),
+            new RouterTargetItem("Remote2", "http://192.168.1.51:11435", true, "Offline", null, "remote",
+                new RouterTargetHardware("nvidia", [], null, 1, null), new RouterTargetExecution(0, null, "none")),
+            // The server ALWAYS appends the Cloud pseudo-target last — the view model must drop it.
+            new RouterTargetItem("Cloud", null, true, "Online", null, "cloud",
+                new RouterTargetHardware("nvidia", [], null, 1, null), new RouterTargetExecution(0, null, "none")),
+        ]);
+
+    /// <summary>
+    /// Task #163 (AC1 — the headline Step 2 dedup regression): a flood of ≥ 12 consecutive
+    /// tick-equivalent refreshes (the exact <c>RefreshCoreAsync</c> path the 2 s poller tick
+    /// runs), fired in overlapping command-side waves PLUS the post-add
+    /// <c>RefreshAsync</c> from <c>AddTargetCommand</c>, leaves <see cref="WizardTargetsStepViewModel.Rows"/>
+    /// REBUILT — never accumulated: exactly 3 rows, each target name exactly once, in fleet
+    /// order, Cloud excluded, at every settle point. (The row Clear()/Add rebuilds are
+    /// marshaled to the UI thread inside the single-writer gate — the FleetTargetsViewModel
+    /// pattern — so the UI's ItemsControl enumeration never races them.)
+    /// </summary>
+    [Fact]
+    public async Task Step2_TickFlood_AndCommandRefreshes_NeverDuplicateRows()
+    {
+        var fake = new FakeRouterApiClient { FleetResponse = ThreeNodePlusCloudFleet() };
+        var vm = BuildTargets(fake);
+
+        void AssertRebuilt() => Assert.Equal(["Local", "Remote", "Remote2"], vm.Rows.Select(r => r.Name));
+
+        await vm.OnStepEnteredAsync(); // auto-Local + the poller's first tick
+        await WaitUntilAsync(() => vm.Rows.Count == 3, "the poller's first tick to populate the rows");
+        AssertRebuilt();
+
+        // 12 tick-equivalent refreshes in overlapping waves of 3 (the command-side overlap
+        // of the live 2 s tick); the rows are REBUILT to the same 3 rows at every settle.
+        var wave = new List<Task>();
+        for (var i = 0; i < 12; i++)
+        {
+            wave.Add(vm.RefreshAsync(CancellationToken.None));
+            if (wave.Count == 3)
+            {
+                await Task.WhenAll(wave);
+                wave.Clear();
+                AssertRebuilt();
+            }
+        }
+        AssertRebuilt();
+
+        // The post-add refresh (the AddTargetCommand's finally-block RefreshAsync): still
+        // rebuilt, not accumulated — each name exactly once.
+        await vm.AddTargetCommand.ExecuteAsync(new AddTargetRequest("Extra", "http://extra:11435"));
+        AssertRebuilt();
+
+        await vm.OnStepLeftAsync();
+        await vm.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Task #163 (AC1 — the Step 2 re-entry arm): enter → (tick) → leave → enter → (tick)
+    /// → leave → enter → (tick) never accumulates: the fleet table is rebuilt by each
+    /// re-entry's poller tick and holds exactly the same 3 rows, no stale names, no doubles.
+    /// </summary>
+    [Fact]
+    public async Task Step2_Reentry_TicksRebuildRows_NeverAccumulate()
+    {
+        var fake = new FakeRouterApiClient { FleetResponse = ThreeNodePlusCloudFleet() };
+        var vm = BuildTargets(fake);
+
+        await vm.OnStepEnteredAsync(); // entry 1: Local absent → added; the first tick rebuilds
+        await WaitUntilAsync(() => vm.Rows.Count == 3, "the first entry's fleet tick");
+        await vm.OnStepLeftAsync();
+        await vm.OnStepEnteredAsync(); // re-entry 1 (fresh poller CTS — the tick must run again)
+        await WaitUntilAsync(
+            () => fake.Calls.Count(c => c == "GetFleetAsync") >= 2 && vm.Rows.Count == 3,
+            "the re-entry's fleet tick to rebuild the rows");
+        await vm.OnStepLeftAsync();
+        await vm.OnStepEnteredAsync(); // re-entry 2
+        await WaitUntilAsync(
+            () => fake.Calls.Count(c => c == "GetFleetAsync") >= 3 && vm.Rows.Count == 3,
+            "the second re-entry's fleet tick to rebuild the rows");
+
+        Assert.Equal(["Local", "Remote", "Remote2"], vm.Rows.Select(r => r.Name));
+        Assert.Equal(3, vm.Rows.Select(r => r.Name).Distinct().Count()); // rebuilt, not accumulated
+        await vm.OnStepLeftAsync();
+        await vm.DisposeAsync();
+    }
+
     /// <summary>
     /// Task #151: entering Step 2 with NO <c>Local</c> target in the config auto-adds it
     /// EXACTLY ONCE — <c>Local</c> @ <c>http://127.0.0.1:11435</c> with the server-side
@@ -2858,6 +2947,49 @@ public sealed class SetupWizardViewModelsTests
         await vm.DisposeAsync();
     }
 
+    /// <summary>
+    /// Task #163 (AC3 — the Step 3 audit arm): repeated <c>RefreshAsync</c> calls (the
+    /// entry + command-side post-toggle/post-add refresh shape; no poller), a
+    /// <c>ToggleCloudCommand</c> execution (its post-toggle refetch included) and a step
+    /// re-entry never accumulate in <see cref="WizardCloudStepViewModel.CloudModels"/> — each
+    /// catalog cloud model appears EXACTLY ONCE at every settle point (the Clear()/Add
+    /// rebuild is marshaled to the UI thread inside the single-writer gate — the
+    /// FleetTargetsViewModel pattern).
+    /// </summary>
+    [Fact]
+    public async Task Step3_Cloud_RefreshFlood_Toggle_AndReentry_CloudModelsNeverDuplicate()
+    {
+        var fake = new FakeRouterApiClient
+        {
+            ConfigResponse = DefaultConfig() with
+            {
+                Cloud = new RouterCloudConfigDto(true, "glm-5.3-flash:cloud", "Local", true),
+            },
+            ModelsResponse = new RouterModelsResponse([
+                Model("llama3:8b"), Model("glm-5.3-flash:cloud"),
+                Model("deepseek-v3.1:671b-cloud"), Model("qwen2.5:7b"),
+            ]),
+        };
+        var vm = new WizardCloudStepViewModel(() => fake);
+
+        await vm.OnStepEnteredAsync();
+        // 8 consecutive command-side refreshes — the dropdown is REBUILT, never accumulated.
+        for (var i = 0; i < 8; i++)
+        {
+            await vm.RefreshAsync();
+            Assert.Equal(["glm-5.3-flash:cloud", "deepseek-v3.1:671b-cloud"], vm.CloudModels);
+        }
+
+        // A toggle (with its post-toggle catalog refetch) — still exactly once each.
+        await vm.ToggleCloudCommand.ExecuteAsync(CancellationToken.None);
+        Assert.Equal(["glm-5.3-flash:cloud", "deepseek-v3.1:671b-cloud"], vm.CloudModels);
+
+        // A re-entry (OnStepEnteredAsync = RefreshAsync) — still exactly once each.
+        await vm.OnStepEnteredAsync();
+        Assert.Equal(["glm-5.3-flash:cloud", "deepseek-v3.1:671b-cloud"], vm.CloudModels);
+        await vm.DisposeAsync();
+    }
+
     // ==================================================================
     //  Step 4 — WizardBenchmarkStepViewModel (renumbered by task #151)
     // ==================================================================
@@ -3248,6 +3380,134 @@ public sealed class SetupWizardViewModelsTests
         await vm.DisposeAsync();
     }
 
+    private static RouterBenchmarkCandidatesResponse ThreeTargetCandidatePlan() =>
+        new([
+            new RouterBenchmarkCandidateTarget("Local", null,
+                [CandidateModel("model-a", BenchmarkCandidateFit.Fits),
+                 CandidateModel("model-b", BenchmarkCandidateFit.Fits)]),
+            new RouterBenchmarkCandidateTarget("Remote", null,
+                [CandidateModel("model-a", BenchmarkCandidateFit.Fits),
+                 CandidateModel("model-b", BenchmarkCandidateFit.Assumed)]),
+            new RouterBenchmarkCandidateTarget("Remote2", null,
+                [CandidateModel("model-b", BenchmarkCandidateFit.Assumed)]),
+        ]);
+
+    private static RouterBenchmarkResultsResponse ThreeTargetResults()
+    {
+        var now = DateTimeOffset.UtcNow;
+        return new RouterBenchmarkResultsResponse([
+            new BenchmarkTargetResult("Local", BenchmarkRunStatus.Running, now, null, [
+                Ctx("model-a", UsageRole.BasicModel, 8192, 25.0, true),
+                Ctx("model-a", UsageRole.BasicModel, 32768, 15.0, false, "below-threshold"),
+            ]),
+            new BenchmarkTargetResult("Remote", BenchmarkRunStatus.Succeeded, now, now, [
+                Ctx("model-b", UsageRole.AgenticChat, 4096, 30.0, true),
+            ]),
+            new BenchmarkTargetResult("Remote2", BenchmarkRunStatus.Running, now, null, [
+                Ctx("model-b", UsageRole.AgenticChat, 4096, 40.0, true),
+            ]),
+        ]);
+    }
+
+    /// <summary>
+    /// Task #163 (AC2 — the headline Step 4 dedup regression): with a 3-target candidate plan
+    /// (each with ≥ 1 candidate model) and benchmark results for all 3 targets, ≥ 10
+    /// consecutive poller ticks (the non-terminal rows keep the poller alive; nothing is
+    /// queued → no self-stop) plus one command-side <c>ClearResultsCommand</c> interleave
+    /// leave <see cref="WizardBenchmarkStepViewModel.CandidateGroups"/> with exactly ONE group
+    /// per target (each model once per group) and <see cref="WizardBenchmarkStepViewModel.BenchmarkRows"/> /
+    /// <see cref="WizardBenchmarkStepViewModel.ResultRows"/> with exactly ONE row per target / per
+    /// (target × model × context) — no duplicates at any settle point (the rebuilds are
+    /// marshaled to the UI thread inside the single-writer gate — the FleetTargetsViewModel
+    /// pattern).
+    /// </summary>
+    [Fact]
+    public async Task Step4_TickFlood_CandidateGroupsAndResultRows_NeverDuplicate()
+    {
+        var mock = MockClient();
+        mock.Setup(c => c.GetBenchmarkCandidatesAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(ThreeTargetCandidatePlan());
+        mock.Setup(c => c.GetBenchmarkResultsAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(ThreeTargetResults());
+
+        int ticks = 0;
+        WizardBenchmarkStepViewModel vm = null!;
+        // The counter increments AFTER the tick's RefreshAsync completes, so a green
+        // "ticks >= N" means the collection mutations are done (no read-during-mutation race).
+        vm = BuildBenchmark(mock, async ct =>
+        {
+            await vm.RefreshAsync(ct);
+            Interlocked.Increment(ref ticks);
+        }, SoftDelay);
+
+        await vm.OnStepEnteredAsync();
+        // ≥ 10 consecutive poller ticks (soft rate; nothing queued → no self-stop).
+        await WaitUntilAsync(() => Volatile.Read(ref ticks) >= 10, "10 consecutive poller ticks");
+
+        // AC2 invariants: exactly ONE group per target (each model once per group) and exactly
+        // ONE row per target / per (target × model × context). A tick may still be MID-
+        // REBUILD when the test thread observes the collections (a rebuild is a
+        // Clear()+Add loop), so the invariants are RETRIED via WaitUntilAsync — a genuine
+        // duplicate would keep them false and the FINAL assert stays unguarded.
+        bool Ac2Holds() => vm.CandidateGroups.Count == 3
+            && vm.CandidateGroups.Select(g => g.Target).SequenceEqual(["Local", "Remote", "Remote2"])
+            && vm.CandidateGroups.All(g => g.Models.Select(m => m.Model).Distinct().Count() == g.Models.Count)
+            && vm.BenchmarkRows.Count == 3
+            && vm.BenchmarkRows.Select(r => r.Target).Distinct().Count() == 3
+            && vm.ResultRows.Count == 4
+            && vm.ResultRows.Select(r => (r.Target, r.Model, r.NumCtx)).Distinct().Count() == 4;
+        await WaitUntilAsync(Ac2Holds, "the AC2 dedup invariants to hold across 10+ ticks");
+        Assert.True(Ac2Holds(), "AC2: groups/rows must hold exactly once per key after 10+ ticks");
+
+        // The command-side ClearResults interleave (the tick's rebuilds must never interleave
+        // with its Clear()s — single-writer gate + UI marshaling).
+        await vm.ClearResultsCommand.ExecuteAsync(CancellationToken.None);
+        await WaitUntilAsync(() => Volatile.Read(ref ticks) >= 12, "two more poller ticks after the clear");
+        await vm.OnStepLeftAsync(); // awaited → the loop fully exits
+
+        // Settle: the cleared rows are REBUILT by the ticks — again exactly once per key
+        // (a final in-flight rebuild may still be landing → retried).
+        await WaitUntilAsync(Ac2Holds, "the AC2 dedup invariants to hold after the clear interleave");
+        Assert.True(Ac2Holds(), "AC2: groups/rows must hold exactly once per key after the clear interleave");
+        await vm.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Task #163 (AC2 — the Step 4 re-entry arm): enter → leave → enter re-fetches the
+    /// candidate plan EXACTLY ONCE per entry (task #152 D7) and re-defaults EVERY checkbox to
+    /// selected — the 3 groups are rebuilt, never accumulated (no duplicates, no stale
+    /// unchecked state from the previous run scope).
+    /// </summary>
+    [Fact]
+    public async Task Step4_Reentry_CandidatePlanReloadedOnce_CheckboxesReDefaulted()
+    {
+        var mock = MockClient();
+        mock.Setup(c => c.GetBenchmarkCandidatesAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(ThreeTargetCandidatePlan());
+        WizardBenchmarkStepViewModel vm = null!;
+        vm = BuildBenchmark(mock, ct => vm.RefreshAsync(ct), GatedDelay);
+
+        await vm.OnStepEnteredAsync();
+        await WaitUntilAsync(() => vm.CandidateGroups.Count == 3, "all three candidate groups (first entry)");
+        var fetchesAfterEntry1 = mock.Invocations.Count(i => i.Method.Name == nameof(IOllamaRouterApiClient.GetBenchmarkCandidatesAsync));
+        Assert.Equal(1, fetchesAfterEntry1); // D7: the plan loaded ONCE on the entry's first tick
+
+        vm.CandidateGroups[0].Models[0].IsSelected = false; // a user opt-out, discarded on re-entry
+        await vm.OnStepLeftAsync();
+        await vm.OnStepEnteredAsync(); // fresh entry = fresh run scope (D7)
+
+        await WaitUntilAsync(
+            () => mock.Invocations.Count(i => i.Method.Name == nameof(IOllamaRouterApiClient.GetBenchmarkCandidatesAsync)) == fetchesAfterEntry1 + 1
+                && vm.CandidateGroups.Count == 3
+                && vm.CandidateGroups.All(g => g.Models.All(m => m.IsSelected)),
+            "the re-entry's single candidate re-fetch to re-default every checkbox to selected");
+
+        Assert.Equal(["Local", "Remote", "Remote2"], vm.CandidateGroups.Select(g => g.Target));
+        Assert.Equal(3, vm.CandidateGroups.Select(g => g.Target).Distinct().Count());
+        await vm.OnStepLeftAsync();
+        await vm.DisposeAsync();
+    }
+
     // ==================================================================
     //  Step 5 — WizardRecommendationsStepViewModel (renumbered by task #151)
     // ==================================================================
@@ -3339,6 +3599,49 @@ public sealed class SetupWizardViewModelsTests
         await vm.RefreshAsync(); // must not throw
         Assert.Contains("Connection failed", vm.Message);
         Assert.Empty(vm.RoleRows);
+        await vm.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Task #163 (AC3 — the Step 5 audit arm): repeated <c>RefreshAsync</c> calls (the entry
+    /// + command-side refresh shape; no poller, no gate — each rebuild is one atomic
+    /// UI-marshaled action), <c>GenerateCommand</c> and TWO <c>ApplyCommand</c> executions
+    /// never accumulate: <see cref="WizardRecommendationsStepViewModel.RoleRows"/> holds the 5
+    /// stable alias rows exactly once, <see cref="WizardRecommendationsStepViewModel.ModelRows"/>
+    /// each model exactly once and <see cref="WizardRecommendationsStepViewModel.AppliedTargets"/>
+    /// each target exactly once — at every settle point.
+    /// </summary>
+    [Fact]
+    public async Task Step5_RefreshGenerateApply_CollectionsNeverDuplicate()
+    {
+        var fake = new FakeRouterApiClient(); // default: empty matrix; default generate/apply responses
+        var vm = new WizardRecommendationsStepViewModel(() => fake);
+
+        await vm.OnStepEnteredAsync();
+        // 8 consecutive command-side refreshes against the (empty) matrix — the 5 stable
+        // alias rows are REBUILT, never accumulated.
+        for (var i = 0; i < 8; i++)
+        {
+            await vm.RefreshAsync();
+            Assert.Equal(5, vm.RoleRows.Count);
+            Assert.Equal(["basic", "agentic_chat", "software_architect", "senior_developer", "junior_developer"],
+                vm.RoleRows.Select(r => r.Role));
+            Assert.Empty(vm.ModelRows);
+        }
+
+        // Generate (fake default: the "basic" role on Local + the llama3:8b model index).
+        await vm.GenerateCommand.ExecuteAsync(CancellationToken.None);
+        Assert.Equal(5, vm.RoleRows.Count);
+        Assert.Equal(5, vm.RoleRows.Select(r => r.Role).Distinct().Count());
+        var models = vm.ModelRows.Select(m => m.Model).ToList();
+        Assert.Equal(models.Count, models.Distinct().Count()); // each model exactly once
+        Assert.Single(vm.ModelRows, m => m.Model == "llama3:8b");
+
+        // Two applies: the AppliedTargets rebuild REPLACES, never accumulates.
+        await vm.ApplyCommand.ExecuteAsync(CancellationToken.None);
+        await vm.ApplyCommand.ExecuteAsync(CancellationToken.None);
+        Assert.Single(vm.AppliedTargets);
+        Assert.Equal("Local", Assert.Single(vm.AppliedTargets).Target);
         await vm.DisposeAsync();
     }
 

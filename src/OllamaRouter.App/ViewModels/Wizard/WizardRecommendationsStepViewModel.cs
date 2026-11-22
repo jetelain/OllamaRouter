@@ -61,6 +61,9 @@ public sealed class RecommendationModelRow
 /// Step 5 — Role Recommendations (task #103, spec §3.5; renumbered by task #151): the live matrix read, the generate
 /// (<c>POST .../generate</c>, 409 ⇒ "benchmark first" hint) and the idempotent apply
 /// (<c>POST .../apply</c>) — all through the shared client SDK.
+/// Task #163 (audit fix): every UI-bound collection rebuild additionally runs on the UI
+/// thread via <c>RunOnUiAsync</c> (the FleetTargetsViewModel pattern). No <c>_refreshGate</c>
+/// is added here: there is no poller, and each rebuild is ONE atomic UI-marshaled action.
 /// </summary>
 public sealed partial class WizardRecommendationsStepViewModel : ObservableObject, IWizardStep
 {
@@ -142,7 +145,8 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
         try
         {
             var matrix = await _clientAccessor().GetRecommendationsAsync(ct).ConfigureAwait(false);
-            LoadMatrix(matrix);
+            // Task #163: the rebuild runs on the UI thread (the FleetTargetsViewModel pattern).
+            await RunOnUiAsync(() => LoadMatrix(matrix));
         }
         catch (OllamaRouterApiException ex)
         {
@@ -166,7 +170,8 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
             RolesAssigned = response.Recommendations.Roles.Count;
             NodesConfigured = response.Targets.Count;
             TotalContextCeilings = response.Recommendations.Roles.Values.Sum(r => r.Nodes.Count);
-            LoadMatrix(response.Recommendations);
+            // Task #163: the rebuild runs on the UI thread (the FleetTargetsViewModel pattern).
+            await RunOnUiAsync(() => LoadMatrix(response.Recommendations));
             _logger.Information(
                 "Wizard step 5: recommendations generated ({Roles} role(s), {Nodes} node(s))",
                 RolesAssigned, NodesConfigured);
@@ -205,11 +210,19 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
         {
             var response = await _clientAccessor().ApplyRecommendationsAsync().ConfigureAwait(false);
             GeneratedAt = response.GeneratedAt;
-            AppliedTargets.Clear();
-            foreach (var target in response.Targets)
+            var applied = response.Targets;
+            // Task #163: marshal the Clear()/Add rebuild to the UI thread (the FleetTargetsViewModel pattern).
+            await RunOnUiAsync(() =>
             {
-                AppliedTargets.Add(target);
-            }
+                AppliedTargets.Clear();
+                if (applied is not null)
+                {
+                    foreach (var target in applied)
+                    {
+                        AppliedTargets.Add(target);
+                    }
+                }
+            });
 
             Message = response.Targets is null || response.Targets.Count == 0
                 ? "Applied (no per-target ceilings)."
@@ -311,6 +324,25 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
     {
         GenerateCommand.NotifyCanExecuteChanged();
         ApplyCommand.NotifyCanExecuteChanged();
+    }
+
+    private static async Task RunOnUiAsync(Action action)
+    {
+        try
+        {
+            if (Avalonia.Application.Current is null || Avalonia.Threading.Dispatcher.UIThread.CheckAccess())
+            {
+                action();
+            }
+            else
+            {
+                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(action);
+            }
+        }
+        catch
+        {
+            action();
+        }
     }
 
     /// <inheritdoc />

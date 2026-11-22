@@ -136,6 +136,10 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
     // Clear()/Add; without serialization they interleave ("Collection was modified") — the
     // same bug class as the Install Model wizard row duplication. Same pattern as
     // RouterTabViewModel._refreshGate.
+    // Task #163: on TOP of the gate, EVERY rebuild additionally runs on the UI thread via
+    // RunOnUiAsync INSIDE the gate (the FleetTargetsViewModel pattern) — the gate alone
+    // cannot stop the UI thread's ItemsControl from enumerating while a thread-pool tick
+    // mutates it (missed Clear()s accumulate duplicate rows).
     private readonly SemaphoreSlim _refreshGate = new(1, 1);
     private List<string> _queuedTargets = [];
     // Task #152 (D7): the candidate plan is fetched ONCE per step entry (the first tick of
@@ -301,12 +305,16 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
             _queuedTargets = [];
 
             // Serialize the row mutations with RefreshAsync (task #130 addendum): the poller
-            // tick may be mid-rebuild on another thread.
+            // tick may be mid-rebuild on another thread. Task #163: marshal the Clear()s to
+            // the UI thread INSIDE the gate (the FleetTargetsViewModel pattern).
             await _refreshGate.WaitAsync().ConfigureAwait(false);
             try
             {
-                BenchmarkRows.Clear();
-                ResultRows.Clear();
+                await RunOnUiAsync(() =>
+                {
+                    BenchmarkRows.Clear();
+                    ResultRows.Clear();
+                });
             }
             finally
             {
@@ -353,10 +361,11 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
     /// first success, never re-fetched while the user stays on the step) + the benchmark
     /// results refresh, then self-stops the poller when every queued target is terminal.
     /// Single-writer (task #130 addendum): overlapping refreshes (poller tick + command side)
-    /// serialize on <c>_refreshGate</c> so the row Clear()/Add rebuilds never interleave. The
-    /// gate wait is deliberately NON-CANCELLABLE: a self-stopped tick's cancellation cancels
-    /// the endpoint reads INSIDE the gate, not the serialization wait (a cancellable wait
-    /// drops the first tick out before it ever runs).
+    /// serialize on <c>_refreshGate</c> so the row Clear()/Add rebuilds never interleave;
+    /// the rebuilds additionally run on the UI thread inside the gate (task #163,
+    /// <c>RunOnUiAsync</c>). The gate wait is deliberately NON-CANCELLABLE: a self-stopped
+    /// tick's cancellation cancels the endpoint reads INSIDE the gate, not the serialization
+    /// wait (a cancellable wait drops the first tick out before it ever runs).
     /// </summary>
     public async Task RefreshAsync(CancellationToken ct = default)
     {
@@ -387,7 +396,7 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
         try
         {
             var results = await client.GetBenchmarkResultsAsync(ct).ConfigureAwait(false);
-            LoadResults(results);
+            await LoadResultsAsync(results).ConfigureAwait(false);
             Error = null;
             LogReachabilityTransition(true, null);
             await MaybeSelfStopAsync().ConfigureAwait(false);
@@ -442,7 +451,8 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
     /// <c>GET /api/router/benchmark/candidates</c>, rebuilds <see cref="CandidateGroups"/>
     /// (every checkbox default selected) and flips <c>_candidatesLoaded</c> ONLY on success —
     /// a failure sets <see cref="Error"/> and leaves the flag false so the next tick retries.
-    /// MUST run under <c>_refreshGate</c> (single writer, task #130 addendum). Returns false
+    /// MUST run under <c>_refreshGate</c> (single writer, task #130 addendum; the group
+    /// rebuild additionally runs on the UI thread via RunOnUiAsync, task #163). Returns false
     /// on failure.
     /// </summary>
     private async Task<bool> LoadCandidatesAsync(CancellationToken ct)
@@ -450,7 +460,7 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
         try
         {
             var candidates = await _clientAccessor().GetBenchmarkCandidatesAsync(ct).ConfigureAwait(false);
-            LoadCandidates(candidates);
+            await ApplyCandidatePlanAsync(candidates).ConfigureAwait(false);
             _candidatesLoaded = true;
             return true;
         }
@@ -466,7 +476,11 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
         }
     }
 
-    private void LoadCandidates(RouterBenchmarkCandidatesResponse candidates)
+    /// <summary>The candidate-plan application (under <c>_refreshGate</c> — single writer):
+    /// builds the replacement groups on the calling thread, then marshals the
+    /// <see cref="CandidateGroups"/> Clear()/Add rebuild (plus the Run CanExecute refresh) to
+    /// the UI thread (task #163 — the FleetTargetsViewModel pattern).</summary>
+    private async Task ApplyCandidatePlanAsync(RouterBenchmarkCandidatesResponse candidates)
     {
         var groups = new List<BenchmarkCandidateGroupRow>();
         foreach (var target in candidates.Targets)
@@ -503,13 +517,17 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
             });
         }
 
-        // Single-writer rebuild (task #130 addendum): Clear()/Add under the gate.
-        CandidateGroups.Clear();
-        foreach (var group in groups)
+        // Single-writer rebuild (task #130 addendum): Clear()/Add under the gate; task #163:
+        // additionally on the UI thread, so the UI's ItemsControl enumeration never races it.
+        await RunOnUiAsync(() =>
         {
-            CandidateGroups.Add(group);
-        }
-        NotifyRunCanExecute();
+            CandidateGroups.Clear();
+            foreach (var group in groups)
+            {
+                CandidateGroups.Add(group);
+            }
+            NotifyRunCanExecute();
+        });
     }
 
     private static string FitTextOf(BenchmarkCandidateFit fit, int maxFitsContext) => fit switch
@@ -521,13 +539,17 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
 
     private void NotifyRunCanExecute() => RunBenchmarksCommand.NotifyCanExecuteChanged();
 
-    private void LoadResults(RouterBenchmarkResultsResponse results)
+    /// <summary>Builds the benchmark/result rows on the calling thread, then marshles one
+    /// UI-thread action that rebuilds BOTH <see cref="BenchmarkRows"/> and
+    /// <see cref="ResultRows"/> (task #163 — under <c>_refreshGate</c>, the
+    /// FleetTargetsViewModel pattern).</summary>
+    private async Task LoadResultsAsync(RouterBenchmarkResultsResponse results)
     {
-        BenchmarkRows.Clear();
-        ResultRows.Clear();
+        var benchmarkRows = new List<BenchmarkRow>(results.Targets.Count);
+        var resultRows = new List<BenchmarkResultRow>();
         foreach (var target in results.Targets)
         {
-            BenchmarkRows.Add(new BenchmarkRow
+            benchmarkRows.Add(new BenchmarkRow
             {
                 Target = target.Target,
                 Status = target.Status,
@@ -537,7 +559,7 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
 
             foreach (var result in target.Results)
             {
-                ResultRows.Add(new BenchmarkResultRow
+                resultRows.Add(new BenchmarkResultRow
                 {
                     Target = target.Target,
                     Model = result.Model,
@@ -549,6 +571,23 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
                 });
             }
         }
+
+        // Task #163: one UI-thread rebuild action per collection (never interleave with the
+        // UI's enumeration).
+        await RunOnUiAsync(() =>
+        {
+            BenchmarkRows.Clear();
+            foreach (var row in benchmarkRows)
+            {
+                BenchmarkRows.Add(row);
+            }
+
+            ResultRows.Clear();
+            foreach (var row in resultRows)
+            {
+                ResultRows.Add(row);
+            }
+        });
     }
 
     /// <summary>
@@ -588,6 +627,25 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
     {
         RunBenchmarksCommand.NotifyCanExecuteChanged();
         ClearResultsCommand.NotifyCanExecuteChanged();
+    }
+
+    private static async Task RunOnUiAsync(Action action)
+    {
+        try
+        {
+            if (Avalonia.Application.Current is null || Avalonia.Threading.Dispatcher.UIThread.CheckAccess())
+            {
+                action();
+            }
+            else
+            {
+                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(action);
+            }
+        }
+        catch
+        {
+            action();
+        }
     }
 
     /// <inheritdoc />
