@@ -45,10 +45,25 @@ internal interface IProcessRunner
 }
 
 /// <inheritdoc cref="IProcessRunner" />
+/// <remarks>
+/// After the child process exits (or is killed on the run-timeout path), the background
+/// stdout/stderr/stdin worker tasks are awaited up to a 30 s safety window
+/// (<see cref="DrainAfterExitSafetyTimeoutMs"/>). Once the child has exited and the pipes
+/// have reached EOF, draining is guaranteed to terminate, so the window only guards
+/// against pathological thread starvation — it is never a functional timeout. If it does
+/// elapse, <see cref="Run"/> proceeds with whatever output was captured so far.
+/// </remarks>
 internal sealed class ProcessRunner : IProcessRunner
 {
     private const int ReadBufferChars = 4096;
-    private const int DrainAfterExitTimeoutMs = 2_000;
+
+    /// <summary>
+    /// Safety cap for the post-exit/post-kill wait on the background drain tasks.
+    /// After the child exits or is killed the pipes are guaranteed to hit EOF, so a
+    /// complete drain is bounded by the amount of buffered data; the 30 s cap exists
+    /// purely so a stuck drain can never hang <see cref="Run"/> indefinitely.
+    /// </summary>
+    private const int DrainAfterExitSafetyTimeoutMs = 30_000;
 
     /// <inheritdoc />
     public ProcessResult Run(string fileName, string arguments, int timeoutMs) =>
@@ -130,7 +145,7 @@ internal sealed class ProcessRunner : IProcessRunner
         }
         finally
         {
-            WaitQuietly(stdOutTask, stdErrTask, stdInTask, DrainAfterExitTimeoutMs);
+            WaitQuietly(stdOutTask, stdErrTask, stdInTask, DrainAfterExitSafetyTimeoutMs);
             process.Dispose();
         }
 
@@ -149,12 +164,20 @@ internal sealed class ProcessRunner : IProcessRunner
         return new ProcessResult(exitCode, stdOut, stdErr, timedOut);
     }
 
-    private static Task StartBackgroundTask(Func<Task> action) =>
-        Task.Factory.StartNew(
+    private static Task StartBackgroundTask(Func<Task> action)
+    {
+        // .Unwrap(): StartNew(Func<Task>, ...) yields a Task<Task> whose OUTER task completes
+        // as soon as the drain reaches its first await — awaiting it (via WaitQuietly) would
+        // return almost immediately while the actual drain is still in flight, so the
+        // post-exit output snapshot could be taken mid-drain (truncated captures at chunk
+        // boundaries). Unwrapping makes the returned task complete when the drain does.
+        return Task.Factory.StartNew(
             action,
             CancellationToken.None,
             TaskCreationOptions.LongRunning | TaskCreationOptions.DenyChildAttach,
-            TaskScheduler.Default);
+            TaskScheduler.Default)
+            .Unwrap();
+    }
 
     private static async Task DrainStream(StreamReader reader, StringBuilder destination, object gate)
     {

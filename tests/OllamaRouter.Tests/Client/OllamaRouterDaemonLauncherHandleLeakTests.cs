@@ -21,6 +21,7 @@ namespace OllamaRouter.Tests.Client;
 /// and is intentionally NOT deleted by the cleanup (a developer may use the build dir as home).
 /// </para>
 /// </summary>
+[Collection("ProcessSpawning")]
 public sealed class OllamaRouterDaemonLauncherHandleLeakTests
 {
     private static readonly string ExeSuffix = OperatingSystem.IsWindows() ? ".exe" : string.Empty;

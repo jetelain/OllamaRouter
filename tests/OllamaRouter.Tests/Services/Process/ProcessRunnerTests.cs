@@ -1,5 +1,9 @@
+using System.Reflection;
 using System.Text;
 using OllamaRouter.Services.Process;
+using OllamaRouter.Tests.Client;
+using OllamaRouter.Tests.Services.Hardware;
+using OllamaRouter.Tests.TestHelpers;
 
 namespace OllamaRouter.Tests.Services.Process;
 
@@ -8,6 +12,11 @@ namespace OllamaRouter.Tests.Services.Process;
 /// pipe draining on payloads larger than OS anonymous pipe buffers (4 KB on Windows, 64 KB on Linux/macOS),
 /// timeout cleanup with partial output preservation, non-zero exit codes, and launch failures.
 /// </summary>
+/// <remarks>
+/// This class spawns real OS processes, so it participates in the serial "ProcessSpawning"
+/// collection (task #162) to avoid CPU contention with the rest of the parallel suite.
+/// </remarks>
+[Collection("ProcessSpawning")]
 public class ProcessRunnerTests
 {
     private static readonly UTF8Encoding Utf8NoBom = new(encoderShouldEmitUTF8Identifier: false);
@@ -122,6 +131,82 @@ public class ProcessRunnerTests
         {
             DeleteQuietly(tempFile);
         }
+    }
+
+    /// <summary>
+    /// Deterministic drain-window regression gate (task #162). The historical 2 s post-exit
+    /// drain cap flaked when, at child exit, a large remainder still needed draining under
+    /// full-suite load. The only way to make post-exit draining take deterministically more
+    /// than 2 s is to have a <b>backgrounded descendant hold the stdout pipe open while the
+    /// direct child has already exited</b>: the drain then legitimately blocks in
+    /// <c>ReadAsync</c> (no data, no EOF) until the descendant flushes its tail and exits.
+    /// The shell therefore writes the payload head, backgrounds <c>sleep 4; cat tail</c>, and
+    /// exits immediately — so the post-exit drain takes ≈ 4 s. With the old 2 s cap the
+    /// snapshot at the <c>WaitAll</c> timeout contains at most the head and
+    /// <c>Assert.Equal(payload, ...)</c> fails deterministically; with the 30 s safety window
+    /// the drain completes when the tail is flushed (≥ 26 s margin).
+    /// </summary>
+    [Fact]
+    public void Run_ChildExitsButDescendantHoldsPipe_DrainsFullPayloadAfterExitWithinSafetyWindow()
+    {
+        var payload = BuildAsciiPayload("holdpipe-line", 256 * 1024);
+        var splitAt = payload.IndexOf('\n', 120 * 1024);
+        var head = payload[..(splitAt + 1)];
+        var tail = payload[(splitAt + 1)..];
+        var headFile = CreateTempFile(head);
+        var tailFile = CreateTempFile(tail);
+        try
+        {
+            var (fileName, arguments) = BuildShellCommand(
+                windowsCommand: $"type \"{headFile}\" & start /b cmd /c \"ping -n 5 127.0.0.1 >nul & type \"{tailFile}\"\"",
+                unixCommand: $"cat '{headFile}'; (sleep 4; cat '{tailFile}') &");
+
+            var runner = new ProcessRunner();
+            var result = runner.Run(fileName, arguments, timeoutMs: OperatingSystem.IsWindows() ? 15_000 : 10_000);
+
+            Assert.True(result.Succeeded, $"Expected success, timedOut={result.TimedOut}, exit={result.ExitCode}, err={result.StdErr}");
+            Assert.False(result.TimedOut);
+            Assert.Equal(0, result.ExitCode);
+            Assert.Equal(payload, result.StdOut);
+            Assert.Equal(string.Empty, result.StdErr);
+        }
+        finally
+        {
+            DeleteQuietly(headFile);
+            DeleteQuietly(tailFile);
+        }
+    }
+
+    /// <summary>
+    /// Layout guard (task #162): the "ProcessSpawning" collection must be defined with
+    /// parallelization disabled, and the real-process-spawning test classes must participate.
+    /// The collection name is read from the attribute's constructor argument
+    /// (<see cref="CustomAttributeData.ConstructorArguments"/>) so the guard does not depend
+    /// on a version-specific property name on xunit's collection attributes.
+    /// </summary>
+    [Fact]
+    public void ProcessSpawning_CollectionIsDefinedAndProcessRunnerTestsParticipates()
+    {
+        AssertParticipatesInProcessSpawningCollection(typeof(ProcessRunnerTests));
+        AssertParticipatesInProcessSpawningCollection(typeof(OllamaRouterDaemonLauncherHandleLeakTests));
+        AssertParticipatesInProcessSpawningCollection(typeof(HardwareProfileTests));
+
+        var definitionData = typeof(ProcessSpawningCollection).GetCustomAttributesData()
+            .FirstOrDefault(a => a.AttributeType == typeof(CollectionDefinitionAttribute));
+        Assert.NotNull(definitionData);
+        Assert.Equal("ProcessSpawning", (string?)definitionData!.ConstructorArguments[0].Value);
+
+        var definition = typeof(ProcessSpawningCollection).GetCustomAttribute<CollectionDefinitionAttribute>();
+        Assert.NotNull(definition);
+        Assert.True(definition.DisableParallelization);
+    }
+
+    private static void AssertParticipatesInProcessSpawningCollection(Type testClass)
+    {
+        var collectionData = testClass.GetCustomAttributesData()
+            .FirstOrDefault(a => a.AttributeType == typeof(CollectionAttribute));
+        Assert.NotNull(collectionData);
+        Assert.Equal("ProcessSpawning", (string?)collectionData!.ConstructorArguments[0].Value);
     }
 
     [Fact]

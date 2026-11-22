@@ -8,6 +8,7 @@ using OllamaRouter.Services.Process;
 
 namespace OllamaRouter.Tests.Services.Hardware;
 
+[Collection("ProcessSpawning")]
 public class HardwareProfileTests
 {
     // ------------------------------------------------------------------
