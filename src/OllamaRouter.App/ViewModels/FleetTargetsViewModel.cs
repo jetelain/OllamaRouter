@@ -169,14 +169,19 @@ public sealed partial class FleetTargetRow : ObservableObject
             : FleetTargetDisplay.BuildOsLine(HardwareProfile.Os, HardwareProfile.Architecture);
 
     /// <summary>The merged RAM/VRAM/bandwidth line of the hardware summary (task #153
-    /// decision 3; null when the profile is unknown or every segment is 0).</summary>
+    /// decision 3; unified-memory correction task #164: unified profiles render
+    /// <c>RAM: {…} (unified)</c> with no VRAM segment; null when the profile is unknown or
+    /// every segment is 0). The unified flag comes from the profile itself — the
+    /// profile-anchored source of truth for the hardware section (NOT the row-level
+    /// <see cref="IsUnifiedMemory"/>, which is a fleet-endpoint projection).</summary>
     public string? HardwareMemoryLine =>
-        HardwareProfile is null
-            ? null
-            : FleetTargetDisplay.BuildMemoryLine(
-                HardwareProfile.SystemRamMB,
-                HardwareProfile.TotalFastMemoryMB,
-                HardwareProfile.EffectiveBandwidthGBs);
+        HardwareProfile is { } profile
+            ? FleetTargetDisplay.BuildMemoryLine(
+                profile.SystemRamMB,
+                profile.TotalFastMemoryMB,
+                profile.EffectiveBandwidthGBs,
+                profile.IsUnifiedMemory)
+            : null;
 
     /// <summary>The single-line GPU summary of the hardware section (task #153 decision 3;
     /// null when the profile is unknown or has no GPUs; unknown sub-values hidden per GPU).</summary>

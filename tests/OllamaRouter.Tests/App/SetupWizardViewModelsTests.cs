@@ -3073,6 +3073,16 @@ public sealed class SetupWizardViewModelsTests
                      new RouterBenchmarkCandidateModel(
                          "qwen3.8:27b", [UsageRole.AgenticChat], "q4", "Dense",
                          27_800_000_000, null, 131_072, BenchmarkCandidateFit.Pruned, 0)]),
+                // Task #164: the verbatim 2026-11-22 Strix Halo unified profile (93379 MB
+                // LPDDR5X, 341.2 GB/s, iGPU 512 MB) — the header must show the fast memory
+                // the sizing computation uses, NOT the 512 MB iGPU VRAM.
+                new RouterBenchmarkCandidateTarget(
+                    "Unified",
+                    new NodeHardwareProfile(
+                        "unified", "linux", "x64", true, 93_379, SystemRamType.LpDdr5X,
+                        [new GpuDeviceProfile("AMD", "Strix Halo", 512, "Unknown", 0, 341.2)],
+                        93_379, 341.2),
+                    [CandidateModel("llama3:8b", BenchmarkCandidateFit.Fits)]),
                 new RouterBenchmarkCandidateTarget("Remote", null,
                     [new RouterBenchmarkCandidateModel(
                         "qwen3.8:27b", [UsageRole.AgenticChat], "q4", "Dense",
@@ -3082,22 +3092,29 @@ public sealed class SetupWizardViewModelsTests
         vm = BuildBenchmark(mock, ct => vm.RefreshAsync(ct), GatedDelay);
 
         await vm.OnStepEnteredAsync(); // first tick loads the plan
-        await WaitUntilAsync(() => vm.CandidateGroups.Count == 2, "both candidate groups");
+        await WaitUntilAsync(() => vm.CandidateGroups.Count == 3, "all candidate groups");
 
         // Every checkbox defaults to selected (the run-scoped opt-out starts empty).
         Assert.All(vm.CandidateGroups, g => Assert.All(g.Models, m => Assert.True(m.IsSelected)));
 
-        // The profiled group carries the hardware annotation (Q2: same strings as the
-        // pre-#152 hardware table); the unknown-profile group carries the note instead.
+        // The profiled groups carry the hardware annotation (task #164: the header is the
+        // effective fast memory — TotalFastMemoryMB — that the fit computation consumes);
+        // the unknown-profile group carries the note instead.
         var local = vm.CandidateGroups.Single(g => g.Target == "Local");
         Assert.Equal("RTX 4090", local.GpuName);
-        Assert.Equal("VRAM: 24576 MB", local.VramText);
+        Assert.Equal("Fast memory: 24 GB", local.VramText);
         Assert.Equal("BW: 1032192 MB/s", local.BandwidthText); // 1008 GB/s × 1024
         Assert.Null(local.Note);
         Assert.Equal("won't fit this node", local.Models.Single(m => m.Model == "qwen3.8:27b").FitText);
         Assert.Contains("8192", local.Models.Single(m => m.Model == "llama3:8b").FitText);
+        var unified = vm.CandidateGroups.Single(g => g.Target == "Unified");
+        Assert.Equal("Strix Halo", unified.GpuName);
+        Assert.Equal("Fast memory: 91.2 GB", unified.VramText); // 93379 MB — NOT "512 MB" iGPU
+        Assert.Equal("BW: 349389 MB/s", unified.BandwidthText); // 341.2 GB/s × 1024
+        Assert.Null(unified.Note);
         var remote = vm.CandidateGroups.Single(g => g.Target == "Remote");
         Assert.Equal("No hardware profile detected", remote.Note);
+        Assert.Equal(string.Empty, remote.VramText); // no profile → empty (never null)
         Assert.Equal("no profile (assumed)", remote.Models[0].FitText);
         Assert.True(vm.RunBenchmarksCommand.CanExecute(null));
         await vm.DisposeAsync();

@@ -61,14 +61,21 @@ public sealed partial class BenchmarkCandidateRow : ObservableObject
 
 /// <summary>
 /// One per-target candidate group of Step 4 (task #152): the target name, its STORED
-/// hardware annotation (GPU name, VRAM, bandwidth — the same strings as the pre-#152
-/// hardware table, Q2) plus a note when the store has no profile, and the candidate model
-/// rows (all default selected).
+/// hardware annotation (GPU name, effective fast memory, bandwidth — task #164: the
+/// fast-memory string replaced the first-GPU VRAM string) plus a note when the store has
+/// no profile, and the candidate model rows (all default selected).
 /// </summary>
 public sealed class BenchmarkCandidateGroupRow
 {
     public required string Target { get; init; }
     public string GpuName { get; init; } = string.Empty;
+    /// <summary>
+    /// The effective FAST-memory annotation (task #164, 2026-11-22): <c>Fast memory: {value}</c>
+    /// from the stored profile's <c>TotalFastMemoryMB</c> — system RAM for unified nodes,
+    /// summed GPU VRAM for discrete ones — i.e. exactly the budget the candidate-sizing
+    /// (dense fit) computation consumes; empty string when the store has no profile or the
+    /// value is 0. (Property name kept as VramText to avoid XAML-binding churn — see task #164.)
+    /// </summary>
     public string VramText { get; init; } = string.Empty;
     public string BandwidthText { get; init; } = string.Empty;
     public string? Note { get; init; }
@@ -481,9 +488,13 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
             {
                 Target = target.Target,
                 GpuName = gpu?.ModelName ?? string.Empty,
-                // Same strings as the pre-#152 hardware table (Q2: the candidate groups are
-                // now the step's single hardware source of truth).
-                VramText = gpu is { } g ? $"VRAM: {g.VramMB} MB" : string.Empty,
+                // Task #164: the header shows the effective fast memory (TotalFastMemoryMB —
+                // system RAM for unified nodes, summed GPU VRAM for discrete) that the fit
+                // computation consumes, instead of the first GPU's dedicated VRAM (which
+                // hides the fast memory on unified nodes).
+                VramText = hardware is not null && hardware.TotalFastMemoryMB > 0
+                    ? $"Fast memory: {FleetTargetDisplay.FormatMemoryMB(hardware.TotalFastMemoryMB)}"
+                    : string.Empty,
                 BandwidthText = hardware is { } profile && profile.EffectiveBandwidthGBs > 0
                     ? $"BW: {profile.EffectiveBandwidthGBs * 1024.0:0} MB/s"
                     : string.Empty,

@@ -458,7 +458,9 @@ public sealed class FleetTargetsViewModelTests : IAsyncLifetime
         // The canonical card lines (CONFIRMED Q1 A: ÷1024, 1 decimal max / 0.## bandwidth).
         Assert.Equal("Hardware profile (persisted)", row.HardwareProfileHeader);
         Assert.Equal("OS: linux x64", row.HardwareOsLine);
-        Assert.Equal("RAM: 91.2 GB · VRAM: 91.2 GB · VRAM Speed: 341.2 GB/s", row.HardwareMemoryLine);
+        // Task #164: unified profile → the duplicated VRAM segment is dropped and the RAM
+        // segment is marked " (unified)" (the 512 MB iGPU stays on the GPU line only).
+        Assert.Equal("RAM: 91.2 GB (unified) · VRAM Speed: 341.2 GB/s", row.HardwareMemoryLine);
         Assert.Equal(
             "GPU: AMD Strix Halo [Radeon Graphics / Radeon 8050S Graphics / Radeon 8060S Graphics]",
             row.HardwareGpuLine); // NO 0 MB / Unknown / 0 GB/s sub-values
@@ -485,6 +487,47 @@ public sealed class FleetTargetsViewModelTests : IAsyncLifetime
         Assert.Null(row.HardwareGpuLine);
         Assert.Null(row.KeepAliveLabel); // null seconds → hidden
         Assert.Null(row.VramOverrideLabel); // profile-anchored → hidden without a profile
+    }
+
+    [Fact]
+    public void Row_HardwareMemoryLine_DiscreteProfile_RendersExactlyAsTask153()
+    {
+        // Task #164: non-unified profiles keep the byte-identical RAM/VRAM/speed line.
+        var row = new FleetTargetRow
+        {
+            Name = "DiscreteBox",
+            HardwareProfile = new NodeHardwareProfile(
+                "DiscreteBox", "linux", "x64", false, 65536, SystemRamType.Ddr5,
+                [new GpuDeviceProfile("NVIDIA", "RTX 4080 SUPER", 16376, "GDDR6X", 256, 468)],
+                16376, 468),
+        };
+        Assert.Equal("RAM: 64 GB · VRAM: 16 GB · VRAM Speed: 468 GB/s", row.HardwareMemoryLine);
+    }
+
+    [Fact]
+    public void Row_HardwareMemoryLine_StrixHaloVerbatimProfile_IgpuVramDoesNotResurface()
+    {
+        // Task #164: the verbatim 2026-11-22 Strix Halo session profile (93379 MB LPDDR5X,
+        // 341.2 GB/s, iGPU 512 MB) — the 512 MB iGPU must NOT resurface as a VRAM segment
+        // on the memory line (it stays on the GPU line only).
+        var row = new FleetTargetRow
+        {
+            Name = "StrixBox",
+            HardwareSource = "persisted",
+            HardwareProfile = new NodeHardwareProfile(
+                "StrixBox", "linux", "x64", true, 93379, SystemRamType.LpDdr5X,
+                [
+                    new GpuDeviceProfile(
+                        "AMD", "Strix Halo [Radeon Graphics / Radeon 8050S Graphics / Radeon 8060S Graphics]",
+                        512, "Unknown", 0, 341.2),
+                ],
+                93379, 341.2),
+        };
+        Assert.Equal("RAM: 91.2 GB (unified) · VRAM Speed: 341.2 GB/s", row.HardwareMemoryLine);
+        // The iGPU VRAM is still visible on the GPU line.
+        Assert.Equal(
+            "GPU: AMD Strix Halo [Radeon Graphics / Radeon 8050S Graphics / Radeon 8060S Graphics] (512 MB, 341.2 GB/s)",
+            row.HardwareGpuLine);
     }
 
     [Fact]

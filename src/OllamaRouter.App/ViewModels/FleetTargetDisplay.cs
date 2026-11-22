@@ -120,25 +120,52 @@ public static class FleetTargetDisplay
     }
 
     /// <summary>
-    /// The merged memory line (task #153 decision 3): the segments
-    /// <c>RAM: {…}</c>, <c>VRAM: {…}</c> and <c>VRAM Speed: {bw:0.##} GB/s</c>, each present
-    /// ONLY when its value is &gt; 0 (memory via <see cref="FormatMemoryMB"/>), joined by
-    /// <c>" · "</c>; none present → <c>null</c> (the whole line hidden). Example:
-    /// <c>RAM: 91.2 GB · VRAM: 91.2 GB · VRAM Speed: 341.2 GB/s</c>.
+    /// The merged memory line (task #153 decision 3; unified-memory correction, task #164
+    /// 2026-11-22): the segments <c>RAM: {…}</c>, <c>VRAM: {…}</c> and
+    /// <c>VRAM Speed: {bw:0.##} GB/s</c>, each present ONLY when its value is &gt; 0 (memory
+    /// via <see cref="FormatMemoryMB"/>), joined by <c>" · "</c>; none present → <c>null</c>
+    /// (the whole line hidden). For UNIFIED-memory profiles (<paramref name="isUnifiedMemory"/>
+    /// true — the server's <c>HardwareMetrics</c> then sets <c>TotalFastMemoryMB</c> = system
+    /// RAM, so a <c>VRAM:</c> segment would duplicate the RAM value), the <c>VRAM:</c> segment
+    /// is NEVER emitted and the RAM segment carries the literal <c> (unified)</c> marker,
+    /// using <paramref name="systemRamMB"/> when &gt; 0 with a defensive fallback to
+    /// <paramref name="totalFastMemoryMB"/>. Example: non-unified →
+    /// <c>RAM: 64 GB · VRAM: 16 GB · VRAM Speed: 468 GB/s</c>, unified (Strix Halo) →
+    /// <c>RAM: 91.2 GB (unified) · VRAM Speed: 341.2 GB/s</c>.
     /// </summary>
-    public static string? BuildMemoryLine(long? systemRamMB, long? totalFastMemoryMB, double? bandwidthGBs)
+    public static string? BuildMemoryLine(
+        long? systemRamMB,
+        long? totalFastMemoryMB,
+        double? bandwidthGBs,
+        bool isUnifiedMemory = false)
     {
         var segments = new List<string>();
-        var ram = FormatMemoryMB(systemRamMB);
-        if (ram is not null)
+        if (isUnifiedMemory)
         {
-            segments.Add($"RAM: {ram}");
+            // Unified: RAM IS the fast memory — mark it and never emit a VRAM segment
+            // (the iGPU's dedicated VRAM stays visible on the GPU line only).
+            var unifiedRam = systemRamMB is > 0
+                ? systemRamMB
+                : totalFastMemoryMB; // defensive fallback (identical for server-generated profiles)
+            var ram = FormatMemoryMB(unifiedRam);
+            if (ram is not null)
+            {
+                segments.Add($"RAM: {ram} (unified)");
+            }
         }
-
-        var vram = FormatMemoryMB(totalFastMemoryMB);
-        if (vram is not null)
+        else
         {
-            segments.Add($"VRAM: {vram}");
+            var ram = FormatMemoryMB(systemRamMB);
+            if (ram is not null)
+            {
+                segments.Add($"RAM: {ram}");
+            }
+
+            var vram = FormatMemoryMB(totalFastMemoryMB);
+            if (vram is not null)
+            {
+                segments.Add($"VRAM: {vram}");
+            }
         }
 
         if (bandwidthGBs is > 0)

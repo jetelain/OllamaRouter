@@ -209,4 +209,43 @@ public sealed class FleetTargetDisplayTests
         Assert.Null(FleetTargetDisplay.BuildMemoryLine(0, 0, 0));
         Assert.Null(FleetTargetDisplay.BuildMemoryLine(null, null, null));
     }
+
+    // -- BuildMemoryLine (task #164, 2026-11-22: unified-memory correction) -------------
+    // Unified profiles (IsUnifiedMemory: the server's HardwareMetrics sets
+    // TotalFastMemoryMB = system RAM) must NOT render a VRAM segment (it duplicates the
+    // RAM value and contradicts the iGPU line) — the RAM segment carries the literal
+    // " (unified)" marker instead. The 3-arg calls above pin the NON-unified rendering
+    // byte-identical to task #153.
+
+    [Fact]
+    public void BuildMemoryLine_Unified_StrixHaloSessionValues_DropsVramSegment_MarksRam()
+    {
+        // Verbatim 2026-11-22 Strix Halo session: 93379 MB RAM = fast memory, 341.2 GB/s.
+        Assert.Equal(
+            "RAM: 91.2 GB (unified) · VRAM Speed: 341.2 GB/s",
+            FleetTargetDisplay.BuildMemoryLine(93379, 93379, 341.2, isUnifiedMemory: true));
+    }
+
+    [Fact]
+    public void BuildMemoryLine_Unified_ZeroBandwidth_RamSegmentOnly()
+    {
+        Assert.Equal(
+            "RAM: 91.2 GB (unified)",
+            FleetTargetDisplay.BuildMemoryLine(93379, 93379, 0, isUnifiedMemory: true));
+    }
+
+    [Fact]
+    public void BuildMemoryLine_Unified_AllValuesZero_IsHidden()
+    {
+        Assert.Null(FleetTargetDisplay.BuildMemoryLine(0, 0, 0, isUnifiedMemory: true));
+        Assert.Null(FleetTargetDisplay.BuildMemoryLine(null, null, null, isUnifiedMemory: true));
+    }
+
+    [Fact]
+    public void BuildMemoryLine_Unified_SystemRamZero_FallsBackToTotalFastMemory()
+    {
+        Assert.Equal(
+            "RAM: 91.2 GB (unified)",
+            FleetTargetDisplay.BuildMemoryLine(0, 93379, 0, isUnifiedMemory: true));
+    }
 }
