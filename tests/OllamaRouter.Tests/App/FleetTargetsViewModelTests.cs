@@ -427,6 +427,123 @@ public sealed class FleetTargetsViewModelTests : IAsyncLifetime
         Assert.True(with.HasHardwareProfile);
     }
 
+    // -- Task #153: the card display projections (one line per topic) --------------------
+
+    /// <summary>The 2026-11-21 test-session profile: linux x64, 93379 MB RAM, 93379 MB fast
+    /// memory, 341.2 GB/s, one lspci AMD GPU with 0 MB / Unknown / 0 GB/s.</summary>
+    private static FleetTargetRow TestSessionRow(int? configMaxVramMB = null) => new()
+    {
+        Name = "StrixBox",
+        Location = "remote",
+        PowerWatts = 125,
+        EffectiveKeepAliveSeconds = -1,
+        KeepAliveSource = "default",
+        ConfigMaxVramMB = configMaxVramMB,
+        HardwareSource = "persisted",
+        HardwareProfile = new NodeHardwareProfile(
+            "StrixBox", "linux", "x64", true, 93379, SystemRamType.LpDdr5X,
+            [
+                new GpuDeviceProfile(
+                    "AMD", "Strix Halo [Radeon Graphics / Radeon 8050S Graphics / Radeon 8060S Graphics]",
+                    0, "Unknown", 0, 0),
+            ],
+            93379, 341.2),
+    };
+
+    [Fact]
+    public void Row_HardwareSummaryProjections_TestSessionProfile_OneLinePerTopic()
+    {
+        var row = TestSessionRow();
+
+        // The canonical card lines (CONFIRMED Q1 A: ÷1024, 1 decimal max / 0.## bandwidth).
+        Assert.Equal("Hardware profile (persisted)", row.HardwareProfileHeader);
+        Assert.Equal("OS: linux x64", row.HardwareOsLine);
+        Assert.Equal("RAM: 91.2 GB · VRAM: 91.2 GB · VRAM Speed: 341.2 GB/s", row.HardwareMemoryLine);
+        Assert.Equal(
+            "GPU: AMD Strix Halo [Radeon Graphics / Radeon 8050S Graphics / Radeon 8060S Graphics]",
+            row.HardwareGpuLine); // NO 0 MB / Unknown / 0 GB/s sub-values
+        Assert.Equal("Keep alive: indefinite (default)", row.KeepAliveLabel);
+        // Config override unset → NO annotation (the effective value falls back to the profile).
+        Assert.Null(row.VramOverrideLabel);
+    }
+
+    [Fact]
+    public void Row_HardwareSummaryProjections_NoProfile_HidesTheLines_AndHeaderCoalescesNone()
+    {
+        var row = new FleetTargetRow
+        {
+            Name = "Plain",
+            HardwareSource = null,
+            EffectiveKeepAliveSeconds = null,
+            KeepAliveSource = null,
+        };
+
+        Assert.Equal("Hardware profile (none)", row.HardwareProfileHeader);
+        Assert.False(row.HasHardwareProfile);
+        Assert.Null(row.HardwareOsLine);
+        Assert.Null(row.HardwareMemoryLine);
+        Assert.Null(row.HardwareGpuLine);
+        Assert.Null(row.KeepAliveLabel); // null seconds → hidden
+        Assert.Null(row.VramOverrideLabel); // profile-anchored → hidden without a profile
+    }
+
+    [Fact]
+    public void Row_VramOverrideLabel_PredicateCombinations()
+    {
+        // Differs → the annotation with the human-readable value.
+        var differs = TestSessionRow(configMaxVramMB: 24576);
+        Assert.Equal("VRAM override: 24 GB", differs.VramOverrideLabel);
+
+        // Equal to the profile's fast memory → the fleet effective value IS the override →
+        // invisible → no annotation.
+        var equal = TestSessionRow(configMaxVramMB: 93379);
+        Assert.Null(equal.VramOverrideLabel);
+
+        // Unset → no annotation.
+        Assert.Null(TestSessionRow().VramOverrideLabel);
+
+        // Set but no profile → the annotation is profile-anchored → hidden.
+        var noProfile = new FleetTargetRow { Name = "Plain", ConfigMaxVramMB = 24576 };
+        Assert.Null(noProfile.VramOverrideLabel);
+    }
+
+    [Fact]
+    public async Task RefreshAsync_ConfigMaxVramMB_RoundTripsFromTheSeededConfig_AndDrivesTheAnnotation()
+    {
+        // A LOCAL target (never ssh-probeable → no auto-probes in this test).
+        _client.SeedTarget(new RouterTargetConfigDto(
+            "StrixBox", "http://127.0.0.1:11435/", true, null, 1, "ollama", null,
+            null, false, null, null, null, 24576)); // persisted config override (13th field)
+        _client.FleetResponse = new RouterFleetResponse(
+        [
+            new RouterTargetItem("StrixBox", "http://127.0.0.1:11435/", true, "Online", 5, "local",
+                new RouterTargetHardware("CPU", [], null, 1, 0.2),
+                new RouterTargetExecution(0, null, "-"), null),
+        ]);
+        _client.HardwareResponse = new RouterFleetHardwareResponse(
+        [
+            new FleetHardwareNode("StrixBox", "persisted",
+                new NodeHardwareProfile(
+                    "StrixBox", "linux", "x64", true, 93379, SystemRamType.LpDdr5X,
+                    [new GpuDeviceProfile("AMD", "Strix Halo", 0, "Unknown", 0, 0)],
+                    93379, 341.2),
+                true),
+        ]);
+
+        await _viewModel.RefreshAsync();
+
+        var row = _viewModel.Rows.Single(r => r.Name == "StrixBox");
+        Assert.Equal(24576, row.ConfigMaxVramMB); // round-tripped from the seeded config DTO
+        Assert.Equal("VRAM override: 24 GB", row.VramOverrideLabel); // ≠ profile 93379 → visible
+
+        // Override == profile → the annotation disappears on the next tick.
+        _client.SeedTarget(new RouterTargetConfigDto(
+            "StrixBox", "http://127.0.0.1:11435/", true, null, 1, "ollama", null,
+            null, false, null, null, null, 93379));
+        await _viewModel.RefreshAsync();
+        Assert.Null(_viewModel.Rows.Single(r => r.Name == "StrixBox").VramOverrideLabel);
+    }
+
     [Fact]
     public void BuildAddRequest_SshFields_ValidateUsernameCharsetAndPortRange()
     {

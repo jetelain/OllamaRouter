@@ -47,8 +47,8 @@
                   </StackPanel>
                 </Grid>
 
-                <!-- Endpoint row: tag / type / provider / URL (ellipsizes) / key state / ssh label -->
-                <Grid ColumnDefinitions="auto,auto,auto,*,auto,auto" ColumnSpacing="8">
+                <!-- Endpoint row: tag / type / provider / URL (ellipsizes) / ssh label -->
+                <Grid ColumnDefinitions="auto,auto,auto,*,auto" ColumnSpacing="8">
                   <Border Grid.Column="0" Theme="{DynamicResource TagBorder}" Padding="6,2" CornerRadius="4"
                           VerticalAlignment="Center">
                     <StackPanel Orientation="Horizontal" Spacing="4">
@@ -65,53 +65,31 @@
                              VerticalAlignment="Center"/>
                   <TextBlock Grid.Column="3" Text="{Binding Url}" Foreground="{DynamicResource SemiColorText2}"
                              VerticalAlignment="Center" TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding Url}"/>
-                  <TextBlock Grid.Column="4" Text="{Binding ApiKeyConfigured, StringFormat='key: {0}'}"
-                             Foreground="{DynamicResource SemiColorText2}" VerticalAlignment="Center"/>
-                  <TextBlock Grid.Column="5" Text="{Binding SshLabel}" Foreground="{DynamicResource SemiColorText2}"
+                  <TextBlock Grid.Column="4" Text="{Binding SshLabel}" Foreground="{DynamicResource SemiColorText2}"
                              VerticalAlignment="Center" TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding SshLabel}"/>
                 </Grid>
 
-                <!-- Effective values (READ-ONLY: no wire API persists them); wraps at narrow widths.
+                <!-- Effective values (task #153, decision 6): exactly five chips —
+                     MaxParallel (always), HardwareHint / Power / Keep alive / VRAM override
+                     (each hidden individually when unset via null text).
                      (WrapPanel has no Spacing property in Avalonia 12 — the chips carry their
                      own 12px inter-chip margin.) -->
                 <WrapPanel>
-                  <TextBlock Text="{Binding SpeedFactor, StringFormat='SpeedFactor: {0:0.###}'}" Margin="0,0,12,4"/>
-                  <TextBlock Text="{Binding MaxVramMB, StringFormat='MaxVramMB: {0}'}" Margin="0,0,12,4"/>
                   <TextBlock Text="{Binding MaxParallel, StringFormat='MaxParallel: {0}'}" Margin="0,0,12,4"/>
-                  <TextBlock Text="{Binding EffectiveKeepAliveSeconds, StringFormat='KeepAlive: {0}s'}" Margin="0,0,12,4"/>
-                  <TextBlock Text="{Binding KeepAliveSource, StringFormat='({0})'}" Foreground="{DynamicResource SemiColorText2}" Margin="0,0,12,4"/>
-                  <TextBlock Text="{Binding PowerWatts, StringFormat='Power: {0:0.#} W'}" Margin="0,0,12,4"/>
                   <TextBlock Text="{Binding HardwareHint}" Foreground="{DynamicResource SemiColorText2}" Margin="0,0,12,4"/>
-                  <TextBlock Text="{Binding ResidentModels.Count, StringFormat='Resident: {0}'}"
-                             ToolTip.Tip="Resident models" Margin="0,0,12,4"/>
+                  <TextBlock Text="{Binding PowerWatts, StringFormat='Power: {0:0.#} W'}" Margin="0,0,12,4"/>
+                  <TextBlock Text="{Binding KeepAliveLabel}" Margin="0,0,12,4"/>
+                  <TextBlock Text="{Binding VramOverrideLabel}" Margin="0,0,12,4"/>
                 </WrapPanel>
 
-                <!-- Declared models roster -->
-                <TextBlock Text="{Binding ModelsCount, StringFormat='Declared models: {0}'}" Foreground="{DynamicResource SemiColorText2}"/>
-
-                <!-- Hardware profile (always expanded — no Expander) -->
+                <!-- Hardware profile (always expanded — no Expander). Task #153, decision 3:
+                     one line per topic (OS / RAM+VRAM+bandwidth / GPU), each null = hidden. -->
                 <StackPanel Spacing="2">
-                  <TextBlock Text="{Binding HardwareSource, StringFormat='Hardware profile ({0})'}" FontWeight="SemiBold"/>
-                  <TextBlock Text="{Binding HardwareReachable, StringFormat='reachable: {0}'}"/>
+                  <TextBlock Text="{Binding HardwareProfileHeader}" FontWeight="SemiBold"/>
                   <StackPanel Spacing="2" IsVisible="{Binding HasHardwareProfile}">
-                    <TextBlock Text="{Binding HardwareOs}" Opacity="0.8"/>
-                    <TextBlock Text="{Binding HardwareArchitecture}" Opacity="0.8"/>
-                    <TextBlock Text="{Binding HardwareSystemRamMB, StringFormat='system RAM: {0} MB'}" Opacity="0.8"/>
-                    <TextBlock Text="{Binding HardwareTotalFastMemoryMB, StringFormat='fast memory: {0} MB'}" Opacity="0.8"/>
-                    <TextBlock Text="{Binding HardwareEffectiveBandwidthGBs, StringFormat='bandwidth: {0:0.##} GB/s'}" Opacity="0.8"/>
-                    <ItemsControl ItemsSource="{Binding Gpus}">
-                      <ItemsControl.ItemTemplate>
-                        <DataTemplate>
-                          <StackPanel Orientation="Horizontal" Spacing="4" Opacity="0.8">
-                            <TextBlock Text="{Binding Vendor}"/>
-                            <TextBlock Text="{Binding ModelName}"/>
-                            <TextBlock Text="{Binding VramMB, StringFormat='{}{0} MB'}"/>
-                            <TextBlock Text="{Binding VramType}"/>
-                            <TextBlock Text="{Binding BandwidthGBs, StringFormat='{}{0:0.##} GB/s'}"/>
-                          </StackPanel>
-                        </DataTemplate>
-                      </ItemsControl.ItemTemplate>
-                    </ItemsControl>
+                    <TextBlock Text="{Binding HardwareOsLine}" Opacity="0.8"/>
+                    <TextBlock Text="{Binding HardwareMemoryLine}" Opacity="0.8"/>
+                    <TextBlock Text="{Binding HardwareGpuLine}" Opacity="0.8"/>
                   </StackPanel>
                   <TextBlock Text="no hardware profile yet" Foreground="{DynamicResource SemiColorText2}"
                              IsVisible="{Binding HasHardwareProfile, Converter={x:Static converters:BoolNegateConverter.Instance}}"/>

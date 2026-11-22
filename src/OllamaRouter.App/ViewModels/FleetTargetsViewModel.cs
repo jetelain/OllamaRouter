@@ -91,6 +91,11 @@ public sealed partial class FleetTargetRow : ObservableObject
     /// <summary>The persisted maxParallel budget.</summary>
     public int ConfigMaxParallel { get; init; } = 1;
 
+    /// <summary>The PERSISTED config max-VRAM override in MB (task #153; null = unset —
+    /// distinct from the fleet endpoint's EFFECTIVE <see cref="MaxVramMB"/>, which already
+    /// falls back to the hardware profile). Drives the card's VRAM-override annotation.</summary>
+    public int? ConfigMaxVramMB { get; init; }
+
     /// <summary>Whether an upstream API key is configured (bool flag; key material is never
     /// exposed).</summary>
     public bool ApiKeyConfigured { get; init; }
@@ -144,30 +149,52 @@ public sealed partial class FleetTargetRow : ObservableObject
     public NodeHardwareProfile? HardwareProfile { get; init; }
 
     // -- Display leaves (compiled XAML bindings cannot traverse non-observable wire
-    //    DTOs, so the nullable sub-paths are flattened here — read-only projections) ----
+    //    DTOs, so the nullable sub-paths are flattened here — read-only projections).
+    //    Task #153: the one-line-per-topic hardware summary + keep-alive label + the
+    //    VRAM-override annotation (via <see cref="FleetTargetDisplay"); the removed display
+    //    leaves (ModelsCount, the per-field hardware leaves, Gpus) are gone — the raw data
+    //    properties the form/probe flows use (Models, ApiKeyConfigured, SpeedFactor, …) stay.
 
-    /// <summary>The declared models roster count (null when no roster is declared).</summary>
-    public int? ModelsCount => Models?.Count;
+    /// <summary>The always-expanded hardware section's header (never null; task #153): the
+    /// provenance label with a null source coalesced to "none", e.g.
+    /// <c>Hardware profile (peer)</c> / <c>Hardware profile (none)</c>.</summary>
+    public string HardwareProfileHeader =>
+        $"Hardware profile ({HardwareSource ?? "none"})";
 
-    /// <summary>The hardware profile OS label (null when the profile is unknown).</summary>
-    public string? HardwareOs => HardwareProfile?.Os;
+    /// <summary>The merged OS line of the hardware summary (task #153 decision 3; null when
+    /// the profile is unknown or the OS/arch are both blank).</summary>
+    public string? HardwareOsLine =>
+        HardwareProfile is null
+            ? null
+            : FleetTargetDisplay.BuildOsLine(HardwareProfile.Os, HardwareProfile.Architecture);
 
-    /// <summary>The hardware profile architecture (null when the profile is unknown).</summary>
-    public string? HardwareArchitecture => HardwareProfile?.Architecture;
+    /// <summary>The merged RAM/VRAM/bandwidth line of the hardware summary (task #153
+    /// decision 3; null when the profile is unknown or every segment is 0).</summary>
+    public string? HardwareMemoryLine =>
+        HardwareProfile is null
+            ? null
+            : FleetTargetDisplay.BuildMemoryLine(
+                HardwareProfile.SystemRamMB,
+                HardwareProfile.TotalFastMemoryMB,
+                HardwareProfile.EffectiveBandwidthGBs);
 
-    /// <summary>The hardware profile system RAM in MB (null when the profile is unknown).</summary>
-    public long? HardwareSystemRamMB => HardwareProfile?.SystemRamMB;
+    /// <summary>The single-line GPU summary of the hardware section (task #153 decision 3;
+    /// null when the profile is unknown or has no GPUs; unknown sub-values hidden per GPU).</summary>
+    public string? HardwareGpuLine =>
+        HardwareProfile?.Gpus is { Count: > 0 } gpus
+            ? FleetTargetDisplay.BuildGpuLine(gpus)
+            : null;
 
-    /// <summary>The hardware profile total fast memory in MB (null when the profile is
-    /// unknown).</summary>
-    public long? HardwareTotalFastMemoryMB => HardwareProfile?.TotalFastMemoryMB;
+    /// <summary>The merged keep-alive chip (task #153 decision 5): seconds + the source
+    /// suffix in ONE value (null = hidden).</summary>
+    public string? KeepAliveLabel =>
+        FleetTargetDisplay.FormatKeepAliveLabel(EffectiveKeepAliveSeconds, KeepAliveSource);
 
-    /// <summary>The hardware profile effective bandwidth in GB/s (null when the profile is
-    /// unknown).</summary>
-    public double? HardwareEffectiveBandwidthGBs => HardwareProfile?.EffectiveBandwidthGBs;
-
-    /// <summary>The hardware profile GPU devices (null when the profile is unknown).</summary>
-    public IReadOnlyList<GpuDeviceProfile>? Gpus => HardwareProfile?.Gpus;
+    /// <summary>The <c>VRAM override: {value}</c> annotation (task #153 decision 2): present
+    /// only when the PERSISTED config MaxVramMB differs from the profile's fast memory
+    /// (null = hidden).</summary>
+    public string? VramOverrideLabel =>
+        FleetTargetDisplay.BuildVramOverrideLabel(ConfigMaxVramMB, HardwareProfile);
 
     /// <summary>Whether a hardware profile is present (drives the always-expanded hardware
     /// section's value lines vs. the "no hardware profile yet" placeholder). Rows are
@@ -314,6 +341,7 @@ public sealed partial class FleetTargetsViewModel : RouterTabViewModel
                     KeepAliveSource = fleetItem?.Preload?.KeepAliveSource,
                     HardwareHint = target.HardwareHint,
                     ConfigMaxParallel = target.MaxParallel,
+                    ConfigMaxVramMB = target.MaxVramMB,
                     ApiKeyConfigured = target.ApiKeyConfigured,
                     PowerWatts = target.PowerWatts,
                     Models = target.Models,

@@ -347,7 +347,10 @@ public static class RouterTargetsEndpoints
                 !string.IsNullOrWhiteSpace(apiKey),
                 addRequest.PowerWatts,
                 addSshUser,
-                addRequest.SshPort),
+                addRequest.SshPort,
+                // AddTargetRequest cannot set maxVramMB (task #153: the override is
+                // config-file-managed) → echo JSON null.
+                null),
             latencyMs),
             OllamaRouterJsonSerializerContext.Default.AddTargetResponse,
             statusCode: StatusCodes.Status201Created);
@@ -566,7 +569,8 @@ public static class RouterTargetsEndpoints
                 !string.IsNullOrWhiteSpace(updated.ApiKey),
                 updated.PowerWatts,
                 updated.SshUser,
-                updated.SshPort)),
+                updated.SshPort,
+                updated.MaxVramMB)),
             OllamaRouterJsonSerializerContext.Default.UpdateTargetResponse);
     }
 

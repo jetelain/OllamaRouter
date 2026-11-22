@@ -50,7 +50,12 @@ public sealed record RouterTargetConfigDto(
     // by the daemon-side explicit hardware probe endpoint (null = unset; the probe host is
     // derived from the target url). Appended at the END for positional-compatibility.
     [property: JsonPropertyName("sshUser")] string? SshUser = null,
-    [property: JsonPropertyName("sshPort")] int? SshPort = null);
+    [property: JsonPropertyName("sshPort")] int? SshPort = null,
+    // Task #153: the PERSISTED max VRAM override in MB (null = unset; the fleet endpoint's
+    // EFFECTIVE value falls back to the hardware profile, so without this field an override
+    // is invisible on the Fleet tab card). Read-only on the wire; appended at the END for
+    // positional-compatibility.
+    [property: JsonPropertyName("maxVramMB")] int? MaxVramMB = null);
 
 /// <summary>
 /// The cloud section of <c>GET /api/router/config</c> (task #19). Contains EXACTLY

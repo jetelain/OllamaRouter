@@ -684,6 +684,39 @@ public class RouterConfigEndpointsTests
         Assert.Null(withoutSsh["sshPort"]);
     }
 
+    // ------------------------------------------------------------------
+    //  Task #153: per-target maxVramMB (config exposure — the PERSISTED override the
+    //  Fleet tab card needs for its VRAM-override annotation)
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task ConfigEndpoint_ExposeMaxVramMB_PresentWhenSet_NullWhenUnset()
+    {
+        var options = SingleTargetOptions();
+        options.Targets[0]!.MaxVramMB = 24576;
+        // A second target WITHOUT the override (unset → JSON null on the wire).
+        options.Targets.Add(new OllamaTargetOptions
+        {
+            Name = "Bare",
+            Url = "http://192.168.1.107:11435"
+        });
+        await using var harness = await CreateTestAppAsync(options);
+
+        using var response = await harness.Client.GetAsync("/api/router/config");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var raw = await response.Content.ReadAsStringAsync();
+        response.Dispose();
+        var json = (JsonNode.Parse(raw)! as JsonObject)!;
+        var targets = (json["targets"]! as JsonArray)!;
+
+        var withOverride = targets.OfType<JsonObject>().Single(t => t!["name"]!.GetValue<string>() == "Local");
+        Assert.Equal(24576, withOverride["maxVramMB"]!.GetValue<int>());
+
+        var withoutOverride = targets.OfType<JsonObject>().Single(t => t!["name"]!.GetValue<string>() == "Bare");
+        Assert.True(withoutOverride.ContainsKey("maxVramMB")); // member present…
+        Assert.Null(withoutOverride["maxVramMB"]);            // …as JSON null (unset).
+    }
+
     [Fact]
     public async Task PostTarget_SshCredentials_PersistedEchoedAndApplied_NoKeysOnDiskWhenUnset()
     {
