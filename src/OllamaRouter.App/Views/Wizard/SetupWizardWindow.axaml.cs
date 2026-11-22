@@ -1,5 +1,6 @@
 using System;
 using Avalonia.Controls;
+using OllamaRouter.App.Logging;
 using OllamaRouter.App.ViewModels.Wizard;
 
 namespace OllamaRouter.App.Views.Wizard;
@@ -40,13 +41,21 @@ public partial class SetupWizardWindow : Window
         base.OnClosing(e);
     }
 
-    protected override async void OnClosed(EventArgs e)
+    protected override void OnClosed(EventArgs e)
     {
         if (DataContext is SetupWizardViewModel viewModel)
         {
-            await viewModel.DisposeAsync();
+            // Task #159: log-only (no window-level message surface); base.OnClosed(e) stays
+            // AFTER the awaited disposal (today's exact ordering).
+            SafeRun.Run(async () =>
+            {
+                await viewModel.DisposeAsync();
+                base.OnClosed(e);
+            });
         }
-
-        base.OnClosed(e);
+        else
+        {
+            base.OnClosed(e);
+        }
     }
 }

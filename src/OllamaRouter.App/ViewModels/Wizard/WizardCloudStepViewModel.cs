@@ -1,9 +1,11 @@
 using System.Collections.ObjectModel;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using OllamaRouter.App.Logging;
 using OllamaRouter.Client;
 using OllamaRouter.Endpoints.RouterApi.Config;
 using OllamaRouter.Endpoints.RouterApi.Targets;
+using Serilog;
 
 namespace OllamaRouter.App.ViewModels.Wizard;
 
@@ -31,11 +33,16 @@ public sealed partial class WizardCloudStepViewModel : ObservableObject, IWizard
     // Set while a refresh/toggle applies REMOTE values to the dropdown/flags: suppresses the
     // selection-change persist (the binding re-seeds SelectedCloudModel after every refresh).
     private bool _applyingRemoteState;
+    // Task #159: the resolved logger (the seam defaults to the static Serilog.Log.Logger).
+    private readonly Serilog.ILogger _logger;
     private bool _disposed;
 
-    public WizardCloudStepViewModel(Func<IOllamaRouterApiClient> clientAccessor)
+    public WizardCloudStepViewModel(
+        Func<IOllamaRouterApiClient> clientAccessor,
+        Serilog.ILogger? logger = null)
     {
         _clientAccessor = clientAccessor ?? throw new ArgumentNullException(nameof(clientAccessor));
+        _logger = logger ?? Serilog.Log.Logger;
     }
 
     /// <summary>The cloud-model dropdown items (fleet-catalog order, deduped).</summary>
@@ -183,15 +190,19 @@ public sealed partial class WizardCloudStepViewModel : ObservableObject, IWizard
 
             ShowConfiguredNote = CloudDefaultModel is { } configured && !cloudModels.Contains(configured);
             Error = null;
+            // Task #159: entry-only refresh (no poller) — plain Debug on success.
+            _logger.Debug("Wizard step 3: refresh ok ({Count} cloud model(s))", cloudModels.Count);
         }
         catch (OllamaRouterApiException ex)
         {
             Error = $"Router error {(int)ex.Status}: {ex.Error ?? "(no error body)"}";
+            _logger.Warning("Wizard step 3: refresh failed: {Error}", Error);
         }
         catch (System.Net.Http.HttpRequestException)
         {
             // The router is DOWN (the canonical first-run state before Step 1 has started it).
             Error = "Connection failed — start the router in Step 1 first.";
+            _logger.Warning("Wizard step 3: refresh failed: {Error}", Error);
         }
         finally
         {
@@ -213,6 +224,7 @@ public sealed partial class WizardCloudStepViewModel : ObservableObject, IWizard
         IsBusy = true;
         try
         {
+            _logger.Information("Wizard step 3: cloud overflow → {Enabled}", CloudEnabled ? "off" : "on");
             var response = await _clientAccessor().UpdateConfigAsync(
                     new UpdateRouterConfigRequest(Cloud: new UpdateCloudConfigRequest(Enabled: !CloudEnabled)))
                 .ConfigureAwait(false);
@@ -224,6 +236,7 @@ public sealed partial class WizardCloudStepViewModel : ObservableObject, IWizard
                 CloudDefaultModel = response.Config?.Cloud.DefaultModel ?? CloudDefaultModel;
                 Error = null;
                 Message = $"Cloud overflow (ollama.com) {(CloudEnabled ? "enabled" : "disabled")}.";
+                _logger.Information("Wizard step 3: cloud overflow → {Enabled}", CloudEnabled ? "on" : "off");
             }
             finally
             {
@@ -237,10 +250,12 @@ public sealed partial class WizardCloudStepViewModel : ObservableObject, IWizard
         catch (OllamaRouterApiException ex)
         {
             Error = $"Router error {(int)ex.Status}: {ex.Error ?? "(no error body)"}";
+            _logger.Warning("Wizard step 3: cloud toggle failed: {Error}", Error);
         }
         catch (System.Net.Http.HttpRequestException ex)
         {
             Error = $"Connection failed: {ex.Message}";
+            _logger.Warning("Wizard step 3: cloud toggle failed: {Error}", Error);
         }
         finally
         {
@@ -269,6 +284,7 @@ public sealed partial class WizardCloudStepViewModel : ObservableObject, IWizard
         IsBusy = true;
         try
         {
+            _logger.Information("Wizard step 3: cloud default model → '{Model}'", model);
             await _clientAccessor().UpdateConfigAsync(
                     new UpdateRouterConfigRequest(
                         Cloud: new UpdateCloudConfigRequest(Enabled: CloudEnabled, DefaultModel: model)))
@@ -290,11 +306,13 @@ public sealed partial class WizardCloudStepViewModel : ObservableObject, IWizard
         catch (OllamaRouterApiException ex)
         {
             Error = $"Router error {(int)ex.Status}: {ex.Error ?? "(no error body)"}";
+            _logger.Warning("Wizard step 3: persisting cloud default model '{Model}' failed: {Error}", model, Error);
             RevertSelection();
         }
         catch (System.Net.Http.HttpRequestException ex)
         {
             Error = $"Connection failed: {ex.Message}";
+            _logger.Warning("Wizard step 3: persisting cloud default model '{Model}' failed: {Error}", model, Error);
             RevertSelection();
         }
         finally
@@ -331,17 +349,21 @@ public sealed partial class WizardCloudStepViewModel : ObservableObject, IWizard
         IsBusy = true;
         try
         {
+            _logger.Information("Wizard step 3: adding provider '{ProviderName}'", request.Name);
             await _clientAccessor().AddTargetAsync(request).ConfigureAwait(false);
+            _logger.Information("Wizard step 3: provider '{ProviderName}' added", request.Name);
             Error = null;
             Message = $"Provider '{request.Name}' added — it appears in the Step 2 fleet table.";
         }
         catch (OllamaRouterApiException ex)
         {
             Error = WizardTargetErrors.MapAddTarget(ex);
+            _logger.Warning("Wizard step 3: adding provider '{ProviderName}' failed: {Error}", request.Name, Error);
         }
         catch (System.Net.Http.HttpRequestException ex)
         {
             Error = WizardTargetErrors.MapAddTarget(ex);
+            _logger.Warning("Wizard step 3: adding provider '{ProviderName}' failed: {Error}", request.Name, Error);
         }
         finally
         {

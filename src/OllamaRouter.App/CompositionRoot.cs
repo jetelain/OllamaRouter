@@ -6,6 +6,7 @@ using OllamaRouter.App.ViewModels.Wizard;
 using OllamaRouter.App.Views;
 using OllamaRouter.App.Views.Wizard;
 using OllamaRouter.Security;
+using Serilog;
 
 namespace OllamaRouter.App;
 
@@ -34,9 +35,11 @@ namespace OllamaRouter.App;
 internal static class CompositionRoot
 {
     /// <summary>Builds the connection service with the production <c>OllamaRouterDefaultKeyReader</c>
-    /// (the default profile is Local).</summary>
+    /// (the default profile is Local). Task #159: the static Serilog logger is passed explicitly
+    /// (production = explicit wiring; the unit tests construct the VMs directly with a capturing
+    /// logger and never touch the static).</summary>
     public static IAppConnectionService CreateConnectionService() =>
-        new AppConnectionService(OllamaRouterDefaultKeyReader.Create());
+        new AppConnectionService(OllamaRouterDefaultKeyReader.Create(), logger: Log.Logger);
 
     /// <summary>
     /// Builds the main window with its full view-model tree, opening on
@@ -52,7 +55,8 @@ internal static class CompositionRoot
         var cartography = new CartographyViewModel(connection.GetClient);
         var settings = new SettingsViewModel(connection.GetClient);
         var mainViewModel = new MainWindowViewModel(
-            connection, monitor, sessions, fleet, cartography, settings, initialTabIndex);
+            connection, monitor, sessions, fleet, cartography, settings, initialTabIndex,
+            logger: Log.Logger);
         return new MainWindow { DataContext = mainViewModel };
     }
 
@@ -67,25 +71,27 @@ internal static class CompositionRoot
     {
         var connection = CreateConnectionService();
         var configurator = new LocalOllamaConfigurator();
-        var environmentStep = new WizardEnvironmentStepViewModel(configurator, connection);
+        var environmentStep = new WizardEnvironmentStepViewModel(configurator, connection, logger: Log.Logger);
 
         WizardTargetsStepViewModel targetsStep = null!;
         targetsStep = new WizardTargetsStepViewModel(
             connection.GetClient,
             ct => targetsStep.RefreshAsync(ct),
-            daemonBaseUrl: () => connection.Profile.BaseUrl);
+            daemonBaseUrl: () => connection.Profile.BaseUrl,
+            logger: Log.Logger);
 
         // Task #151: the new Step 3 (Cloud & External Providers) — entry-refresh only (no
         // poller), so it needs no self-referential tick wiring.
-        var cloudStep = new WizardCloudStepViewModel(connection.GetClient);
+        var cloudStep = new WizardCloudStepViewModel(connection.GetClient, logger: Log.Logger);
 
         WizardBenchmarkStepViewModel benchmarkStep = null!;
-        benchmarkStep = new WizardBenchmarkStepViewModel(connection.GetClient, ct => benchmarkStep.RefreshAsync(ct));
+        benchmarkStep = new WizardBenchmarkStepViewModel(connection.GetClient, ct => benchmarkStep.RefreshAsync(ct),
+            logger: Log.Logger);
 
         SetupWizardViewModel root = null!;
         // Task #151: the micro-benchmark is now step index 3 (Step 4).
         var recommendationsStep = new WizardRecommendationsStepViewModel(
-            connection.GetClient, goToBenchmark: () => _ = root.GoToAsync(3));
+            connection.GetClient, goToBenchmark: () => _ = root.GoToAsync(3), logger: Log.Logger);
 
         root = new SetupWizardViewModel(
             connection, environmentStep, targetsStep, cloudStep, benchmarkStep, recommendationsStep,

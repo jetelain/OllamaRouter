@@ -21,6 +21,18 @@
     <AvaloniaResource Include="Assets\icon.ico" />
   </ItemGroup>
 
+  <!-- Task #111 convention (the daemon's NoWarn block, task #111 comment): IL3000/IL2104/IL3053 are the
+       trim/AOT analysis warnings Serilog emits (IL3000 = reflection-based logging API usage, IL2104/IL3053 =
+       the per-assembly singlewarn summaries of package-internal warnings). Serilog is AOT-proven in this
+       repo: the daemon (Serilog.AspNetCore 10.0.0, task #111) and now the app (Serilog 4.3.0 +
+       Serilog.Sinks.File 7.0.0 — the same resolved family, pinned exactly; NOT Serilog.AspNetCore,
+       which is an ASP.NET hosting package) only use the static Serilog.Log API and the file sink,
+       both of which are reflection-free in practice. Suppressed (AOT publishes only) so the AOT
+       pass stays clean of package-attributable warnings. -->
+  <PropertyGroup Condition="'$(PublishAot)' == 'true'">
+    <NoWarn>$(NoWarn);IL3000;IL2104;IL3053</NoWarn>
+  </PropertyGroup>
+
   <ItemGroup>
     <PackageReference Include="Avalonia" Version="12.1.6" />
     <PackageReference Include="Avalonia.Desktop" Version="12.1.6" />
@@ -28,6 +40,12 @@
     <PackageReference Include="Avalonia.Fonts.Inter" Version="12.1.6" />
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
     <PackageReference Include="Semi.Avalonia" Version="12.1.0.1" />
+    <!-- Task #159: app-wide file logging. SAME family as the daemon's Serilog.AspNetCore 10.0.0
+         (pinned to the daemon's resolved graph: Serilog 4.3.0 + Serilog.Sinks.File 7.0.0); both
+         are in the offline NuGet cache. The app references these two DIRECTLY — never
+         Serilog.AspNetCore (it would drag ASP.NET hosting into the WinExe). -->
+    <PackageReference Include="Serilog" Version="4.3.0" />
+    <PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
     <!-- Transitive-of-Avalonia.Desktop pin: 0.21.2 carries NU1903 (GHSA-xrw6-gwf8-vvr9);
          0.21.3 is the same-series patched backport. -->
     <PackageReference Include="Tmds.DBus.Protocol" Version="0.95.2" />

@@ -1,5 +1,6 @@
 using Avalonia.Controls;
 using Avalonia.Interactivity;
+using OllamaRouter.App.Logging;
 using OllamaRouter.App.ViewModels;
 using OllamaRouter.App.Views.Dialogs;
 using OllamaRouter.App.Views.InstallModelWizard;
@@ -14,7 +15,8 @@ namespace OllamaRouter.App.Views;
 /// (preview-then-preload, owned by the dialog view model); the per-model Uninstall button
 /// (hidden when the model is present on no target — task #126) opens the
 /// <see cref="UninstallDialog"/> (destructive, Confirm-gated) and refreshes the matrix
-/// immediately afterwards.
+/// immediately afterwards. Task #159: the async handlers run through <see cref="SafeRun"/>
+/// with the tab's <c>LastError</c>/<c>IsErrorVisible</c> message surface.
 /// </summary>
 public partial class CartographyView : UserControl
 {
@@ -37,7 +39,7 @@ public partial class CartographyView : UserControl
         dialog.ShowDialog(owner);
     }
 
-    private async void OnInstallModelClick(object? sender, RoutedEventArgs e)
+    private void OnInstallModelClick(object? sender, RoutedEventArgs e)
     {
         if (DataContext is not CartographyViewModel viewModel ||
             TopLevel.GetTopLevel(this) is not Window owner)
@@ -46,14 +48,23 @@ public partial class CartographyView : UserControl
         }
 
         var window = new InstallModelWizardWindow(viewModel.CreateInstallModelWizard());
-        await window.ShowDialog(owner);
+        SafeRun.Run(
+            async () =>
+            {
+                await window.ShowDialog(owner);
 
-        // Immediate matrix refresh after the wizard closes (the 5 s poll + the server-side
-        // catalog refresh also cover it; this makes the install visible at once).
-        await viewModel.RefreshAsync();
+                // Immediate matrix refresh after the wizard closes (the 5 s poll + the server-side
+                // catalog refresh also cover it; this makes the install visible at once).
+                await viewModel.RefreshAsync();
+            },
+            surfaceError: message =>
+            {
+                viewModel.LastError = message;
+                viewModel.IsErrorVisible = true;
+            });
     }
 
-    private async void OnUninstallClick(object? sender, RoutedEventArgs e)
+    private void OnUninstallClick(object? sender, RoutedEventArgs e)
     {
         if (DataContext is not CartographyViewModel viewModel ||
             e.Source is not Control { DataContext: CartographyModelRowVm row } ||
@@ -63,11 +74,20 @@ public partial class CartographyView : UserControl
         }
 
         var dialog = new UninstallDialog(viewModel.CreateUninstallDialog(row));
-        await dialog.ShowDialog(owner);
+        SafeRun.Run(
+            async () =>
+            {
+                await dialog.ShowDialog(owner);
 
-        // The matrix reflects the deletion immediately (deleted cells read "not present"; the
-        // 5 s poller keeps it consistent regardless — the daemon's /api/tags + /api/ps no
-        // longer carry the model, so the resident-process table drops it too).
-        await viewModel.RefreshAsync();
+                // The matrix reflects the deletion immediately (deleted cells read "not present"; the
+                // 5 s poller keeps it consistent regardless — the daemon's /api/tags + /api/ps no
+                // longer carry the model, so the resident-process table drops it too).
+                await viewModel.RefreshAsync();
+            },
+            surfaceError: message =>
+            {
+                viewModel.LastError = message;
+                viewModel.IsErrorVisible = true;
+            });
     }
 }

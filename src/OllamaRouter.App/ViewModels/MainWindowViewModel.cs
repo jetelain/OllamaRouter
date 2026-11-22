@@ -1,9 +1,11 @@
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using OllamaRouter.App.Connection;
+using OllamaRouter.App.Logging;
 using OllamaRouter.Client;
 using OllamaRouter.Client.Process;
 using OllamaRouter.Endpoints.RouterApi.Info;
+using Serilog;
 
 namespace OllamaRouter.App.ViewModels;
 
@@ -22,7 +24,12 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
 {
     private readonly IAppConnectionService _connection;
     private readonly SemaphoreSlim _commandGate = new(1, 1);
+    // Task #159: the observed RouterDaemonState transition gate (D8): log STATE CHANGES only
+    // (null = not yet observed) — a stopped/running daemon must not re-log every 2–3 s probe.
+    private RouterDaemonState? _lastDaemonState;
     private bool _disposed;
+    // Task #159: the resolved logger (the seam defaults to the static Serilog.Log.Logger).
+    private readonly ILogger _logger;
 
     /// <summary>
     /// Creates the main view model over the composition-root connection service and the five
@@ -37,9 +44,11 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
         FleetTargetsViewModel fleet,
         CartographyViewModel cartography,
         SettingsViewModel settings,
-        int initialTabIndex = 0)
+        int initialTabIndex = 0,
+        ILogger? logger = null)
     {
         _connection = connection ?? throw new ArgumentNullException(nameof(connection));
+        _logger = logger ?? Log.Logger;
         MonitorTab = monitor ?? throw new ArgumentNullException(nameof(monitor));
         SessionsTab = sessions ?? throw new ArgumentNullException(nameof(sessions));
         FleetTab = fleet ?? throw new ArgumentNullException(nameof(fleet));
@@ -146,25 +155,31 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
     {
         await RunGuardedAsync(async token =>
         {
+            _logger.Information("Daemon start requested");
             try
             {
                 var status = await _connection.DaemonLauncher!.StartAsync(token).ConfigureAwait(false);
+                _logger.Information("Daemon start → {State}", status.State.ToString());
                 ApplyDaemonStatus(status);
             }
             catch (RouterDaemonPortOccupiedException ex)
             {
+                _logger.Warning(ex, "Daemon start failed: port occupied by a non-router service");
                 ApplyForeignPortStatus(ex.Status);
             }
             catch (RouterDaemonExecutableNotFoundException ex)
             {
+                _logger.Warning(ex, "Daemon start failed: {Message}", ex.Message);
                 ApplyStoppedStatus(ex.Message);
             }
             catch (RouterDaemonStartTimeoutException ex)
             {
+                _logger.Warning(ex, "Daemon start failed: {Message}", ex.Message);
                 ApplyStoppedStatus(ex.Message);
             }
             catch (Exception ex)
             {
+                _logger.Warning(ex, "Daemon start failed: {Message}", ex.Message);
                 ApplyStoppedStatus(ex.Message);
             }
         }, ct);
@@ -176,17 +191,21 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
     {
         await RunGuardedAsync(async token =>
         {
+            _logger.Information("Daemon stop requested");
             try
             {
                 var status = await _connection.DaemonLauncher!.StopAsync(token).ConfigureAwait(false);
+                _logger.Information("Daemon stop → {State}", status.State.ToString());
                 ApplyDaemonStatus(status);
             }
             catch (RouterDaemonException ex)
             {
+                _logger.Warning(ex, "Daemon stop failed: {Message}", ex.Message);
                 ApplyStoppedStatus(ex.Message);
             }
             catch (Exception ex)
             {
+                _logger.Warning(ex, "Daemon stop failed: {Message}", ex.Message);
                 ApplyStoppedStatus(ex.Message);
             }
         }, ct);
@@ -199,19 +218,23 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
     {
         await RunGuardedAsync(async token =>
         {
+            _logger.Information("Daemon restart requested");
             try
             {
                 var launcher = _connection.DaemonLauncher!;
                 await launcher.StopAsync(token).ConfigureAwait(false);
                 var status = await launcher.StartAsync(token).ConfigureAwait(false);
+                _logger.Information("Daemon restart → {State}", status.State.ToString());
                 ApplyDaemonStatus(status);
             }
             catch (RouterDaemonPortOccupiedException ex)
             {
+                _logger.Warning(ex, "Daemon restart failed: port occupied by a non-router service");
                 ApplyForeignPortStatus(ex.Status);
             }
             catch (Exception ex)
             {
+                _logger.Warning(ex, "Daemon restart failed: {Message}", ex.Message);
                 ApplyStoppedStatus(ex.Message);
             }
         }, ct);
@@ -224,6 +247,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
     {
         await RunGuardedAsync(async token =>
         {
+            _logger.Information("Connecting to local daemon");
             await _connection
                 .SwitchConnectionAsync(AppConnectionService.LocalProfile(), token).ConfigureAwait(false);
             IsLocalModeChanged();
@@ -253,6 +277,10 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
 
         await RunGuardedAsync(async token =>
         {
+            // Task #159: the key value NEVER reaches the log directly — SecretsMasker only (AC7).
+            _logger.Information(
+                "Connecting to remote router at {BaseUrl} (API key: {ApiKey})",
+                uri, SecretsMasker.Mask(RemoteApiKey));
             await _connection
                 .SwitchConnectionAsync(
                     new RouterConnectionProfile(RouterConnectionMode.Remote, uri, RemoteApiKey), token)
@@ -414,6 +442,8 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
 
     private void ApplyDaemonStatus(RouterDaemonStatus status)
     {
+        LogDaemonStateTransition(status.State, status.Detail);
+
         switch (status.State)
         {
             case RouterDaemonState.Running:
@@ -438,8 +468,35 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
         RaiseCommandAvailability();
     }
 
+    /// <summary>
+    /// Task #159 — the observed <see cref="RouterDaemonState"/> transition gate (D8, the same
+    /// pattern as the wizard step-2/4 poll gates): logs each state CHANGE exactly once
+    /// (null = first observation) and stays silent while the state is unchanged — the
+    /// 2–3 s probes never spam. The detail is appended only for a non-Running target state.
+    /// </summary>
+    private void LogDaemonStateTransition(RouterDaemonState state, string? detail)
+    {
+        if (_lastDaemonState is { } last && last == state)
+        {
+            return;
+        }
+
+        var from = _lastDaemonState?.ToString() ?? "unknown";
+        if (state != RouterDaemonState.Running && !string.IsNullOrWhiteSpace(detail))
+        {
+            _logger.Information("Router daemon state: {From} → {To} ({Detail})", from, state.ToString(), detail);
+        }
+        else
+        {
+            _logger.Information("Router daemon state: {From} → {To}", from, state.ToString());
+        }
+
+        _lastDaemonState = state;
+    }
+
     private void ApplyForeignPortStatus(RouterDaemonStatus status)
     {
+        LogDaemonStateTransition(status.State, status.Detail);
         IsPortConflict = true;
         IsDaemonRunning = false;
         StatusText = "Port Conflict";

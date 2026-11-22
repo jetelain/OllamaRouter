@@ -2,9 +2,11 @@ using System.Collections.ObjectModel;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using OllamaRouter.App.ViewModels;
+using OllamaRouter.App.Logging;
 using OllamaRouter.Client;
 using OllamaRouter.Endpoints.RouterApi.Benchmark;
 using OllamaRouter.Services.Benchmarking;
+using Serilog;
 
 namespace OllamaRouter.App.ViewModels.Wizard;
 
@@ -134,14 +136,22 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
     // the user stays on the step — the unchecked boxes are the run-scoped exclusion state
     // and must survive the 2 s poll. A fresh entry resets the flag (re-default all selected).
     private bool _candidatesLoaded;
+    // Task #159 (D8): the daemon-reachability transition gate for the 2 s benchmark poll
+    // (null = not yet observed) — identical anti-spam semantics to WizardTargetsStepViewModel
+    // (plain benign single-word bool; worst case one duplicate transition log under a race).
+    private bool? _daemonReachable;
+    // Task #159: the resolved logger (the seam defaults to the static Serilog.Log.Logger).
+    private readonly Serilog.ILogger _logger;
     private bool _disposed;
 
     public WizardBenchmarkStepViewModel(
         Func<IOllamaRouterApiClient> clientAccessor,
         Func<CancellationToken, Task> pollerTick,
-        Func<TimeSpan, CancellationToken, Task>? pollerDelay = null)
+        Func<TimeSpan, CancellationToken, Task>? pollerDelay = null,
+        Serilog.ILogger? logger = null)
     {
         _clientAccessor = clientAccessor ?? throw new ArgumentNullException(nameof(clientAccessor));
+        _logger = logger ?? Serilog.Log.Logger;
         _poller = new DashboardPoller(pollerTick ?? throw new ArgumentNullException(nameof(pollerTick)),
             TimeSpan.FromSeconds(2), pollerDelay);
     }
@@ -182,6 +192,7 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
         IsBusy = true;
         try
         {
+            _logger.Information("Wizard step 4: benchmark run started");
             // 1. Lazy load (direct command execution without a prior tick). Under the
             // single-writer gate so the group rebuild never interleaves with a poller-tick
             // rebuild; the gate wait is deliberately NON-CANCELLABLE (existing convention).
@@ -248,16 +259,23 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
             Message = _queuedTargets.Count == 0
                 ? "No active non-Cloud targets to benchmark — add a node in Step 2 first."
                 : $"Benchmarking {_queuedTargets.Count} target(s)…";
+            _logger.Information(
+                _queuedTargets.Count == 0
+                    ? "Wizard step 4: benchmark run completed (0 target(s) queued — no active non-Cloud targets)"
+                    : "Wizard step 4: benchmark run completed — {Count} target(s) queued",
+                _queuedTargets.Count);
             await _poller.StartAsync().ConfigureAwait(false);
             await RefreshAsync(CancellationToken.None).ConfigureAwait(false);
         }
         catch (OllamaRouterApiException ex)
         {
             Error = $"Router error {(int)ex.Status}: {ex.Error ?? "(no error body)"}";
+            _logger.Warning("Wizard step 4: benchmark run failed: {Error}", Error);
         }
         catch (System.Net.Http.HttpRequestException ex)
         {
             Error = $"Connection failed: {ex.Message}";
+            _logger.Warning("Wizard step 4: benchmark run failed: {Error}", Error);
         }
         finally
         {
@@ -289,10 +307,12 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
             }
 
             Message = "Benchmark results cleared.";
+            _logger.Information("Wizard step 4: results cleared");
         }
         catch (OllamaRouterApiException ex)
         {
             Error = $"Router error {(int)ex.Status}: {ex.Error ?? "(no error body)"}";
+            _logger.Warning("Wizard step 4: clearing results failed: {Error}", Error);
         }
         finally
         {
@@ -362,16 +382,39 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
             var results = await client.GetBenchmarkResultsAsync(ct).ConfigureAwait(false);
             LoadResults(results);
             Error = null;
+            LogReachabilityTransition(true, null);
             await MaybeSelfStopAsync().ConfigureAwait(false);
         }
         catch (OllamaRouterApiException ex)
         {
             Error = $"Router error {(int)ex.Status}: {ex.Error ?? "(no error body)"}";
+            LogReachabilityTransition(false, ex.Message);
         }
         catch (System.Net.Http.HttpRequestException ex)
         {
             Error = $"Connection failed: {ex.Message}";
+            LogReachabilityTransition(false, ex.Message);
         }
+    }
+
+    /// <summary>
+    /// Task #159 (D8) — the benchmark-poll reachability transition gate (identical semantics
+    /// to the Step 2 gate): ONE Information entry per STATE CHANGE only — the 2 s poll never
+    /// spams (AC6).
+    /// </summary>
+    private void LogReachabilityTransition(bool reachable, string? reason)
+    {
+        if (_daemonReachable is { } last && last == reachable)
+        {
+            return;
+        }
+
+        var was = _daemonReachable is { } prev
+            ? (prev ? "reachable" : "unreachable")
+            : "unknown";
+        var now = reachable ? "reachable" : $"unreachable ({reason ?? "no reason recorded"})";
+        _logger.Information("Wizard step 4: benchmark poll — daemon {Was} → {Now}", was, now);
+        _daemonReachable = reachable;
     }
 
     /// <summary>Step lifecycle: fresh entry = fresh run scope (task #152 D7) — reset the

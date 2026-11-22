@@ -1,7 +1,9 @@
 using Avalonia;
 using Avalonia.Win32;
 using Avalonia.X11;
+using OllamaRouter.App.Logging;
 using OllamaRouter.Client.Protocol;
+using Serilog;
 
 namespace OllamaRouter.App;
 
@@ -16,6 +18,29 @@ public static class Program
     [STAThread]
     public static void Main(string[] args)
     {
+        // Task #159: bootstrap the app-wide Serilog file logging FIRST (fail-open) so even a
+        // fault in the registration window below is captured in the log.
+        AppLogging.Bootstrap();
+
+        // Task #159 crash capture (AC5): global unhandled-exception hooks. The handlers ONLY
+        // log at Fatal — no other behavior change (deliberately NO e.SetObserved() on the
+        // unobserved-task hook: "process behavior otherwise unchanged"). An uncaught Avalonia
+        // dispatcher exception is re-raised by Avalonia and terminates through
+        // AppDomain.UnhandledException, so these two hooks cover UI-thread escapes too.
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+        {
+            if (e.ExceptionObject is Exception ex)
+            {
+                Log.Fatal(ex, "Unhandled exception — the process is terminating");
+            }
+            else
+            {
+                Log.Fatal("Unhandled exception — the process is terminating (non-Exception payload: {Payload})", e.ExceptionObject);
+            }
+        };
+        TaskScheduler.UnobservedTaskException += (_, e) =>
+            Log.Fatal(e.Exception, "Unobserved task exception");
+
         LaunchOptions = ProtocolUriParser.Parse(args);
         try
         {

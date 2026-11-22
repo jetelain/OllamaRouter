@@ -1,5 +1,6 @@
 using Avalonia.Controls;
 using Avalonia.Interactivity;
+using OllamaRouter.App.Logging;
 using OllamaRouter.App.ViewModels;
 
 namespace OllamaRouter.App.Views.Dialogs;
@@ -12,7 +13,9 @@ namespace OllamaRouter.App.Views.Dialogs;
 /// unit-testable): the Uninstall button builds the exact-enumeration message (model + every
 /// checked target) and routes it through the shared <see cref="Confirm"/> dialog; on OK the
 /// <c>UninstallCommand</c> fires and the dialog stays open to display the per-target
-/// results (Cancel at either step sends NO request).
+/// results (Cancel at either step sends NO request). Task #159: the handler runs through
+/// <see cref="SafeRun"/> — log-only: <c>UninstallDialogViewModel.ErrorMessage</c> is
+/// private-set, so there is no view-level message surface to feed.
 /// </summary>
 public partial class UninstallDialog : Window
 {
@@ -32,7 +35,7 @@ public partial class UninstallDialog : Window
         DataContext = viewModel ?? throw new ArgumentNullException(nameof(viewModel));
     }
 
-    private async void OnUninstallClick(object? sender, RoutedEventArgs e)
+    private void OnUninstallClick(object? sender, RoutedEventArgs e)
     {
         if (DataContext is not UninstallDialogViewModel viewModel)
         {
@@ -43,20 +46,24 @@ public partial class UninstallDialog : Window
         if (selected.Count == 0)
         {
             // The validation error is surfaced by the command (no request is sent).
-            await viewModel.UninstallCommand.ExecuteAsync(null);
+            SafeRun.Run(() => viewModel.UninstallCommand.ExecuteAsync(null));
             return;
         }
 
         var targets = string.Join("\n", selected.Select(t => $"  • {t}"));
-        var confirmed = await Confirm.ShowAsync(
-            this,
-            $"Permanently delete model \"{viewModel.ModelName}\" from:\n{targets}\n"
-            + "This removes the model files from the selected nodes and cannot be undone.",
-            "Uninstall Model");
-        if (confirmed)
-        {
-            await viewModel.UninstallCommand.ExecuteAsync(null);
-        }
+        SafeRun.Run(
+            async () =>
+            {
+                var confirmed = await Confirm.ShowAsync(
+                    this,
+                    $"Permanently delete model \"{viewModel.ModelName}\" from:\n{targets}\n"
+                    + "This removes the model files from the selected nodes and cannot be undone.",
+                    "Uninstall Model");
+                if (confirmed)
+                {
+                    await viewModel.UninstallCommand.ExecuteAsync(null);
+                }
+            });
     }
 
     private void OnCancelClick(object? sender, RoutedEventArgs e) => Close();

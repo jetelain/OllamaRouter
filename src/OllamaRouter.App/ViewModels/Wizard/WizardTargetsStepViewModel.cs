@@ -3,9 +3,11 @@ using System.Net;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using OllamaRouter.App.ViewModels;
+using OllamaRouter.App.Logging;
 using OllamaRouter.Client;
 using OllamaRouter.Client.Process;
 using OllamaRouter.Endpoints.RouterApi.Targets;
+using Serilog;
 
 namespace OllamaRouter.App.ViewModels.Wizard;
 
@@ -56,19 +58,29 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
     // rebuilds interleave and DUPLICATE rows. Same pattern as
     // WizardBenchmarkStepViewModel._refreshGate / RouterTabViewModel._refreshGate.
     private readonly SemaphoreSlim _refreshGate = new(1, 1);
+    // Task #159 (D8): the daemon-reachability transition gate for the 2 s fleet poll
+    // (null = not yet observed): the poll logs STATE CHANGES only — persistent identical
+    // failures emit exactly ONE entry (AC6 anti-spam). Plain field by design: it is a
+    // benign single-word bool written from the poller tick AND UI-thread command refreshes;
+    // worst case under a race is one duplicate transition log (Serilog itself is thread-safe).
+    private bool? _daemonReachable;
+    // Task #159: the resolved logger (the seam defaults to the static Serilog.Log.Logger).
+    private readonly Serilog.ILogger _logger;
     private bool _disposed;
 
     public WizardTargetsStepViewModel(
         Func<IOllamaRouterApiClient> clientAccessor,
         Func<CancellationToken, Task> pollerTick,
         Func<TimeSpan, CancellationToken, Task>? pollerDelay = null,
-        Func<Uri>? daemonBaseUrl = null)
+        Func<Uri>? daemonBaseUrl = null,
+        Serilog.ILogger? logger = null)
     {
         _clientAccessor = clientAccessor ?? throw new ArgumentNullException(nameof(clientAccessor));
         // The connection-profile daemon base URL (task #158) — a Func (not a snapshot), so a
         // later SwitchConnectionAsync profile swap is reflected at failure time without
         // rebuilding the view model (the same accessor pattern as _clientAccessor).
         _daemonBaseUrl = daemonBaseUrl ?? (() => OllamaRouterDaemonLauncher.DefaultBaseUrl);
+        _logger = logger ?? Serilog.Log.Logger;
         _poller = new DashboardPoller(pollerTick ?? throw new ArgumentNullException(nameof(pollerTick)),
             TimeSpan.FromSeconds(2), pollerDelay);
     }
@@ -120,16 +132,22 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
         IsBusy = true;
         try
         {
+            _logger.Information("Wizard step 2: adding target '{TargetName}'", request.Name);
             await _clientAccessor().AddTargetAsync(request).ConfigureAwait(false);
+            _logger.Information("Wizard step 2: target '{TargetName}' added", request.Name);
             Message = $"Target '{request.Name}' added.";
         }
         catch (OllamaRouterApiException ex)
         {
-            SetFailureMessage(WizardTargetErrors.MapAddTarget(ex, _daemonBaseUrl()));
+            var mapped = WizardTargetErrors.MapAddTarget(ex, _daemonBaseUrl());
+            _logger.Warning("Wizard step 2: adding target '{TargetName}' failed: {Error}", request.Name, mapped);
+            SetFailureMessage(mapped);
         }
         catch (System.Net.Http.HttpRequestException ex)
         {
-            SetFailureMessage(WizardTargetErrors.MapAddTarget(ex, _daemonBaseUrl()));
+            var mapped = WizardTargetErrors.MapAddTarget(ex, _daemonBaseUrl());
+            _logger.Warning("Wizard step 2: adding target '{TargetName}' failed: {Error}", request.Name, mapped);
+            SetFailureMessage(mapped);
         }
         finally
         {
@@ -201,18 +219,42 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
             {
                 Rows.Add(row);
             }
+
+            LogReachabilityTransition(true, null);
         }
         catch (OllamaRouterApiException ex)
         {
             Message = $"Router error {(int)ex.Status}: {ex.Error ?? "(no error body)"}";
+            LogReachabilityTransition(false, ex.Message);
         }
-        catch (System.Net.Http.HttpRequestException)
+        catch (System.Net.Http.HttpRequestException ex)
         {
             // The router is DOWN (the canonical first-run state before Step 1 has started
             // it): the shared actionable daemon-down message (task #158) — never the raw
             // transport text (which leaked "…actively refused it. (127.0.0.1:11434)").
             SetFailureMessage(DaemonDownMessage());
+            LogReachabilityTransition(false, ex.Message);
         }
+    }
+
+    /// <summary>
+    /// Task #159 (D8) — the fleet-poll reachability transition gate: logs ONE Information
+    /// entry per STATE CHANGE (first observation logs <c>unknown → …</c>; identical repeated
+    /// outcomes log nothing), so the 2 s poll never spams the log (AC6).
+    /// </summary>
+    private void LogReachabilityTransition(bool reachable, string? reason)
+    {
+        if (_daemonReachable is { } last && last == reachable)
+        {
+            return;
+        }
+
+        var was = _daemonReachable is { } prev
+            ? (prev ? "reachable" : "unreachable")
+            : "unknown";
+        var now = reachable ? "reachable" : $"unreachable ({reason ?? "no reason recorded"})";
+        _logger.Information("Wizard step 2: fleet poll — daemon {Was} → {Now}", was, now);
+        _daemonReachable = reachable;
     }
 
     /// <summary>
@@ -244,33 +286,40 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
                 if (config.Targets.Any(t =>
                         string.Equals(t.Name, LocalTargetName, StringComparison.OrdinalIgnoreCase)))
                 {
+                    // Task #159: one line covers attempt + outcome (the idempotent no-op).
+                    _logger.Information("Wizard step 2: local node auto-add → already-present (no-op)");
                     return; // Present (any URL): idempotent no-op — re-entry never re-adds.
                 }
 
                 await client.AddTargetAsync(
                         new AddTargetRequest(LocalTargetName, LocalTargetUrl, TestConnectionFirst: true))
                     .ConfigureAwait(false);
+                _logger.Information("Wizard step 2: local node auto-add → added");
                 Message = "Local node added.";
             }
             catch (OllamaRouterApiException ex) when (ex.Status == HttpStatusCode.Conflict)
             {
+                _logger.Warning("Wizard step 2: local node auto-add → conflict (left unchanged): {Message}", ex.Message);
                 Message = "A target named 'Local' already exists — left unchanged.";
             }
             catch (OllamaRouterApiException ex) when (ex.Status == HttpStatusCode.UnprocessableEntity)
             {
+                _logger.Warning("Wizard step 2: local node auto-add → 422 local unreachable: {Message}", ex.Message);
                 Message = "Local Ollama is unreachable — fix Step 1 and retry.";
             }
-            catch (OllamaRouterApiException)
+            catch (OllamaRouterApiException ex)
             {
                 // The daemon RESPONDED with a router error (not a down-state): the legacy
                 // actionable text (unchanged by task #158).
+                _logger.Warning("Wizard step 2: local node auto-add → router down (retry on next entry): {Message}", ex.Message);
                 Message = "Connection failed — start the router in Step 1 first.";
             }
-            catch (System.Net.Http.HttpRequestException)
+            catch (System.Net.Http.HttpRequestException ex)
             {
                 // The router is DOWN (the canonical first-run state before Step 1 has
                 // started it): the shared actionable daemon-down message (task #158),
                 // identical to the fleet poll's — no throw, the next step entry retries.
+                _logger.Warning("Wizard step 2: local node auto-add → router down (retry on next entry): {Message}", ex.Message);
                 SetFailureMessage(DaemonDownMessage());
             }
         }

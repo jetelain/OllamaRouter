@@ -1,6 +1,8 @@
 using OllamaRouter.Client;
 using OllamaRouter.Client.Process;
+using OllamaRouter.App.Logging;
 using Pmad.LocalApi.Security;
+using Serilog;
 
 namespace OllamaRouter.App.Connection;
 
@@ -32,6 +34,8 @@ public sealed class AppConnectionService : IAppConnectionService
 
     private readonly ClientFactory _clientFactory;
     private readonly LauncherFactory _launcherFactory;
+    // Task #159: the resolved logger (the seam defaults to the static Serilog.Log.Logger).
+    private readonly ILogger _logger;
 
     private IOllamaRouterApiClient _client;
     private IOllamaRouterDaemonLauncher? _daemonLauncher;
@@ -41,8 +45,11 @@ public sealed class AppConnectionService : IAppConnectionService
     /// Creates the service on the <paramref name="initial"/> profile (default: Local on the
     /// conventional daemon URL) using the real SDK client/launcher factories.
     /// </summary>
-    public AppConnectionService(IDefaultKeyReader keyReader, RouterConnectionProfile? initial = null)
-        : this(keyReader, initial, DefaultClientFactory, DefaultLauncherFactory)
+    public AppConnectionService(
+        IDefaultKeyReader keyReader,
+        RouterConnectionProfile? initial = null,
+        ILogger? logger = null)
+        : this(keyReader, initial, DefaultClientFactory, DefaultLauncherFactory, logger)
     {
     }
 
@@ -54,11 +61,13 @@ public sealed class AppConnectionService : IAppConnectionService
         IDefaultKeyReader keyReader,
         RouterConnectionProfile? initial,
         ClientFactory clientFactory,
-        LauncherFactory launcherFactory)
+        LauncherFactory launcherFactory,
+        ILogger? logger = null)
     {
         _keyReader = keyReader ?? throw new ArgumentNullException(nameof(keyReader));
         _clientFactory = clientFactory ?? throw new ArgumentNullException(nameof(clientFactory));
         _launcherFactory = launcherFactory ?? throw new ArgumentNullException(nameof(launcherFactory));
+        _logger = logger ?? Log.Logger;
         _profile = Normalize(initial ?? LocalProfile());
         (_client, _daemonLauncher) = Build(_profile);
         GetClient = () => _client;
@@ -94,11 +103,34 @@ public sealed class AppConnectionService : IAppConnectionService
             throw new ArgumentNullException(nameof(profile));
         }
 
-        var normalized = Normalize(profile);
+        var normalized = NormalizeOrLog(profile);
+        var fromMode = _profile.Mode;
         DisposeCurrent();
         (_profile, (_client, _daemonLauncher)) = (normalized, Build(normalized));
+        // Task #159 connection lifecycle: the API key value NEVER reaches the log directly —
+        // only through SecretsMasker.Mask (AC7 privacy choke point).
+        _logger.Information(
+            "Connection profile switched: {FromMode} → {ToMode} at {BaseUrl} (API key: {ApiKey})",
+            fromMode.ToString(), normalized.Mode.ToString(), normalized.BaseUrl, SecretsMasker.Mask(normalized.ApiKey));
         ConnectionChanged?.Invoke();
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Task #159: <see cref="Normalize"/> with a logged (but rethrown — behavior unchanged)
+    /// failure: an invalid remote profile is an Error entry, never a silent throw.
+    /// </summary>
+    private RouterConnectionProfile NormalizeOrLog(RouterConnectionProfile profile)
+    {
+        try
+        {
+            return Normalize(profile);
+        }
+        catch (ArgumentException ex)
+        {
+            _logger.Error(ex, "Connection profile switch rejected: {Message}", ex.Message);
+            throw;
+        }
     }
 
     /// <inheritdoc />

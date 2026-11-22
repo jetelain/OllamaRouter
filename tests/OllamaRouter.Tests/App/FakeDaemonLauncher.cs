@@ -4,6 +4,7 @@ using OllamaRouter.Client.Process;
 using OllamaRouter.Endpoints.RouterApi.Info;
 using OllamaRouter.Security;
 using Pmad.LocalApi.Security;
+using Serilog;
 
 namespace OllamaRouter.Tests.App;
 
@@ -167,7 +168,8 @@ internal sealed class AppConnectionHarness : IDisposable
     public AppConnectionHarness(
         IDefaultKeyReader keyReader,
         Func<FakeRouterApiClient> clientFactory,
-        Func<FakeDaemonLauncher> launcherFactory)
+        Func<FakeDaemonLauncher> launcherFactory,
+        ILogger? logger = null)
     {
         KeyReader = keyReader;
         var clientDelegate = (AppConnectionService.ClientFactory)((baseUrl, apiKey, reader) =>
@@ -186,7 +188,7 @@ internal sealed class AppConnectionHarness : IDisposable
             _launchers.Add(launcher);
             return launcher;
         });
-        _service = new AppConnectionService(keyReader, null, clientDelegate, launcherDelegate);
+        _service = new AppConnectionService(keyReader, null, clientDelegate, launcherDelegate, logger);
     }
 
     /// <summary>The key reader the service was built with.</summary>

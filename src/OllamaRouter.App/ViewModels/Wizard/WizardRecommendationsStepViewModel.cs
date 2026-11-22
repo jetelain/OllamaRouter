@@ -2,9 +2,11 @@ using System.Collections.ObjectModel;
 using System.Net;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using OllamaRouter.App.Logging;
 using OllamaRouter.Client;
 using OllamaRouter.Endpoints.RouterApi.Recommendations;
 using OllamaRouter.Services.Recommendations;
+using Serilog;
 
 namespace OllamaRouter.App.ViewModels.Wizard;
 
@@ -68,15 +70,19 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
 
     private readonly Func<IOllamaRouterApiClient> _clientAccessor;
     private readonly Action? _goToBenchmark;
+    // Task #159: the resolved logger (the seam defaults to the static Serilog.Log.Logger).
+    private readonly Serilog.ILogger _logger;
     private bool _canGoToBenchmark;
     private bool _disposed;
 
     public WizardRecommendationsStepViewModel(
         Func<IOllamaRouterApiClient> clientAccessor,
-        Action? goToBenchmark = null)
+        Action? goToBenchmark = null,
+        Serilog.ILogger? logger = null)
     {
         _clientAccessor = clientAccessor ?? throw new ArgumentNullException(nameof(clientAccessor));
         _goToBenchmark = goToBenchmark;
+        _logger = logger ?? Serilog.Log.Logger;
     }
 
     /// <summary>The five role rows in the stable alias order (absent roles show the hint).</summary>
@@ -161,21 +167,27 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
             NodesConfigured = response.Targets.Count;
             TotalContextCeilings = response.Recommendations.Roles.Values.Sum(r => r.Nodes.Count);
             LoadMatrix(response.Recommendations);
+            _logger.Information(
+                "Wizard step 5: recommendations generated ({Roles} role(s), {Nodes} node(s))",
+                RolesAssigned, NodesConfigured);
             Message = $"Generated {RolesAssigned} role assignment(s) across {NodesConfigured} node(s) " +
                       $"({TotalContextCeilings} context ceiling(s)).";
         }
         catch (OllamaRouterApiException ex) when (ex.Status == HttpStatusCode.Conflict)
         {
+            _logger.Information("Wizard step 5: recommendations generate — none available (409 — benchmark first)");
             Message = "No benchmark results available — run the Step 4 micro-benchmark first";
             _canGoToBenchmark = true;
             GoToBenchmarkCommand.NotifyCanExecuteChanged();
         }
         catch (OllamaRouterApiException ex)
         {
+            _logger.Warning("Wizard step 5: recommendations generate failed: {Message}", ex.Message);
             Message = $"Router error {(int)ex.Status}: {ex.Error ?? "(no error body)"}";
         }
         catch (System.Net.Http.HttpRequestException ex)
         {
+            _logger.Warning("Wizard step 5: recommendations generate failed: {Message}", ex.Message);
             Message = $"Connection failed: {ex.Message}";
         }
         finally
@@ -202,17 +214,21 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
             Message = response.Targets is null || response.Targets.Count == 0
                 ? "Applied (no per-target ceilings)."
                 : "Applied: " + string.Join(", ", response.Targets.Select(t => $"{t.Target} → {t.MaxContextCeiling}"));
+            _logger.Information("Wizard step 5: recommendations applied ({Summary})", Message);
         }
         catch (OllamaRouterApiException ex) when (ex.Status == HttpStatusCode.Conflict)
         {
+            _logger.Warning("Wizard step 5: recommendations apply failed (409 — nothing to apply)");
             Message = "No recommendations to apply — generate them first.";
         }
         catch (OllamaRouterApiException ex)
         {
+            _logger.Warning("Wizard step 5: recommendations apply failed: {Message}", ex.Message);
             Message = $"Router error {(int)ex.Status}: {ex.Error ?? "(no error body)"}";
         }
         catch (System.Net.Http.HttpRequestException ex)
         {
+            _logger.Warning("Wizard step 5: recommendations apply failed: {Message}", ex.Message);
             Message = $"Connection failed: {ex.Message}";
         }
         finally

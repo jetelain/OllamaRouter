@@ -1,7 +1,9 @@
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using OllamaRouter.App.Connection;
+using OllamaRouter.App.Logging;
 using OllamaRouter.Client.Process;
+using Serilog;
 
 namespace OllamaRouter.App.ViewModels.Wizard;
 
@@ -55,15 +57,19 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
 {
     private readonly LocalOllamaConfigurator _configurator;
     private readonly IAppConnectionService _connection;
+    // Task #159: the resolved logger (the seam defaults to the static Serilog.Log.Logger).
+    private readonly Serilog.ILogger _logger;
     private bool _disposed;
 
     internal WizardEnvironmentStepViewModel(
         LocalOllamaConfigurator configurator,
         IAppConnectionService connection,
-        Func<CancellationToken, Task>? delay = null)
+        Func<CancellationToken, Task>? delay = null,
+        Serilog.ILogger? logger = null)
     {
         _configurator = configurator ?? throw new ArgumentNullException(nameof(configurator));
         _connection = connection ?? throw new ArgumentNullException(nameof(connection));
+        _logger = logger ?? Serilog.Log.Logger;
         // Forward the (test) port-wait gate to the configurator so every action path uses it.
         if (delay is not null)
         {
@@ -211,9 +217,11 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
         IsBusy = true;
         try
         {
+            _logger.Information("Wizard step 1: install started");
             Message = "Installing Ollama via the official script — this can take several minutes…";
             MessageIsError = false;
             var result = await _configurator.InstallOllamaAsync(CancellationToken.None).ConfigureAwait(false);
+            LogStepOutcome("install", result);
             Message = result.Message;
             MessageIsError = !result.Success;
             await RefreshAsync(CancellationToken.None).ConfigureAwait(false);
@@ -236,9 +244,11 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
         IsBusy = true;
         try
         {
+            _logger.Information("Wizard step 1: update started");
             Message = "Updating Ollama: stop → official script → restart…";
             MessageIsError = false;
             var result = await _configurator.UpdateOllamaAsync(OllamaLanState == OllamaLanState.Lan, CancellationToken.None).ConfigureAwait(false);
+            LogStepOutcome("update", result);
             Message = result.Message;
             MessageIsError = !result.Success;
             await RefreshAsync(CancellationToken.None).ConfigureAwait(false);
@@ -265,7 +275,9 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
         IsBusy = true;
         try
         {
+            _logger.Information("Wizard step 1: start started");
             var result = await _configurator.StartOllamaOnlyAsync(OllamaLanState == OllamaLanState.Lan, CancellationToken.None).ConfigureAwait(false);
+            LogStepOutcome("start", result);
             Message = result.Message;
             MessageIsError = !result.Success;
             await RefreshAsync(CancellationToken.None).ConfigureAwait(false);
@@ -289,9 +301,11 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
         IsBusy = true;
         try
         {
+            _logger.Information("Wizard step 1: change port started");
             Message = "Changing the Ollama port (set OLLAMA_HOST and restart Ollama)…";
             MessageIsError = false;
             var result = await _configurator.StartOllamaOnlyAsync(OllamaLanState == OllamaLanState.Lan, CancellationToken.None).ConfigureAwait(false);
+            LogStepOutcome("change port", result);
             Message = result.Message;
             MessageIsError = !result.Success;
             await RefreshAsync(CancellationToken.None).ConfigureAwait(false);
@@ -318,11 +332,13 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
         IsBusy = true;
         try
         {
+            _logger.Information("Wizard step 1: lan toggle started ({Target})", target ? "LAN" : "loopback");
             Message = target
                 ? $"Exposing Ollama on the LAN (set OLLAMA_HOST to 0.0.0.0:{LocalOllamaConfigurator.OllamaPort} and restart Ollama)…"
                 : $"Restricting Ollama to localhost (set OLLAMA_HOST to 127.0.0.1:{LocalOllamaConfigurator.OllamaPort} and restart Ollama)…";
             MessageIsError = false;
             var result = await _configurator.StartOllamaOnlyAsync(target, CancellationToken.None).ConfigureAwait(false);
+            LogStepOutcome("lan toggle", result);
             Message = result.Message;
             MessageIsError = !result.Success;
             await RefreshAsync(CancellationToken.None).ConfigureAwait(false);
@@ -344,11 +360,13 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
         IsBusy = true;
         try
         {
+            _logger.Information("Wizard step 1: router start requested");
             Message = "Starting the router on :11434…";
             MessageIsError = false;
             try
             {
                 var status = await _connection.DaemonLauncher!.StartAsync(CancellationToken.None).ConfigureAwait(false);
+                _logger.Information("Wizard step 1: router start → {State}", status.State.ToString());
                 Message = status.State == RouterDaemonState.Running
                     ? "Router is running on :11434 ✓"
                     : "Router is starting on :11434";
@@ -358,6 +376,7 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
             {
                 // Typed launcher failures (port occupied / executable not found / start
                 // timeout) and anything else: a readable message, never a crash.
+                _logger.Warning(ex, "Wizard step 1: router start failed: {Message}", ex.Message);
                 Message = $"Could not start the router: {ex.Message}";
                 MessageIsError = true;
             }
@@ -416,6 +435,38 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
             _ => Port11434Status.Free,
         };
         RouterStatusLabel = Describe(Port11434Status);
+
+        // Task #159: the detection results are Debug-level diagnostics (not per-action spam).
+        _logger.Debug(
+            "Wizard step 1 detection: installed={Installed} running={Running} effectivePort={EffectivePort} portStatus={PortStatus} routerPort={RouterPort}",
+            OllamaInstalled, OllamaRunning, OllamaDetectedPort, OllamaPortStatus.ToString(), Port11434Status.ToString());
+    }
+
+    /// <summary>
+    /// Task #159: logs a Step 1 one-click action outcome — Information on success, Warning on
+    /// failure (the <see cref="LocalOllamaConfigResult"/> carries the readable message, never a
+    /// secret: script paths and OLLAMA_HOST values are safe to log).
+    /// </summary>
+    private void LogStepOutcome(string action, LocalOllamaConfigResult result)
+    {
+        LogStepOutcomeCore(action, result.Success, result.Message);
+    }
+
+    private void LogStepOutcome(string action, OllamaScriptResult result)
+    {
+        LogStepOutcomeCore(action, result.Success, result.Message);
+    }
+
+    private void LogStepOutcomeCore(string action, bool success, string message)
+    {
+        if (success)
+        {
+            _logger.Information("Wizard step 1: {Action} completed: {Message}", action, message);
+        }
+        else
+        {
+            _logger.Warning("Wizard step 1: {Action} failed: {Message}", action, message);
+        }
     }
 
     /// <summary>Step lifecycle: refresh the detection + port state on entry.</summary>
