@@ -345,7 +345,7 @@ public class RouterConfigurationSourceTests : IDisposable
 
         var reloadValue = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        var host = new HostBuilder()
+        using var host = new HostBuilder()
             .UseContentRoot(root)
             .ConfigureAppConfiguration((_, config) =>
             {
@@ -457,11 +457,14 @@ public class RouterConfigurationSourceTests : IDisposable
         var builder = CreateFactoryBuilder(root);
         RouterConfigurationSources.AddUserConfiguration(builder, root, environment: null, logger);
         var config = builder.Build();
+        using var _ = config as IDisposable;
 
         await File.WriteAllTextAsync(userConfigPath, "{ broken");
+        config.Reload();
 
         await logger.ErrorLogged.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.Contains(logger.Entries, e => e.Level == LogLevel.Error && e.Message.Contains("could not be reloaded"));
+        Assert.Equal("http://initial:11434/", config["OllamaRouter:BindAddress"]);
     }
 
     [Fact]
@@ -482,11 +485,14 @@ public class RouterConfigurationSourceTests : IDisposable
             loggerAccessor: () => deferredLogger);
 
         var config = builder.Build();
+        using var _ = config as IDisposable;
         deferredLogger = logger;
 
         await File.WriteAllTextAsync(userConfigPath, "{ broken");
+        config.Reload();
 
         await logger.ErrorLogged.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.Contains(logger.Entries, e => e.Level == LogLevel.Error && e.Message.Contains("could not be reloaded"));
+        Assert.Equal("http://initial:11434/", config["OllamaRouter:BindAddress"]);
     }
 }
