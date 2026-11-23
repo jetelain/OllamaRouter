@@ -8,12 +8,12 @@
   <UserControl.Styles>
     <!-- Failed requests render the STATUS text in the app's error red (task #117). -->
     <Style Selector="TextBlock.status-failed">
-      <Setter Property="Foreground" Value="#FF7B7B"/>
+      <Setter Property="Foreground" Value="{DynamicResource NightCodeAccentCrimsonLightText}"/>
     </Style>
   </UserControl.Styles>
   <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
     <StackPanel Spacing="16" Margin="12,12,12,48">
-      <TextBlock Text="{Binding LastError}" Foreground="#FF7B7B" TextWrapping="Wrap" IsVisible="{Binding IsErrorVisible}"/>
+      <TextBlock Text="{Binding LastError}" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" TextWrapping="Wrap" IsVisible="{Binding IsErrorVisible}"/>
 
       <!-- 1. FLEET STATUS & RUNTIME AVAILABILITY (Top section, exactly matching web monitor) -->
       <Border Theme="{DynamicResource CardBorder}" Padding="14">
@@ -136,7 +136,8 @@
 
             <!-- Segmented 7-day usage ratio bar (web-monitor parity): one colored segment per target, width ∝ token share -->
             <Grid Height="18">
-              <Border Background="#181818" CornerRadius="6" IsVisible="{Binding HasUsageActivity}">
+              <Border Background="{DynamicResource NightCodeBgInput}" BorderBrush="{DynamicResource SemiColorBorder}"
+                      BorderThickness="1" CornerRadius="6" IsVisible="{Binding HasUsageActivity}">
                 <ItemsControl ItemsSource="{Binding UsageRatios}" Margin="1">
                   <ItemsControl.ItemsPanel>
                     <ItemsPanelTemplate>
@@ -154,7 +155,7 @@
                 </ItemsControl>
               </Border>
               <TextBlock Text="No token activity in the last 7 days"
-                         FontSize="11" FontStyle="Italic" Foreground="#666666"
+                         FontSize="11" FontStyle="Italic" Foreground="{DynamicResource SemiColorText3}"
                          HorizontalAlignment="Center" VerticalAlignment="Center"
                          IsVisible="{Binding HasUsageActivity, Converter={x:Static converters:BoolNegateConverter.Instance}}"/>
             </Grid>
@@ -197,10 +198,10 @@
         <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="12" IsVisible="{Binding HasCost}">
           <!-- Actual 7-Day Savings Card -->
           <Border Theme="{DynamicResource CardBorder}" Padding="14" Width="260"
-                  BorderBrush="#34E0A1" BorderThickness="4,1,1,1">
+                  BorderBrush="{DynamicResource TargetRemoteBrush}" BorderThickness="4,1,1,1">
             <StackPanel Spacing="4">
               <TextBlock Text="Actual 7-Day Savings" FontSize="12" Foreground="{DynamicResource SemiColorText2}"/>
-              <TextBlock Text="{Binding FormattedEstimatedSavings}" FontSize="24" FontWeight="Bold" Foreground="White"/>
+              <TextBlock Text="{Binding FormattedEstimatedSavings}" FontSize="24" FontWeight="Bold" Foreground="{DynamicResource SemiColorText0}"/>
               <TextBlock Text="net of electricity" FontSize="11" Foreground="{DynamicResource SemiColorText2}"/>
 
               <!-- Per-target savings list -->
@@ -223,10 +224,10 @@
 
           <!-- Cloud Overflow Cost Card -->
           <Border Theme="{DynamicResource CardBorder}" Padding="14" Width="200"
-                  BorderBrush="#C48BFF" BorderThickness="4,1,1,1">
+                  BorderBrush="{DynamicResource TargetCloudBrush}" BorderThickness="4,1,1,1">
             <StackPanel Spacing="4">
               <TextBlock Text="Cloud Overflow Cost" FontSize="12" Foreground="{DynamicResource SemiColorText2}"/>
-              <TextBlock Text="{Binding FormattedCloudOverflow}" FontSize="24" FontWeight="Bold" Foreground="White"/>
+              <TextBlock Text="{Binding FormattedCloudOverflow}" FontSize="24" FontWeight="Bold" Foreground="{DynamicResource SemiColorText0}"/>
               <TextBlock Text="7 days" FontSize="11" Foreground="{DynamicResource SemiColorText2}"/>
             </StackPanel>
           </Border>

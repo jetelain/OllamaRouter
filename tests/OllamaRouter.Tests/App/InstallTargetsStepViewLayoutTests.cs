@@ -57,6 +57,7 @@ public sealed class InstallTargetsStepViewLayoutTests
     private static StackPanel LoadIdentityStrip()
     {
         var view = new InstallTargetsStepView();
+        HeadlessThemeHelper.Apply(view);
         view.ApplyTemplate();
         var all = AllControls(view).ToList();
 

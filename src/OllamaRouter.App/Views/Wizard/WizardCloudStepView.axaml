@@ -13,7 +13,8 @@
            label + display-only CheckBox + "Toggle Cloud" button convention. The click runs
            ToggleCloudCommand (optimistic flip + wire confirm); while IsBusy the command's
            CanExecute gating auto-disables the CheckBox. -->
-      <Border Padding="10" CornerRadius="6" Background="#1E1E2A">
+      <Border Padding="10" CornerRadius="6" Background="{DynamicResource NightCodeBgSurface}"
+              BorderBrush="{DynamicResource SemiColorBorder}" BorderThickness="1">
         <StackPanel Spacing="8">
           <TextBlock Text="Ollama Cloud" FontSize="15" FontWeight="Bold"/>
           <CheckBox Content="Use Ollama Cloud when all local GPU are busy"
@@ -30,25 +31,26 @@
                       Width="360"
                       SelectionChanged="OnCloudModelSelectionChanged"/>
           </StackPanel>
-          <TextBlock TextWrapping="Wrap" Foreground="#9AA0B5" IsVisible="{Binding ShowEmptyModelsNote}"
+          <TextBlock TextWrapping="Wrap" Foreground="{DynamicResource SemiColorText2}" IsVisible="{Binding ShowEmptyModelsNote}"
                      Text="No cloud models in the fleet catalog — enable cloud overflow and/or set per-model CloudModel entries to populate this list."/>
-          <TextBlock TextWrapping="Wrap" Foreground="#FFB74D" IsVisible="{Binding ShowConfiguredNote}"
+          <TextBlock TextWrapping="Wrap" Foreground="{DynamicResource NightCodeAccentAmber}" IsVisible="{Binding ShowConfiguredNote}"
                      Text="{Binding ConfiguredDefaultNote}"/>
-          <TextBlock TextWrapping="Wrap" Foreground="#9AA0B5" IsVisible="{Binding !CloudOverflowConfigured}"
+          <TextBlock TextWrapping="Wrap" Foreground="{DynamicResource SemiColorText2}" IsVisible="{Binding !CloudOverflowConfigured}"
                      Text="Cloud relay needs an ollama.com sign-in on a fleet node."/>
           <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4"/>
-          <TextBlock Text="{Binding Message}" TextWrapping="Wrap" Foreground="#8BC34A"/>
-          <TextBlock Text="{Binding Error}" TextWrapping="Wrap" Foreground="#FF7B7B"/>
+          <TextBlock Text="{Binding Message}" TextWrapping="Wrap" Foreground="{DynamicResource SemiColorSuccess}"/>
+          <TextBlock Text="{Binding Error}" TextWrapping="Wrap" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}"/>
         </StackPanel>
       </Border>
 
       <!-- Card 2: Other providers — the main app's dedicated provider dialog (opened
            view-side; modal ownership needs the Window top level). -->
-      <Border Padding="10" CornerRadius="6" Background="#1E1E2A">
+      <Border Padding="10" CornerRadius="6" Background="{DynamicResource NightCodeBgSurface}"
+              BorderBrush="{DynamicResource SemiColorBorder}" BorderThickness="1">
         <StackPanel Spacing="8">
           <TextBlock Text="Other providers" FontSize="15" FontWeight="Bold"/>
           <Button Content="Add Provider" Click="OnAddProviderClick"/>
-          <TextBlock TextWrapping="Wrap" Foreground="#9AA0B5"
+          <TextBlock TextWrapping="Wrap" Foreground="{DynamicResource SemiColorText2}"
                      Text="External (OpenAI-compatible) providers use the main app's provider dialog and appear in the Step 2 fleet table."/>
         </StackPanel>
       </Border>

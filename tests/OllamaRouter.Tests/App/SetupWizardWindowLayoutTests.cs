@@ -266,7 +266,10 @@ public sealed class SetupWizardWindowLayoutTests : IClassFixture<SetupWizardWind
                     .Concat(routerRow.GetLogicalDescendants().OfType<Button>()),
                 b => Assert.NotNull(BindingOperations.GetBindingExpressionBase(b, Button.CommandProperty)));
 
-            // The two green ✓ right cells (port row + router row): text + #8BC34A foreground.
+            // The two green ✓ right cells (port row + router row): text + the
+            // NightCodeForge success green #10B981 foreground (task #170: the literal
+            // #8BC34A moved to the {DynamicResource SemiColorSuccess} token, resolved
+            // through the theme merged by HeadlessThemeHelper.Apply(window) in GetStep1View).
             var checks = stepView.GetLogicalDescendants().OfType<TextBlock>()
                 .Where(t => t.Text == "✓")
                 .ToArray();
@@ -276,7 +279,7 @@ public sealed class SetupWizardWindowLayoutTests : IClassFixture<SetupWizardWind
                 // Avalonia 12 parses XAML brush strings into IMMUTABLE brushes — assert via
                 // the ISolidColorBrush interface (works for both mutable and immutable).
                 var brush = Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(t.Foreground);
-                Assert.Equal(Avalonia.Media.Color.Parse("#8BC34A"), brush.Color);
+                Assert.Equal(Avalonia.Media.Color.Parse("#10B981"), brush.Color);
             });
 
             // Exactly 7 TextBlocks in Section 2 carry a LIVE Text binding: 1 LanRowLabel +
@@ -299,6 +302,7 @@ public sealed class SetupWizardWindowLayoutTests : IClassFixture<SetupWizardWind
     private static DockPanel GetWindowDock()
     {
         var window = new SetupWizardWindow { DataContext = BuildRootViewModel() };
+        HeadlessThemeHelper.Apply(window);
         return Assert.IsType<DockPanel>(window.Content);
     }
 
@@ -347,6 +351,7 @@ public sealed class SetupWizardWindowLayoutTests : IClassFixture<SetupWizardWind
     private static WizardEnvironmentStepView GetStep1View()
     {
         var window = new SetupWizardWindow { DataContext = BuildRootViewModel() };
+        HeadlessThemeHelper.Apply(window);
         var dock = Assert.IsType<DockPanel>(window.Content);
         // The step body is the LAST DockPanel child (fill); child 0 of its Grid is the
         // Step 1 pane (SelectedStep defaults to 0).
@@ -358,6 +363,7 @@ public sealed class SetupWizardWindowLayoutTests : IClassFixture<SetupWizardWind
     private static WizardTargetsStepView GetStep2View()
     {
         var window = new SetupWizardWindow { DataContext = BuildRootViewModel() };
+        HeadlessThemeHelper.Apply(window);
         var dock = Assert.IsType<DockPanel>(window.Content);
         // The step body is the LAST DockPanel child (fill); child 1 of its Grid is the
         // Step 2 (Fleet Targets) pane.
@@ -370,6 +376,7 @@ public sealed class SetupWizardWindowLayoutTests : IClassFixture<SetupWizardWind
     {
         var root = BuildRootViewModel();
         var window = new SetupWizardWindow { DataContext = root };
+        HeadlessThemeHelper.Apply(window);
         var dock = Assert.IsType<DockPanel>(window.Content);
         // The step body is the LAST DockPanel child (fill); child 2 of its Grid is the
         // Step 3 (Cloud & External Providers) pane (task #151).

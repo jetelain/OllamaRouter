@@ -11,7 +11,7 @@
     <StackPanel DockPanel.Dock="Top" Spacing="6">
       <TextBlock Text="{Binding ModelName}" FontWeight="Bold" FontSize="16"/>
       <TextBlock Text="This permanently deletes the model files on the selected nodes. This cannot be undone."
-                 Foreground="#FF7B7B" TextWrapping="Wrap"/>
+                 Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" TextWrapping="Wrap"/>
       <ScrollViewer MaxHeight="200" VerticalScrollBarVisibility="Auto">
         <ItemsControl ItemsSource="{Binding Targets}">
           <ItemsControl.ItemTemplate>
@@ -20,9 +20,9 @@
                 <CheckBox Grid.Column="0" IsChecked="{Binding IsSelected}" VerticalAlignment="Center"/>
                 <TextBlock Grid.Column="1" Text="{Binding Target}" FontWeight="SemiBold" VerticalAlignment="Center"/>
                 <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
-                  <TextBlock Text="deleted" Foreground="#22C55E" VerticalAlignment="Center"
+                  <TextBlock Text="deleted" Foreground="{DynamicResource SemiColorSuccess}" VerticalAlignment="Center"
                              IsVisible="{Binding Succeeded, Converter={x:Static local:SuccessVisibilityConverter.SuccessInstance}}"/>
-                  <TextBlock Text="{Binding ResultText}" Foreground="#FF7B7B" TextTrimming="CharacterEllipsis"
+                  <TextBlock Text="{Binding ResultText}" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" TextTrimming="CharacterEllipsis"
                              VerticalAlignment="Center"
                              IsVisible="{Binding Succeeded, Converter={x:Static local:SuccessVisibilityConverter.FailureInstance}}"/>
                 </StackPanel>
@@ -31,9 +31,9 @@
           </ItemsControl.ItemTemplate>
         </ItemsControl>
       </ScrollViewer>
-      <TextBlock Text="{Binding ErrorMessage}" Foreground="#FF7B7B" TextWrapping="Wrap"/>
+      <TextBlock Text="{Binding ErrorMessage}" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" TextWrapping="Wrap"/>
       <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
-        <Button Content="Uninstall" Classes="Primary" Click="OnUninstallClick"/>
+        <Button Content="Uninstall" Classes="Danger" Click="OnUninstallClick"/>
         <Button Content="Cancel" Click="OnCancelClick"/>
         <Button Content="Close" IsVisible="{Binding HasResults}" Click="OnCancelClick"/>
       </StackPanel>

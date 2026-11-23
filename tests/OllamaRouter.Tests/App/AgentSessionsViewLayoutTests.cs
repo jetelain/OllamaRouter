@@ -389,6 +389,7 @@ public sealed class AgentSessionsViewLayoutTests
         // constructor — no Application / headless platform needed (and HeadlessUnitTestSession
         // is deliberately avoided: it deadlocks in this environment).
         var view = new AgentSessionsView();
+        HeadlessThemeHelper.Apply(view);
         view.ApplyTemplate();
         return view;
     }

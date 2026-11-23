@@ -11,7 +11,9 @@
         WindowStartupLocation="CenterOwner">
   <DockPanel>
     <!-- 3-step progress header: all titles visible, the active step is bold -->
-    <Border DockPanel.Dock="Top" Padding="12,10" BorderBrush="#333" BorderThickness="0,0,0,1">
+    <Border DockPanel.Dock="Top" Padding="12,10"
+            Background="{DynamicResource NightCodeBgSurface}"
+            BorderBrush="{DynamicResource SemiColorBorder}" BorderThickness="0,0,0,1">
       <StackPanel Orientation="Horizontal" Spacing="18">
         <TextBlock Text="1 · Model"
                    FontWeight="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToFontWeightConverter.Instance}, ConverterParameter=0}"/>
@@ -23,14 +25,16 @@
     </Border>
 
     <!-- Bottom navigation bar: Cancel | Back | Next | Install | Done -->
-    <Border DockPanel.Dock="Bottom" Padding="12,10" BorderBrush="#333" BorderThickness="0,1,0,0">
+    <Border DockPanel.Dock="Bottom" Padding="12,10"
+            Background="{DynamicResource NightCodeBgSurface}"
+            BorderBrush="{DynamicResource SemiColorBorder}" BorderThickness="0,1,0,0">
       <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
         <Button Content="Cancel" Command="{Binding CancelCommand}"/>
         <Button Content="Back" Command="{Binding BackCommand}"/>
-        <Button Content="Next" Command="{Binding NextCommand}"/>
+        <Button Content="Next" Classes="Primary" Command="{Binding NextCommand}"/>
         <Button Content="Install" Command="{Binding ReviewStep.InstallCommand}" Classes="Primary"
                 IsVisible="{Binding ReviewStep.IsRunning, Converter={x:Static conv:BoolNegateConverter.Instance}}"/>
-        <Button Content="Cancel install" Command="{Binding ReviewStep.CancelInstallCommand}"
+        <Button Content="Cancel install" Classes="Danger" Command="{Binding ReviewStep.CancelInstallCommand}"
                 IsVisible="{Binding ReviewStep.IsRunning}"/>
         <Button Content="Done" Command="{Binding DoneCommand}" Classes="Primary"
                 IsVisible="{Binding ReviewStep.RunCompleted}"/>

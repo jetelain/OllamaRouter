@@ -67,11 +67,14 @@ public static class Program
     /// The verified Avalonia 11.3 software-rendering pattern: in 11.x the
     /// <c>UseWin32</c>/<c>UseX11</c> extensions take no options argument; the platform
     /// options are registered through <see cref="AppBuilder.With(object)"/> into the
-    /// <c>AvaloniaLocator</c> and consumed by the platform at initialization.
+    /// <c>AvaloniaLocator</c> and consumed by the platform at initialization. The Inter font is
+    /// registered explicitly (task #170 — the companion NightCodeForge apps' pattern; under
+    /// Native AOT it must NOT rely on automatic font registration).
     /// </summary>
     public static AppBuilder BuildAvaloniaApp() =>
         AppBuilder.Configure<App>()
             .UsePlatformDetect()
+            .WithInterFont()
             .With(new Win32PlatformOptions { RenderingMode = [Win32RenderingMode.Software] })
             .With(new X11PlatformOptions { RenderingMode = [X11RenderingMode.Software] });
 }

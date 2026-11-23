@@ -275,6 +275,7 @@ public sealed class MonitorViewLayoutTests
                     Grid RecentHeader, Grid RecentRow) LoadTables()
     {
         var view = new MonitorView();
+        HeadlessThemeHelper.Apply(view);
         view.ApplyTemplate();
         var all = AllControls(view).ToList();
 

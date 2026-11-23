@@ -24,7 +24,7 @@
                    Text="{Binding ParsedTag, StringFormat='quant/tag: {0}'}"
                    IsVisible="{Binding ParsedTag, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
       </Grid>
-      <TextBlock Text="{Binding ParseError}" Foreground="#FF7B7B" TextWrapping="Wrap"/>
+      <TextBlock Text="{Binding ParseError}" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" TextWrapping="Wrap"/>
 
       <!-- Quick-pick common quant tags (suggestions only; manual mode) -->
       <StackPanel Orientation="Horizontal" Spacing="6">
@@ -44,8 +44,8 @@
 
       <!-- Assisted mode: the fleet-known state (setup-wizard-style fetch-on-entry) -->
       <StackPanel Spacing="4" IsVisible="{Binding Assisted}">
-        <TextBlock Text="{Binding FleetMessage}" TextWrapping="Wrap" Foreground="#8BC34A"/>
-        <TextBlock Text="{Binding FleetError}" TextWrapping="Wrap" Foreground="#FF7B7B"/>
+        <TextBlock Text="{Binding FleetMessage}" TextWrapping="Wrap" Foreground="{DynamicResource SemiColorSuccess}"/>
+        <TextBlock Text="{Binding FleetError}" TextWrapping="Wrap" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}"/>
         <TextBlock Text="{Binding TagProvenance, StringFormat='tag: {0}'}"
                    Foreground="{DynamicResource SemiColorText2}" FontSize="11"
                    IsVisible="{Binding TagProvenance, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>

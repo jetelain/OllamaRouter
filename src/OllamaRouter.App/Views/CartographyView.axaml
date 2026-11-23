@@ -6,7 +6,7 @@
              x:DataType="vm:CartographyViewModel">
   <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto">
     <StackPanel Spacing="16" Margin="12,12,12,48">
-      <TextBlock Text="{Binding LastError}" Foreground="#FF7B7B" TextWrapping="Wrap" IsVisible="{Binding IsErrorVisible}"/>
+      <TextBlock Text="{Binding LastError}" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" TextWrapping="Wrap" IsVisible="{Binding IsErrorVisible}"/>
       <Grid ColumnDefinitions="*,auto,auto">
         <TextBlock Grid.Column="0" Text="Model Cartography &amp; Deployment Matrix" FontWeight="Bold" FontSize="16" VerticalAlignment="Center"/>
         <Button Grid.Column="1" Content="Install Model" Classes="Primary" Click="OnInstallModelClick" Margin="0,0,8,0"/>

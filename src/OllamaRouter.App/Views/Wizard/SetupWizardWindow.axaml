@@ -12,15 +12,19 @@
   <DockPanel>
     <!-- Task #150: branding header (OllamaRouter name + logo) — Setup Wizard window ONLY,
          docked ABOVE the step strip (the main app window is untouched). -->
-    <Border DockPanel.Dock="Top" Padding="12,8" BorderBrush="#333" BorderThickness="0,0,0,1">
+    <Border DockPanel.Dock="Top" Padding="12,8"
+            Background="{DynamicResource NightCodeBgSurface}"
+            BorderBrush="{DynamicResource SemiColorBorder}" BorderThickness="0,0,0,1">
       <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
         <Image Source="avares://ollamarouter-app/Assets/icon.ico" Width="28" Height="28"/>
-        <TextBlock Text="OllamaRouter" FontSize="18" FontWeight="Bold" VerticalAlignment="Center"/>
+        <TextBlock Text="OllamaRouter" FontSize="18" FontWeight="Bold" Foreground="{DynamicResource SemiColorText0}"
+                   VerticalAlignment="Center"/>
       </StackPanel>
     </Border>
-
     <!-- 5-step progress header (task #151): all titles visible, the active step is bold -->
-    <Border DockPanel.Dock="Top" Padding="12,10" BorderBrush="#333" BorderThickness="0,0,0,1">
+    <Border DockPanel.Dock="Top" Padding="12,10"
+            Background="{DynamicResource NightCodeBgSurface}"
+            BorderBrush="{DynamicResource SemiColorBorder}" BorderThickness="0,0,0,1">
       <StackPanel Orientation="Horizontal" Spacing="18">
         <TextBlock Text="1 · Local Ollama"
                    FontWeight="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToFontWeightConverter.Instance}, ConverterParameter=0}"/>
@@ -36,11 +40,13 @@
     </Border>
 
     <!-- Bottom navigation bar (Finish is the only hard gate) -->
-    <Border DockPanel.Dock="Bottom" Padding="12,10" BorderBrush="#333" BorderThickness="0,1,0,0">
+    <Border DockPanel.Dock="Bottom" Padding="12,10"
+            Background="{DynamicResource NightCodeBgSurface}"
+            BorderBrush="{DynamicResource SemiColorBorder}" BorderThickness="0,1,0,0">
       <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
         <Button Content="Back" Command="{Binding BackCommand}"/>
-        <Button Content="Next" Command="{Binding NextCommand}"/>
-        <Button Content="Finish" Command="{Binding FinishCommand}"/>
+        <Button Content="Next" Classes="Primary" Command="{Binding NextCommand}"/>
+        <Button Content="Finish" Classes="Primary" Command="{Binding FinishCommand}"/>
       </StackPanel>
     </Border>
 

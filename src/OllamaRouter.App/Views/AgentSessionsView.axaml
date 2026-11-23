@@ -8,7 +8,7 @@
              x:DataType="vm:AgentSessionsViewModel">
   <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
     <StackPanel Spacing="16" Margin="12,12,12,48">
-      <TextBlock Text="{Binding LastError}" Foreground="#FF7B7B" TextWrapping="Wrap" IsVisible="{Binding IsErrorVisible}"/>
+      <TextBlock Text="{Binding LastError}" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" TextWrapping="Wrap" IsVisible="{Binding IsErrorVisible}"/>
 
       <!-- 1. SUMMARY: fleet-wide aggregates over the listed sessions -->
       <Border Theme="{DynamicResource CardBorder}" Padding="14">
@@ -90,7 +90,7 @@
           </ListBox>
 
           <TextBlock Text="No agent sessions recorded yet. Sessions are tracked per X-OllamaRouter-Session-Id (or X-OllamaRouter-Agent-Id) request header — completed requests with a session/agent ID appear here."
-                     FontSize="11" FontStyle="Italic" Foreground="#666666"
+                     FontSize="11" FontStyle="Italic" Foreground="{DynamicResource SemiColorText3}"
                      IsVisible="{Binding HasSessions, Converter={x:Static converters:BoolNegateConverter.Instance}}"/>
         </StackPanel>
       </Border>
@@ -129,7 +129,7 @@
             <TextBlock Grid.Column="8" Text="{Binding SelectedRow.FormattedSavings}" VerticalAlignment="Center" TextAlignment="Right"/>
           </Grid>
 
-          <TextBlock Text="{Binding SelectedDetailError}" Foreground="#FF7B7B" TextWrapping="Wrap"
+          <TextBlock Text="{Binding SelectedDetailError}" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" TextWrapping="Wrap"
                      IsVisible="{Binding SelectedDetailError, Converter={x:Static dialogs:NotNullToBoolConverter.Instance}}"/>
 
           <!-- Per-target breakdown (fleet order, Cloud last) -->

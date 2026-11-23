@@ -3803,14 +3803,14 @@ public sealed class SetupWizardViewModelsTests
         var conv = BoolToMessageForegroundConverter.Instance;
         var culture = System.Globalization.CultureInfo.InvariantCulture;
 
-        var error = Assert.IsType<Avalonia.Media.SolidColorBrush>(conv.Convert(true, typeof(object), null, culture));
-        Assert.Equal(Avalonia.Media.Color.Parse("#F2A0A0"), error.Color);
+        var error = Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(conv.Convert(true, typeof(object), null, culture));
+        Assert.Equal(Avalonia.Media.Color.Parse("#F87171"), error.Color);
 
-        var ok = Assert.IsType<Avalonia.Media.SolidColorBrush>(conv.Convert(false, typeof(object), null, culture));
-        Assert.Equal(Avalonia.Media.Color.Parse("#8BC34A"), ok.Color);
+        var ok = Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(conv.Convert(false, typeof(object), null, culture));
+        Assert.Equal(Avalonia.Media.Color.Parse("#10B981"), ok.Color);
 
-        var nonBool = Assert.IsType<Avalonia.Media.SolidColorBrush>(conv.Convert("bogus", typeof(object), null, culture));
-        Assert.Equal(Avalonia.Media.Color.Parse("#8BC34A"), nonBool.Color);
+        var nonBool = Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(conv.Convert("bogus", typeof(object), null, culture));
+        Assert.Equal(Avalonia.Media.Color.Parse("#10B981"), nonBool.Color);
 
         // One-way converter: ConvertBack is a no-op for bindings.
         Assert.Throws<System.NotSupportedException>(() => conv.ConvertBack(null, typeof(object), null, culture));

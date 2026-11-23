@@ -333,6 +333,7 @@ public sealed class FleetTargetsViewLayoutTests
     private static StackPanel GetToolbar()
     {
         var view = new FleetTargetsView();
+        HeadlessThemeHelper.Apply(view);
         view.ApplyTemplate();
         var scrollViewer = Assert.IsType<ScrollViewer>(view.Content);
         var root = Assert.IsType<StackPanel>(scrollViewer.Content);
@@ -342,6 +343,7 @@ public sealed class FleetTargetsViewLayoutTests
     private static (StackPanel Row, Grid Identity, Grid Endpoint) LoadRowTemplate()
     {
         var view = new FleetTargetsView();
+        HeadlessThemeHelper.Apply(view);
         view.ApplyTemplate();
         var all = AllControls(view).ToList();
 

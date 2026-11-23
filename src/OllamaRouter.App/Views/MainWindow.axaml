@@ -27,20 +27,29 @@
   </Window.DataTemplates>
 
   <Grid RowDefinitions="Auto,*">
-    <!-- Modern Header / Connection bar -->
-    <Border Grid.Row="0" BorderBrush="{DynamicResource SemiColorBorder}" BorderThickness="0,0,0,1">
+    <!-- NightCodeForge surface-card branding header (task #170): app icon + two-tone
+         Ollama/Router wordmark + the daemon status pill + the controls. -->
+    <Border Grid.Row="0"
+            Background="{DynamicResource NightCodeBgSurface}"
+            BorderBrush="{DynamicResource SemiColorBorder}"
+            BorderThickness="1"
+            CornerRadius="8"
+            Margin="8,8,8,0"
+            Padding="12,10">
       <StackPanel>
-        <Grid ColumnDefinitions="auto,*,auto" Margin="14,10" VerticalAlignment="Center">
+        <Grid ColumnDefinitions="auto,*,auto" VerticalAlignment="Center">
           <!-- Left: Title & Status -->
           <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
-            <TextBlock Text="OllamaRouter" FontSize="16" FontWeight="Bold" VerticalAlignment="Center"/>
+            <Image Source="avares://ollamarouter-app/Assets/icon.ico" Width="28" Height="28"
+                   VerticalAlignment="Center"/>
+            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+              <TextBlock Text="Ollama" FontSize="18" FontWeight="Bold"/>
+              <TextBlock Text="Router" FontSize="18" FontWeight="ExtraBold"
+                         Foreground="{DynamicResource NightCodeAccentIndigoLightText}"/>
+            </StackPanel>
             <Border Theme="{DynamicResource TagBorder}" Padding="8,3" CornerRadius="12">
               <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
-                <Ellipse Width="8" Height="8" VerticalAlignment="Center">
-                  <Ellipse.Fill>
-                    <SolidColorBrush Color="#3BA55C"/>
-                  </Ellipse.Fill>
-                </Ellipse>
+                <Ellipse Width="8" Height="8" Fill="{DynamicResource SemiColorSuccess}" VerticalAlignment="Center"/>
                 <TextBlock Text="{Binding StatusText}" FontWeight="SemiBold" FontSize="12" VerticalAlignment="Center"/>
               </StackPanel>
             </Border>

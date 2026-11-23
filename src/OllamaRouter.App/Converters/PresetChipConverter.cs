@@ -20,8 +20,9 @@ public sealed class PresetChipConverter : IValueConverter
 
     // IMMUTABLE brushes: the statics are shared process-wide (converter + layout tests
     // run on different threads), so they must not capture a thread owner — the
-    // TargetVisualConverters convention.
-    private static readonly IBrush SelectedBrush = new ImmutableSolidColorBrush(Color.FromArgb(90, 90, 160, 255));
+    // TargetVisualConverters convention. Task #170: the accent moved from the ad-hoc
+    // indigo tint to the NightCodeForge accent indigo (#6366F1 at ~25% alpha).
+    private static readonly IBrush SelectedBrush = new ImmutableSolidColorBrush(Color.FromArgb(64, 99, 102, 241));
     private static readonly IBrush UnselectedBrush = new ImmutableSolidColorBrush(Colors.Transparent);
 
     private PresetChipConverter()

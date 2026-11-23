@@ -5,8 +5,10 @@ using OllamaRouter.App.Bootstrap;
 namespace OllamaRouter.App;
 
 /// <summary>
-/// The Fluent-themed application shell (task #102; task #103 adds the wizard mode). The Inter
-/// font is registered automatically by the <c>Avalonia.Fonts.Inter</c> package. The window is
+/// The NightCodeForge Obsidian &amp; Indigo themed application shell (task #102; task #103 adds
+/// the wizard mode; task #170 merges <c>Themes/NightCodeForgeTheme.axaml</c> and adopts the
+/// companion apps' surface hierarchy). The Inter font is registered explicitly by
+/// <c>Program.BuildAvaloniaApp</c> via <c>.WithInterFont()</c>. The window is
 /// built through the composition root: the 4-step Setup Wizard when <c>--wizard</c> is passed
 /// OR when no <c>config/config.json</c> exists in any config root (first run), else the dashboard.
 /// </summary>

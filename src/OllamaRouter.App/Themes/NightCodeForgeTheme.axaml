@@ -1,0 +1,269 @@
+<ResourceDictionary xmlns="https://github.com/avaloniaui"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+  <!-- ======================================================================
+       NightCodeForge Obsidian & Indigo Design Tokens
+       Mirrors NightCodeForge.Web/wwwroot/css/theme.css
+       ====================================================================== -->
+
+  <!-- Raw Colors -->
+  <Color x:Key="NightCodeBgCanvasColor">#0B0D13</Color>
+  <Color x:Key="NightCodeBgPrimaryColor">#0F1117</Color>
+  <Color x:Key="NightCodeBgSurfaceColor">#181B24</Color>
+  <Color x:Key="NightCodeBgCardColor">#202433</Color>
+  <Color x:Key="NightCodeBgCardHoverColor">#272C3D</Color>
+  <Color x:Key="NightCodeBgElevatedColor">#242938</Color>
+  <Color x:Key="NightCodeBgInputColor">#12141C</Color>
+
+  <Color x:Key="NightCodeBorderSubtleColor">#2D3345</Color>
+  <Color x:Key="NightCodeBorderMediumColor">#3B4256</Color>
+  <Color x:Key="NightCodeBorderFocusColor">#6366F1</Color>
+  <Color x:Key="NightCodeBorderAccentColor">#596366F1</Color>
+
+  <Color x:Key="NightCodeTextPrimaryColor">#F8FAFC</Color>
+  <Color x:Key="NightCodeTextHighColor">#CBD5E1</Color>
+  <Color x:Key="NightCodeTextSecondaryColor">#94A3B8</Color>
+  <Color x:Key="NightCodeTextMutedColor">#64748B</Color>
+  <Color x:Key="NightCodeTextDisabledColor">#475569</Color>
+
+  <Color x:Key="NightCodeAccentIndigoColor">#6366F1</Color>
+  <Color x:Key="NightCodeAccentIndigoHoverColor">#4F46E5</Color>
+  <Color x:Key="NightCodeAccentIndigoActiveColor">#4338CA</Color>
+  <Color x:Key="NightCodeAccentIndigoLightTextColor">#A5B4FC</Color>
+  <Color x:Key="NightCodeAccentIndigoDisabledColor">#312E81</Color>
+
+  <Color x:Key="NightCodeAccentTealColor">#14B8A6</Color>
+  <Color x:Key="NightCodeAccentTealHoverColor">#0D9488</Color>
+  <Color x:Key="NightCodeAccentTealActiveColor">#0F766E</Color>
+  <Color x:Key="NightCodeAccentTealDisabledColor">#134E4A</Color>
+
+  <Color x:Key="NightCodeAccentAmberColor">#F59E0B</Color>
+  <Color x:Key="NightCodeAccentAmberHoverColor">#D97706</Color>
+  <Color x:Key="NightCodeAccentAmberActiveColor">#B45309</Color>
+
+  <Color x:Key="NightCodeAccentCrimsonColor">#EF4444</Color>
+  <Color x:Key="NightCodeAccentCrimsonHoverColor">#DC2626</Color>
+  <Color x:Key="NightCodeAccentCrimsonActiveColor">#B91C1C</Color>
+  <Color x:Key="NightCodeAccentCrimsonLightTextColor">#F87171</Color>
+
+  <Color x:Key="NightCodeStatusSuccessColor">#10B981</Color>
+  <Color x:Key="NightCodeStatusSuccessHoverColor">#059669</Color>
+  <Color x:Key="NightCodeStatusSuccessActiveColor">#047857</Color>
+  <Color x:Key="NightCodeStatusSuccessDisabledColor">#064E3B</Color>
+
+  <!-- Named Brushes for Views -->
+  <SolidColorBrush x:Key="NightCodeBgCanvas" Color="{StaticResource NightCodeBgCanvasColor}" />
+  <SolidColorBrush x:Key="NightCodeBgPrimary" Color="{StaticResource NightCodeBgPrimaryColor}" />
+  <SolidColorBrush x:Key="NightCodeBgSurface" Color="{StaticResource NightCodeBgSurfaceColor}" />
+  <SolidColorBrush x:Key="NightCodeBgCard" Color="{StaticResource NightCodeBgCardColor}" />
+  <SolidColorBrush x:Key="NightCodeBgCardHover" Color="{StaticResource NightCodeBgCardHoverColor}" />
+  <SolidColorBrush x:Key="NightCodeBgElevated" Color="{StaticResource NightCodeBgElevatedColor}" />
+  <SolidColorBrush x:Key="NightCodeBgInput" Color="{StaticResource NightCodeBgInputColor}" />
+  <SolidColorBrush x:Key="NightCodeBorderAccent" Color="{StaticResource NightCodeBorderAccentColor}" />
+  <SolidColorBrush x:Key="NightCodeAccentIndigoLightText" Color="{StaticResource NightCodeAccentIndigoLightTextColor}" />
+  <SolidColorBrush x:Key="NightCodeAccentAmber" Color="{StaticResource NightCodeAccentAmberColor}" />
+  <SolidColorBrush x:Key="NightCodeAccentCrimsonLightText" Color="{StaticResource NightCodeAccentCrimsonLightTextColor}" />
+
+  <!-- ======================================================================
+       Semi.Avalonia Semantic Token Overrides
+       ====================================================================== -->
+
+  <!-- Backgrounds -->
+  <SolidColorBrush x:Key="SemiColorBackground0" Color="{StaticResource NightCodeBgCanvasColor}" />
+  <SolidColorBrush x:Key="SemiColorBackground1" Color="{StaticResource NightCodeBgPrimaryColor}" />
+  <SolidColorBrush x:Key="SemiColorBackground2" Color="{StaticResource NightCodeBgSurfaceColor}" />
+  <SolidColorBrush x:Key="SemiColorBackground3" Color="{StaticResource NightCodeBgCardColor}" />
+  <SolidColorBrush x:Key="SemiColorBackground4" Color="{StaticResource NightCodeBgElevatedColor}" />
+  <SolidColorBrush x:Key="SemiColorNavBackground" Color="{StaticResource NightCodeBgPrimaryColor}" />
+  <SolidColorBrush x:Key="SemiColorOverlayBackground" Opacity="0.82" Color="#080A0F" />
+
+  <!-- Text -->
+  <SolidColorBrush x:Key="SemiColorText0" Color="{StaticResource NightCodeTextPrimaryColor}" />
+  <SolidColorBrush x:Key="SemiColorText1" Color="{StaticResource NightCodeTextHighColor}" />
+  <SolidColorBrush x:Key="SemiColorText2" Color="{StaticResource NightCodeTextSecondaryColor}" />
+  <SolidColorBrush x:Key="SemiColorText3" Color="{StaticResource NightCodeTextMutedColor}" />
+  <SolidColorBrush x:Key="SemiColorDisabledText" Color="{StaticResource NightCodeTextDisabledColor}" />
+
+  <!-- Borders & Fills -->
+  <SolidColorBrush x:Key="SemiColorBorder" Color="{StaticResource NightCodeBorderSubtleColor}" />
+  <SolidColorBrush x:Key="SemiColorFocusBorder" Color="{StaticResource NightCodeBorderFocusColor}" />
+  <SolidColorBrush x:Key="SemiColorDisabledBorder" Color="#1E293B" />
+  <SolidColorBrush x:Key="SemiColorFill0" Color="{StaticResource NightCodeBgSurfaceColor}" />
+  <SolidColorBrush x:Key="SemiColorFill1" Color="{StaticResource NightCodeBgCardColor}" />
+  <SolidColorBrush x:Key="SemiColorFill2" Color="{StaticResource NightCodeBgCardHoverColor}" />
+  <SolidColorBrush x:Key="SemiColorDisabledFill" Color="{StaticResource NightCodeBgInputColor}" />
+  <SolidColorBrush x:Key="SemiColorDisabledBackground" Color="{StaticResource NightCodeBgSurfaceColor}" />
+
+  <!-- Primary (Indigo) -->
+  <SolidColorBrush x:Key="SemiColorPrimary" Color="{StaticResource NightCodeAccentIndigoColor}" />
+  <SolidColorBrush x:Key="SemiColorPrimaryPointerover" Color="{StaticResource NightCodeAccentIndigoHoverColor}" />
+  <SolidColorBrush x:Key="SemiColorPrimaryActive" Color="{StaticResource NightCodeAccentIndigoActiveColor}" />
+  <SolidColorBrush x:Key="SemiColorPrimaryDisabled" Color="{StaticResource NightCodeAccentIndigoDisabledColor}" />
+  <SolidColorBrush x:Key="SemiColorPrimaryLight" Opacity="0.15" Color="{StaticResource NightCodeAccentIndigoColor}" />
+  <SolidColorBrush x:Key="SemiColorPrimaryLightPointerover" Opacity="0.25" Color="{StaticResource NightCodeAccentIndigoColor}" />
+  <SolidColorBrush x:Key="SemiColorPrimaryLightActive" Opacity="0.35" Color="{StaticResource NightCodeAccentIndigoColor}" />
+
+  <!-- Secondary (Teal) -->
+  <SolidColorBrush x:Key="SemiColorSecondary" Color="{StaticResource NightCodeAccentTealColor}" />
+  <SolidColorBrush x:Key="SemiColorSecondaryPointerover" Color="{StaticResource NightCodeAccentTealHoverColor}" />
+  <SolidColorBrush x:Key="SemiColorSecondaryActive" Color="{StaticResource NightCodeAccentTealActiveColor}" />
+  <SolidColorBrush x:Key="SemiColorSecondaryDisabled" Color="{StaticResource NightCodeAccentTealDisabledColor}" />
+  <SolidColorBrush x:Key="SemiColorSecondaryLight" Opacity="0.15" Color="{StaticResource NightCodeAccentTealColor}" />
+  <SolidColorBrush x:Key="SemiColorSecondaryLightPointerover" Opacity="0.25" Color="{StaticResource NightCodeAccentTealColor}" />
+  <SolidColorBrush x:Key="SemiColorSecondaryLightActive" Opacity="0.35" Color="{StaticResource NightCodeAccentTealColor}" />
+
+  <!-- Information (Indigo) -->
+  <SolidColorBrush x:Key="SemiColorInformation" Color="{StaticResource NightCodeAccentIndigoColor}" />
+  <SolidColorBrush x:Key="SemiColorInformationPointerover" Color="{StaticResource NightCodeAccentIndigoHoverColor}" />
+  <SolidColorBrush x:Key="SemiColorInformationActive" Color="{StaticResource NightCodeAccentIndigoActiveColor}" />
+  <SolidColorBrush x:Key="SemiColorInformationDisabled" Color="{StaticResource NightCodeAccentIndigoDisabledColor}" />
+  <SolidColorBrush x:Key="SemiColorInformationLight" Opacity="0.15" Color="{StaticResource NightCodeAccentIndigoColor}" />
+  <SolidColorBrush x:Key="SemiColorInformationLightPointerover" Opacity="0.25" Color="{StaticResource NightCodeAccentIndigoColor}" />
+  <SolidColorBrush x:Key="SemiColorInformationLightActive" Opacity="0.35" Color="{StaticResource NightCodeAccentIndigoColor}" />
+
+  <!-- Success -->
+  <SolidColorBrush x:Key="SemiColorSuccess" Color="{StaticResource NightCodeStatusSuccessColor}" />
+  <SolidColorBrush x:Key="SemiColorSuccessPointerover" Color="{StaticResource NightCodeStatusSuccessHoverColor}" />
+  <SolidColorBrush x:Key="SemiColorSuccessActive" Color="{StaticResource NightCodeStatusSuccessActiveColor}" />
+  <SolidColorBrush x:Key="SemiColorSuccessDisabled" Color="{StaticResource NightCodeStatusSuccessDisabledColor}" />
+  <SolidColorBrush x:Key="SemiColorSuccessLight" Opacity="0.15" Color="{StaticResource NightCodeStatusSuccessColor}" />
+  <SolidColorBrush x:Key="SemiColorSuccessLightPointerover" Opacity="0.25" Color="{StaticResource NightCodeStatusSuccessColor}" />
+  <SolidColorBrush x:Key="SemiColorSuccessLightActive" Opacity="0.35" Color="{StaticResource NightCodeStatusSuccessColor}" />
+
+  <!-- Warning -->
+  <SolidColorBrush x:Key="SemiColorWarning" Color="{StaticResource NightCodeAccentAmberColor}" />
+  <SolidColorBrush x:Key="SemiColorWarningPointerover" Color="{StaticResource NightCodeAccentAmberHoverColor}" />
+  <SolidColorBrush x:Key="SemiColorWarningActive" Color="{StaticResource NightCodeAccentAmberActiveColor}" />
+  <SolidColorBrush x:Key="SemiColorWarningLight" Opacity="0.15" Color="{StaticResource NightCodeAccentAmberColor}" />
+  <SolidColorBrush x:Key="SemiColorWarningLightPointerover" Opacity="0.25" Color="{StaticResource NightCodeAccentAmberColor}" />
+  <SolidColorBrush x:Key="SemiColorWarningLightActive" Opacity="0.35" Color="{StaticResource NightCodeAccentAmberColor}" />
+
+  <!-- Danger -->
+  <SolidColorBrush x:Key="SemiColorDanger" Color="{StaticResource NightCodeAccentCrimsonColor}" />
+  <SolidColorBrush x:Key="SemiColorDangerPointerover" Color="{StaticResource NightCodeAccentCrimsonHoverColor}" />
+  <SolidColorBrush x:Key="SemiColorDangerActive" Color="{StaticResource NightCodeAccentCrimsonActiveColor}" />
+  <SolidColorBrush x:Key="SemiColorDangerDisabled" Color="#7F1D1D" />
+  <SolidColorBrush x:Key="SemiColorDangerLight" Opacity="0.15" Color="{StaticResource NightCodeAccentCrimsonColor}" />
+  <SolidColorBrush x:Key="SemiColorDangerLightPointerover" Opacity="0.25" Color="{StaticResource NightCodeAccentCrimsonColor}" />
+  <SolidColorBrush x:Key="SemiColorDangerLightActive" Opacity="0.35" Color="{StaticResource NightCodeAccentCrimsonColor}" />
+
+  <!-- Links -->
+  <SolidColorBrush x:Key="SemiColorLink" Color="{StaticResource NightCodeAccentIndigoColor}" />
+  <SolidColorBrush x:Key="SemiColorLinkPointerover" Color="#818CF8" />
+  <SolidColorBrush x:Key="SemiColorLinkActive" Color="{StaticResource NightCodeAccentIndigoLightTextColor}" />
+  <SolidColorBrush x:Key="SemiColorLinkVisited" Color="{StaticResource NightCodeAccentIndigoColor}" />
+
+  <!-- Radii -->
+  <CornerRadius x:Key="SemiBorderRadiusSmall">4</CornerRadius>
+  <CornerRadius x:Key="SemiBorderRadiusMedium">8</CornerRadius>
+  <CornerRadius x:Key="SemiBorderRadiusLarge">12</CornerRadius>
+
+  <!-- ======================================================================
+       Control-Level Token Overrides (for Semi.Avalonia StaticResource bindings)
+       ====================================================================== -->
+
+  <!-- Window -->
+  <SolidColorBrush x:Key="WindowDefaultBackground" Color="{StaticResource NightCodeBgCanvasColor}" />
+  <SolidColorBrush x:Key="WindowDefaultForeground" Color="{StaticResource NightCodeTextPrimaryColor}" />
+  <SolidColorBrush x:Key="DefaultForeground" Color="{StaticResource NightCodeTextPrimaryColor}" />
+
+  <!-- Button -->
+  <SolidColorBrush x:Key="ButtonDefaultPrimaryForeground" Color="{StaticResource NightCodeAccentIndigoLightTextColor}" />
+  <SolidColorBrush x:Key="ButtonDefaultSecondaryForeground" Color="#5EEAD4" />
+  <SolidColorBrush x:Key="ButtonDefaultTertiaryForeground" Color="{StaticResource NightCodeTextPrimaryColor}" />
+  <SolidColorBrush x:Key="ButtonDefaultSuccessForeground" Color="#34D399" />
+  <SolidColorBrush x:Key="ButtonDefaultWarningForeground" Color="#FBBF24" />
+  <SolidColorBrush x:Key="ButtonDefaultDangerForeground" Color="{StaticResource NightCodeAccentCrimsonLightTextColor}" />
+  <SolidColorBrush x:Key="ButtonDefaultDisabledForeground" Color="{StaticResource NightCodeTextDisabledColor}" />
+  <SolidColorBrush x:Key="ButtonDefaultBackground" Color="{StaticResource NightCodeBgCardColor}" />
+  <SolidColorBrush x:Key="ButtonDefaultPointeroverBackground" Color="{StaticResource NightCodeBgCardHoverColor}" />
+  <SolidColorBrush x:Key="ButtonDefaultPressedBackground" Color="{StaticResource NightCodeBgElevatedColor}" />
+  <SolidColorBrush x:Key="ButtonDefaultBorderBrush" Color="{StaticResource NightCodeBorderSubtleColor}" />
+  <SolidColorBrush x:Key="ButtonDefaultPointeroverBorderBrush" Color="{StaticResource NightCodeBorderFocusColor}" />
+  <SolidColorBrush x:Key="ButtonDefaultPressedBorderBrush" Color="{StaticResource NightCodeAccentIndigoHoverColor}" />
+
+  <SolidColorBrush x:Key="ButtonSolidForeground" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="ButtonSolidPrimaryBackground" Color="{StaticResource NightCodeAccentIndigoColor}" />
+  <SolidColorBrush x:Key="ButtonSolidPrimaryPointeroverBackground" Color="{StaticResource NightCodeAccentIndigoHoverColor}" />
+  <SolidColorBrush x:Key="ButtonSolidPrimaryPressedForeground" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="ButtonSolidPrimaryPressedBackground" Color="{StaticResource NightCodeAccentIndigoActiveColor}" />
+  <SolidColorBrush x:Key="ButtonSolidPrimaryBorderBrush" Color="{StaticResource NightCodeAccentIndigoColor}" />
+  <SolidColorBrush x:Key="ButtonSolidPrimaryPointeroverBorderBrush" Color="{StaticResource NightCodeAccentIndigoHoverColor}" />
+  <SolidColorBrush x:Key="ButtonSolidPrimaryPressedBorderBrush" Color="{StaticResource NightCodeAccentIndigoActiveColor}" />
+
+  <SolidColorBrush x:Key="ButtonSolidDangerBackground" Color="{StaticResource NightCodeAccentCrimsonColor}" />
+  <SolidColorBrush x:Key="ButtonSolidDangerPointeroverBackground" Color="{StaticResource NightCodeAccentCrimsonHoverColor}" />
+  <SolidColorBrush x:Key="ButtonSolidDangerPressedBackground" Color="{StaticResource NightCodeAccentCrimsonActiveColor}" />
+  <SolidColorBrush x:Key="ButtonSolidDangerBorderBrush" Color="{StaticResource NightCodeAccentCrimsonColor}" />
+  <SolidColorBrush x:Key="ButtonSolidDangerPointeroverBorderBrush" Color="{StaticResource NightCodeAccentCrimsonHoverColor}" />
+  <SolidColorBrush x:Key="ButtonSolidDangerPressedBorderBrush" Color="{StaticResource NightCodeAccentCrimsonActiveColor}" />
+  <SolidColorBrush x:Key="ButtonSolidDisabledForeground" Color="{StaticResource NightCodeTextDisabledColor}" />
+  <SolidColorBrush x:Key="ButtonSolidDisabledBackground" Color="{StaticResource NightCodeBgSurfaceColor}" />
+
+  <!-- TextBox -->
+  <SolidColorBrush x:Key="TextBoxTextCaretBrush" Color="{StaticResource NightCodeTextPrimaryColor}" />
+  <SolidColorBrush x:Key="TextBoxDefaultBackground" Color="{StaticResource NightCodeBgInputColor}" />
+  <SolidColorBrush x:Key="TextBoxPointeroverBackground" Color="{StaticResource NightCodeBgSurfaceColor}" />
+  <SolidColorBrush x:Key="TextBoxPressedBackground" Color="{StaticResource NightCodeBgSurfaceColor}" />
+  <SolidColorBrush x:Key="TextBoxDefaultBorderBrush" Color="{StaticResource NightCodeBorderSubtleColor}" />
+  <SolidColorBrush x:Key="TextBoxPointeroverBorderBrush" Color="{StaticResource NightCodeBorderMediumColor}" />
+  <SolidColorBrush x:Key="TextBoxFocusBorderBrush" Color="{StaticResource NightCodeBorderFocusColor}" />
+  <SolidColorBrush x:Key="TextBoxForeground" Color="{StaticResource NightCodeTextPrimaryColor}" />
+  <SolidColorBrush x:Key="TextBoxPlaceholderForeground" Color="{StaticResource NightCodeTextMutedColor}" />
+  <SolidColorBrush x:Key="TextBoxInnerForeground" Color="{StaticResource NightCodeTextSecondaryColor}" />
+  <SolidColorBrush x:Key="TextBoxDisabledBackground" Color="{StaticResource NightCodeBgInputColor}" />
+  <SolidColorBrush x:Key="TextBoxDisabledForeground" Color="{StaticResource NightCodeTextDisabledColor}" />
+  <SolidColorBrush x:Key="TextBoxSelectionBackground" Opacity="0.45" Color="{StaticResource NightCodeAccentIndigoColor}" />
+  <SolidColorBrush x:Key="TextBoxSelectionForeground" Color="#FFFFFF" />
+
+  <!-- ComboBox -->
+  <SolidColorBrush x:Key="ComboBoxSelectorBackground" Color="{StaticResource NightCodeBgInputColor}" />
+  <SolidColorBrush x:Key="ComboBoxSelectorPlaceHolderForeground" Color="{StaticResource NightCodeTextMutedColor}" />
+  <SolidColorBrush x:Key="ComboBoxSelectorPointeroverBackground" Color="{StaticResource NightCodeBgSurfaceColor}" />
+  <SolidColorBrush x:Key="ComboBoxSelectorFocusBackground" Color="{StaticResource NightCodeBgSurfaceColor}" />
+  <SolidColorBrush x:Key="ComboBoxSelectorPressedBackground" Color="{StaticResource NightCodeBgCardColor}" />
+  <SolidColorBrush x:Key="ComboBoxSelectorDisabledBackground" Color="{StaticResource NightCodeBgInputColor}" />
+  <SolidColorBrush x:Key="ComboBoxSelectorBorderBrush" Color="{StaticResource NightCodeBorderSubtleColor}" />
+  <SolidColorBrush x:Key="ComboBoxSelectorPointeroverBorderBrush" Color="{StaticResource NightCodeBorderMediumColor}" />
+  <SolidColorBrush x:Key="ComboBoxSelectorFocusBorderBrush" Color="{StaticResource NightCodeBorderFocusColor}" />
+  <SolidColorBrush x:Key="ComboBoxSelectorPressedBorderBrush" Color="{StaticResource NightCodeBorderFocusColor}" />
+  <SolidColorBrush x:Key="ComboBoxIconDefaultForeground" Color="{StaticResource NightCodeTextSecondaryColor}" />
+  <SolidColorBrush x:Key="ComboBoxIconPointeroverForeground" Color="{StaticResource NightCodeTextPrimaryColor}" />
+  <SolidColorBrush x:Key="ComboBoxIconFocusForeground" Color="{StaticResource NightCodeTextPrimaryColor}" />
+  <SolidColorBrush x:Key="ComboBoxIconPressedForeground" Color="{StaticResource NightCodeTextPrimaryColor}" />
+  <SolidColorBrush x:Key="ComboBoxPopupBackground" Color="{StaticResource NightCodeBgCardColor}" />
+  <SolidColorBrush x:Key="ComboBoxPopupBorderBrush" Color="{StaticResource NightCodeBorderSubtleColor}" />
+  <SolidColorBrush x:Key="ComboBoxItemForeground" Color="{StaticResource NightCodeTextPrimaryColor}" />
+  <SolidColorBrush x:Key="ComboBoxItemPointeroverForeground" Color="{StaticResource NightCodeTextPrimaryColor}" />
+  <SolidColorBrush x:Key="ComboBoxItemPointeroverBackground" Color="{StaticResource NightCodeBgCardHoverColor}" />
+  <SolidColorBrush x:Key="ComboBoxItemFocusBackground" Color="{StaticResource NightCodeBgCardHoverColor}" />
+  <SolidColorBrush x:Key="ComboBoxItemSelectedForeground" Color="{StaticResource NightCodeTextPrimaryColor}" />
+  <SolidColorBrush x:Key="ComboBoxItemSelectedBackground" Opacity="0.18" Color="{StaticResource NightCodeAccentIndigoColor}" />
+  <SolidColorBrush x:Key="ComboBoxItemSelectedPointeroverBackground" Opacity="0.28" Color="{StaticResource NightCodeAccentIndigoColor}" />
+
+  <!-- CheckBox -->
+  <SolidColorBrush x:Key="CheckBoxForeground" Color="{StaticResource NightCodeTextPrimaryColor}" />
+  <SolidColorBrush x:Key="CheckBoxDisabledForeground" Color="{StaticResource NightCodeTextDisabledColor}" />
+  <SolidColorBrush x:Key="CheckBoxGlyphFill" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="CheckBoxDefaultBorderBrush" Color="{StaticResource NightCodeBorderMediumColor}" />
+  <SolidColorBrush x:Key="CheckBoxPointeroverBackground" Color="{StaticResource NightCodeBgSurfaceColor}" />
+  <SolidColorBrush x:Key="CheckBoxPointeroverBorderBrush" Color="{StaticResource NightCodeAccentIndigoColor}" />
+  <SolidColorBrush x:Key="CheckBoxCheckedDefaultBackground" Color="{StaticResource NightCodeAccentIndigoColor}" />
+  <SolidColorBrush x:Key="CheckBoxCheckedDefaultBorderBrush" Color="{StaticResource NightCodeAccentIndigoColor}" />
+  <SolidColorBrush x:Key="CheckBoxCheckedPointeroverBackground" Color="{StaticResource NightCodeAccentIndigoHoverColor}" />
+  <SolidColorBrush x:Key="CheckBoxCheckedPointeroverBorderBrush" Color="{StaticResource NightCodeAccentIndigoHoverColor}" />
+  <SolidColorBrush x:Key="CheckBoxCheckedPressedBackground" Color="{StaticResource NightCodeAccentIndigoActiveColor}" />
+  <SolidColorBrush x:Key="CheckBoxCheckedPressedBorderBrush" Color="{StaticResource NightCodeAccentIndigoActiveColor}" />
+
+  <!-- ScrollBar -->
+  <SolidColorBrush x:Key="ScrollBarButtonDefaultForeground" Color="{StaticResource NightCodeTextMutedColor}" />
+  <SolidColorBrush x:Key="ScrollBarButtonPointeroverForeground" Color="{StaticResource NightCodeTextSecondaryColor}" />
+  <SolidColorBrush x:Key="ScrollBarThumbForeground" Color="{StaticResource NightCodeBorderSubtleColor}" />
+  <SolidColorBrush x:Key="ScrollBarThumbPointeroverForeground" Color="{StaticResource NightCodeTextMutedColor}" />
+
+  <!-- ToolTip -->
+  <SolidColorBrush x:Key="ToolTipBackground" Color="{StaticResource NightCodeBgCardColor}" />
+  <SolidColorBrush x:Key="ToolTipForeground" Color="{StaticResource NightCodeTextPrimaryColor}" />
+  <SolidColorBrush x:Key="ToolTipBorderBrush" Color="{StaticResource NightCodeBorderSubtleColor}" />
+
+</ResourceDictionary>

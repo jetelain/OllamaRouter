@@ -7,11 +7,11 @@
         Width="640" Height="640"
         WindowStartupLocation="CenterOwner">
   <DockPanel Margin="8">
-    <TextBlock DockPanel.Dock="Top" Text="{Binding ValidationErrorMessage}" Foreground="#FF7B7B"
+    <TextBlock DockPanel.Dock="Top" Text="{Binding ValidationErrorMessage}" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}"
                TextWrapping="Wrap" IsVisible="{Binding HasValidationError}" Margin="0,0,0,6"/>
     <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
       <Button Content="Cancel" Click="OnCancelClick" MinWidth="90"/>
-      <Button Content="Save" Click="OnSaveClick" MinWidth="90"/>
+      <Button Content="Save" Classes="Primary" Click="OnSaveClick" MinWidth="90"/>
     </StackPanel>
 
     <ScrollViewer>
@@ -69,7 +69,7 @@
                   <TextBox Grid.Column="0" Text="{Binding Name}" Watermark="model name"/>
                   <TextBox Grid.Column="1" Text="{Binding ContextLength}" Watermark="contextLength"/>
                   <TextBox Grid.Column="2" Text="{Binding Quantization}" Watermark="quantization"/>
-                  <Button Grid.Column="3" Content="Remove" Click="OnRemoveModelRowClick" Tag="{Binding}"/>
+                  <Button Grid.Column="3" Content="Remove" Classes="Danger" Click="OnRemoveModelRowClick" Tag="{Binding}"/>
                 </Grid>
               </DataTemplate>
             </ItemsControl.ItemTemplate>

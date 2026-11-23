@@ -116,6 +116,7 @@ public sealed class PreloadDialogLayoutTests : IClassFixture<PreloadDialogLayout
     {
         var viewModel = new PreloadDialogViewModel("test-model", () => new FakeRouterApiClient());
         var dialog = new PreloadDialog(viewModel);
+        HeadlessThemeHelper.Apply(dialog);
 
         var dock = Assert.IsType<DockPanel>(dialog.Content);
         var stack = Assert.IsType<StackPanel>(dock.Children[0]);

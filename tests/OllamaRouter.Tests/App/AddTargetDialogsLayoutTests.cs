@@ -207,7 +207,7 @@ public sealed class AddTargetDialogsLayoutTests :
             Assert.All(byContent.Values, b => AssertBrushAlpha(b, 0));
 
             form.ApplyPresetCommand.Execute("groq");
-            AssertBrushAlpha(byContent["Groq"], 90); // the soft accent
+            AssertBrushAlpha(byContent["Groq"], 64); // the soft accent (#6366F1 @ ~25% alpha, task #170)
             AssertBrushAlpha(byContent["OpenRouter"], 0);
             AssertBrushAlpha(byContent["OpenAI"], 0);
             AssertBrushAlpha(byContent["Custom"], 0);
@@ -269,6 +269,7 @@ public sealed class AddTargetDialogsLayoutTests :
     private static (DockPanel dock, StackPanel buttons, ScrollViewer scroll, StackPanel content)
         Traverse(Window dialog)
     {
+        HeadlessThemeHelper.Apply(dialog);
         var dock = Assert.IsType<DockPanel>(dialog.Content);
         var buttons = Assert.IsType<StackPanel>(dock.Children[1]); // the bottom-docked button row
         var scroll = Assert.IsType<ScrollViewer>(dock.Children[2]); // the fill

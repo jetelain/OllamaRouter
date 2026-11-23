@@ -119,6 +119,7 @@ public sealed class TargetEditDialogLayoutTests :
     {
         var form = new TargetEditFormViewModel(isEdit: false);
         var dialog = new TargetEditDialog(form);
+        HeadlessThemeHelper.Apply(dialog);
 
         var dock = Assert.IsType<DockPanel>(dialog.Content);
         var scrollViewer = Assert.IsType<ScrollViewer>(dock.Children[2]);

@@ -9,16 +9,18 @@
       <TextBlock TextWrapping="Wrap"
                  Text="Select the fleet targets to install the model on. Pullable targets are Ollama-protocol nodes (the Ollama daemon pulls from the registry); non-Ollama targets are shown disabled."/>
 
-      <TextBlock Text="{Binding NextGateHint}" Foreground="#FFC107" IsVisible="{Binding NextGateHint, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+      <TextBlock Text="{Binding NextGateHint}" Foreground="{DynamicResource NightCodeAccentAmber}" IsVisible="{Binding NextGateHint, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
       <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsFetching}" Height="4"/>
-      <TextBlock Text="{Binding Error}" Foreground="#FF7B7B" TextWrapping="Wrap"/>
+      <TextBlock Text="{Binding Error}" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" TextWrapping="Wrap"/>
 
       <!-- Target rows -->
-      <Border Padding="8" CornerRadius="6" Background="#1E1E2A">
+      <Border Padding="8" CornerRadius="6" Background="{DynamicResource NightCodeBgSurface}"
+              BorderBrush="{DynamicResource SemiColorBorder}" BorderThickness="1">
         <ItemsControl ItemsSource="{Binding Rows}">
           <ItemsControl.ItemTemplate>
             <DataTemplate x:DataType="vm:InstallTargetRowVm">
-              <Border Padding="8,6" CornerRadius="4" Margin="0,2" Background="#252536">
+              <Border Padding="8,6" CornerRadius="4" Margin="0,2" Background="{DynamicResource NightCodeBgInput}"
+                      BorderBrush="{DynamicResource SemiColorBorder}" BorderThickness="1">
                 <StackPanel Spacing="4">
                   <StackPanel Orientation="Horizontal" Spacing="10">
                     <CheckBox IsChecked="{Binding Selected}" IsEnabled="{Binding Pullable}" VerticalAlignment="Center"/>
@@ -35,7 +37,7 @@
                       <TextBlock Text="already present" FontSize="11"/>
                     </Border>
                   </StackPanel>
-                  <TextBlock Text="{Binding Note}" Foreground="#FF7B7B" FontSize="11"
+                  <TextBlock Text="{Binding Note}" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" FontSize="11"
                              IsVisible="{Binding Note, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
                   <!-- BOTH modes (unified by task #131): the per-target quant/tag + context
                        inputs + the per-target alias hint chip + the suggestion (assisted). -->
@@ -54,7 +56,7 @@
                                FontSize="11" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"
                                IsVisible="{Binding SuggestionProvenance, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
                   </StackPanel>
-                  <TextBlock Text="{Binding ModelRefError}" Foreground="#FF7B7B" FontSize="11" TextWrapping="Wrap"
+                  <TextBlock Text="{Binding ModelRefError}" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" FontSize="11" TextWrapping="Wrap"
                              IsVisible="{Binding ModelRefError, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
                 </StackPanel>
               </Border>

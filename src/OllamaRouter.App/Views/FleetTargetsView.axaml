@@ -7,7 +7,7 @@
              x:DataType="vm:FleetTargetsViewModel">
   <ScrollViewer VerticalScrollBarVisibility="Auto">
     <StackPanel Spacing="12" Margin="12,12,12,48">
-      <TextBlock Text="{Binding LastError}" Foreground="#FF7B7B" TextWrapping="Wrap" IsVisible="{Binding IsErrorVisible}"/>
+      <TextBlock Text="{Binding LastError}" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" TextWrapping="Wrap" IsVisible="{Binding IsErrorVisible}"/>
       <StackPanel Orientation="Horizontal" Spacing="8">
         <Button Content="Refresh" Command="{Binding RefreshCommand}"/>
         <Button Content="Add Ollama Node" Classes="Primary" Click="OnAddOllamaNodeClick"/>

@@ -18,7 +18,7 @@
 
       <StackPanel Orientation="Horizontal" Spacing="16">
         <TextBlock Text="{Binding GeneratedAtText}"/>
-        <TextBlock Text="{Binding SummaryText}" Foreground="#9AA0B5"/>
+        <TextBlock Text="{Binding SummaryText}" Foreground="{DynamicResource SemiColorText2}"/>
       </StackPanel>
 
       <!-- Role matrix (stable 5-alias order; absent roles show the benchmark hint) -->
@@ -32,8 +32,8 @@
                 <TextBlock Text="{Binding Model}" Width="200"/>
                 <TextBlock Text="{Binding ContextText}" Width="90"/>
               </StackPanel>
-              <TextBlock Text="{Binding Description}" Foreground="#9AA0B5"/>
-              <TextBlock Text="{Binding NodesText}" Foreground="#8BC34A"/>
+              <TextBlock Text="{Binding Description}" Foreground="{DynamicResource SemiColorText2}"/>
+              <TextBlock Text="{Binding NodesText}" Foreground="{DynamicResource SemiColorSuccess}"/>
             </StackPanel>
           </DataTemplate>
         </ItemsControl.ItemTemplate>
@@ -70,7 +70,7 @@
       </ItemsControl>
 
       <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4"/>
-      <TextBlock Text="{Binding Message}" TextWrapping="Wrap" Foreground="#8BC34A"/>
+      <TextBlock Text="{Binding Message}" TextWrapping="Wrap" Foreground="{DynamicResource SemiColorSuccess}"/>
     </StackPanel>
   </ScrollViewer>
 </UserControl>
