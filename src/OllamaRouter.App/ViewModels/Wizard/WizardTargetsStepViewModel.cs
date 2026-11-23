@@ -248,6 +248,20 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
             SetFailureMessage(DaemonDownMessage());
             LogReachabilityTransition(false, ex.Message);
         }
+        catch (System.Net.Sockets.SocketException ex)
+        {
+            // Task #165: the transport abort class (e.g. 995 OperationAborted, the Windows
+            // shape of a cancel/teardown aborting an in-flight socket I/O) — same daemon-down
+            // family as HttpRequestException (task #158: the shared message, never raw text).
+            SetFailureMessage(DaemonDownMessage());
+            LogReachabilityTransition(false, ex.Message);
+        }
+        catch (System.IO.IOException ex)
+        {
+            // Task #165: the transport re-wraps the aborted socket I/O — same daemon-down family.
+            SetFailureMessage(DaemonDownMessage());
+            LogReachabilityTransition(false, ex.Message);
+        }
     }
 
     /// <summary>
@@ -351,6 +365,19 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
                 // The router is DOWN (the canonical first-run state before Step 1 has
                 // started it): the shared actionable daemon-down message (task #158),
                 // identical to the fleet poll's — no throw, the next step entry retries.
+                _logger.Warning("Wizard step 2: local node auto-add → router down (retry on next entry): {Message}", ex.Message);
+                SetFailureMessage(DaemonDownMessage());
+            }
+            catch (System.Net.Sockets.SocketException ex)
+            {
+                // Task #165: the transport abort class (e.g. 995 OperationAborted) — same
+                // daemon-down family as HttpRequestException (no throw, retry on next entry).
+                _logger.Warning("Wizard step 2: local node auto-add → router down (retry on next entry): {Message}", ex.Message);
+                SetFailureMessage(DaemonDownMessage());
+            }
+            catch (System.IO.IOException ex)
+            {
+                // Task #165: the transport re-wraps the aborted socket I/O — same family.
                 _logger.Warning("Wizard step 2: local node auto-add → router down (retry on next entry): {Message}", ex.Message);
                 SetFailureMessage(DaemonDownMessage());
             }

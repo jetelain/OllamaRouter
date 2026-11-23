@@ -578,6 +578,186 @@ public sealed class OllamaRouterDaemonLauncherTests : IDisposable
     }
 
     // ------------------------------------------------------------------
+    //  Task #165 — socket-layer abort class (995 OperationAborted & friends)
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task GetStatus_ProbeSocketAbort995_ClassifiedStopped()
+    {
+        // The probe's own cancellation aborting an in-flight connect surfaces on Windows as a
+        // RAW SocketException(995) instead of a clean OperationCanceledException — the launcher
+        // must still classify it Stopped (its documented refusal/timeout/abort contract).
+        var handler = new ProbeHttpMessageHandler((_, _) => throw new System.Net.Sockets.SocketException(995));
+        var launcher = CreateRealClientLauncher(handler);
+
+        var status = await launcher.GetStatusAsync();
+
+        Assert.Equal(RouterDaemonState.Stopped, status.State);
+        Assert.Contains("socket layer", status.Detail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetStatus_ProbeIoExceptionWrappingSocketAbort_ClassifiedStopped()
+    {
+        // The transport re-wrap shape: IOException("aborted", new SocketException(995)).
+        var handler = new ProbeHttpMessageHandler((_, _) =>
+            throw new IOException("aborted", new System.Net.Sockets.SocketException(995)));
+        var launcher = CreateRealClientLauncher(handler);
+
+        var status = await launcher.GetStatusAsync();
+
+        Assert.Equal(RouterDaemonState.Stopped, status.State);
+        Assert.Contains("transport layer", status.Detail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetStatus_ProbeSocketRefusedRaw_ClassifiedStopped()
+    {
+        // Windows raw-refused shape (10061 WSAECONNREFUSED) as a raw socket exception.
+        var handler = new ProbeHttpMessageHandler((_, _) => throw new System.Net.Sockets.SocketException(10061));
+        var launcher = CreateRealClientLauncher(handler);
+
+        var status = await launcher.GetStatusAsync();
+
+        Assert.Equal(RouterDaemonState.Stopped, status.State);
+        Assert.Contains("socket layer", status.Detail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task EnsureRunning_ProbeAbortsAtSocketLayer_ThenRecovers_Starts()
+    {
+        // An aborted probe must NOT abort the start sequence: probe 1 aborts raw (→ Stopped),
+        // the pre-launch probe and the first start poll then recover and the daemon reaches
+        // Running.
+        var installDir = PrepareInstallDir();
+        var started = new FakeRouterProcess(4242);
+        var client = new FakeRouterClient();
+        client.GetInfo = ct =>
+        {
+            var count = Interlocked.Increment(ref client.probeCount);
+            if (count <= 2)
+            {
+                return Task.FromException<RouterInfoResponse>(new System.Net.Sockets.SocketException(995));
+            }
+
+            return Task.FromResult(RunningInfo);
+        };
+        client.Shutdown = _ =>
+        {
+            started.SetExited(true); // the daemon exits on the graceful stop signal
+            return Task.FromResult(new RouterShutdownResponse(true, 4242));
+        };
+        var launcher = new OllamaRouterDaemonLauncher(client, installDir,
+            startPollInterval: TimeSpan.FromMilliseconds(20), startTimeout: TimeSpan.FromSeconds(1),
+            stopExitTimeout: TimeSpan.FromMilliseconds(300));
+        launcher.UseDefaultSearchRoots = false;
+        launcher.ProcessStarter = _ => started;
+
+        var status = await launcher.EnsureRunningAsync();
+
+        Assert.Equal(RouterDaemonState.Running, status.State);
+        Assert.Equal(4242, status.ProcessId);
+        await launcher.StopAsync(); // tracked handle: graceful stop on the fake, process exits
+    }
+
+    [Fact]
+    public async Task Stop_GracefulShutdown_SocketAbort_FallsThrough_WaitsAndReportsStopped()
+    {
+        // The graceful shutdown call itself is aborted at the socket layer (the server is
+        // already dying): the stop MUST fall through to the wait/kill path — never throw.
+        var process = new FakeRouterProcess(4242);
+        var client = new FakeRouterClient { GetInfo = _ => Task.FromResult(RunningInfo) };
+        client.Shutdown = _ =>
+        {
+            process.SetExited(true); // the daemon exits right after the aborted exchange
+            client.GetInfo = ct => throw new HttpRequestException("connection refused");
+            throw new System.Net.Sockets.SocketException(995);
+        };
+        var launcher = new OllamaRouterDaemonLauncher(client, stopExitTimeout: TimeSpan.FromMilliseconds(500));
+        launcher.ProcessLookup = _ => process;
+
+        var status = await launcher.StopAsync();
+
+        Assert.Equal(RouterDaemonState.Stopped, status.State);
+        Assert.Equal(1, client.ShutdownCalls);
+        Assert.Equal(0, process.KillCalls); // it exited on its own
+        Assert.True(process.Disposed);
+    }
+
+    [Fact]
+    public async Task StartupSequence_SocketAborts_NoUnobservedTaskException()
+    {
+        // Task #165 regression gate: across the ensure-running → stop startup sequence with
+        // abort-prone probes (raw SocketException(995) + one raw OperationCanceledException),
+        // NO task faults unobserved — the class the app's #159 FTL hook would surface as
+        // "FTL Unobserved task exception" at startup/exit. Forced finalizer pass makes any
+        // abandoned faulted task report within the assertion window.
+        var installDir = PrepareInstallDir();
+        var client = new FakeRouterClient();
+        var process = new FakeRouterProcess(4242);
+        client.GetInfo = ct =>
+        {
+            var count = Interlocked.Increment(ref client.probeCount);
+            if (count == 1)
+            {
+                return Task.FromException<RouterInfoResponse>(new System.Net.Sockets.SocketException(995));
+            }
+
+            if (count == 2)
+            {
+                return Task.FromException<RouterInfoResponse>(new OperationCanceledException());
+            }
+
+            return Task.FromResult(RunningInfo);
+        };
+        client.Shutdown = _ =>
+        {
+            process.SetExited(true);
+            // After the graceful stop: the daemon is gone.
+            client.GetInfo = ct => Task.FromException<RouterInfoResponse>(new HttpRequestException("connection refused"));
+            return Task.FromResult(new RouterShutdownResponse(true, 4242));
+        };
+        var launcher = new OllamaRouterDaemonLauncher(client, installDir,
+            startPollInterval: TimeSpan.FromMilliseconds(20), startTimeout: TimeSpan.FromSeconds(1),
+            stopExitTimeout: TimeSpan.FromMilliseconds(500));
+        launcher.UseDefaultSearchRoots = false;
+        launcher.ProcessStarter = _ => process;
+        launcher.ProcessLookup = _ => process;
+
+        var unobserved = 0;
+        EventHandler<UnobservedTaskExceptionEventArgs> onUnobserved = (_, e) =>
+        {
+            Interlocked.Increment(ref unobserved);
+            e.SetObserved(); // keep the in-test hook from escalating to a crash
+        };
+        TaskScheduler.UnobservedTaskException += onUnobserved;
+        try
+        {
+            var started = await launcher.EnsureRunningAsync();
+            Assert.Equal(RouterDaemonState.Running, started.State);
+            var stopped = await launcher.StopAsync();
+            Assert.Equal(RouterDaemonState.Stopped, stopped.State);
+
+            // Force any abandoned faulted task to report (bounded — sub-second in practice).
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            for (var i = 0; i < 50; i++)
+            {
+                await Task.Yield();
+            }
+
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+        }
+        finally
+        {
+            TaskScheduler.UnobservedTaskException -= onUnobserved;
+        }
+
+        Assert.Equal(0, unobserved);
+    }
+
+    // ------------------------------------------------------------------
     //  Helpers + fakes
     // ------------------------------------------------------------------
 
@@ -717,6 +897,9 @@ public sealed class OllamaRouterDaemonLauncherTests : IDisposable
         public Func<CancellationToken, Task<RouterShutdownResponse>>? Shutdown { get; set; }
 
         public int ShutdownCalls { get; private set; }
+
+        /// <summary>Raw probe (GetInfoAsync) call counter (task #165 abort sequences).</summary>
+        public int probeCount;
 
         public Task<RouterInfoResponse> GetInfoAsync(CancellationToken ct = default) =>
             GetInfo is { } get ? get(ct) : Task.FromException<RouterInfoResponse>(new HttpRequestException("connection refused"));

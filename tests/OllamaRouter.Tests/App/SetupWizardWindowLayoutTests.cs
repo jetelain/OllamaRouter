@@ -112,6 +112,53 @@ public sealed class SetupWizardWindowLayoutTests : IClassFixture<SetupWizardWind
     }
 
     /// <summary>
+    /// Task #165 (a): the rightmost `Enabled` column of the fleet table — the bold header
+    /// AND the row-template `enabled` cell — declares a width (60 px) that fits the unclipped
+    /// 14 px text (bold "Enabled" needs ≈52–54 px), the other six columns keep their declared
+    /// widths, and the structural table budget (declared columns + 6×10 spacing + 16 border
+    /// padding + 24 scroll padding = 850 px) fits the window's 860 px minimum.
+    /// </summary>
+    [Fact]
+    public async Task Step2_FleetTable_EnabledColumn_UnclippedWidthWithinWindowMinimum()
+    {
+        await _fixture.DispatchAsync(() =>
+        {
+            var stepView = GetStep2View();
+
+            // The header row: the horizontal StackPanel whose label children are exactly the
+            // seven fleet columns ("Name" ... "Enabled").
+            var headerRow = stepView.GetLogicalDescendants().OfType<StackPanel>().Single(p =>
+                p.GetLogicalChildren().OfType<TextBlock>().ToArray() is { } labels
+                && labels.Length == 7
+                && labels[0].Text == "Name"
+                && labels[^1].Text == "Enabled");
+            var headerLabels = headerRow.GetLogicalChildren().OfType<TextBlock>().ToList();
+            Assert.Equal(
+                ["Name", "URL", "GPU", "VRAM", "Bandwidth", "Liveness", "Enabled"],
+                headerLabels.Select(t => t.Text));
+
+            // The other six columns keep their layout; the rightmost declares ≥56 px
+            // (task #165: 36 px clipped to "Enabl").
+            Assert.Equal([120d, 200d, 140d, 80d, 80d, 70d],
+                headerLabels.Take(6).Select(t => t.Width));
+            var enabledHeader = headerLabels[^1];
+            Assert.InRange(enabledHeader.Width, 56d, double.PositiveInfinity);
+
+            // The row-template `enabled` cell (structural — the DataTemplate is built, never
+            // measured: the test project never bootstraps fonts): same unclipped width.
+            var itemsControl = stepView.GetLogicalDescendants().OfType<ItemsControl>().Single();
+            var template = itemsControl.ItemTemplate!.Build(new WizardTargetRow { Name = "probe" });
+            var enabledCell = template!.GetLogicalDescendants().OfType<TextBlock>().Single(t => t.Text == "enabled");
+            Assert.Equal(enabledHeader.Width, enabledCell.Width);
+            Assert.InRange(enabledCell.Width, 56d, double.PositiveInfinity);
+
+            // Budget guard: declared columns + spacing + paddings must fit the window minimum.
+            var budget = headerLabels.Sum(t => t.Width) + 6 * 10 + 16 + 24;
+            Assert.True(budget <= 860, $"the declared table budget ({budget} px) exceeds the 860 px window minimum");
+        });
+    }
+
+    /// <summary>
     /// Task #151 Step 3 pane (re-baselined by task #161): the "Ollama Cloud" card holds ONE
     /// interactive CheckBox labeled byte-exact "Use Ollama Cloud when all local GPU are busy"
     /// (OneWay <c>IsChecked</c> on CloudEnabled + command-bound to ToggleCloudCommand — the

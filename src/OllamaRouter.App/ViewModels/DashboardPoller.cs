@@ -85,9 +85,12 @@ internal sealed class DashboardPoller : IAsyncDisposable
         {
             await loop;
         }
-        catch (OperationCanceledException)
+        catch (Exception)
         {
-            // Expected on shutdown.
+            // Observation boundary (task #165): a loop task that faults during teardown — e.g.
+            // a cancellation abort surfacing as a socket-layer exception from the delay — is
+            // OBSERVED here and must never propagate into disposers or the fire-and-forget
+            // Task.Run(() => poller.StopAsync()) self-stop (unobserved → the app's FTL hook).
         }
     }
 

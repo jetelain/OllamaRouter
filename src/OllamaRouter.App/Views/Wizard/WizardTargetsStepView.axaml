@@ -11,7 +11,10 @@
 
       <!-- Fleet table: header row + live rows (task #151 — hardware columns; the Cloud
            pseudo-target is excluded by the view model). Fixed column widths tuned so a row
-           fits the 860 px window minimum without page-level horizontal scroll. -->
+           fits the 860 px window minimum without page-level horizontal scroll: declared
+           columns 120+200+140+80+80+70+60 = 750 px + 6×10 spacing + 16 border padding +
+           24 scroll padding = 850 px ≤ 860 px (the 60 px rightmost column — bold "Enabled" —
+           needs ≈52–54 px at 14 px text; task #165). -->
       <Border Padding="8" CornerRadius="6" Background="#1E1E2A">
         <StackPanel Spacing="4">
           <StackPanel Orientation="Horizontal" Spacing="10">
@@ -21,7 +24,7 @@
             <TextBlock Text="VRAM" Width="80" FontWeight="Bold"/>
             <TextBlock Text="Bandwidth" Width="80" FontWeight="Bold"/>
             <TextBlock Text="Liveness" Width="70" FontWeight="Bold"/>
-            <TextBlock Text="Enabled" Width="36" FontWeight="Bold"/>
+            <TextBlock Text="Enabled" Width="60" FontWeight="Bold"/>
           </StackPanel>
           <ItemsControl ItemsSource="{Binding Rows}">
             <ItemsControl.ItemTemplate>
@@ -36,7 +39,7 @@
                   <TextBlock Text="{Binding VramText}" Width="80"/>
                   <TextBlock Text="{Binding BandwidthText}" Width="80"/>
                   <TextBlock Text="{Binding Liveness}" Width="70"/>
-                  <TextBlock Text="enabled" Width="36" IsVisible="{Binding Enabled}"/>
+                  <TextBlock Text="enabled" Width="60" IsVisible="{Binding Enabled}"/>
                 </StackPanel>
               </DataTemplate>
             </ItemsControl.ItemTemplate>

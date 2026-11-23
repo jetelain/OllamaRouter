@@ -135,4 +135,29 @@ public sealed class DashboardPollerTests
         Assert.Equal(1, ticks); // exactly one loop ran — the second start was a no-op
         await poller.DisposeAsync();
     }
+
+    /// <summary>
+    /// Task #165 (the FTL stop-boundary): a delay that faults with a socket-layer abort
+    /// (995) after the first tick faults the loop task. <see cref="DashboardPoller.StopAsync"/>
+    /// and <see cref="DashboardPoller.DisposeAsync"/> must OBSERVE that fault — never
+    /// re-surface it into disposers or the fire-and-forget <c>Task.Run(() =&gt; poller.StopAsync())</c>
+    /// self-stop (which would surface as the app's FTL "Unobserved task exception").
+    /// </summary>
+    [Fact]
+    public async Task Stop_DelayFaultsAtAbortClass_LoopFaultObserved_StopAndDisposeComplete()
+    {
+        var ticks = 0;
+        var poller = new DashboardPoller(
+            _ => { Interlocked.Increment(ref ticks); return Task.CompletedTask; },
+            TimeSpan.FromMilliseconds(1),
+            (_, _) => throw new System.Net.Sockets.SocketException(995));
+
+        await poller.StartAsync();
+        await WaitUntilAsync(() => ticks >= 1);
+
+        var stopError = await Record.ExceptionAsync(() => poller.StopAsync());
+        Assert.Null(stopError);
+        var disposeError = await Record.ExceptionAsync(async () => await poller.DisposeAsync());
+        Assert.Null(disposeError);
+    }
 }

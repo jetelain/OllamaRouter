@@ -2283,6 +2283,37 @@ public sealed class SetupWizardViewModelsTests
     }
 
     /// <summary>
+    /// Task #165 (AC4): when the transport faults with the socket-abort class (a raw
+    /// <c>SocketException(995)</c> — the Windows shape of a cancel/teardown aborting an
+    /// in-flight socket I/O, e.g. the daemon starting then exiting) instead of
+    /// <c>HttpRequestException</c>, the step entry and the poll tick surface the SAME shared
+    /// daemon-down message (byte-exact, task #158 contract) and never throw — raw transport
+    /// text never leaks.
+    /// </summary>
+    [Fact]
+    public async Task Step2_Poll_SocketAbortRaw_TransportFailure_DaemonDownMessage()
+    {
+        var mock = new Mock<IOllamaRouterApiClient>();
+        mock.Setup(c => c.GetFleetAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new System.Net.Sockets.SocketException(995));
+        mock.Setup(c => c.GetConfigAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new System.Net.Sockets.SocketException(995));
+        WizardTargetsStepViewModel vm = null!;
+        vm = new WizardTargetsStepViewModel(() => mock.Object, ct => vm.RefreshAsync(ct), GatedDelay);
+
+        await vm.OnStepEnteredAsync(); // entry (auto-Local attempt + poller start): no throw
+        await vm.OnStepLeftAsync();
+        await vm.RefreshAsync(); // the exact poll-tick entry point (RefreshCoreAsync)
+
+        Assert.Equal(
+            "The OllamaRouter daemon is not reachable on 127.0.0.1:11434 — go back to Step 1 and click 'Start router'.",
+            vm.Message);
+        Assert.Empty(vm.Rows);
+        mock.Verify(c => c.AddTargetAsync(It.IsAny<AddTargetRequest>(), It.IsAny<CancellationToken>()), Moq.Times.Never);
+        await vm.DisposeAsync();
+    }
+
+    /// <summary>
     /// Task #158 (AC1 + AC6 — the headline no-churn guarantee): across ≥ 3 consecutive
     /// FAILED refreshes (the exact <c>RefreshCoreAsync</c> path the 2 s poller tick runs,
     /// plus the entry auto-add attempt) the daemon-down message stays BYTE-IDENTICAL (no
@@ -3367,6 +3398,27 @@ public sealed class SetupWizardViewModelsTests
         Assert.Contains("500", vm.Error);
         Assert.Contains("boom", vm.Error);
         await vm.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Task #165 (AC4, Step 4 mirror): the results tick whose transport faults with the
+    /// socket-abort class (a raw <c>SocketException(995)</c>, e.g. the daemon started then
+    /// exited mid-poll) surfaces the existing <c>Connection failed: …</c> error shape and does
+    /// NOT throw — the loop survives (same family as the <c>HttpRequestException</c> handling).
+    /// </summary>
+    [Fact]
+    public async Task Step3_ResultsPoll_SocketAbortRaw_SetsConnectionFailedAndLoopSurvives()
+    {
+        var mock = MockClient();
+        mock.Setup(c => c.GetBenchmarkResultsAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new System.Net.Sockets.SocketException(995));
+        WizardBenchmarkStepViewModel vm = null!;
+        vm = BuildBenchmark(mock, ct => vm.RefreshAsync(ct), GatedDelay);
+
+        await vm.OnStepEnteredAsync(); // immediate tick hits the raw socket abort
+        await WaitUntilAsync(() => vm.Error is not null, "the poll tick to surface the abort error");
+        Assert.StartsWith("Connection failed:", vm.Error);
+        await vm.DisposeAsync(); // disposal completes despite the faulted tick (no throw)
     }
 
     [Fact]

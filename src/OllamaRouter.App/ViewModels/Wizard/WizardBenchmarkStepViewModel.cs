@@ -411,6 +411,19 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
             Error = $"Connection failed: {ex.Message}";
             LogReachabilityTransition(false, ex.Message);
         }
+        catch (System.Net.Sockets.SocketException ex)
+        {
+            // Task #165: the transport abort class (e.g. 995 OperationAborted) — same
+            // connection-failed family as HttpRequestException (no throw, next tick retries).
+            Error = $"Connection failed: {ex.Message}";
+            LogReachabilityTransition(false, ex.Message);
+        }
+        catch (System.IO.IOException ex)
+        {
+            // Task #165: the transport re-wraps the aborted socket I/O — same family.
+            Error = $"Connection failed: {ex.Message}";
+            LogReachabilityTransition(false, ex.Message);
+        }
     }
 
     /// <summary>

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Net;
+using System.Net.Sockets;
 using OllamaRouter.Endpoints.RouterApi.Info;
 using Pmad.LocalApi.Security;
 
@@ -29,7 +30,13 @@ namespace OllamaRouter.Client.Process;
 /// <c>/api/*</c> surface) → <see cref="RouterDaemonState.Running"/>; any OTHER HTTP payload
 /// (a raw Ollama daemon 404s the identity route; a 200 with a non-router body is unparseable)
 /// → <see cref="RouterDaemonState.PortOccupiedByOtherService"/>; connection refused/reset or a
-/// probe timeout → <see cref="RouterDaemonState.Stopped"/>.
+/// probe timeout → <see cref="RouterDaemonState.Stopped"/>. A probe aborted at the socket layer
+/// (<see cref="SocketException"/> — e.g. 995 <c>OperationAborted</c>, the Windows shape of the
+/// probe's own cancellation aborting an in-flight connect — or a raw 10061 refused) or a
+/// transport <see cref="System.IO.IOException"/> wrapping that abort is the same
+/// refusal/timeout/abort class → <see cref="RouterDaemonState.Stopped"/> (task #165: the
+/// daemon-launch/connect path must be total for this class so no unobserved-exception
+/// escapes into the app's crash-capture hooks).
 /// </para>
 /// </summary>
 public sealed class OllamaRouterDaemonLauncher : IOllamaRouterDaemonLauncher
@@ -221,7 +228,28 @@ public sealed class OllamaRouterDaemonLauncher : IOllamaRouterDaemonLauncher
         {
             return new RouterDaemonStatus(RouterDaemonState.Stopped, null, "connection refused");
         }
+        catch (SocketException ex)
+        {
+            // The probe's own cancellation (or a refused/aborted connect) surfaced at the raw
+            // socket layer instead of as a clean OperationCanceledException/HttpRequestException
+            // (Windows 995 OperationAborted, 10060 timed out, 10061 refused) — same Stopped
+            // family as connection refused/reset or probe timeout (task #165).
+            return new RouterDaemonStatus(
+                RouterDaemonState.Stopped, null, $"probe aborted at the socket layer ({ex.SocketErrorCode})");
+        }
+        catch (System.IO.IOException ex)
+        {
+            // The transport re-wraps the aborted socket I/O (e.g. IOException("aborted",
+            // new SocketException(995))) — same Stopped family.
+            return new RouterDaemonStatus(
+                RouterDaemonState.Stopped, null, $"probe aborted at the transport layer ({DescribeTransportAbort(ex)})");
+        }
     }
+
+    private static string DescribeTransportAbort(System.IO.IOException ex) =>
+        ex.InnerException is SocketException socket
+            ? $"socket layer ({socket.SocketErrorCode})"
+            : "transport layer";
 
     // ------------------------------------------------------------------
     //  Start
@@ -480,6 +508,14 @@ public sealed class OllamaRouterDaemonLauncher : IOllamaRouterDaemonLauncher
         catch (HttpRequestException)
         {
             // The server is already dying — fall through.
+        }
+        catch (SocketException)
+        {
+            // The server is already dying (socket-layer abort of the shutdown call) — fall through.
+        }
+        catch (System.IO.IOException)
+        {
+            // The server is already dying (transport abort wrapping the socket-layer error) — fall through.
         }
 
         var process = ResolveProcessHandle(status);
