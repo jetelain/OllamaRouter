@@ -412,7 +412,7 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
         // 1. Filter catalog candidates by roles/model, then drop the run-scoped exclusions of
         // THIS target (task #152): a case-insensitive name set (blank entries dropped; unknown
         // keys never match). Excluded models produce no rows — no sizing, no /api/tags presence
-        // check, no /api/pull, no /api/show, no warmup, no generate.
+        // check, no /api/pull, no /api/show, no eviction, no generate.
         var excludedForTarget = ExcludedModelNamesFor(name, excludedModels);
         var candidates = FilterCandidates(roles, modelFilter)
             .Where(c => !excludedForTarget.Contains(c.Candidate.Name))
@@ -436,7 +436,15 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
         var ladder = _catalogOptions.Value.BenchmarkContextLadder;
         var allResults = new List<BenchmarkContextResult>();
 
-        // 3. For each candidate: sizing, pull, warmup, benchmark loop.
+        // Last candidate that was measured in this target run (task #167 cold-start
+        // isolation): it is evicted BEFORE the next candidate's first rung so its weights +
+        // KV (Ollama's default 5-minute keep-alive) do not stay resident during the next
+        // candidate's cold loads (distorted layer offloading / spurious OOMs). Sizing-pruned
+        // and pull-failed candidates load nothing and never update it; after the run ends
+        // nothing is unloaded (the last model stays resident for real traffic).
+        string? previousMeasuredModel = null;
+
+        // 3. For each candidate: sizing, pull, cap, benchmark loop (evict → measure).
         foreach (var (candidate, role) in candidates)
         {
             if (ct.IsCancellationRequested)
@@ -475,33 +483,40 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
                 continue;
             }
 
-            // 5. Get the Modelfile num_ctx (if available) to cap the ladder.
-            int? modelfileNumCtx = null;
+            // 5. Derive the effective context cap (task #167): candidate.NativeContext, refined
+            // DOWNWARD only by the live GGUF architectural ceiling (model_info["*.context_length"]
+            // via /api/show). The Modelfile PARAMETER num_ctx is NEVER a cap — options.num_ctx at
+            // generate time overrides it up to the model's native context (the conservative
+            // Modelfile defaults would silently drop rungs like 128k/160k/256k). Fail-soft:
+            // show failure / missing model_info → NativeContext alone.
+            long? ggufNativeCtx = null;
             try
             {
                 var show = await _catalogClient.GetShowAsync(url, candidate.Name, ct).ConfigureAwait(false);
-                if (show is not null)
-                {
-                    modelfileNumCtx = ModelMetadataParser.ParseNumCtx(show);
-                }
+                ggufNativeCtx = ModelMetadataParser.ExtractNativeContextLength(show?["model_info"] as JsonObject);
             }
             catch
             {
-                // Fail-soft: no Modelfile cap.
+                // Fail-soft: no GGUF cap.
             }
 
-            var effectiveMaxCtx = Math.Min(candidate.NativeContext, modelfileNumCtx ?? candidate.NativeContext);
+            var effectiveMaxCtx = (int)Math.Min((long)candidate.NativeContext, ggufNativeCtx ?? (long)candidate.NativeContext);
 
-            // 6. Warmup: one generate at the smallest non-pruned context.
-            var warmupCtx = ladder.Where(ctx => ctx <= effectiveMaxCtx &&
-                fit.SizingByContext[ctx].Status is MemoryFitStatus.Fits or MemoryFitStatus.Assumed)
-                .FirstOrDefault();
-            if (warmupCtx > 0)
+            // Cross-candidate cold-start eviction (task #167): release the previously measured
+            // candidate BEFORE this candidate's cold loads (its VRAM residency would otherwise
+            // distort the offloading decision and trigger spurious OOMs).
+            if (previousMeasuredModel is not null)
             {
-                await WarmupAsync(url, candidate.Name, warmupCtx, ct).ConfigureAwait(false);
+                await UnloadModelAsync(url, previousMeasuredModel, ct).ConfigureAwait(false);
             }
 
-            // 7. Benchmark loop (ascending ladder).
+            // 6. Benchmark loop (ascending ladder): evict → measure at every surviving rung.
+            // There is NO warmup (removed in task #167 — the proven benchmark.py methodology
+            // is evict → single generate): the first measurement generate of a rung loads the
+            // weights + allocates the KV buffer at EXACTLY this rung's num_ctx + prefills +
+            // decodes, and llama.cpp builds its compute graph at load time, so
+            // eval_count/eval_duration (the viability gate input) are representative
+            // steady-state decode.
             foreach (var ctx in ladder.Where(c => c <= effectiveMaxCtx))
             {
                 if (ct.IsCancellationRequested)
@@ -522,7 +537,11 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
                     continue;
                 }
 
-                // Surviving context: benchmark it.
+                // Surviving context: evict this model so the KV allocation is a clean
+                // cold start at exactly this rung's num_ctx (no inherited smaller buffer or
+                // partial context from the previous rung), then benchmark it.
+                await UnloadModelAsync(url, candidate.Name, ct).ConfigureAwait(false);
+
                 var (viable, result) = await RunSingleBenchmarkAsync(
                     url, candidate, role, ctx, ct).ConfigureAwait(false);
 
@@ -538,6 +557,11 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
                     break;
                 }
             }
+
+            // This candidate was measured (or at least attempted) — the next candidate evicts
+            // IT before its own first rung. Sizing-pruned and pull-failed candidates continue
+            // before reaching here and never update the tracker (they load nothing).
+            previousMeasuredModel = candidate.Name;
         }
 
         // 8. Determine the final status and persist.
@@ -643,14 +667,17 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
     /// (task #152): the per-context <see cref="CandidateSizingEstimate"/> map over the WHOLE
     /// ladder, whether ANY context survives sizing (<see cref="AnySurvived"/> — the run loop's
     /// pull / sizing-pruned decision), the largest surviving ladder context capped by the
-    /// model's <see cref="CandidateModel.NativeContext"/> (<see cref="MaxSurvivingCtx"/> — the
-    /// run loop's <c>effectiveMaxCtx</c> PRE the Modelfile cap; 0 when nothing survives) and
-    /// whether sizing ran fail-open (<see cref="AssumedSizing"/> — the run loop's
-    /// "assumed" sizing source rule: null profile or TotalFastMemoryMB <= 0).
+    /// model's <see cref="CandidateModel.NativeContext"/> (<see cref="MaxSurvivingCtx"/>; 0 when
+    /// nothing survives) and whether sizing ran fail-open (<see cref="AssumedSizing"/> — the
+    /// run loop's "assumed" sizing source rule: null profile or TotalFastMemoryMB <= 0).
     /// <para>
     /// ONE shared derivation: the run loop and <see cref="GetBenchmarkCandidates"/> both use
     /// these exact values, so the published candidate plan can never drift from what a run
-    /// would actually do on the node.
+    /// would actually do on the node. Accepted nuance (task #167): the network-free plan caps
+    /// at NativeContext, while a live run may refine the effective context cap DOWNWARD only,
+    /// when the daemon's GGUF <c>model_info["*.context_length"]</c> reports a smaller
+    /// architectural ceiling (a no-op for every curated model, whose GGUF context_length
+    /// equals NativeContext = 262,144). The Modelfile <c>PARAMETER num_ctx</c> is never a cap.
     /// </para>
     /// </summary>
     internal sealed record CandidateFitEvaluation(
@@ -675,7 +702,9 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
             {
                 anySurvived = true;
                 // Cap by NativeContext: the run loop never measures a rung above the model's
-                // native context (effectiveMaxCtx = min(NativeContext, Modelfile cap ?? NativeContext)).
+                // native context (effectiveMaxCtx = min(NativeContext, live GGUF
+                // context_length ?? NativeContext) — the Modelfile PARAMETER num_ctx is
+                // never a cap, task #167).
                 if (ctx <= candidate.NativeContext && ctx > maxSurvivingCtx)
                 {
                     maxSurvivingCtx = ctx;
@@ -790,48 +819,40 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
     }
 
     // ------------------------------------------------------------------
-    //  Warmup + benchmark
+    //  Cold-start eviction + benchmark
     // ------------------------------------------------------------------
 
-    private async Task WarmupAsync(string? baseUrl, string modelName, int numCtx, CancellationToken ct)
+    /// <summary>
+    /// Cold-start model eviction (task #167): asks Ollama to release
+    /// <paramref name="modelName"/> immediately — the exact <c>POST /api/generate</c>
+    /// <c>{"model", "keep_alive": 0}</c> isolation call of the proven benchmark.py
+    /// methodology — via the already-injected catalog client (its own 4 s bound; the
+    /// call is a fast memory release, never a reload). The next measurement generate then
+    /// loads fresh and allocates the KV buffer at EXACTLY the rung's num_ctx. Fail-soft:
+    /// a failed eviction only distorts VRAM residency for that rung — the run continues
+    /// (warning logged) and the next rung's own eviction re-attempts for the same model.
+    /// Short-circuits on a blank url/model or an already-cancelled token; a caller-requested
+    /// cancellation during the call propagates as <see cref="OperationCanceledException"/>
+    /// (the run-loop's Cancelled contract).
+    /// </summary>
+    private async Task UnloadModelAsync(string? baseUrl, string modelName, CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(baseUrl))
+        if (ct.IsCancellationRequested ||
+            string.IsNullOrWhiteSpace(baseUrl) ||
+            string.IsNullOrWhiteSpace(modelName))
         {
             return;
         }
 
-        try
+        var unloaded = await _catalogClient
+            .UnloadModelAsync(baseUrl, modelName, ct)
+            .ConfigureAwait(false);
+        if (!unloaded)
         {
-            var body = new JsonObject
-            {
-                ["model"] = modelName,
-                ["prompt"] = "Write a short sentence.",
-                ["stream"] = false,
-                ["options"] = new JsonObject
-                {
-                    ["num_ctx"] = numCtx,
-                    ["num_predict"] = 16,
-                    ["temperature"] = 0
-                }
-            };
-
-            using var content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            cts.CancelAfter(GenerateTimeout);
-
-            using var warmupRequest = new HttpRequestMessage(HttpMethod.Post, new Uri(new Uri(baseUrl), GeneratePath)) { Content = content };
-            await _httpClient
-                .SendAsync(warmupRequest, cts.Token)
-                .ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            // Warmup failure is non-fatal: the model may still work for the real benchmark.
-            _logger.LogDebug(ex, "Warmup for {Model} at {NumCtx} ctx failed; continuing.", modelName, numCtx);
+            _logger.LogWarning(
+                "Cold-start eviction for {Model} on {Url} did not land; the run continues " +
+                "(the next rung's own eviction re-attempts for that model).",
+                modelName, baseUrl);
         }
     }
 
@@ -856,7 +877,7 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
 
         try
         {
-            // Build the deterministic filler prompt.
+            // Build the deterministic fixed-size filler prompt (rung-invariant, task #167).
             var filler = BuildFillerPrompt(numCtx, candidate.Name);
 
             var body = new JsonObject
@@ -957,16 +978,33 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
     // ------------------------------------------------------------------
 
     /// <summary>
-    /// Builds a deterministic real-text filler prompt whose estimated token count is ≈
-    /// <paramref name="numCtx"/> (a few percent under is fine — the benchmark row records the
-    /// measured prefill speed at whatever the model actually prefilled). The prompt must be
-    /// *real text*, not padding bytes, so prefill is representative. Token math is O(1)
-    /// per estimator call (tokens × repetitions, never a re-estimate of the whole string)
-    /// so 262k contexts do not blow the estimator's sum. A fixed benchmark suffix is
-    /// appended.
+    /// Fixed filler-prompt size target in estimated tokens (task #167): the middle of the
+    /// ~512–1,024 token window the benchmark methodology prescribes for the measurement
+    /// prefill.
+    /// </summary>
+    private const int FillerPromptTargetTokens = 768;
+
+    /// <summary>
+    /// Builds the deterministic real-text filler prompt for the measurement generate
+    /// (task #167): a FIXED string of ≈ <see cref="FillerPromptTargetTokens"/> estimated
+    /// tokens, BYTE-IDENTICAL at every ladder rung. Cold-start KV sizing comes from
+    /// <c>options.num_ctx</c> in the measurement body — NOT from the prompt length — so the
+    /// old numCtx-scaled multi-megabyte prompt (whose 256k prefill alone exceeded the 5-minute
+    /// GenerateTimeout) is never built; the model allocates the full rung KV cache and
+    /// decodes on a bounded, representative prefill. The prompt must be *real text*, not
+    /// padding bytes, so the prefill speed is representative; token math is O(1) per
+    /// estimator call (tokens × repetitions, never a re-estimate of the whole string). A
+    /// fixed benchmark suffix is appended.
+    /// <para>
+    /// <paramref name="numCtx"/> is retained for call-site clarity only — by design it does
+    /// NOT influence the output (the prompt is rung-invariant).
+    /// </para>
     /// </summary>
     internal string BuildFillerPrompt(int numCtx, string? modelName = null)
     {
+        // Rung-invariant by design: options.num_ctx (not the prompt) sizes the KV cache.
+        _ = numCtx;
+
         const string Suffix = "Summarize the above text in one paragraph. Begin now:";
         const string BaseSentence =
             "The quick brown fox jumps over the lazy dog near the riverbank while the " +
@@ -979,13 +1017,11 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
             baseTokens = 20; // fallback
         }
 
-        var suffixTokens = _tokenEstimator.EstimateTokens(Suffix, modelName);
-        var targetFillerTokens = Math.Max(baseTokens, numCtx - suffixTokens - 8);
-
-        var repetitions = Math.Max(1, targetFillerTokens / baseTokens);
-        // Defensive cap: even a pathological estimator (tokens-per-char) must not yield an
-        // unbounded prompt string. The target is then simply not reached.
-        const int MaxRepetitions = 100_000;
+        var repetitions = Math.Max(1, (FillerPromptTargetTokens + baseTokens - 1) / baseTokens);
+        // Defensive cap: even a pathological estimator must not yield an unbounded prompt
+        // string (a 1-token/char estimator caps out at a few KB of real text). The target
+        // is then simply not reached.
+        const int MaxRepetitions = 100;
         if (repetitions > MaxRepetitions)
         {
             repetitions = MaxRepetitions;

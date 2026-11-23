@@ -4,7 +4,7 @@
 
 OllamaRouter routes requests across targets that expose the **same model name** (or a mapped virtual role alias). You can set up your fleet in two ways:
 
-1. **Automated Setup Wizard & Role Recommendations (recommended for standard catalog models):** Pull native library models (e.g. `gemma4:e4b`, `qwen3.8:27b`, `qwen3.6:35b-a3b`) directly on your nodes and run the Setup Wizard (`ollamarouter setup`) or benchmark/recommendation API (`ollamarouter benchmark run`, `POST /api/router/recommendations/generate`). The router automatically enforces per-node context ceilings (`recommended.json`) without requiring separate custom Modelfile aliases per node.
+1. **Automated Setup Wizard & Role Recommendations (recommended for standard catalog models):** Pull native library models (e.g. `jetelain/Flint:q4`, `jetelain/Qwen3.8-27B:latest`, `jetelain/Qwen3.6-35B-A3B:q4`) directly on your nodes and run the Setup Wizard (`ollamarouter setup`) or benchmark/recommendation API (`ollamarouter benchmark run`, `POST /api/router/recommendations/generate`). The router automatically enforces per-node context ceilings (`recommended.json`) without requiring separate custom Modelfile aliases per node.
 2. **Custom Modelfile aliases (for mixed quantizations or custom `num_ctx`):** Run a more heavily quantized model locally (to fit in limited VRAM) and a less-quantized or full-precision version remotely (to take advantage of larger unified RAM/VRAM), both aliased under the same model name with explicit per-node `num_ctx`.
 
 > **Note on namespaced models (`FilterNamespacedModels`).** By default (`FilterNamespacedModels: true`), OllamaRouter filters out models whose names contain a `/` namespace (such as `jetelain/Qwen3.8-27B:iq3`) from the merged fleet catalog so backing weights don't trigger redundant capability probes — only native library names (`qwen3.8:27b`), local aliases without a slash (`Qwen3.8-27B`), or models explicitly listed in `OllamaRouter:Models` are exposed for routing.
@@ -141,4 +141,3 @@ Laptop node (`config/config.json`):
 ```
 
 Swap `192.168.1.10` / `192.168.1.20` for each node's real LAN IP. When a peer target's `Url` uses port `:11435`, the router automatically infers `RouterUrl` on port `:11434` of the same host to query the peer router's `/api/router/hardware` endpoint for remote VRAM discovery (or set `RouterUrl` explicitly if the peer router binds a non-standard port). Other per-target settings (`MaxVramMB`, `KeepAliveSeconds`, `PowerWatts`, `Location`, etc.) apply as documented in [Configuration](configuration.md).
-

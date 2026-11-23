@@ -89,6 +89,7 @@ namespace OllamaRouter.Serialization;
 [JsonSerializable(typeof(RouterFleetHardwareResponse))]
 [JsonSerializable(typeof(RouterVramReclaimResponse))]
 [JsonSerializable(typeof(CandidateModel))]
+[JsonSerializable(typeof(CandidateModelClass))]
 [JsonSerializable(typeof(UsageRole))]
 [JsonSerializable(typeof(BenchmarkContextResult))]
 [JsonSerializable(typeof(BenchmarkTargetResult))]

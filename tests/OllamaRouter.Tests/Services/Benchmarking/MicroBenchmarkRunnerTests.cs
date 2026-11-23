@@ -33,9 +33,11 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
 
     /// <summary>
     /// Records every request (method, absolute path, body) and answers /api/generate from a
-    /// first-in-first-out queue of response bodies (one body per generate call, warmup
-    /// included). /api/pull always answers 200 {"status":"success"}. An optional gate can
-    /// stall the FIRST generate call so tests can assert the single-flight contract.
+    /// first-in-first-out queue of response bodies — STRICT 1:1 with the measurement
+    /// generates (task #167: no warmup generates exist and cold-start evictions never reach
+    /// this handler; they ride the Moq'd catalog client). /api/pull always answers 200
+    /// {"status":"success"}. An optional gate can stall the FIRST generate call so tests
+    /// can assert the single-flight contract.
     /// </summary>
     private sealed class RecordingHandler : HttpMessageHandler
     {
@@ -315,7 +317,6 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
     public async Task UnknownProfile_FailOpen_BenchmarkProceeds()
     {
         var runner = CreateRunner(profile: null);
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // warmup
         _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // 16k
         _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // 32k
 
@@ -341,21 +342,19 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
     public async Task ModelPresent_NoPullIssued()
     {
         var runner = CreateRunner(Profile(32_768), modelPresent: true);
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // warmup
         _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
         _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
 
         Assert.True(runner.TryStartRun(target: null, roles: null, model: null));
         await WaitUntilRunCompleteAsync(runner);
 
-        Assert.Equal(3, _handler.GenerateCallCount); // warmup + 2 ladder rungs
+        Assert.Equal(2, _handler.GenerateCallCount); // 2 ladder rungs (no warmup — task #167)
     }
 
     [Fact]
     public async Task ModelAbsent_ExactlyOnePull_WithNonStreamBody()
     {
         var runner = CreateRunner(Profile(32_768), modelPresent: false);
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // warmup
         _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
         _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
 
@@ -372,39 +371,48 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
     public async Task GenerateRequests_CarryNumCtxAndNumPredict64_AndStreamFalse()
     {
         var runner = CreateRunner(Profile(32_768), modelPresent: true);
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // warmup
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
+        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // 16k
+        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // 32k
 
         Assert.True(runner.TryStartRun(target: null, roles: null, model: null));
         await WaitUntilRunCompleteAsync(runner);
 
+        // A6 (task #167): a 2-rung single-model run issues EXACTLY 2 /api/generate calls on
+        // the runner's HTTP client — no warmup generate remains (WarmupAsync deleted).
         var generates = _handler.RequestsByPath("/api/generate");
-        Assert.Equal(3, generates.Count);
+        Assert.Equal(2, generates.Count);
 
-        // Warmup: the smallest context, num_predict 16, the fixed short prompt.
-        var warmup = JsonNode.Parse(generates[0].Body) as JsonObject;
-        Assert.Equal(16, warmup?["options"]?["num_predict"]?.GetValue<int>());
-        Assert.Equal(16_384, warmup?["options"]?["num_ctx"]?.GetValue<int>());
-        Assert.Equal(false, warmup?["stream"]?.GetValue<bool>());
-        Assert.Equal("Write a short sentence.", warmup?["prompt"]?.GetValue<string>());
-
-        // Ladder rungs: ascending num_ctx, num_predict 64, real-text filler prompt.
-        var ladder = generates.Skip(1)
-            .Select(r => JsonNode.Parse(r.Body) as JsonObject)
-            .Select(b => b?["options"]?["num_ctx"]?.GetValue<int>())
-            .ToList();
-        Assert.Equal([16_384, 32_768], ladder);
-        foreach (var request in generates.Skip(1))
+        // Each measured body: options.num_ctx = its rung (ascending), num_predict 64,
+        // stream false, and a bounded real-text prompt.
+        var expectedLadder = new[] { 16_384, 32_768 };
+        for (var i = 0; i < generates.Count; i++)
         {
-            var body = JsonNode.Parse(request.Body) as JsonObject;
+            var body = JsonNode.Parse(generates[i].Body) as JsonObject;
+            Assert.Equal(expectedLadder[i], body?["options"]?["num_ctx"]?.GetValue<int>());
             Assert.Equal(64, body?["options"]?["num_predict"]?.GetValue<int>());
+            Assert.Equal(false, body?["stream"]?.GetValue<bool>());
+
             var prompt = body?["prompt"]?.GetValue<string>();
             Assert.False(string.IsNullOrWhiteSpace(prompt));
-            Assert.True(
-                prompt!.Length / 4 >= 8_000,
-                $"filler prompt too short for a 16k+ ctx: {prompt.Length / 4} estimated tokens");
-            Assert.Contains("Summarize the above text in one paragraph. Begin now:", prompt);
+            // Fixed-size filler (task #167): ~768 estimated tokens (4 chars = 1 token in
+            // the FixedTokenEstimator), inside the ~512–1,024 window — NOT the old
+            // numCtx-scaled multi-megabyte prompt — with the benchmark suffix.
+            Assert.InRange(prompt!.Length / 4, 512, 1_024);
+            Assert.True(prompt.Length < 16_000, $"filler prompt unbounded: {prompt.Length} chars");
+            Assert.EndsWith("Summarize the above text in one paragraph. Begin now:", prompt);
+        }
+
+        // Rung invariance: the SAME byte-identical prompt at every rung (cold-start KV
+        // sizing comes from options.num_ctx, never from the prompt length).
+        Assert.Equal(
+            (JsonNode.Parse(generates[0].Body) as JsonObject)?["prompt"]?.GetValue<string>(),
+            (JsonNode.Parse(generates[1].Body) as JsonObject)?["prompt"]?.GetValue<string>());
+
+        // No request body anywhere carries the removed warmup shape.
+        foreach (var request in _handler.Requests)
+        {
+            Assert.DoesNotContain("Write a short sentence.", request.Body);
+            Assert.DoesNotContain("\"num_predict\":16", request.Body);
         }
     }
 
@@ -416,9 +424,8 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
     public async Task Exactly20Tps_IsViable()
     {
         var runner = CreateRunner(Profile(32_768), modelPresent: true);
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // warmup
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 3_200_000_000)); // 64 / 3.2 s = exactly 20.0
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));  // 32k rung (ladder continues)
+        _handler.EnqueueGenerateResponse(GenerateJson(64, 3_200_000_000)); // 16k → 64 / 3.2 s = exactly 20.0
+        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // 32k rung (ladder continues)
 
         Assert.True(runner.TryStartRun(target: null, roles: null, model: null));
         await WaitUntilRunCompleteAsync(runner);
@@ -437,7 +444,6 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
     public async Task FirstNonViableRow_StopsTheLadder()
     {
         var runner = CreateRunner(Profile(32_768), modelPresent: true);
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // warmup
         _handler.EnqueueGenerateResponse(GenerateJson(64, 6_400_000_000)); // 16k → 10 tps
         _handler.EnqueueGenerateResponse(GenerateJson(64, 1_000_000_000)); // must never be consumed
 
@@ -450,14 +456,13 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
         Assert.Equal("below-threshold", row.Reason);
         Assert.Equal(10.0, row.DecodeTokensPerSecond, precision: 3);
         Assert.Single(results.Results); // the boundary row is recorded; 32k is NOT
-        Assert.Equal(2, _handler.GenerateCallCount); // warmup + 16k; 32k never requested
+        Assert.Equal(1, _handler.GenerateCallCount); // 16k only; 32k never requested
     }
 
     [Fact]
     public async Task OllamaError_IsOomRow_AndStopsLadder()
     {
         var runner = CreateRunner(Profile(32_768), modelPresent: true);
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // warmup
         _handler.EnqueueGenerateResponse(
             "{\"error\":\"could not select any CUDA devices for model: out of memory\"}");
 
@@ -475,7 +480,6 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
     public async Task CorruptMetrics_IsErrorRow_AndStopsLadder()
     {
         var runner = CreateRunner(Profile(32_768), modelPresent: true);
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // warmup
         _handler.EnqueueGenerateResponse(GenerateJson(0, 0)); // eval_count 0 → bad metrics
 
         Assert.True(runner.TryStartRun(target: null, roles: null, model: null));
@@ -498,14 +502,13 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
         var runner = CreateRunner(Profile(32_768), modelPresent: true);
         var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         _handler.SetGenerateGate(gate);
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // warmup (gated)
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
+        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // 16k (gated)
+        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // 32k
 
         Assert.True(runner.TryStartRun(target: null, roles: null, model: null));
         try
         {
-            // Wait until the run is actually in flight (warmup generate in progress).
+            // Wait until the run is actually in flight (16k rung measurement in progress).
             var sw = Stopwatch.StartNew();
             while (_handler.GenerateCallCount == 0 && sw.ElapsedMilliseconds < 5_000)
             {
@@ -571,14 +574,13 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
 
         var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         _handler.SetGenerateGate(gate);
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // warmup (gated)
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
+        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // 16k (gated)
+        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // 32k
 
         Assert.True(runner.TryStartRun(target: null, roles: null, model: null));
         try
         {
-            // Wait until the run is actually in flight (warmup generate blocked on the gate).
+            // Wait until the run is actually in flight (16k rung measurement blocked on the gate).
             var sw = Stopwatch.StartNew();
             while (_handler.GenerateCallCount == 0 && sw.ElapsedMilliseconds < 5_000)
             {
@@ -660,7 +662,6 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
         var runner = CreateRunner(Profile(32_768), modelPresent: true);
         _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
         _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
 
         Assert.True(runner.TryStartRun(target: null, roles: null, model: null));
         await WaitUntilRunCompleteAsync(runner);
@@ -693,7 +694,6 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
         var speedPath = Path.Combine(_stateDirectory, "targets-speed.json");
 
         var runner = CreateRunner(Profile(32_768), modelPresent: true);
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // warmup
         _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // 16k → 32 tps
         _handler.EnqueueGenerateResponse(GenerateJson(64, 2_400_000_000)); // 32k → 26.667 tps
 
@@ -719,7 +719,6 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
             OllamaRouterJsonSerializerContext.Default.DictionaryStringDictionaryStringSpeedSnapshotEntry));
 
         var runner2 = CreateRunner(Profile(32_768), modelPresent: true);
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // warmup
         _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // 16k
         _handler.EnqueueGenerateResponse(GenerateJson(64, 2_400_000_000)); // 32k
 
@@ -738,7 +737,6 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
     public async Task NoViableRows_SpeedSnapshotNotSeeded()
     {
         var runner = CreateRunner(Profile(32_768), modelPresent: true);
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // warmup
         _handler.EnqueueGenerateResponse(GenerateJson(64, 6_400_000_000)); // 10 tps → below threshold
 
         Assert.True(runner.TryStartRun(target: null, roles: null, model: null));
@@ -805,7 +803,6 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
         };
 
         var runner = CreateRunner(Profile(32_768), catalog: options, modelPresent: true);
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // warmup
         _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // 16k
 
         Assert.True(runner.TryStartRun(target: null, roles: [UsageRole.AgenticChat], model: null));
@@ -814,7 +811,7 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
         var results = runner.GetAllResults().Single();
         Assert.All(results.Results, r => Assert.Equal(TestModel.Name, r.Model));
         Assert.All(results.Results, r => Assert.Equal(UsageRole.AgenticChat, r.Role));
-        Assert.Equal(2, _handler.GenerateCallCount); // warmup + 1 rung; basic:4b never touched
+        Assert.Equal(1, _handler.GenerateCallCount); // 1 rung (no warmup); basic:4b never touched
     }
 
     [Fact]
@@ -832,7 +829,6 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
         };
 
         var runner = CreateRunner(Profile(32_768), catalog: options, modelPresent: true);
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // warmup
         _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // 16k
 
         Assert.True(runner.TryStartRun(target: null, roles: null, model: "BASIC:4b"));
@@ -840,7 +836,7 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
 
         var results = runner.GetAllResults().Single();
         Assert.All(results.Results, r => Assert.Equal("basic:4b", r.Model));
-        Assert.Equal(2, _handler.GenerateCallCount); // only basic:4b benchmarked
+        Assert.Equal(1, _handler.GenerateCallCount); // only basic:4b benchmarked (no warmup)
     }
 
     // ------------------------------------------------------------------
@@ -864,8 +860,7 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
     public async Task TryStartRun_ExcludedModel_IsNeverPulledNorBenchmarked()
     {
         var runner = CreateRunner(Profile(65_536), catalog: TwoModelCatalog(), modelPresent: false);
-        // Only small:4b is measured: warmup + 2 ladder rungs (3 generates).
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
+        // Only small:4b is measured: 2 ladder rungs = 2 generates (no warmup — task #167).
         _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
         _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
 
@@ -885,7 +880,7 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
         Assert.All(results.Results, r => Assert.True(r.Viable));
         Assert.Equal(1, _handler.PullCallCount); // small:4b only
         Assert.Equal("small:4b", (JsonNode.Parse(_handler.FirstByPath("/api/pull")!.Body) as JsonObject)?["model"]?.GetValue<string>());
-        Assert.Equal(3, _handler.GenerateCallCount);
+        Assert.Equal(2, _handler.GenerateCallCount);
         foreach (var request in _handler.RequestsByPath("/api/generate"))
         {
             var body = JsonNode.Parse(request.Body) as JsonObject;
@@ -919,8 +914,8 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
     public async Task TryStartRun_EmptyExclusionDictionary_BehavesExactlyLikeAbsent()
     {
         var runner = CreateRunner(Profile(65_536), catalog: TwoModelCatalog(), modelPresent: false);
-        // Two models × (warmup + 2 rungs) = 6 generates, 2 pulls for a full run.
-        for (var i = 0; i < 12; i++)
+        // Two runs × two models × 2 rungs = 8 generates (no warmup — task #167), 4 pulls.
+        for (var i = 0; i < 8; i++)
         {
             _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
         }
@@ -955,7 +950,6 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
     public async Task TryStartRun_ExclusionIsCaseInsensitive_AndSkipsBlankEntries()
     {
         var runner = CreateRunner(Profile(65_536), catalog: TwoModelCatalog(), modelPresent: false);
-        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // warmup
         _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // 16k
         _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // 32k
 
@@ -969,7 +963,7 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
 
         var results = runner.GetAllResults().Single();
         Assert.All(results.Results, r => Assert.Equal("small:4b", r.Model));
-        Assert.Equal(3, _handler.GenerateCallCount); // small:4b fully benchmarked
+        Assert.Equal(2, _handler.GenerateCallCount); // small:4b fully benchmarked (2 rungs, no warmup)
         Assert.Equal(0, _handler.RequestsByPath("/api/pull").Count(p =>
             JsonNode.Parse(p.Body) is { } node &&
             string.Equals((node as JsonObject)?["model"]?.GetValue<string>(), TestModel.Name, StringComparison.OrdinalIgnoreCase)));
@@ -997,7 +991,9 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
         "moe:35b", [UsageRole.JuniorDeveloper], "MoE",
         TotalParams: 35_000_000_000, ActiveParams: 3_300_000_000,
         "q4", 4, Layers: 64, KvHeads: 8, HeadDim: 128,
-        NativeContext: 32_768, DefaultContext: 32_768);
+        NativeContext: 32_768, DefaultContext: 32_768,
+        ModelClass: CandidateModelClass.MoE,
+        AllowCpuOffload: true);
 
     private static CandidateModelCatalogOptions CandidateTestCatalog() => new()
     {
@@ -1093,9 +1089,10 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
             .Select(c => c.Model)
             .ToArray();
 
-        // The real run on the same small profile: small:2b + moe:35b measure (warmup + 2
-        // rungs each = 6 generates); big:27b is sizing-pruned at every rung, never pulled.
-        for (var i = 0; i < 6; i++)
+        // The real run on the same small profile: small:2b + moe:35b measure (2 rungs
+        // each = 4 generates — no warmup, task #167; the 32k rung is sizing-pruned);
+        // big:27b is sizing-pruned at every rung, never pulled.
+        for (var i = 0; i < 4; i++)
         {
             _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
         }
@@ -1135,5 +1132,239 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
         Assert.Single(empty.Targets);
         Assert.NotNull(empty.Targets[0].Candidates);
         Assert.Empty(empty.Targets[0].Candidates);
+    }
+
+    // ------------------------------------------------------------------
+    //  Task #167: empirical ladder, Modelfile cap removal, fixed-size prompt, cold-start
+    //  eviction (evict → measure)
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// A 2B dense model with the curated NativeContext (262_144) that FITS at every ladder
+    /// rung on a 96 GB fast-memory node (weights 953.7 MiB + KV 73_728 MiB @ 256k = 74_681.7
+    /// MiB &lt; 92% × 98_304 = 90_439.7 MiB).
+    /// </summary>
+    private static CandidateModel WideModel(string name) => new(
+        name, [UsageRole.AgenticChat], "Dense",
+        TotalParams: 2_000_000_000, ActiveParams: null,
+        "q4", 4, Layers: 36, KvHeads: 8, HeadDim: 256,
+        NativeContext: 262_144, DefaultContext: 131_072);
+
+    [Fact]
+    public void DefaultLadder_IsTheEmpiricalBreakpoints()
+    {
+        // A1 (task #167): the old ladder { 16384, 32768, 49152, 65536, 131072, 184320,
+        // 262144 } lacked the 96k/160k/192k decision boundaries and carried the 16k start /
+        // 180k rung that match no empirical breakpoint.
+        var ladder = new CandidateModelCatalogOptions().BenchmarkContextLadder;
+        Assert.Equal([32_768, 49_152, 65_536, 98_304, 131_072, 163_840, 196_608, 262_144],
+            ladder.ToArray());
+        // 131072 (128k) is the downstream role-eligibility floor — explicitly present.
+        Assert.Contains(131_072, ladder);
+    }
+
+    [Fact]
+    public async Task ModelfileNumCtx_DoesNotCapTheLadder_UpToNativeContext()
+    {
+        // A2 (task #167): the Modelfile PARAMETER num_ctx (here 65536 — the exact shape
+        // ModelMetadataParser.ParseNumCtx matches) used to cap effectiveMaxCtx and SILENTLY
+        // produced NO rows above 65536. Now only candidate.NativeContext (refined downward
+        // by the live GGUF context_length — absent here) caps the ladder.
+        var wide = WideModel("wide:2b");
+        var options = new CandidateModelCatalogOptions
+        {
+            Models = [wide],
+            BenchmarkContextLadder = [32_768, 65_536, 98_304, 131_072, 163_840, 196_608, 262_144]
+        };
+
+        // The /api/show response declares Modelfile num_ctx 65536 and NO model_info (no
+        // GGUF cap → NativeContext 262_144 governs).
+        _catalogClient
+            .Setup(c => c.GetShowAsync(TargetUrl, wide.Name, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new JsonObject
+            {
+                ["parameters"] = "num_ctx 65536\nnum_predict 2048\n"
+            });
+
+        var runner = CreateRunner(Profile(98_304), catalog: options, modelPresent: false);
+        for (var i = 0; i < 7; i++)
+        {
+            _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
+        }
+
+        Assert.True(runner.TryStartRun(target: null, roles: null, model: null));
+        await WaitUntilRunCompleteAsync(runner);
+
+        var results = runner.GetAllResults().Single();
+        Assert.Equal(BenchmarkRunStatus.Succeeded, results.Status);
+
+        // Measured rows exist for ALL rungs up to 262144 — including 131072/163840/196608
+        // and 262144, the ones the old Modelfile cap silently dropped.
+        Assert.Equal([32_768, 65_536, 98_304, 131_072, 163_840, 196_608, 262_144],
+            results.Results.Select(r => r.NumCtx).ToArray());
+        Assert.All(results.Results, r => Assert.True(r.Viable));
+        Assert.Equal(7, _handler.GenerateCallCount);
+
+        // Every measurement body carries its rung's FULL options.num_ctx (ascending).
+        var bodies = _handler.RequestsByPath("/api/generate")
+            .Select(r => JsonNode.Parse(r.Body) as JsonObject)
+            .ToList();
+        Assert.Equal(7, bodies.Count);
+        for (var i = 0; i < bodies.Count; i++)
+        {
+            Assert.Equal(results.Results[i].NumCtx, bodies[i]?["options"]?["num_ctx"]?.GetValue<int>());
+        }
+    }
+
+    [Fact]
+    public async Task GgufContextLength_BelowNativeContext_CapsTheLadder()
+    {
+        // A3 (task #167): the live GGUF architectural ceiling
+        // (model_info["*.context_length"]) is the ONLY cap signal — here 98304 below
+        // NativeContext 262_144 → NO measurement rows above 98304 (GenerateCallCount =
+        // surviving rungs only). The control candidate (show → null, fail-soft) is NOT
+        // capped: NativeContext governs and the full ladder is measured.
+        var capped = WideModel("capped:2b");
+        var uncapped = WideModel("uncapped:2b");
+        var ladder = new CandidateModelCatalogOptions().BenchmarkContextLadder; // the 8 empirical rungs
+        var options = new CandidateModelCatalogOptions
+        {
+            Models = [capped, uncapped],
+            BenchmarkContextLadder = ladder
+        };
+
+        _catalogClient
+            .Setup(c => c.GetShowAsync(TargetUrl, capped.Name, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new JsonObject
+            {
+                ["model_info"] = new JsonObject { ["test.context_length"] = 98_304 }
+            });
+        // uncapped:2b falls through to the constructor default → show null (fail-soft).
+
+        var runner = CreateRunner(Profile(98_304), catalog: options, modelPresent: false);
+        // capped: 4 rungs (≤ 98304) + uncapped: all 8 rungs = 12 measurement generates.
+        for (var i = 0; i < 12; i++)
+        {
+            _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
+        }
+
+        Assert.True(runner.TryStartRun(target: null, roles: null, model: null));
+        await WaitUntilRunCompleteAsync(runner);
+
+        var results = runner.GetAllResults().Single();
+        Assert.Equal(BenchmarkRunStatus.Succeeded, results.Status);
+        Assert.Equal(12, _handler.GenerateCallCount);
+
+        var cappedRows = results.Results.Where(r => r.Model == capped.Name).ToArray();
+        Assert.Equal([32_768, 49_152, 65_536, 98_304], cappedRows.Select(r => r.NumCtx).ToArray());
+        Assert.All(cappedRows, r => Assert.True(r.Viable));
+
+        // The control candidate is NOT capped: it measures the full ladder up to 262144.
+        var uncappedRows = results.Results.Where(r => r.Model == uncapped.Name).ToArray();
+        Assert.Equal(ladder.ToArray(), uncappedRows.Select(r => r.NumCtx).ToArray());
+        Assert.Contains(uncappedRows, r => r.NumCtx == 262_144);
+    }
+
+    [Fact]
+    public void BuildFillerPrompt_IsFixedSize_AndRungInvariant()
+    {
+        // A4 (task #167): the old BuildFillerPrompt(262144) built a ~262k-token
+        // multi-megabyte string (whose prefill alone exceeded the 5-minute GenerateTimeout).
+        // Now: the SAME bounded (~768 estimated tokens) real-text prompt at every rung.
+        var runner = CreateRunner(Profile(32_768), modelPresent: true);
+
+        var small = runner.BuildFillerPrompt(32_768);
+        var large = runner.BuildFillerPrompt(262_144);
+
+        // Byte-identical across rungs.
+        Assert.Equal(small, large);
+
+        // Bounded: ~768 estimated tokens (4 chars = 1 token in the FixedTokenEstimator),
+        // inside the ~512–1,024 window, far below the old prompt size, with the benchmark
+        // suffix.
+        var estimatedTokens = new FixedTokenEstimator().EstimateTokens([large]);
+        Assert.InRange(estimatedTokens, 512, 1_024);
+        Assert.True(large.Length < 16_000, $"filler prompt unbounded: {large.Length} chars");
+        Assert.EndsWith("Summarize the above text in one paragraph. Begin now:", large);
+
+        // O(1) build: a reintroduced O(numCtx) scaling must not slip back in.
+        var sw = Stopwatch.StartNew();
+        _ = runner.BuildFillerPrompt(262_144);
+        Assert.True(sw.ElapsedMilliseconds < 50, $"filler build took {sw.ElapsedMilliseconds} ms");
+    }
+
+    [Fact]
+    public async Task Eviction_IsSentBeforeEveryMeasuredRung_AndThePreviousCandidateBetweenThem()
+    {
+        // A5 (task #167, design D3): the old code NEVER called UnloadModelAsync — Ollama's
+        // default 5-minute keep-alive kept the previous candidate's weights + KV resident
+        // during the next candidate's cold loads (distorted offloading / spurious OOMs).
+        // Now: one eviction immediately before EVERY measured rung of the current
+        // candidate, plus one eviction of the previously measured candidate before a new
+        // candidate's first rung.
+        var evictionOrder = new List<string>();
+        _catalogClient
+            .Setup(c => c.UnloadModelAsync(It.IsAny<string?>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Callback<string?, string, CancellationToken>((url, model, ct) => evictionOrder.Add(model ?? ""))
+            .ReturnsAsync(true);
+
+        var runner = CreateRunner(Profile(65_536), catalog: TwoModelCatalog(), modelPresent: false);
+        // Two models × 2 measured rungs = 4 measurement generates (no warmup).
+        for (var i = 0; i < 4; i++)
+        {
+            _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
+        }
+
+        Assert.True(runner.TryStartRun(target: null, roles: null, model: null));
+        await WaitUntilRunCompleteAsync(runner);
+
+        var results = runner.GetAllResults().Single();
+        Assert.Equal(BenchmarkRunStatus.Succeeded, results.Status);
+        Assert.Equal(4, _handler.GenerateCallCount);
+        Assert.All(results.Results, r => Assert.True(r.Viable));
+
+        // bench:27b (measured FIRST, 2 rungs): 2 per-rung + 1 cross-candidate (it is
+        // evicted before small:4b's first rung) = 3. small:4b (measured SECOND, 2 rungs):
+        // 2 per-rung = 2.
+        _catalogClient.Verify(
+            c => c.UnloadModelAsync(TargetUrl, TestModel.Name, It.IsAny<CancellationToken>()),
+            Times.Exactly(3));
+        _catalogClient.Verify(
+            c => c.UnloadModelAsync(TargetUrl, "small:4b", It.IsAny<CancellationToken>()),
+            Times.Exactly(2));
+
+        // Ordering: [bench:27b, bench:27b, (cross) bench:27b, small:4b, small:4b] — the
+        // cross-candidate call for small:4b carries bench:27b's name, and every measured
+        // rung is preceded by an eviction of the model being measured.
+        Assert.Equal(
+            [TestModel.Name, TestModel.Name, TestModel.Name, "small:4b", "small:4b"],
+            evictionOrder);
+    }
+
+    [Fact]
+    public async Task Eviction_FailSoft_RunStillCompletes()
+    {
+        // A5 (task #167, design D1): an eviction that does not land (the catalog client
+        // reports false) NEVER fails the run — it only distorts VRAM residency for that
+        // rung; the next rung's own eviction re-attempts for the same model.
+        _catalogClient
+            .Setup(c => c.UnloadModelAsync(It.IsAny<string?>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(false);
+
+        var runner = CreateRunner(Profile(32_768), modelPresent: true);
+        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // 16k
+        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // 32k
+
+        Assert.True(runner.TryStartRun(target: null, roles: null, model: null));
+        await WaitUntilRunCompleteAsync(runner);
+
+        var results = runner.GetAllResults().Single();
+        Assert.Equal(BenchmarkRunStatus.Succeeded, results.Status);
+        Assert.Equal(2, results.Results.Count);
+        Assert.All(results.Results, r => Assert.True(r.Viable));
+        // Both rungs still got their evict-before-measure call.
+        _catalogClient.Verify(
+            c => c.UnloadModelAsync(TargetUrl, TestModel.Name, It.IsAny<CancellationToken>()),
+            Times.Exactly(2));
     }
 }
