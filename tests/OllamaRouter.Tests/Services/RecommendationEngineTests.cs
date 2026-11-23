@@ -38,49 +38,50 @@ public class RecommendationEngineTests
     private static readonly IReadOnlyList<CandidateModel> Catalog = CandidateModelCatalogOptions.DefaultModels;
 
     /// <summary>
-    /// The spec example fleet: qwen3.8:27b viable to 49 152 on Desktop and 262 144 on
-    /// Aiserver (evidence beyond the 131 072 catalog native); gemma4:e4b viable to 131 072
-    /// everywhere; qwen3.6:35b-a3b (MoE) viable to 65 536 (next row non-viable).
+    /// The spec example fleet (task #166 names): jetelain/Qwen3.8-27B:latest viable to
+    /// 49 152 on Desktop and 262 144 on Aiserver (evidence at the 262 144 catalog native);
+    /// jetelain/Qwen3.6-35B-A3B:q4 viable to 131 072 everywhere; jetelain/Flint:q4 (MoE)
+    /// viable to 65 536 on Desktop (next row non-viable) / 131 072 on Aiserver.
     /// </summary>
     private static IReadOnlyList<BenchmarkTargetResult> DefaultFleetResults() =>
     [
         new BenchmarkTargetResult(Desktop, BenchmarkRunStatus.Succeeded,
             FixedStamp.AddMinutes(-20), FixedStamp.AddMinutes(-10),
         [
-            Row("gemma4:e4b", 16_384, 90.0),
-            Row("gemma4:e4b", 32_768, 84.0),
-            Row("gemma4:e4b", 49_152, 77.0),
-            Row("gemma4:e4b", 65_536, 70.0),
-            Row("gemma4:e4b", 131_072, 48.0),
-            Row("qwen3.8:27b", 16_384, 45.0),
-            Row("qwen3.8:27b", 32_768, 40.0),
-            Row("qwen3.8:27b", 49_152, 33.0),
-            Row("qwen3.8:27b", 65_536, 12.0, viable: false, reason: "below-threshold"),
-            Row("qwen3.6:35b-a3b", 16_384, 55.0),
-            Row("qwen3.6:35b-a3b", 32_768, 51.0),
-            Row("qwen3.6:35b-a3b", 65_536, 42.0),
-            Row("qwen3.6:35b-a3b", 131_072, 14.0, viable: false, reason: "below-threshold")
+            Row("jetelain/Qwen3.6-35B-A3B:q4", 16_384, 90.0),
+            Row("jetelain/Qwen3.6-35B-A3B:q4", 32_768, 84.0),
+            Row("jetelain/Qwen3.6-35B-A3B:q4", 49_152, 77.0),
+            Row("jetelain/Qwen3.6-35B-A3B:q4", 65_536, 70.0),
+            Row("jetelain/Qwen3.6-35B-A3B:q4", 131_072, 48.0),
+            Row("jetelain/Qwen3.8-27B:latest", 16_384, 45.0),
+            Row("jetelain/Qwen3.8-27B:latest", 32_768, 40.0),
+            Row("jetelain/Qwen3.8-27B:latest", 49_152, 33.0),
+            Row("jetelain/Qwen3.8-27B:latest", 65_536, 12.0, viable: false, reason: "below-threshold"),
+            Row("jetelain/Flint:q4", 16_384, 55.0),
+            Row("jetelain/Flint:q4", 32_768, 51.0),
+            Row("jetelain/Flint:q4", 65_536, 42.0),
+            Row("jetelain/Flint:q4", 131_072, 14.0, viable: false, reason: "below-threshold")
         ]),
         new BenchmarkTargetResult(AiServer, BenchmarkRunStatus.Succeeded,
             FixedStamp.AddMinutes(-10), FixedStamp,
         [
-            Row("gemma4:e4b", 16_384, 95.0),
-            Row("gemma4:e4b", 32_768, 91.0),
-            Row("gemma4:e4b", 49_152, 88.0),
-            Row("gemma4:e4b", 65_536, 82.0),
-            Row("gemma4:e4b", 131_072, 61.0),
-            Row("qwen3.8:27b", 16_384, 30.0),
-            Row("qwen3.8:27b", 32_768, 29.0),
-            Row("qwen3.8:27b", 49_152, 28.0),
-            Row("qwen3.8:27b", 65_536, 27.0),
-            Row("qwen3.8:27b", 131_072, 25.5),
-            Row("qwen3.8:27b", 184_320, 24.0),
-            Row("qwen3.8:27b", 262_144, 22.5),
-            Row("qwen3.6:35b-a3b", 16_384, 60.0),
-            Row("qwen3.6:35b-a3b", 32_768, 57.0),
-            Row("qwen3.6:35b-a3b", 65_536, 49.0),
-            Row("qwen3.6:35b-a3b", 131_072, 38.0),
-            Row("qwen3.6:35b-a3b", 131_072, 38.0)
+            Row("jetelain/Qwen3.6-35B-A3B:q4", 16_384, 95.0),
+            Row("jetelain/Qwen3.6-35B-A3B:q4", 32_768, 91.0),
+            Row("jetelain/Qwen3.6-35B-A3B:q4", 49_152, 88.0),
+            Row("jetelain/Qwen3.6-35B-A3B:q4", 65_536, 82.0),
+            Row("jetelain/Qwen3.6-35B-A3B:q4", 131_072, 61.0),
+            Row("jetelain/Qwen3.8-27B:latest", 16_384, 30.0),
+            Row("jetelain/Qwen3.8-27B:latest", 32_768, 29.0),
+            Row("jetelain/Qwen3.8-27B:latest", 49_152, 28.0),
+            Row("jetelain/Qwen3.8-27B:latest", 65_536, 27.0),
+            Row("jetelain/Qwen3.8-27B:latest", 131_072, 25.5),
+            Row("jetelain/Qwen3.8-27B:latest", 184_320, 24.0),
+            Row("jetelain/Qwen3.8-27B:latest", 262_144, 22.5),
+            Row("jetelain/Flint:q4", 16_384, 60.0),
+            Row("jetelain/Flint:q4", 32_768, 57.0),
+            Row("jetelain/Flint:q4", 65_536, 49.0),
+            Row("jetelain/Flint:q4", 131_072, 38.0),
+            Row("jetelain/Flint:q4", 131_072, 38.0)
         ])
     ];
 
@@ -92,8 +93,15 @@ public class RecommendationEngineTests
     public void Generate_DensePerNodeCeilings_LargestViableRowWins_EvidenceMayExceedNative()
     {
         var engine = new RecommendationEngine();
+        // Catalog restricted to the curated dense flagship: with the full 5-role MoE catalog
+        // it loses every role tie-break to Qwen3.6-35B-A3B:q4 (pre-#168 interim scoring), so
+        // its per-node shape is exercised through the roles it carries alone.
+        var denseCatalog = new[]
+        {
+            CandidateModelCatalogOptions.DefaultModels.First(m => m.Name == "jetelain/Qwen3.8-27B:latest")
+        };
         var matrix = engine.Generate(
-            DefaultFleetResults(), Catalog,
+            DefaultFleetResults(), denseCatalog,
             hardwareProfileLookup: name => name switch
             {
                 Desktop => Profile(Desktop, 16_384),
@@ -102,9 +110,9 @@ public class RecommendationEngineTests
             },
             generatedAt: FixedStamp);
 
-        var qwen = matrix.Models["qwen3.8:27b"];
+        var qwen = matrix.Models["jetelain/Qwen3.8-27B:latest"];
         Assert.Equal("Dense", qwen.Architecture);
-        Assert.Equal(131_072, qwen.NativeContext);
+        Assert.Equal(262_144, qwen.NativeContext);
 
         // Fleet configuration order: Desktop first, then Aiserver.
         Assert.Equal([Desktop, AiServer], qwen.Nodes.Select(n => n.Target).ToList());
@@ -116,7 +124,7 @@ public class RecommendationEngineTests
         Assert.Equal(16_384, desktop.VramMB);
 
         var server = qwen.Nodes[1];
-        Assert.Equal(262_144, server.ContextCeiling);        // evidence beyond the 131 072 native
+        Assert.Equal(262_144, server.ContextCeiling);        // evidence at the 262 144 native
         Assert.Null(server.BaselineContext);
         Assert.Equal(22.5, server.TokensPerSecond);          // tps of the 262 144 row
         Assert.Equal(98_304, server.VramMB);
@@ -126,13 +134,20 @@ public class RecommendationEngineTests
     public void Generate_MoeShape_NativeContextCeiling_WithLargestViableBaseline()
     {
         var engine = new RecommendationEngine();
-        var matrix = engine.Generate(DefaultFleetResults(), Catalog, generatedAt: FixedStamp);
+        // Catalog restricted to the curated MoE model: with the full 5-role MoE catalog it
+        // loses every shared-role tie-break to Qwen3.6-35B-A3B:q4 (61.0 tps > 38.0), so the
+        // MoE node shape is exercised through the roles it carries alone.
+        var moeCatalog = new[]
+        {
+            CandidateModelCatalogOptions.DefaultModels.First(m => m.Name == "jetelain/Flint:q4")
+        };
+        var matrix = engine.Generate(DefaultFleetResults(), moeCatalog, generatedAt: FixedStamp);
 
-        var moe = matrix.Models["qwen3.6:35b-a3b"];
+        var moe = matrix.Models["jetelain/Flint:q4"];
         Assert.Equal("MoE", moe.Architecture);
         foreach (var node in moe.Nodes)
         {
-            Assert.Equal(131_072, node.ContextCeiling);      // the model's native context (single extensible bucket)
+            Assert.Equal(262_144, node.ContextCeiling);      // the model's native context (single extensible bucket)
         }
 
         // Largest viable rows: Desktop 65 536 (next row non-viable), Aiserver 131 072.
@@ -143,25 +158,31 @@ public class RecommendationEngineTests
     }
 
     [Fact]
-    public void Generate_MultiRoleUnifiedModel_ThreeRolesShareIdenticalNativeName()
+    public void Generate_InterimPre168_AllFiveRolesResolveToQwen36Q4()
     {
+        // INTERIM pre-#168 winner behavior (engine scoring untouched by task #166): with the
+        // new 5-role MoE catalog, under the default fixture ALL FIVE roles win by
+        // jetelain/Qwen3.6-35B-A3B:q4 — the 262 144 MoE-ceiling tie is broken by its tps
+        // (61.0 on Aiserver beats Flint:q4's 38.0 and Qwen3.8-27B:latest's 22.5).
+        // Superseded by task #168's hardware-aware ModelClass comparator.
         var engine = new RecommendationEngine();
         var matrix = engine.Generate(DefaultFleetResults(), Catalog, generatedAt: FixedStamp);
 
-        // The multi-role unified hot cache: the SAME native name for all three roles.
+        Assert.Equal(5, matrix.Roles.Count);
+        foreach (var alias in new[]
+        {
+            "basic", "agentic_chat", "software_architect", "senior_developer", "junior_developer"
+        })
+        {
+            Assert.Equal("jetelain/Qwen3.6-35B-A3B:q4", matrix.Roles[alias].Model);
+            Assert.Equal(262_144, matrix.Roles[alias].RecommendedContextWindow);
+        }
+
+        // Nodes in fleet configuration order; the single MoE winner is the only model.
         var chat = matrix.Roles["agentic_chat"];
-        var architect = matrix.Roles["software_architect"];
-        var senior = matrix.Roles["senior_developer"];
-        Assert.Equal("qwen3.8:27b", chat.Model);
-        Assert.Equal("qwen3.8:27b", architect.Model);
-        Assert.Equal("qwen3.8:27b", senior.Model);
-
-        Assert.Equal("gemma4:e4b", matrix.Roles["basic"].Model);
-        Assert.Equal("qwen3.6:35b-a3b", matrix.Roles["junior_developer"].Model);
-
-        // RecommendedContextWindow = max node ceiling; Nodes in fleet configuration order.
-        Assert.Equal(262_144, chat.RecommendedContextWindow);
         Assert.Equal([Desktop, AiServer], chat.Nodes.Select(n => n.Target).ToList());
+        Assert.Single(matrix.Models);
+        Assert.True(matrix.Models.ContainsKey("jetelain/Qwen3.6-35B-A3B:q4"));
         Assert.NotEmpty(chat.Description);
         Assert.All(matrix.Roles.Values, r => Assert.False(string.IsNullOrWhiteSpace(r.Description)));
     }
@@ -249,15 +270,16 @@ public class RecommendationEngineTests
             // qwen row must not contribute).
             new BenchmarkTargetResult(Desktop, BenchmarkRunStatus.Running, FixedStamp, null,
             [
-                Row("qwen3.8:27b", 262_144, 99.0)
+                Row("jetelain/Qwen3.8-27B:latest", 262_144, 99.0)
             ]),
-            // Completed target: gemma4:e4b is fully non-viable (dropped), qwen is viable only
-            // on Aiserver; basic has NO viable model anywhere → the role is ABSENT.
+            // Completed target: Qwen3.6-35B-A3B:q4 is fully non-viable (dropped), the dense
+            // flagship is viable only on Aiserver; basic + junior have NO viable model
+            // anywhere → the roles are ABSENT.
             new BenchmarkTargetResult(AiServer, BenchmarkRunStatus.Succeeded, FixedStamp, FixedStamp,
             [
-                Row("gemma4:e4b", 16_384, 10.0, viable: false, reason: "below-threshold"),
-                Row("qwen3.8:27b", 16_384, 30.0),
-                Row("qwen3.8:27b", 32_768, 28.0)
+                Row("jetelain/Qwen3.6-35B-A3B:q4", 16_384, 10.0, viable: false, reason: "below-threshold"),
+                Row("jetelain/Qwen3.8-27B:latest", 16_384, 30.0),
+                Row("jetelain/Qwen3.8-27B:latest", 32_768, 28.0)
             ])
         };
 
@@ -266,12 +288,13 @@ public class RecommendationEngineTests
         Assert.False(matrix.Roles.ContainsKey("basic"));              // no viable candidate anywhere
         Assert.False(matrix.Roles.ContainsKey("junior_developer"));   // no MoE data at all
         var qwen = matrix.Roles["agentic_chat"];
+        Assert.Equal("jetelain/Qwen3.8-27B:latest", qwen.Model);
         Assert.Equal(32_768, qwen.RecommendedContextWindow);
         // The node list contains ONLY Aiserver (Desktop was Running; its 262 144 row is gone).
         Assert.Equal([AiServer], qwen.Nodes.Select(n => n.Target).ToList());
         // The Models index covers only the winners.
         Assert.Single(matrix.Models);
-        Assert.True(matrix.Models.ContainsKey("qwen3.8:27b"));
+        Assert.True(matrix.Models.ContainsKey("jetelain/Qwen3.8-27B:latest"));
     }
 
     [Fact]
@@ -281,7 +304,7 @@ public class RecommendationEngineTests
         {
             new BenchmarkTargetResult(Desktop, BenchmarkRunStatus.Running, FixedStamp, null,
             [
-                Row("qwen3.8:27b", 16_384, 30.0)
+                Row("jetelain/Qwen3.8-27B:latest", 16_384, 30.0)
             ])
         };
 
@@ -328,7 +351,7 @@ public class RecommendationEngineTests
     }
 
     [Theory]
-    [InlineData("qwen3.8:27b")]
+    [InlineData("qwen3.8:27b")] // a model name that is NOT a role alias
     [InlineData("nonexistent_role")]
     [InlineData("")]
     [InlineData(null)]

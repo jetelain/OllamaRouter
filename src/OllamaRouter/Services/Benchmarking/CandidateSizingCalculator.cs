@@ -35,29 +35,49 @@ public sealed record CandidateSizingEstimate(
     [property: JsonPropertyName("reason")] string? Reason);
 
 /// <summary>
-/// Pure, static, no-I/O sizing calculator for benchmark candidates (task #28). Mirrors the
-/// <see cref="HardwareMetrics"/> style: deterministic math, no DI.
+/// Pure, static, no-I/O sizing calculator for benchmark candidates (task #28, reworked for
+/// hybrid/UD models in task #166). Mirrors the <see cref="HardwareMetrics"/> style:
+/// deterministic math, no DI.
 /// <para>
-/// Formulas (pinned by tests):
+/// Formulas (pinned by tests; MB = MiB, 2^20):
 /// <list type="bullet">
-/// <item>weights = totalParams × bitsPerWeight / 8 / 2^20 (MB = MiB)</item>
-/// <item>KV cache = contextTokens × layers × kvHeads × headDim × 2 (K and V) × bytesPerElement / 2^20
-/// (GQA: only the KV heads are counted, not the full attention-head count)</item>
+/// <item>weights = <c>EstimatedWeightsMB</c> when set (exact known resident footprint of the
+/// mixed-precision/UD GGUF + bundled mmproj, where it differs from the parametric size),
+/// otherwise totalParams × bitsPerWeight / 8 / 2^20 — see <see cref="ComputeEffectiveWeightsMB"/></item>
+/// <item>activeWeights = (activeParams ?? totalParams) × bitsPerWeight / 8 / 2^20 — MoE models
+/// decode on the active experts only; Dense models have active == total (parametric; the
+/// mmproj/UD delta is intentionally NOT applied to the decode buffer)</item>
+/// <item>KV cache = contextTokens × <c>KvBytesPerToken</c> / 2^20 when set (calibrated
+/// absolute bytes/token — K+V, all layers, KV dtype included; the only correct path for
+/// sliding-window / hybrid SSM+attention architectures whose KV does not grow on every
+/// layer), otherwise the parametric fallback contextTokens × layers × kvHeads × headDim ×
+/// 2 (K and V) × <see cref="CandidateModelCatalogOptions.KvCacheBytesPerElement"/> (f16 = 2) / 2^20
+/// — see <see cref="ComputeEffectiveKvCacheMB"/>. Those are the ONLY two KV math paths, so
+/// the computation stays deterministic and transparent.</item>
 /// <item>totalRequired = weights + KV</item>
 /// </list>
 /// </para>
 /// <para>
-/// Pruning rule (Dense, known profile): prune only when <see cref="TotalRequiredMB"/> is
-/// STRICTLY greater than 0.92 × TotalFastMemoryMB (a candidate exactly at the limit Fits).
-/// <see cref="MemoryFitStatus.PrunedWeights"/> when the weights alone exceed the limit,
-/// <see cref="MemoryFitStatus.PrunedKvCache"/> when only the sum exceeds it.
+/// Strict (dense/expert) pruning rule, applied when <c>AllowCpuOffload == false</c> (all
+/// Dense/Expert models, Ornith's hybrid frontier, and any legacy/synthetic model — the
+/// architecture string is NO LONGER the gate; the explicit flag is): prune only when a size
+/// is STRICTLY greater than 0.92 × TotalFastMemoryMB (a candidate exactly at the limit
+/// Fits). <see cref="MemoryFitStatus.PrunedWeights"/> when the weights alone exceed the
+/// limit, <see cref="MemoryFitStatus.PrunedKvCache"/> when only the sum exceeds it. The
+/// conservative 92% rule is deliberately kept (2026-11-22 product decision) — e.g.
+/// Qwen3.8-27B:iq3 prunes at 48k on a dedicated 16 GiB node even though empirical reports
+/// put the boundary at ~48–64k.
 /// </para>
 /// <para>
-/// MoE rule: decode is active-parameter-bound, so the fast-memory test is
-/// activeWeights + KV ≤ 0.92 × fast. The full weights additionally must be resident in some
-/// tier: on non-unified nodes, weights + KV ≤ 0.92 × (fast + SystemRamMB), otherwise
-/// <see cref="MemoryFitStatus.PrunedWeights"/> ("full MoE weights do not fit in fast+system
-/// memory"); unified nodes apply the same 0.92 rule on fast for the full sum.
+/// CPU-offload (MoE) rule, applied when <c>AllowCpuOffload == true</c> (the lightweight
+/// MoE models: Flint:*, Qwen3.6-35B-A3B:*): decode is active-parameter-bound, so the
+/// fast-memory test is activeWeights + KV ≤ 0.92 × fast (pruned as
+/// <see cref="MemoryFitStatus.PrunedKvCache"/> unless the active buffer ALONE exceeds the
+/// limit → <see cref="MemoryFitStatus.PrunedWeights"/>). The full weights additionally must
+/// be resident in some tier: on non-unified nodes, weights + KV ≤ 0.92 × (fast +
+/// SystemRamMB), otherwise <see cref="MemoryFitStatus.PrunedWeights"/> ("full MoE weights
+/// do not fit in fast+system memory"); unified nodes apply the same 0.92 rule on fast for
+/// the full sum.
 /// </para>
 /// <para>
 /// Unknown profile (null or TotalFastMemoryMB ≤ 0): <see cref="MemoryFitStatus.Assumed"/>
@@ -74,16 +94,21 @@ public static class CandidateSizingCalculator
         totalParams * (double)bitsPerWeight / 8.0 / 1_048_576.0;
 
     /// <summary>
-    /// Active weights size in MiB: MoE models decode on the active experts only
-    /// (activeParams); Dense models have active == total.
+    /// The effective full-weights resident footprint in MiB: the curated model's known
+    /// <see cref="CandidateModel.EstimatedWeightsMB"/> when set (UD mixed-precision GGUF +
+    /// bundled mmproj — differs from the parametric size), otherwise the parametric
+    /// <see cref="ComputeWeightsMB(long, int)"/> formula.
     /// </summary>
-    public static double ComputeActiveWeightsMB(CandidateModel model)
-    {
-        var activeParams = string.Equals(model.Architecture, "MoE", StringComparison.OrdinalIgnoreCase)
-            ? model.ActiveParams ?? model.TotalParams
-            : model.TotalParams;
-        return ComputeWeightsMB(activeParams, model.BitsPerWeight);
-    }
+    public static double ComputeEffectiveWeightsMB(CandidateModel model) =>
+        model.EstimatedWeightsMB ?? ComputeWeightsMB(model.TotalParams, model.BitsPerWeight);
+
+    /// <summary>
+    /// Active weights size in MiB: MoE models decode on the active experts only
+    /// (activeParams); Dense models have active == total (activeParams null).
+    /// Purely parametric — it never uses <see cref="CandidateModel.EstimatedWeightsMB"/>.
+    /// </summary>
+    public static double ComputeActiveWeightsMB(CandidateModel model) =>
+        ComputeWeightsMB(model.ActiveParams ?? model.TotalParams, model.BitsPerWeight);
 
     /// <summary>
     /// KV cache size in MiB for the given context: context × layers × kvHeads × headDim ×
@@ -98,20 +123,30 @@ public static class CandidateSizingCalculator
         contextTokens * (double)layers * kvHeads * headDim * 2.0 * bytesPerElement / 1_048_576.0;
 
     /// <summary>
+    /// The effective KV-cache size in MiB for one model at one context: the calibrated
+    /// <see cref="CandidateModel.KvBytesPerToken"/> (context × bytes/token / 2^20) when set —
+    /// required for sliding-window / hybrid SSM+attention architectures whose KV only grows
+    /// on the full-attention layers — otherwise the parametric
+    /// <see cref="ComputeKvCacheMB(int, int, int, int, int)"/> fallback.
+    /// </summary>
+    public static double ComputeEffectiveKvCacheMB(CandidateModel model, int contextTokens) =>
+        model.KvBytesPerToken is { } kvBytesPerToken
+            ? contextTokens * kvBytesPerToken / 1_048_576.0
+            : ComputeKvCacheMB(
+                contextTokens, model.Layers, model.KvHeads, model.HeadDim,
+                CandidateModelCatalogOptions.KvCacheBytesPerElement);
+
+    /// <summary>
     /// Evaluates the memory fit of one candidate at one context size on one node profile.
     /// See the type-level documentation for the exact formulas and boundary semantics
     /// (prune only when STRICTLY greater than the 92% fast-memory limit).
     /// </summary>
     public static CandidateSizingEstimate Evaluate(CandidateModel model, int contextTokens, NodeHardwareProfile? profile)
     {
-        var weightsMB = ComputeWeightsMB(model.TotalParams, model.BitsPerWeight);
+        var weightsMB = ComputeEffectiveWeightsMB(model);
         var activeWeightsMB = ComputeActiveWeightsMB(model);
-        var kvCacheMB = ComputeKvCacheMB(
-            contextTokens, model.Layers, model.KvHeads, model.HeadDim,
-            CandidateModelCatalogOptions.KvCacheBytesPerElement);
+        var kvCacheMB = ComputeEffectiveKvCacheMB(model, contextTokens);
         var totalRequiredMB = weightsMB + kvCacheMB;
-
-        var isMoE = string.Equals(model.Architecture, "MoE", StringComparison.OrdinalIgnoreCase);
 
         // Fail-open: no usable profile → no pruning, the benchmark proceeds and an OOM at
         // runtime is the empirical safety net (decision #4). All sizes are still computed.
@@ -126,7 +161,7 @@ public static class CandidateSizingCalculator
 
         var limitMB = CandidateModelCatalogOptions.FastMemoryOccupancyLimit * profile.TotalFastMemoryMB;
 
-        if (!isMoE)
+        if (!model.AllowCpuOffload)
         {
             // Dense: weights + KV must fit 100% within the fast-memory budget.
             if (weightsMB > limitMB)
@@ -155,7 +190,8 @@ public static class CandidateSizingCalculator
                 profile.TotalFastMemoryMB, MemoryFitStatus.Fits, null);
         }
 
-        // MoE: decode is active-parameter-bound — the active weights + KV must fit fast memory.
+        // CPU-offload-eligible MoE: decode is active-parameter-bound — the active weights +
+        // KV must fit fast memory.
         var decodeRequiredMB = activeWeightsMB + kvCacheMB;
         if (decodeRequiredMB > limitMB)
         {

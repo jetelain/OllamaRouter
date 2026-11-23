@@ -997,7 +997,9 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
         "moe:35b", [UsageRole.JuniorDeveloper], "MoE",
         TotalParams: 35_000_000_000, ActiveParams: 3_300_000_000,
         "q4", 4, Layers: 64, KvHeads: 8, HeadDim: 128,
-        NativeContext: 32_768, DefaultContext: 32_768);
+        NativeContext: 32_768, DefaultContext: 32_768,
+        ModelClass: CandidateModelClass.MoE,
+        AllowCpuOffload: true);
 
     private static CandidateModelCatalogOptions CandidateTestCatalog() => new()
     {
