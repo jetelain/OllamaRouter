@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
 using OllamaRouter.Middleware;
 using OllamaRouter.Options;
 using OllamaRouter.Serialization;
@@ -44,14 +45,16 @@ public static class RouterRecommendationEndpoints
             IMicroBenchmarkRunner benchmarkRunner,
             IFleetHardwareService fleetHardware,
             IRecommendationEngine engine,
-            IRecommendationStore store) =>
+            IRecommendationStore store,
+            IOptions<CandidateModelCatalogOptions> catalog) =>
         {
-            // Recompute from the frozen seed catalog + the persisted benchmark results (the
-            // runner is already backed by <state>/benchmarks.json) + the fleet hardware
-            // profiles (<state>/targets-hardware.json).
+            // Recompute from the DI-injected catalog (IOptions<CandidateModelCatalogOptions>,
+            // the curated 7-model DefaultModels in production; task #168) + the persisted
+            // benchmark results (the runner is already backed by <state>/benchmarks.json) +
+            // the fleet hardware profiles (<state>/targets-hardware.json).
             var matrix = engine.Generate(
                 benchmarkRunner.GetAllResults(),
-                CandidateModelCatalogOptions.DefaultModels,
+                catalog.Value.Models,
                 hardwareProfileLookup: name => fleetHardware.GetProfile(name));
 
             if (matrix.Models.Count == 0 && matrix.Roles.Count == 0)
@@ -95,9 +98,10 @@ public static class RouterRecommendationEndpoints
         .WithName("PostRouterRecommendationsGenerate")
         .WithTags("Recommendations")
         .WithSummary("Recompute, persist and activate the role recommendations (protected: API key required).")
-        .WithDescription("Consumes IMicroBenchmarkRunner.GetAllResults() + IFleetHardwareService.GetProfile over the "
-            + "code-defined seed catalog, persists <stateDir>/recommended.json (atomic write) and activates the "
-            + "matrix in the live store (Stage-1 ceilings + dense clamp/inject + MoE baseline take effect "
+        .WithDescription("Consumes IMicroBenchmarkRunner.GetAllResults() + IFleetHardwareService.GetProfile over "
+            + "the injected IOptions<CandidateModelCatalogOptions> catalog (the curated 7-model DefaultModels in "
+            + "production), persists <stateDir>/recommended.json (atomic write) and activates the matrix in the "
+            + "live store (Stage-1 ceilings + dense clamp/inject + MoE baseline take effect "
             + "immediately, no restart). 200 = generated + activated; 409 = no terminal benchmark data "
             + "(run POST /api/router/benchmark first; nothing is written). Protected by the API-key middleware.");
 

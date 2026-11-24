@@ -56,6 +56,10 @@ public sealed class CandidateModelCatalogOptions
     /// <summary>Viability floor for decode throughput. Frozen constant, not user-configurable.</summary>
     public const double MinViableTokensPerSecond = 20.0;
 
+    /// <summary>Role-eligibility floor: a (model, node) pair only contributes when its largest
+    /// viable (≥ MinViableTokensPerSecond) measured context is ≥ this many tokens (task #168).</summary>
+    public const int MinEligibleContextTokens = 131_072;
+
     /// <summary>Fast-memory occupancy ceiling: weights + KV must stay ≤ 92% of TotalFastMemoryMB.</summary>
     public const double FastMemoryOccupancyLimit = 0.92;
 

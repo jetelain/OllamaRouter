@@ -9,12 +9,14 @@ using System.Text.Json;
 namespace OllamaRouter.Tests.Services;
 
 /// <summary>
-/// Unit tests for the native role recommendation engine (task #66): the deterministic
-/// assignment algorithm (terminal-status gate, largest-viable-row dense ceilings, MoE
-/// baseline + native extensible limit, (ceiling, tps, catalog order) scoring, role
-/// absence) and the live <see cref="RecommendationStore"/> (fail-soft load, ceiling
-/// lookups with tag-stripped/case-insensitive model matching, atomic activation, JSON
-/// round-trip). Pure in-memory fixtures — no daemons, no network.
+/// Unit tests for the native role recommendation engine (task #66, hardware-capability-aware
+/// since task #168): the deterministic assignment algorithm (terminal-status gate, the 128k
+/// per-(model, node) eligibility floor, largest-viable-row dense ceilings, MoE baseline +
+/// native extensible limit, class-staged role pools with the QualityRank / role-family /
+/// max-ceiling / max-tps / catalog-order comparator, role absence) and the live
+/// <see cref="RecommendationStore"/> (fail-soft load, ceiling lookups with
+/// tag-stripped/case-insensitive model matching, atomic activation, JSON round-trip).
+/// Pure in-memory fixtures — no daemons, no network.
 /// </summary>
 public class RecommendationEngineTests
 {
@@ -29,6 +31,26 @@ public class RecommendationEngineTests
 
     private static BenchmarkContextResult Row(string model, int numCtx, double tps, bool viable = true, string? reason = null) =>
         new(model, UsageRole.AgenticChat, numCtx, 64, (long)(64e9 / tps), tps, 5_000, Viable: viable, Reason: reason);
+
+    /// <summary>
+    /// A sizing-pruned row in the exact shape the runner records for a model that cannot fit
+    /// on the node (all-zero measurements, non-viable, "sizing-pruned" reason, task #166).
+    /// The engine only reads Viable == true rows, so this is behaviorally identical to zero
+    /// rows (task #168 decision 6) — used where it documents intent.
+    /// </summary>
+    private static BenchmarkContextResult PrunedRow(string model, int numCtx = 32_768) =>
+        new(model, UsageRole.AgenticChat, numCtx, 0, 0, 0, 0, Viable: false, Reason: "sizing-pruned");
+
+    /// <summary>
+    /// A synthetic all-5-role MoE model (the catalog's universal-fallback shape) for the
+    /// single-model boundary catalogs (task #168 floor-boundary facts).
+    /// </summary>
+    private static CandidateModel AllRoleMoe(string name) => new(
+        name,
+        [UsageRole.BasicModel, UsageRole.JuniorDeveloper, UsageRole.AgenticChat,
+         UsageRole.SoftwareArchitect, UsageRole.SeniorDeveloper],
+        "MoE", 35_000_000_000, 3_200_000_000, "q4", 4, 41, 2, 128, 262_144, 131_072,
+        ModelClass: CandidateModelClass.MoE);
 
     private static NodeHardwareProfile Profile(string name, long totalFastMemoryMB) => new(
         name, "linux", "x64", false, 32_768, SystemRamType.Ddr5,
@@ -93,9 +115,9 @@ public class RecommendationEngineTests
     public void Generate_DensePerNodeCeilings_LargestViableRowWins_EvidenceMayExceedNative()
     {
         var engine = new RecommendationEngine();
-        // Catalog restricted to the curated dense flagship: with the full 5-role MoE catalog
-        // it loses every role tie-break to Qwen3.6-35B-A3B:q4 (pre-#168 interim scoring), so
-        // its per-node shape is exercised through the roles it carries alone.
+        // Catalog restricted to the curated dense flagship so its per-node shape is exercised
+        // through the roles it carries alone (it would win the expert roles anyway — Expert
+        // stage, rank 2 — with the full catalog).
         var denseCatalog = new[]
         {
             CandidateModelCatalogOptions.DefaultModels.First(m => m.Name == "jetelain/Qwen3.8-27B:latest")
@@ -114,18 +136,14 @@ public class RecommendationEngineTests
         Assert.Equal("Dense", qwen.Architecture);
         Assert.Equal(262_144, qwen.NativeContext);
 
-        // Fleet configuration order: Desktop first, then Aiserver.
-        Assert.Equal([Desktop, AiServer], qwen.Nodes.Select(n => n.Target).ToList());
+        // Desktop's 49 152 viable ceiling is BELOW the 128k role-eligibility floor (task #168)
+        // → the (model, Desktop) pair is dropped; only the eligible Aiserver node remains in
+        // the winner's Nodes list.
+        Assert.Equal([AiServer], qwen.Nodes.Select(n => n.Target).ToList());
 
-        var desktop = qwen.Nodes[0];
-        Assert.Equal(49_152, desktop.ContextCeiling);        // evidence-driven, NOT capped by the catalog native
-        Assert.Null(desktop.BaselineContext);                // dense: no baseline bucket
-        Assert.Equal(33.0, desktop.TokensPerSecond);         // tps of the 49 152 row
-        Assert.Equal(16_384, desktop.VramMB);
-
-        var server = qwen.Nodes[1];
+        var server = qwen.Nodes[0];
         Assert.Equal(262_144, server.ContextCeiling);        // evidence at the 262 144 native
-        Assert.Null(server.BaselineContext);
+        Assert.Null(server.BaselineContext);                 // dense: no baseline bucket
         Assert.Equal(22.5, server.TokensPerSecond);          // tps of the 262 144 row
         Assert.Equal(98_304, server.VramMB);
     }
@@ -134,9 +152,8 @@ public class RecommendationEngineTests
     public void Generate_MoeShape_NativeContextCeiling_WithLargestViableBaseline()
     {
         var engine = new RecommendationEngine();
-        // Catalog restricted to the curated MoE model: with the full 5-role MoE catalog it
-        // loses every shared-role tie-break to Qwen3.6-35B-A3B:q4 (61.0 tps > 38.0), so the
-        // MoE node shape is exercised through the roles it carries alone.
+        // Catalog restricted to the curated MoE model so the MoE node shape is exercised
+        // through the roles it carries alone.
         var moeCatalog = new[]
         {
             CandidateModelCatalogOptions.DefaultModels.First(m => m.Name == "jetelain/Flint:q4")
@@ -145,45 +162,46 @@ public class RecommendationEngineTests
 
         var moe = matrix.Models["jetelain/Flint:q4"];
         Assert.Equal("MoE", moe.Architecture);
-        foreach (var node in moe.Nodes)
-        {
-            Assert.Equal(262_144, node.ContextCeiling);      // the model's native context (single extensible bucket)
-        }
 
-        // Largest viable rows: Desktop 65 536 (next row non-viable), Aiserver 131 072.
-        Assert.Equal(65_536, moe.Nodes[0].BaselineContext);
-        Assert.Equal(131_072, moe.Nodes[1].BaselineContext);
-        Assert.Equal(42.0, moe.Nodes[0].TokensPerSecond);
-        Assert.Equal(38.0, moe.Nodes[1].TokensPerSecond);
+        // Desktop's 65 536 viable ceiling is below the 128k floor (task #168) → pair dropped;
+        // only Aiserver (largest viable row 131 072) survives.
+        Assert.Equal([AiServer], moe.Nodes.Select(n => n.Target).ToList());
+        var node = moe.Nodes[0];
+        Assert.Equal(262_144, node.ContextCeiling);      // the model's native context (single extensible bucket)
+        Assert.Equal(131_072, node.BaselineContext);     // largest viable row, ≥ floor by construction
+        Assert.Equal(38.0, node.TokensPerSecond);
     }
 
     [Fact]
-    public void Generate_InterimPre168_AllFiveRolesResolveToQwen36Q4()
+    public void Generate_DefaultFixture_Post168_HardwareAwareWinners()
     {
-        // INTERIM pre-#168 winner behavior (engine scoring untouched by task #166): with the
-        // new 5-role MoE catalog, under the default fixture ALL FIVE roles win by
-        // jetelain/Qwen3.6-35B-A3B:q4 — the 262 144 MoE-ceiling tie is broken by its tps
-        // (61.0 on Aiserver beats Flint:q4's 38.0 and Qwen3.8-27B:latest's 22.5).
-        // Superseded by task #168's hardware-aware ModelClass comparator.
+        // Post-#168 hardware-aware winners for the default fixture: the 128k floor drops the
+        // Desktop nodes (Qwen3.8-27B:latest ceiling 49 152, Flint:q4 ceiling 65 536), leaving
+        // eligible pairs: Qwen3.6-35B-A3B:q4 on BOTH nodes, Qwen3.8-27B:latest + Flint:q4 on
+        // Aiserver only. basic → Qwen3.6:q4 (Q4-tier tie, Qwen3.6 family preferred);
+        // junior → Flint:q4 (Flint family preferred); all three expert roles →
+        // Qwen3.8-27B:latest (Expert stage, rank 2).
         var engine = new RecommendationEngine();
         var matrix = engine.Generate(DefaultFleetResults(), Catalog, generatedAt: FixedStamp);
 
         Assert.Equal(5, matrix.Roles.Count);
-        foreach (var alias in new[]
+        Assert.Equal("jetelain/Qwen3.6-35B-A3B:q4", matrix.Roles["basic"].Model);
+        Assert.Equal(262_144, matrix.Roles["basic"].RecommendedContextWindow);
+        Assert.Equal([Desktop, AiServer], matrix.Roles["basic"].Nodes.Select(n => n.Target).ToList());
+
+        Assert.Equal("jetelain/Flint:q4", matrix.Roles["junior_developer"].Model);
+        Assert.Equal(262_144, matrix.Roles["junior_developer"].RecommendedContextWindow);
+        Assert.Equal([AiServer], matrix.Roles["junior_developer"].Nodes.Select(n => n.Target).ToList());
+
+        foreach (var alias in new[] { "agentic_chat", "software_architect", "senior_developer" })
         {
-            "basic", "agentic_chat", "software_architect", "senior_developer", "junior_developer"
-        })
-        {
-            Assert.Equal("jetelain/Qwen3.6-35B-A3B:q4", matrix.Roles[alias].Model);
+            Assert.Equal("jetelain/Qwen3.8-27B:latest", matrix.Roles[alias].Model);
             Assert.Equal(262_144, matrix.Roles[alias].RecommendedContextWindow);
+            Assert.Equal([AiServer], matrix.Roles[alias].Nodes.Select(n => n.Target).ToList());
         }
 
-        // Nodes in fleet configuration order; the single MoE winner is the only model.
-        var chat = matrix.Roles["agentic_chat"];
-        Assert.Equal([Desktop, AiServer], chat.Nodes.Select(n => n.Target).ToList());
-        Assert.Single(matrix.Models);
-        Assert.True(matrix.Models.ContainsKey("jetelain/Qwen3.6-35B-A3B:q4"));
-        Assert.NotEmpty(chat.Description);
+        // The Models index covers exactly the three winners.
+        Assert.Equal(3, matrix.Models.Count);
         Assert.All(matrix.Roles.Values, r => Assert.False(string.IsNullOrWhiteSpace(r.Description)));
     }
 
@@ -214,25 +232,22 @@ public class RecommendationEngineTests
             Model("sameB:7b", [UsageRole.SoftwareArchitect])
         };
 
+        // Synthetic rows all clear the 128k eligibility floor (task #168).
         var results = new List<BenchmarkTargetResult>
         {
             new(Desktop, BenchmarkRunStatus.Succeeded, FixedStamp, FixedStamp,
             [
-                Row("small:7b", 16_384, 90.0),
-                Row("small:7b", 32_768, 80.0),
-                Row("big:14b", 16_384, 50.0),
-                Row("big:14b", 32_768, 45.0),
-                Row("big:14b", 49_152, 40.0),   // big wins: higher max ceiling (49 152 > 32 768)
-                Row("sameA:7b", 16_384, 60.0),
-                Row("sameA:7b", 32_768, 55.0),
-                Row("sameB:7b", 16_384, 70.0),
-                Row("sameB:7b", 32_768, 65.0)   // tie on ceiling (32 768) → sameB wins on tps (65 > 55)
+                Row("small:7b", 131_072, 80.0),
+                Row("big:14b", 131_072, 45.0),
+                Row("big:14b", 163_840, 40.0),   // big wins: higher max ceiling (163 840 > 131 072)
+                Row("sameA:7b", 131_072, 55.0),
+                Row("sameB:7b", 131_072, 65.0)   // tie on ceiling (131 072) → sameB wins on tps (65 > 55)
             ])
         };
 
         var matrix = new RecommendationEngine().Generate(results, catalog, generatedAt: FixedStamp);
         Assert.Equal("big:14b", matrix.Roles["senior_developer"].Model);
-        Assert.Equal(49_152, matrix.Roles["senior_developer"].RecommendedContextWindow);
+        Assert.Equal(163_840, matrix.Roles["senior_developer"].RecommendedContextWindow);
         Assert.Equal("sameB:7b", matrix.Roles["software_architect"].Model);
     }
 
@@ -248,8 +263,8 @@ public class RecommendationEngineTests
         {
             new(Desktop, BenchmarkRunStatus.Succeeded, FixedStamp, FixedStamp,
             [
-                Row("first:7b", 32_768, 55.0),
-                Row("second:7b", 32_768, 55.0)   // full tie → catalog declaration order (first)
+                Row("first:7b", 131_072, 55.0),
+                Row("second:7b", 131_072, 55.0)   // full tie → catalog declaration order (first)
             ])
         };
 
@@ -273,23 +288,22 @@ public class RecommendationEngineTests
                 Row("jetelain/Qwen3.8-27B:latest", 262_144, 99.0)
             ]),
             // Completed target: Qwen3.6-35B-A3B:q4 is fully non-viable (dropped), the dense
-            // flagship is viable only on Aiserver; basic + junior have NO viable model
-            // anywhere → the roles are ABSENT.
+            // flagship is eligible on Aiserver only (131 072 @ 28.0 clears the 128k floor);
+            // basic + junior have NO eligible MoE anywhere → the roles are ABSENT.
             new BenchmarkTargetResult(AiServer, BenchmarkRunStatus.Succeeded, FixedStamp, FixedStamp,
             [
                 Row("jetelain/Qwen3.6-35B-A3B:q4", 16_384, 10.0, viable: false, reason: "below-threshold"),
-                Row("jetelain/Qwen3.8-27B:latest", 16_384, 30.0),
-                Row("jetelain/Qwen3.8-27B:latest", 32_768, 28.0)
+                Row("jetelain/Qwen3.8-27B:latest", 131_072, 28.0)
             ])
         };
 
         var matrix = new RecommendationEngine().Generate(results, Catalog, generatedAt: FixedStamp);
 
-        Assert.False(matrix.Roles.ContainsKey("basic"));              // no viable candidate anywhere
+        Assert.False(matrix.Roles.ContainsKey("basic"));              // no eligible MoE anywhere
         Assert.False(matrix.Roles.ContainsKey("junior_developer"));   // no MoE data at all
         var qwen = matrix.Roles["agentic_chat"];
         Assert.Equal("jetelain/Qwen3.8-27B:latest", qwen.Model);
-        Assert.Equal(32_768, qwen.RecommendedContextWindow);
+        Assert.Equal(131_072, qwen.RecommendedContextWindow);
         // The node list contains ONLY Aiserver (Desktop was Running; its 262 144 row is gone).
         Assert.Equal([AiServer], qwen.Nodes.Select(n => n.Target).ToList());
         // The Models index covers only the winners.
@@ -323,6 +337,331 @@ public class RecommendationEngineTests
         var after = DateTimeOffset.UtcNow;
         Assert.NotNull(matrix.GeneratedAt);
         Assert.True(matrix.GeneratedAt >= before && matrix.GeneratedAt <= after);
+    }
+
+    // ------------------------------------------------------------------
+    //  Engine: fleet topologies (task #168, synthetic ladders anchored to the measured
+    //  8 GB / 16 GB / 64 GB / 96 GB breakpoints)
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public void Generate_Fleet8Gb_BothQ4MoeEligible_AllFiveRolesViable_FlintWinsArchitectJunior()
+    {
+        // 8 GB GPU + 64 GB RAM: all three Expert models are sizing-pruned, the Q8
+        // Qwen3.6-35B-A3B:code peaks at 98 304 (112k boundary case — the 131 072 row drops to
+        // 17.8 t/s) → dropped by the 128k floor. Both Q4 MoEs are ≥128k-eligible, so per the
+        // decision-5 binding rule: basic + agentic_chat → Qwen3.6-35B-A3B:q4 (family
+        // preference), junior + architect + senior → Flint:q4 (family preference).
+        // ZERO empty expert roles.
+        var results = new List<BenchmarkTargetResult>
+        {
+            new("Gpu8", BenchmarkRunStatus.Succeeded, FixedStamp, FixedStamp,
+            [
+                PrunedRow("jetelain/Qwen3.8-27B:latest"),
+                PrunedRow("jetelain/Qwen3.8-27B:iq3"),
+                PrunedRow("jetelain/Ornith-1.5-122b:latest"),
+                Row("jetelain/Qwen3.6-35B-A3B:code", 32_768, 20.5),
+                Row("jetelain/Qwen3.6-35B-A3B:code", 49_152, 20.4),
+                Row("jetelain/Qwen3.6-35B-A3B:code", 65_536, 20.35),
+                Row("jetelain/Qwen3.6-35B-A3B:code", 98_304, 20.3),
+                Row("jetelain/Qwen3.6-35B-A3B:code", 131_072, 17.8, viable: false, reason: "below-threshold"),
+                Row("jetelain/Qwen3.6-35B-A3B:q4", 131_072, 30.6),
+                Row("jetelain/Qwen3.6-35B-A3B:q4", 163_840, 23.5),
+                Row("jetelain/Qwen3.6-35B-A3B:q4", 196_608, 21.8),
+                Row("jetelain/Flint:q4", 131_072, 22.0)
+            ])
+        };
+
+        var matrix = new RecommendationEngine().Generate(results, Catalog, generatedAt: FixedStamp);
+
+        Assert.Equal(5, matrix.Roles.Count);
+        Assert.Equal("jetelain/Qwen3.6-35B-A3B:q4", matrix.Roles["basic"].Model);
+        Assert.Equal("jetelain/Flint:q4", matrix.Roles["junior_developer"].Model);
+        // Expert stage empty → MoE fallback; Q4-tier tie → role-specific family preference.
+        Assert.Equal("jetelain/Qwen3.6-35B-A3B:q4", matrix.Roles["agentic_chat"].Model);
+        Assert.Equal("jetelain/Flint:q4", matrix.Roles["software_architect"].Model);
+        Assert.Equal("jetelain/Flint:q4", matrix.Roles["senior_developer"].Model);
+        Assert.All(matrix.Roles.Values, r =>
+        {
+            Assert.Equal(262_144, r.RecommendedContextWindow);   // MoE ceiling = NativeContext
+            Assert.Equal(["Gpu8"], r.Nodes.Select(n => n.Target).ToList());
+        });
+
+        // The floor-dropped Q8 model wins NOTHING: no role value, no Models key.
+        Assert.DoesNotContain(matrix.Roles.Values, r => r.Model == "jetelain/Qwen3.6-35B-A3B:code");
+        Assert.False(matrix.Models.ContainsKey("jetelain/Qwen3.6-35B-A3B:code"));
+        Assert.Equal(2, matrix.Models.Count);
+    }
+
+    [Fact]
+    public void Generate_Fleet8Gb_FlintQ4BelowFloor_EveryRoleQwen36Q4()
+    {
+        // Same 8 GB fleet as the previous fact, but Flint:q4 is viable only to 98 304 (the
+        // 131 072 row is non-viable) → the "Flint:q4 if ≥128k else Qwen3.6-35B-A3B:q4"
+        // sub-case: ALL five roles fall to the single remaining eligible MoE.
+        var results = new List<BenchmarkTargetResult>
+        {
+            new("Gpu8", BenchmarkRunStatus.Succeeded, FixedStamp, FixedStamp,
+            [
+                PrunedRow("jetelain/Qwen3.8-27B:latest"),
+                PrunedRow("jetelain/Qwen3.8-27B:iq3"),
+                PrunedRow("jetelain/Ornith-1.5-122b:latest"),
+                Row("jetelain/Qwen3.6-35B-A3B:code", 32_768, 20.5),
+                Row("jetelain/Qwen3.6-35B-A3B:code", 49_152, 20.4),
+                Row("jetelain/Qwen3.6-35B-A3B:code", 65_536, 20.35),
+                Row("jetelain/Qwen3.6-35B-A3B:code", 98_304, 20.3),
+                Row("jetelain/Qwen3.6-35B-A3B:code", 131_072, 17.8, viable: false, reason: "below-threshold"),
+                Row("jetelain/Qwen3.6-35B-A3B:q4", 131_072, 30.6),
+                Row("jetelain/Qwen3.6-35B-A3B:q4", 163_840, 23.5),
+                Row("jetelain/Qwen3.6-35B-A3B:q4", 196_608, 21.8),
+                Row("jetelain/Flint:q4", 32_768, 26.0),
+                Row("jetelain/Flint:q4", 98_304, 22.5),
+                Row("jetelain/Flint:q4", 131_072, 19.0, viable: false, reason: "below-threshold")
+            ])
+        };
+
+        var matrix = new RecommendationEngine().Generate(results, Catalog, generatedAt: FixedStamp);
+
+        Assert.Equal(5, matrix.Roles.Count);
+        Assert.All(matrix.Roles.Values, r =>
+        {
+            Assert.Equal("jetelain/Qwen3.6-35B-A3B:q4", r.Model);
+            Assert.Equal(262_144, r.RecommendedContextWindow);
+        });
+        Assert.Single(matrix.Models);
+        Assert.True(matrix.Models.ContainsKey("jetelain/Qwen3.6-35B-A3B:q4"));
+    }
+
+    [Fact]
+    public void Generate_Fleet16Gb_Iq3BelowFloor_ExpertsFallBackToQ8Moe()
+    {
+        // 16 GB GPU + 64 GB RAM: Qwen3.8-27B:iq3 peaks at 49 152 (the 65 536 row drops to
+        // 14.7 t/s — the 48k/56k boundary case) → floor-dropped; Qwen3.8-27B:latest is
+        // sizing-pruned (18 944 MiB > 92% of 16 384). The Expert stages are empty → the Q8
+        // MoE tier (QualityRank 4) beats both Q4 MoEs (rank 5): basic → Qwen3.6:code (family),
+        // junior → Flint:q8, agentic_chat → Qwen3.6:code (family), architect/senior →
+        // Flint:q8 (family).
+        var results = new List<BenchmarkTargetResult>
+        {
+            new("Gpu16", BenchmarkRunStatus.Succeeded, FixedStamp, FixedStamp,
+            [
+                Row("jetelain/Qwen3.8-27B:iq3", 32_768, 45.0),
+                Row("jetelain/Qwen3.8-27B:iq3", 49_152, 40.0),
+                Row("jetelain/Qwen3.8-27B:iq3", 65_536, 14.7, viable: false, reason: "below-threshold"),
+                PrunedRow("jetelain/Qwen3.8-27B:latest"),
+                Row("jetelain/Qwen3.6-35B-A3B:code", 131_072, 55.0),
+                Row("jetelain/Qwen3.6-35B-A3B:code", 163_840, 54.0),
+                Row("jetelain/Flint:q8", 131_072, 44.0),
+                Row("jetelain/Flint:q8", 163_840, 43.0),
+                Row("jetelain/Qwen3.6-35B-A3B:q4", 131_072, 70.0),
+                Row("jetelain/Flint:q4", 131_072, 45.0)
+            ])
+        };
+
+        var matrix = new RecommendationEngine().Generate(results, Catalog, generatedAt: FixedStamp);
+
+        Assert.Equal(5, matrix.Roles.Count);
+        Assert.Equal("jetelain/Qwen3.6-35B-A3B:code", matrix.Roles["basic"].Model);
+        Assert.Equal("jetelain/Flint:q8", matrix.Roles["junior_developer"].Model);
+        Assert.Equal("jetelain/Qwen3.6-35B-A3B:code", matrix.Roles["agentic_chat"].Model);
+        Assert.Equal("jetelain/Flint:q8", matrix.Roles["software_architect"].Model);
+        Assert.Equal("jetelain/Flint:q8", matrix.Roles["senior_developer"].Model);
+        Assert.All(matrix.Roles.Values, r => Assert.Equal(262_144, r.RecommendedContextWindow));
+        Assert.All(matrix.Roles.Values, r => Assert.Equal(["Gpu16"], r.Nodes.Select(n => n.Target).ToList()));
+    }
+
+    [Fact]
+    public void Generate_Fleet64GbUnified_ExpertQ4Wins_AllFiveRoles()
+    {
+        // 64 GB unified memory node (alone): Ornith-1.5-122b is sizing-pruned (71 583 MiB
+        // > 92% of 65 536 = 60 293); Qwen3.8-27B:latest (Q4, rank 2) beats the ELIGIBLE
+        // Qwen3.8-27B:iq3 (rank 3) on QualityRank and wins all three expert roles; the Q8 MoE
+        // tier wins basic (Qwen3.6:code, family) and junior (Flint:q8, family).
+        var results = new List<BenchmarkTargetResult>
+        {
+            new("Unified64", BenchmarkRunStatus.Succeeded, FixedStamp, FixedStamp,
+            [
+                PrunedRow("jetelain/Ornith-1.5-122b:latest"),
+                Row("jetelain/Qwen3.8-27B:latest", 131_072, 24.5),
+                Row("jetelain/Qwen3.8-27B:latest", 163_840, 24.0),
+                Row("jetelain/Qwen3.8-27B:latest", 196_608, 23.5),
+                Row("jetelain/Qwen3.8-27B:latest", 262_144, 23.0),
+                Row("jetelain/Qwen3.8-27B:iq3", 131_072, 23.0),
+                Row("jetelain/Qwen3.8-27B:iq3", 163_840, 22.5),
+                Row("jetelain/Qwen3.8-27B:iq3", 262_144, 21.5),
+                Row("jetelain/Qwen3.6-35B-A3B:code", 262_144, 40.0),
+                Row("jetelain/Flint:q8", 262_144, 35.0),
+                Row("jetelain/Qwen3.6-35B-A3B:q4", 262_144, 55.0),
+                Row("jetelain/Flint:q4", 262_144, 50.0)
+            ])
+        };
+
+        var matrix = new RecommendationEngine().Generate(results, Catalog, generatedAt: FixedStamp);
+
+        Assert.Equal(5, matrix.Roles.Count);
+        foreach (var alias in new[] { "agentic_chat", "software_architect", "senior_developer" })
+        {
+            var role = matrix.Roles[alias];
+            Assert.Equal("jetelain/Qwen3.8-27B:latest", role.Model);
+            Assert.Equal(262_144, role.RecommendedContextWindow);
+            // The winner's node list is restricted to the eligible node.
+            Assert.Equal(["Unified64"], role.Nodes.Select(n => n.Target).ToList());
+        }
+        Assert.Equal("jetelain/Qwen3.6-35B-A3B:code", matrix.Roles["basic"].Model);
+        Assert.Equal("jetelain/Flint:q8", matrix.Roles["junior_developer"].Model);
+    }
+
+    [Fact]
+    public void Generate_Fleet96GbUnified_OrnithWinsArchitectSenior_LatestWinsAgenticChat()
+    {
+        // 96 GB unified node (88 GB VRAM pool): Ornith-1.5-122b (rank 1) is eligible and wins
+        // software_architect + senior_developer; it is EXCLUDED from agentic_chat by its
+        // catalog Roles (the key scenario-4 assertion) EVEN THOUGH it is eligible on the node
+        // → Qwen3.8-27B:latest (rank 2) wins agentic_chat. The Models index holds the 4
+        // distinct winners (Ornith wins two roles — union, no duplicates).
+        var results = new List<BenchmarkTargetResult>
+        {
+            new("Unified96", BenchmarkRunStatus.Succeeded, FixedStamp, FixedStamp,
+            [
+                Row("jetelain/Ornith-1.5-122b:latest", 131_072, 31.0),
+                Row("jetelain/Ornith-1.5-122b:latest", 163_840, 27.0),
+                Row("jetelain/Ornith-1.5-122b:latest", 196_608, 24.0),
+                Row("jetelain/Ornith-1.5-122b:latest", 262_144, 22.0),
+                Row("jetelain/Qwen3.8-27B:latest", 131_072, 25.5),
+                Row("jetelain/Qwen3.8-27B:latest", 163_840, 25.0),
+                Row("jetelain/Qwen3.8-27B:latest", 196_608, 25.0),
+                Row("jetelain/Qwen3.8-27B:latest", 262_144, 25.0),
+                Row("jetelain/Qwen3.8-27B:iq3", 262_144, 24.0),
+                Row("jetelain/Qwen3.6-35B-A3B:code", 262_144, 50.0),
+                Row("jetelain/Flint:q8", 262_144, 45.0)
+            ])
+        };
+
+        var matrix = new RecommendationEngine().Generate(results, Catalog, generatedAt: FixedStamp);
+
+        Assert.Equal(5, matrix.Roles.Count);
+        Assert.Equal("jetelain/Ornith-1.5-122b:latest", matrix.Roles["software_architect"].Model);
+        Assert.Equal("jetelain/Ornith-1.5-122b:latest", matrix.Roles["senior_developer"].Model);
+        Assert.Equal("jetelain/Qwen3.8-27B:latest", matrix.Roles["agentic_chat"].Model);
+        Assert.Equal("jetelain/Qwen3.6-35B-A3B:code", matrix.Roles["basic"].Model);
+        Assert.Equal("jetelain/Flint:q8", matrix.Roles["junior_developer"].Model);
+        Assert.All(matrix.Roles.Values, r => Assert.Equal(262_144, r.RecommendedContextWindow));
+
+        // The Models index: union of the role winners — 4 distinct models, each winner
+        // exactly once.
+        Assert.Equal(4, matrix.Models.Count);
+        Assert.Equal(
+            [
+                "jetelain/Flint:q8",
+                "jetelain/Ornith-1.5-122b:latest",
+                "jetelain/Qwen3.6-35B-A3B:code",
+                "jetelain/Qwen3.8-27B:latest"
+            ],
+            matrix.Models.Keys.OrderBy(k => k, StringComparer.Ordinal).ToList());
+    }
+
+    [Fact]
+    public void Generate_MixedFleet8GbPlus64Gb_WinnerNodesRestrictedToEligibleNodes()
+    {
+        // Mixed fleet (the fact-8 Gpu8 ladder + the fact-11 Unified64 ladder): Qwen3.6-35B-A3B:
+        // code is floor-dropped on Gpu8 (ceiling 98 304) but eligible on Unified64 → it wins
+        // basic with its Nodes list restricted to [Unified64]; the Q4 MoEs are eligible on
+        // BOTH nodes but never win when a Q8-tier model is eligible anywhere.
+        var gpu8 = new BenchmarkTargetResult("Gpu8", BenchmarkRunStatus.Succeeded, FixedStamp, FixedStamp,
+        [
+            PrunedRow("jetelain/Qwen3.8-27B:latest"),
+            PrunedRow("jetelain/Qwen3.8-27B:iq3"),
+            PrunedRow("jetelain/Ornith-1.5-122b:latest"),
+            Row("jetelain/Qwen3.6-35B-A3B:code", 32_768, 20.5),
+            Row("jetelain/Qwen3.6-35B-A3B:code", 49_152, 20.4),
+            Row("jetelain/Qwen3.6-35B-A3B:code", 65_536, 20.35),
+            Row("jetelain/Qwen3.6-35B-A3B:code", 98_304, 20.3),
+            Row("jetelain/Qwen3.6-35B-A3B:code", 131_072, 17.8, viable: false, reason: "below-threshold"),
+            Row("jetelain/Qwen3.6-35B-A3B:q4", 131_072, 30.6),
+            Row("jetelain/Qwen3.6-35B-A3B:q4", 163_840, 23.5),
+            Row("jetelain/Qwen3.6-35B-A3B:q4", 196_608, 21.8),
+            Row("jetelain/Flint:q4", 131_072, 22.0)
+        ]);
+        var unified64 = new BenchmarkTargetResult("Unified64", BenchmarkRunStatus.Succeeded, FixedStamp, FixedStamp,
+        [
+            PrunedRow("jetelain/Ornith-1.5-122b:latest"),
+            Row("jetelain/Qwen3.8-27B:latest", 131_072, 24.5),
+            Row("jetelain/Qwen3.8-27B:latest", 163_840, 24.0),
+            Row("jetelain/Qwen3.8-27B:latest", 196_608, 23.5),
+            Row("jetelain/Qwen3.8-27B:latest", 262_144, 23.0),
+            Row("jetelain/Qwen3.8-27B:iq3", 131_072, 23.0),
+            Row("jetelain/Qwen3.8-27B:iq3", 163_840, 22.5),
+            Row("jetelain/Qwen3.8-27B:iq3", 262_144, 21.5),
+            Row("jetelain/Qwen3.6-35B-A3B:code", 262_144, 40.0),
+            Row("jetelain/Flint:q8", 262_144, 35.0),
+            Row("jetelain/Qwen3.6-35B-A3B:q4", 262_144, 55.0),
+            Row("jetelain/Flint:q4", 262_144, 50.0)
+        ]);
+
+        var matrix = new RecommendationEngine().Generate([gpu8, unified64], Catalog, generatedAt: FixedStamp);
+
+        Assert.Equal(5, matrix.Roles.Count);
+        Assert.Equal("jetelain/Qwen3.6-35B-A3B:code", matrix.Roles["basic"].Model);
+        Assert.Equal(["Unified64"], matrix.Roles["basic"].Nodes.Select(n => n.Target).ToList());
+        Assert.Equal("jetelain/Flint:q8", matrix.Roles["junior_developer"].Model);
+        Assert.Equal(["Unified64"], matrix.Roles["junior_developer"].Nodes.Select(n => n.Target).ToList());
+        foreach (var alias in new[] { "agentic_chat", "software_architect", "senior_developer" })
+        {
+            Assert.Equal("jetelain/Qwen3.8-27B:latest", matrix.Roles[alias].Model);
+            Assert.Equal(["Unified64"], matrix.Roles[alias].Nodes.Select(n => n.Target).ToList());
+        }
+        // The Q4 MoEs (eligible on both nodes) never win when the Q8 tier is eligible.
+        Assert.DoesNotContain(
+            matrix.Roles.Values, r => r.Model is "jetelain/Qwen3.6-35B-A3B:q4" or "jetelain/Flint:q4");
+    }
+
+    [Fact]
+    public void Generate_FloorBoundary_Exactly128kAtExactly20Tps_Eligible()
+    {
+        // Both boundaries are INCLUSIVE: exactly 131 072 tokens at exactly 20.0 t/s is viable
+        // AND eligible (>= on both).
+        var catalog = new[] { AllRoleMoe("edge/moe:q4") };
+        var results = new List<BenchmarkTargetResult>
+        {
+            new(Desktop, BenchmarkRunStatus.Succeeded, FixedStamp, FixedStamp,
+            [
+                Row("edge/moe:q4", 131_072, 20.0)
+            ])
+        };
+
+        var matrix = new RecommendationEngine().Generate(results, catalog, generatedAt: FixedStamp);
+
+        Assert.Equal(5, matrix.Roles.Count);
+        Assert.All(matrix.Roles.Values, r =>
+        {
+            Assert.Equal("edge/moe:q4", r.Model);
+            Assert.Equal(262_144, r.RecommendedContextWindow);   // MoE ceiling = NativeContext
+            Assert.Equal(131_072, r.Nodes[0].BaselineContext);
+            Assert.Equal(20.0, r.Nodes[0].TokensPerSecond);
+        });
+        Assert.Single(matrix.Models);
+    }
+
+    [Fact]
+    public void Generate_FloorBoundary_CeilingBelow128k_Disqualified_AllRolesAbsent()
+    {
+        // The 131 072 row is non-viable (19.0 t/s < the 20.0 floor) and the largest viable
+        // row (98 304) is below the 128k floor → the (model, node) pair is dropped → no role
+        // is assignable → the matrix is empty.
+        var catalog = new[] { AllRoleMoe("edge/moe:q4") };
+        var results = new List<BenchmarkTargetResult>
+        {
+            new(Desktop, BenchmarkRunStatus.Succeeded, FixedStamp, FixedStamp,
+            [
+                Row("edge/moe:q4", 98_304, 25.0),
+                Row("edge/moe:q4", 131_072, 19.0, viable: false, reason: "below-threshold")
+            ])
+        };
+
+        var matrix = new RecommendationEngine().Generate(results, catalog, generatedAt: FixedStamp);
+
+        Assert.Empty(matrix.Roles);
+        Assert.Empty(matrix.Models);
     }
 
     // ------------------------------------------------------------------

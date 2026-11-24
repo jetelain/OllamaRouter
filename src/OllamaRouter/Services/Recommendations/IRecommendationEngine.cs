@@ -14,10 +14,10 @@ public interface IRecommendationEngine
 {
     /// <summary>
     /// Generates the fleet recommendation matrix:
-    /// <paramref name="catalog"/> is the code-defined seed catalog
-    /// (<c>CandidateModelCatalogOptions.DefaultModels</c>), and the nullable
-    /// <paramref name="hardwareProfileLookup"/> supplies the per-target fast-memory size
-    /// (fail-open: null profile → <c>VramMB = null</c>). <paramref name="generatedAt"/> is
+    /// <paramref name="catalog"/> is the candidate catalog supplied by the caller (in
+    /// production: <c>IOptions&lt;CandidateModelCatalogOptions&gt;.Value.Models</c>), and the
+    /// nullable <paramref name="hardwareProfileLookup"/> supplies the per-target fast-memory
+    /// size (fail-open: null profile → <c>VramMB = null</c>). <paramref name="generatedAt"/> is
     /// the endpoint-supplied stamp (null → <c>DateTimeOffset.UtcNow</c>); tests pass a
     /// fixed value for determinism.
     /// </summary>
