@@ -1,10 +1,12 @@
 using System.Collections.ObjectModel;
+using System.Globalization;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using OllamaRouter.App.ViewModels;
 using OllamaRouter.App.Logging;
 using OllamaRouter.Client;
 using OllamaRouter.Endpoints.RouterApi.Benchmark;
+using OllamaRouter.Options;
 using OllamaRouter.Services.Benchmarking;
 using Serilog;
 
@@ -12,8 +14,11 @@ namespace OllamaRouter.App.ViewModels.Wizard;
 
 /// <summary>
 /// One (target × model) candidate row of Step 4 (task #152): a catalog candidate of one
-/// per-target hardware group, its roles, the pre-flight fit verdict text and the user's
-/// selection checkbox (default SELECTED — the run-scoped opt-out state, never persisted).
+/// per-target hardware group, its class/offload/size annotation, its roles, the pre-flight
+/// fit verdict text and the user's selection checkbox (default selected EXCEPT pre-flight
+/// Pruned candidates — task #169: they start unchecked instead of pre-checking a 70+ GB
+/// model on an 8 GB node; fully user-toggleable either way — the run-scoped opt-in/opt-out
+/// state, never persisted).
 /// Changing <see cref="IsSelected"/> re-evaluates the owning step's Run command
 /// (CanExecute = at least one candidate model selected).
 /// </summary>
@@ -24,15 +29,19 @@ public sealed partial class BenchmarkCandidateRow : ObservableObject
     public BenchmarkCandidateRow(
         string target,
         string model,
+        string classText,
         string rolesText,
         string fitText,
-        Action selectionChanged)
+        Action selectionChanged,
+        bool isSelected = true)
     {
         Target = target ?? throw new ArgumentNullException(nameof(target));
         Model = model ?? throw new ArgumentNullException(nameof(model));
+        ClassText = classText;
         RolesText = rolesText;
         FitText = fitText;
         _selectionChanged = selectionChanged ?? throw new ArgumentNullException(nameof(selectionChanged));
+        _isSelected = isSelected;
     }
 
     /// <summary>The target (group) this candidate is tested on.</summary>
@@ -41,7 +50,19 @@ public sealed partial class BenchmarkCandidateRow : ObservableObject
     /// <summary>The catalog candidate model name.</summary>
     public string Model { get; }
 
-    /// <summary>The comma-separated candidate roles (display only).</summary>
+    /// <summary>
+    /// The class/offload/size annotation (task #169, display only):
+    /// "{modelClass} · {CPU offload OK|VRAM only}" + " · ~{n.n} GB" (the curated sizing
+    /// anchor in GB, 1 decimal, invariant culture) — the size segment is omitted when the
+    /// model has no curated anchor (null).
+    /// </summary>
+    public string ClassText { get; }
+
+    /// <summary>
+    /// The candidate roles (display only): "All roles (primary: X)" when the catalog entry
+    /// covers all five roles (primary = Roles[0] per the #166 catalog convention),
+    /// otherwise the comma-joined role names in catalog order (primary first).
+    /// </summary>
     public string RolesText { get; }
 
     /// <summary>
@@ -52,9 +73,12 @@ public sealed partial class BenchmarkCandidateRow : ObservableObject
     /// </summary>
     public string FitText { get; }
 
-    /// <summary>Whether the model is selected for the next run (default: selected).</summary>
+    /// <summary>
+    /// Whether the model is selected for the next run (default: selected — EXCEPT pre-flight
+    /// Pruned candidates, which start unchecked, task #169).
+    /// </summary>
     [ObservableProperty]
-    private bool _isSelected = true;
+    private bool _isSelected;
 
     partial void OnIsSelectedChanged(bool value) => _selectionChanged();
 }
@@ -63,7 +87,8 @@ public sealed partial class BenchmarkCandidateRow : ObservableObject
 /// One per-target candidate group of Step 4 (task #152): the target name, its STORED
 /// hardware annotation (GPU name, effective fast memory, bandwidth — task #164: the
 /// fast-memory string replaced the first-GPU VRAM string) plus a note when the store has
-/// no profile, and the candidate model rows (all default selected).
+/// no profile, and the candidate model rows (all default selected except pre-flight Pruned
+/// candidates — task #169).
 /// </summary>
 public sealed class BenchmarkCandidateGroupRow
 {
@@ -506,9 +531,13 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
                 rows.Add(new BenchmarkCandidateRow(
                     target.Target,
                     candidate.Model,
-                    string.Join(", ", candidate.Roles.Select(r => r.ToString())),
+                    ClassTextOf(candidate),
+                    RolesTextOf(candidate.Roles),
                     FitTextOf(candidate.Fit, candidate.MaxFitsContext),
-                    NotifyRunCanExecute));
+                    NotifyRunCanExecute,
+                    // Task #169 (D3): pre-flight Pruned candidates start UNCHECKED (no
+                    // pre-checked 70+ GB model on an 8 GB node) but stay fully toggleable.
+                    isSelected: candidate.Fit != BenchmarkCandidateFit.Pruned));
             }
 
             groups.Add(new BenchmarkCandidateGroupRow
@@ -549,6 +578,38 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
         BenchmarkCandidateFit.Pruned => "won't fit this node",
         _ => "no profile (assumed)"
     };
+
+    /// <summary>
+    /// The class/offload/size annotation (task #169, D4): "{modelClass} · {offload}" where
+    /// offload = "CPU offload OK" / "VRAM only", plus " · ~{n.n} GB" (the curated sizing
+    /// anchor, invariant 1-decimal GB) — the size segment is OMITTED when the anchor is
+    /// null (e.g. a synthetic model without a curated anchor).
+    /// </summary>
+    private static string ClassTextOf(RouterBenchmarkCandidateModel candidate)
+    {
+        var text = $"{candidate.ModelClass} · {(candidate.AllowCpuOffload ? "CPU offload OK" : "VRAM only")}";
+        if (candidate.EstimatedWeightsMB is { } mb)
+        {
+            text += $" · ~{(mb / 1024.0).ToString("0.0", CultureInfo.InvariantCulture)} GB";
+        }
+
+        return text;
+    }
+
+    /// <summary>
+    /// The role display text (task #169, D4): the MoE "covers everything" case (all five
+    /// roles) renders as "All roles (primary: X)" (primary = Roles[0] per the #166 catalog
+    /// convention), otherwise the comma-joined role names in catalog order (primary first).
+    /// </summary>
+    private static string RolesTextOf(IReadOnlyList<UsageRole> roles)
+    {
+        if (roles.Count == 5)
+        {
+            return $"All roles (primary: {roles[0]})";
+        }
+
+        return string.Join(", ", roles.Select(r => r.ToString()));
+    }
 
     private void NotifyRunCanExecute() => RunBenchmarksCommand.NotifyCanExecuteChanged();
 

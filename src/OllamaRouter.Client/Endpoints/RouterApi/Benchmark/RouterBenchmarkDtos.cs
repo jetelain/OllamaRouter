@@ -71,7 +71,20 @@ public enum BenchmarkCandidateFit
 /// catalog entry (name / roles / quantization / architecture / params / native context) plus
 /// the per-target pre-flight fit verdict and <c>maxFitsContext</c> — the largest ladder
 /// context that survives sizing, capped by the model's <c>nativeContext</c> (0 when
-/// <see cref="BenchmarkCandidateFit.Pruned"/>).
+/// <see cref="BenchmarkCandidateFit.Pruned"/>) — and the curated-catalog class metadata
+/// (task #169; the roles are NOT exclusive assignments, Step 5 resolves them dynamically per
+/// hardware):
+/// <c>modelClass</c> is the plain string <c>"MoE"</c> (lightweight-active, CPU-offload
+/// eligible) or <c>"Expert"</c> (dense/hybrid frontier tier) — exactly the server
+/// <c>CandidateModelClass.ToString()</c> value (a string, not an enum, because the enum lives
+/// in the server assembly this leaf SDK cannot reference); <c>allowCpuOffload</c> is the
+/// curated catalog's CPU-offload eligibility (the sizing gate); <c>estimatedWeightsMB</c> is
+/// the measured resident sizing anchor in MiB (the value the run's sizing uses) or <c>null</c>
+/// for models without a curated anchor (parametric sizing).
+/// All three parameters are optional with defaults mirroring the catalog's conservative
+/// fallbacks (unknown/synthetic = dense-strict): an OLD daemon that omits them deserializes
+/// to <c>"Expert"</c>/<c>false</c>/<c>null</c> (a cosmetic "Expert · VRAM only" degradation on
+/// a mixed-version fleet only), and a NEW daemon's extra fields are ignored by an OLD app.
 /// </summary>
 public sealed record RouterBenchmarkCandidateModel(
     [property: JsonPropertyName("model")] string Model,
@@ -82,7 +95,10 @@ public sealed record RouterBenchmarkCandidateModel(
     [property: JsonPropertyName("activeParams")] long? ActiveParams,
     [property: JsonPropertyName("nativeContext")] int NativeContext,
     [property: JsonPropertyName("fit")] BenchmarkCandidateFit Fit,
-    [property: JsonPropertyName("maxFitsContext")] int MaxFitsContext);
+    [property: JsonPropertyName("maxFitsContext")] int MaxFitsContext,
+    [property: JsonPropertyName("modelClass")] string ModelClass = "Expert",
+    [property: JsonPropertyName("allowCpuOffload")] bool AllowCpuOffload = false,
+    [property: JsonPropertyName("estimatedWeightsMB")] double? EstimatedWeightsMB = null);
 
 /// <summary>
 /// One target group of <c>GET /api/router/benchmark/candidates</c> (task #152): the target

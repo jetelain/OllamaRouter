@@ -7,7 +7,7 @@
     <StackPanel Spacing="12">
       <TextBlock Text="Step 4 — Micro-Benchmark" FontSize="18" FontWeight="Bold"/>
       <TextBlock TextWrapping="Wrap"
-                 Text="Benchmark the selected candidate models on every active node. A context is viable when it decodes at 20 tokens/s or faster. Unchecking a model skips it for the next run only — a fresh step entry selects all again."/>
+                 Text="Benchmark the selected candidate models on every active node. A context is viable when it decodes at 20 tokens/s or faster. Unchecking a model skips it for the next run only — a fresh step entry re-defaults the selection (candidates the pre-flight sizing marks as not fitting this node start unchecked)."/>
 
       <StackPanel Orientation="Horizontal" Spacing="8">
         <Button Content="Run benchmarks" Command="{Binding RunBenchmarksCommand}"/>
@@ -31,11 +31,20 @@
               <ItemsControl ItemsSource="{Binding Models}">
                 <ItemsControl.ItemTemplate>
                   <DataTemplate x:DataType="vm:BenchmarkCandidateRow">
-                    <StackPanel Orientation="Horizontal" Spacing="10" Margin="16,1,0,1">
-                      <CheckBox IsChecked="{Binding IsSelected}" VerticalAlignment="Center"/>
-                      <TextBlock Text="{Binding Model}" Width="150" VerticalAlignment="Center"/>
-                      <TextBlock Text="{Binding RolesText}" Width="150" VerticalAlignment="Center"/>
-                      <TextBlock Text="{Binding FitText}" VerticalAlignment="Center"/>
+                    <!-- Task #169 (D4): two-line row — line 1 = selection + model + the
+                         class/offload/size annotation; line 2 (indented past the
+                         checkbox) = roles + the fit verdict. One line risks horizontal
+                         clipping in the vertical ScrollViewer. -->
+                    <StackPanel Spacing="1" Margin="16,1,0,3">
+                      <StackPanel Orientation="Horizontal" Spacing="10">
+                        <CheckBox IsChecked="{Binding IsSelected}" VerticalAlignment="Center"/>
+                        <TextBlock Text="{Binding Model}" Width="150" VerticalAlignment="Center"/>
+                        <TextBlock Text="{Binding ClassText}" Foreground="{DynamicResource SemiColorText2}" VerticalAlignment="Center"/>
+                      </StackPanel>
+                      <StackPanel Orientation="Horizontal" Spacing="10" Margin="26,0,0,0">
+                        <TextBlock Text="{Binding RolesText}" Width="250" VerticalAlignment="Center"/>
+                        <TextBlock Text="{Binding FitText}" VerticalAlignment="Center"/>
+                      </StackPanel>
                     </StackPanel>
                   </DataTemplate>
                 </ItemsControl.ItemTemplate>

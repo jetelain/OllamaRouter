@@ -338,16 +338,22 @@ public sealed class RouterBenchmarkEndpointsTests : IDisposable
                 [
                     new RouterBenchmarkCandidateModel(
                         "qwen3.8:27b", [UsageRole.AgenticChat, UsageRole.SeniorDeveloper], "q4", "Dense",
-                        27_800_000_000, null, 131_072, BenchmarkCandidateFit.Fits, 65_536),
+                        27_800_000_000, null, 131_072, BenchmarkCandidateFit.Fits, 65_536,
+                        // Task #169: the curated-catalog class metadata (Fits dense — anchored).
+                        ModelClass: "Expert", AllowCpuOffload: false, EstimatedWeightsMB: 12_288.0),
                     new RouterBenchmarkCandidateModel(
                         "gemma4:e4b", [UsageRole.BasicModel], "q4", "Dense",
-                        4_500_000_000, null, 131_072, BenchmarkCandidateFit.Pruned, 0),
+                        4_500_000_000, null, 131_072, BenchmarkCandidateFit.Pruned, 0,
+                        // Task #169: Pruned dense — no curated anchor (null stays a JSON null key).
+                        ModelClass: "Expert", AllowCpuOffload: false, EstimatedWeightsMB: null),
                 ]),
                 new RouterBenchmarkCandidateTarget("Peer", null,
                 [
                     new RouterBenchmarkCandidateModel(
                         "qwen3.8:27b", [UsageRole.AgenticChat, UsageRole.SeniorDeveloper], "q4", "Dense",
-                        27_800_000_000, null, 131_072, BenchmarkCandidateFit.Assumed, 131_072),
+                        27_800_000_000, null, 131_072, BenchmarkCandidateFit.Assumed, 131_072,
+                        // Task #169: Assumed MoE (synthetic, offload-eligible, anchored).
+                        ModelClass: "MoE", AllowCpuOffload: true, EstimatedWeightsMB: 22_528.0),
                 ]),
             ])
         };
@@ -376,8 +382,19 @@ public sealed class RouterBenchmarkEndpointsTests : IDisposable
             firstCandidates[0]!["roles"]!.AsArray().Select(r => r!.GetValue<string>()!).ToArray());
         Assert.Equal(27_800_000_000, firstCandidates[0]!["totalParams"]!.GetValue<long>());
         Assert.Null(firstCandidates[0]!["activeParams"]);
+        // Task #169: the curated-catalog class metadata round-trips over the wire.
+        Assert.Equal("Expert", firstCandidates[0]!["modelClass"]!.GetValue<string>());
+        Assert.False(firstCandidates[0]!["allowCpuOffload"]!.GetValue<bool>());
+        Assert.Equal(12_288.0, firstCandidates[0]!["estimatedWeightsMB"]!.GetValue<double>());
         Assert.Equal("Pruned", firstCandidates[1]!["fit"]!.GetValue<string>());
         Assert.Equal(0, firstCandidates[1]!["maxFitsContext"]!.GetValue<int>()); // Pruned → 0
+        Assert.Equal("Expert", firstCandidates[1]!["modelClass"]!.GetValue<string>());
+        Assert.False(firstCandidates[1]!["allowCpuOffload"]!.GetValue<bool>());
+        // .NET 10 JsonNode gotcha: a JSON null-valued property indexes as a null node —
+        // assert the key IS present, then that its value is null (a missing key would pass
+        // Assert.Null alone).
+        Assert.True(firstCandidates[1]!.AsObject()!.ContainsKey("estimatedWeightsMB"));
+        Assert.Null(firstCandidates[1]!["estimatedWeightsMB"]);
 
         // Group 2: unknown profile → hardware null (never a probe), still the same candidates.
         var second = targets[1]!.AsObject()!;
@@ -389,6 +406,62 @@ public sealed class RouterBenchmarkEndpointsTests : IDisposable
         Assert.Single(secondCandidates);
         Assert.Equal("Assumed", secondCandidates[0]!["fit"]!.GetValue<string>());
         Assert.Equal(131_072, secondCandidates[0]!["maxFitsContext"]!.GetValue<int>());
+        // Task #169: the Assumed MoE candidate's class metadata.
+        Assert.Equal("MoE", secondCandidates[0]!["modelClass"]!.GetValue<string>());
+        Assert.True(secondCandidates[0]!["allowCpuOffload"]!.GetValue<bool>());
+        Assert.Equal(22_528.0, secondCandidates[0]!["estimatedWeightsMB"]!.GetValue<double>());
+    }
+
+    [Fact]
+    public void CandidateModel_RoundTrips_ThroughTheServerAotContext_WithTheTask169Fields()
+    {
+        // Task #169 (AC5): the source-generated SERVER context covers the three new
+        // properties at RUNTIME, not just compile time — serialize to raw JSON, assert the
+        // wire field names/values (a plain string — no JsonStringEnumConverter), then
+        // deserialize back through the same context.
+        var response = new RouterBenchmarkCandidatesResponse(
+        [
+            new RouterBenchmarkCandidateTarget("Local", null,
+            [
+                new RouterBenchmarkCandidateModel(
+                    "jetelain/Qwen3.6-35B-A3B:q4",
+                    [UsageRole.BasicModel, UsageRole.JuniorDeveloper],
+                    "UD-Q4_K_XL", "MoE", 35_000_000_000L, 3_200_000_000L, 262_144,
+                    BenchmarkCandidateFit.Fits, 262_144,
+                    ModelClass: "MoE", AllowCpuOffload: true, EstimatedWeightsMB: 22_528.0),
+                new RouterBenchmarkCandidateModel(
+                    "jetelain/Ornith-1.5-122b:latest",
+                    [UsageRole.SoftwareArchitect, UsageRole.SeniorDeveloper],
+                    "UD-Q4_K_XL", "Hybrid MoE", 124_600_000_000L, 10_000_000_000L, 262_144,
+                    BenchmarkCandidateFit.Pruned, 0,
+                    ModelClass: "Expert", AllowCpuOffload: false, EstimatedWeightsMB: null),
+            ]),
+        ]);
+
+        var json = JsonSerializer.Serialize(response, OllamaRouterJsonSerializerContext.Default.RouterBenchmarkCandidatesResponse);
+        using var doc = JsonDocument.Parse(json);
+        var first = doc.RootElement.GetProperty("targets")[0].GetProperty("candidates")[0];
+        Assert.Equal("MoE", first.GetProperty("modelClass").GetString());
+        Assert.True(first.GetProperty("allowCpuOffload").GetBoolean());
+        Assert.Equal(22_528.0, first.GetProperty("estimatedWeightsMB").GetDouble());
+        var second = doc.RootElement.GetProperty("targets")[0].GetProperty("candidates")[1];
+        Assert.Equal("Expert", second.GetProperty("modelClass").GetString());
+        Assert.False(second.GetProperty("allowCpuOffload").GetBoolean());
+        Assert.True(second.GetProperty("estimatedWeightsMB").ValueKind == System.Text.Json.JsonValueKind.Null);
+
+        var roundTripped = JsonSerializer.Deserialize(json, OllamaRouterJsonSerializerContext.Default.RouterBenchmarkCandidatesResponse)!;
+        var a = roundTripped.Targets[0].Candidates[0];
+        Assert.Equal("MoE", a.ModelClass);
+        Assert.True(a.AllowCpuOffload);
+        Assert.Equal(22_528.0, a.EstimatedWeightsMB);
+        Assert.Equal(BenchmarkCandidateFit.Fits, a.Fit);
+        Assert.Equal(262_144, a.MaxFitsContext);
+        var b = roundTripped.Targets[0].Candidates[1];
+        Assert.Equal("Expert", b.ModelClass);
+        Assert.False(b.AllowCpuOffload);
+        Assert.Null(b.EstimatedWeightsMB);
+        Assert.Equal(BenchmarkCandidateFit.Pruned, b.Fit);
+        Assert.Equal(0, b.MaxFitsContext);
     }
 
     // ------------------------------------------------------------------

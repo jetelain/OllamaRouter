@@ -252,7 +252,12 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
                     candidate.ActiveParams,
                     candidate.NativeContext,
                     verdict,
-                    fit.MaxSurvivingCtx));
+                    fit.MaxSurvivingCtx,
+                    // Task #169: the curated-catalog class metadata (a plain string on the
+                    // wire — CandidateModelClass lives in this server assembly; D1).
+                    candidate.ModelClass.ToString(),
+                    candidate.AllowCpuOffload,
+                    candidate.EstimatedWeightsMB));
             }
 
             groups.Add(new RouterBenchmarkCandidateTarget(name, profile, rows));

@@ -67,6 +67,53 @@ public sealed class SetupWizardViewModelsTests
     /// dispatcher in tests) is treated as "not yet" and re-polled (task #148/#150 flake
     /// lesson); the FINAL assertion stays unguarded.
     /// </summary>
+    /// <summary>
+    /// Final post-<see cref="WaitUntilAsync"/> assertion for collections a still-running
+    /// soft-delay poller can rebuild mid-read (the VM mutates on a thread-pool thread; no
+    /// Avalonia dispatcher in tests — production marshals to the UI thread, so the race is
+    /// test-host-only). Re-verifies the invariant over a short retry window; a genuine
+    /// invariant violation keeps it false and the final assert fails.
+    /// </summary>
+    private static async Task AssertHoldsEventuallyAsync(Func<bool> condition, string what)
+    {
+        for (var i = 0; i < 2_000; i++)
+        {
+            try
+            {
+                if (condition())
+                {
+                    return;
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                // Collection mid-rebuild: treat as not yet.
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                // Indexer on a collection just Clear()-ed mid-rebuild: treat as not yet.
+            }
+
+            await Task.Yield();
+        }
+
+        bool holds;
+        try
+        {
+            holds = condition();
+        }
+        catch (InvalidOperationException)
+        {
+            holds = false;
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            holds = false;
+        }
+
+        Assert.True(holds, what);
+    }
+
     private static async Task WaitUntilAsync(Func<bool> condition, string what, int maxBeats = 200_000)
     {
         for (var i = 0; i < maxBeats; i++)
@@ -83,11 +130,32 @@ public sealed class SetupWizardViewModelsTests
                 // Collection mid-rebuild (the VM mutates it on a thread-pool thread; production
                 // marshals to the UI thread, so the race is test-host-only): treat as not yet.
             }
+            catch (ArgumentOutOfRangeException)
+            {
+                // Indexer on a collection just Clear()-ed mid-rebuild (same test-host-only
+                // race): treat as not yet.
+            }
 
             await Task.Yield();
         }
 
-        Assert.True(condition(), $"condition not met after {maxBeats} cooperative yields: {what}");
+        // The final re-check may itself catch a mid-rebuild read — report it as
+        // "condition not met" (a hard fail) instead of a misleading collection exception.
+        bool holds;
+        try
+        {
+            holds = condition();
+        }
+        catch (InvalidOperationException)
+        {
+            holds = false;
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            holds = false;
+        }
+
+        Assert.True(holds, $"condition not met after {maxBeats} cooperative yields: {what}");
     }
 
     private sealed class TempDir : IAsyncDisposable
@@ -3220,7 +3288,7 @@ public sealed class SetupWizardViewModelsTests
     }
 
     [Fact]
-    public async Task Step3_Candidates_LoadOnStepEntry_DefaultAllSelected_AndHardwareAnnotated()
+    public async Task Step3_Candidates_LoadOnStepEntry_PrunedDefaultsUnselected_OthersSelected_AndHardwareAnnotated()
     {
         var mock = MockClient();
         mock.Setup(c => c.GetBenchmarkCandidatesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(
@@ -3257,9 +3325,6 @@ public sealed class SetupWizardViewModelsTests
         await vm.OnStepEnteredAsync(); // first tick loads the plan
         await WaitUntilAsync(() => vm.CandidateGroups.Count == 3, "all candidate groups");
 
-        // Every checkbox defaults to selected (the run-scoped opt-out starts empty).
-        Assert.All(vm.CandidateGroups, g => Assert.All(g.Models, m => Assert.True(m.IsSelected)));
-
         // The profiled groups carry the hardware annotation (task #164: the header is the
         // effective fast memory — TotalFastMemoryMB — that the fit computation consumes);
         // the unknown-profile group carries the note instead.
@@ -3279,7 +3344,258 @@ public sealed class SetupWizardViewModelsTests
         Assert.Equal("No hardware profile detected", remote.Note);
         Assert.Equal(string.Empty, remote.VramText); // no profile → empty (never null)
         Assert.Equal("no profile (assumed)", remote.Models[0].FitText);
+        // Task #169 (AC2): the pre-flight Pruned candidate starts UNCHECKED (no pre-checked
+        // oversized model on a small node); every Fits/Assumed row starts selected.
+        Assert.True(local.Models.Single(m => m.Model == "llama3:8b").IsSelected);      // Fits
+        Assert.False(local.Models.Single(m => m.Model == "qwen3.8:27b").IsSelected);  // Pruned
+        Assert.True(unified.Models.Single(m => m.Model == "llama3:8b").IsSelected);   // Fits
+        Assert.True(remote.Models.Single(m => m.Model == "qwen3.8:27b").IsSelected);  // Assumed
         Assert.True(vm.RunBenchmarksCommand.CanExecute(null));
+        await vm.DisposeAsync();
+    }
+
+    // ==================================================================
+    //  Task #169: curated-catalog class metadata + Pruned default-unselected
+    // ==================================================================
+
+    /// <summary>
+    /// The 8 GB node profile of the curated-catalog wizard tests (task #169, item 8): 8 GiB
+    /// fast memory (discrete VRAM) + 64 GiB system RAM, non-unified — the MoE full-weights
+    /// residency tier is fast + RAM. The ladder verdicts below are the COMPUTED TRUTH of
+    /// <see cref="CandidateSizingCalculator"/> (the shared derivation) pinned per the #166
+    /// anchors: budget = 0.92 × 8_192 = 7_536.64 MiB; Qwen3.6:code (active 3_051.8 + KV) is
+    /// the only MoE whose 256k decode exceeds the budget (max rung 196_608); the three
+    /// dense/hybrid strict models are weights-pruned at every rung.
+    /// </summary>
+    private static NodeHardwareProfile CuratedEightGbProfile() => new(
+        "local", "linux", "x64", false, 65_536, SystemRamType.Ddr5,
+        [new GpuDeviceProfile("nvidia", "RTX 4080", 8_192, "GDDR6X", 256, 717)],
+        8_192, 717.0);
+
+    /// <summary>
+    /// The one-target curated 7-model candidate plan on the 8 GB node (task #169, item 8):
+    /// every field of each row mirrors <see cref="CandidateModelCatalogOptions.DefaultModels"/>
+    /// and the (Fit, MaxFitsContext) verdict is RECOMPUTED here via
+    /// <see cref="CandidateSizingCalculator"/> over the default ladder — the computed truth,
+    /// never a stale hand-pinned number.
+    /// </summary>
+    private static RouterBenchmarkCandidatesResponse CuratedSevenModelPlan()
+    {
+        var profile = CuratedEightGbProfile();
+        var ladder = new CandidateModelCatalogOptions().BenchmarkContextLadder;
+        var rows = new List<RouterBenchmarkCandidateModel>();
+        foreach (var model in CandidateModelCatalogOptions.DefaultModels)
+        {
+            var anySurvived = false;
+            var maxSurviving = 0;
+            foreach (var ctx in ladder)
+            {
+                var status = CandidateSizingCalculator.Evaluate(model, ctx, profile).Status;
+                if (status is MemoryFitStatus.Fits or MemoryFitStatus.Assumed)
+                {
+                    anySurvived = true;
+                    if (ctx <= model.NativeContext && ctx > maxSurviving)
+                    {
+                        maxSurviving = ctx;
+                    }
+                }
+            }
+
+            var fit = anySurvived ? BenchmarkCandidateFit.Fits : BenchmarkCandidateFit.Pruned;
+            rows.Add(new RouterBenchmarkCandidateModel(
+                model.Name, model.Roles, model.Quantization, model.Architecture,
+                model.TotalParams, model.ActiveParams, model.NativeContext,
+                fit, maxSurviving,
+                model.ModelClass.ToString(), model.AllowCpuOffload, model.EstimatedWeightsMB));
+        }
+
+        return new RouterBenchmarkCandidatesResponse(
+            [new RouterBenchmarkCandidateTarget("Local", profile, rows)]);
+    }
+
+    [Fact]
+    public async Task Step3_CuratedSevenModelPlan_EightGbNode_ClassSizeRolesAndPrunedDefaults()
+    {
+        // Task #169 (AC3 + AC2 headline): on an 8 GB node the curated 7-model plan renders the
+        // class/offload/size annotation + the role text per D4, and the three pre-flight
+        // Pruned models (the 70+ GB Ornith included) start UNCHECKED — no pre-checked
+        // oversized model on an 8 GB laptop.
+        var mock = MockClient();
+        mock.Setup(c => c.GetBenchmarkCandidatesAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(CuratedSevenModelPlan());
+        WizardBenchmarkStepViewModel vm = null!;
+        vm = BuildBenchmark(mock, ct => vm.RefreshAsync(ct), GatedDelay);
+
+        await vm.OnStepEnteredAsync();
+        await WaitUntilAsync(() => vm.CandidateGroups.Count == 1 && vm.CandidateGroups[0].Models.Count == 7,
+            "the curated 7-model candidate group");
+        var rows = vm.CandidateGroups[0].Models;
+
+        // The node is the 8 GB one (task #164: the header is the fast memory).
+        Assert.Equal("Fast memory: 8 GB", vm.CandidateGroups[0].VramText);
+
+        // ClassText (D4): "{modelClass} · {offload} · ~{n.n} GB" from the curated anchors.
+        Assert.Equal(
+            [
+                "MoE · CPU offload OK · ~23.3 GB",   // Flint:q4      (23_859 MiB)
+                "MoE · CPU offload OK · ~39.4 GB",   // Flint:q8      (40_346 MiB)
+                "MoE · CPU offload OK · ~22.0 GB",   // Qwen3.6:q4    (22_528 MiB)
+                "MoE · CPU offload OK · ~40.0 GB",   // Qwen3.6:code  (40_960 MiB)
+                "Expert · VRAM only · ~12.0 GB",     // Qwen3.8:iq3   (12_288 MiB)
+                "Expert · VRAM only · ~18.5 GB",     // Qwen3.8:latest(18_944 MiB)
+                "Expert · VRAM only · ~69.9 GB",     // Ornith        (71_583 MiB)
+            ],
+            rows.Select(r => r.ClassText).ToArray());
+
+        // RolesText (D4): 5-role MoE = "All roles (primary: X)" (primary = Roles[0]);
+        // the strict models keep the comma join in catalog order.
+        Assert.Equal(
+            [
+                "All roles (primary: JuniorDeveloper)",
+                "All roles (primary: JuniorDeveloper)",
+                "All roles (primary: BasicModel)",
+                "All roles (primary: BasicModel)",
+                "AgenticChat, SoftwareArchitect, SeniorDeveloper",
+                "AgenticChat, SoftwareArchitect, SeniorDeveloper",
+                "SoftwareArchitect, SeniorDeveloper",
+            ],
+            rows.Select(r => r.RolesText).ToArray());
+
+        // FitText + IsSelected from the COMPUTED 8 GB verdicts (pinned computed truth):
+        // the three MoEs fit (Qwen3.6:code capped at 196_608); the three strict models are
+        // weights-pruned → unchecked.
+        Assert.Equal(
+            [
+                "ctx ≤ 262144", "ctx ≤ 262144", "ctx ≤ 262144", "ctx ≤ 196608",
+                "won't fit this node", "won't fit this node", "won't fit this node",
+            ],
+            rows.Select(r => r.FitText).ToArray());
+        Assert.Equal(
+            [true, true, true, true, false, false, false],
+            rows.Select(r => r.IsSelected).ToArray());
+        Assert.False(rows.Single(r => r.Model == "jetelain/Ornith-1.5-122b:latest").IsSelected);
+        Assert.True(vm.RunBenchmarksCommand.CanExecute(null));
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step3_PrunedCandidate_ExcludedByDefault_AndUserOverrideHonored()
+    {
+        // Task #169 (AC2, item 9): a Pruned row travels in the run-scoped excludedModels map
+        // while unchecked (exactly like a user-unchecked row); checking it force-includes it
+        // (the run-loop sizing re-prunes — no pull, only sizing-pruned rows).
+        var mock = MockClient();
+        mock.Setup(c => c.GetBenchmarkCandidatesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(
+            new RouterBenchmarkCandidatesResponse(
+            [
+                new RouterBenchmarkCandidateTarget("Local", null,
+                    [CandidateModel("fits-model", BenchmarkCandidateFit.Fits),
+                     new RouterBenchmarkCandidateModel(
+                         "pruned-model", [UsageRole.BasicModel], "q4", "Dense",
+                         124_600_000_000, 10_000_000_000, 262_144, BenchmarkCandidateFit.Pruned, 0)]),
+            ]));
+        RouterBenchmarkRequest? captured = null;
+        mock.Setup(c => c.StartBenchmarkAsync(It.IsAny<RouterBenchmarkRequest?>(), It.IsAny<CancellationToken>()))
+            .Callback<RouterBenchmarkRequest?, CancellationToken>((request, _) => captured = request)
+            .ReturnsAsync(new RouterBenchmarkRunResponse(true, ["Local"]));
+        WizardBenchmarkStepViewModel vm = null!;
+        vm = BuildBenchmark(mock, ct => vm.RefreshAsync(ct), GatedDelay);
+
+        await vm.OnStepEnteredAsync();
+        await WaitUntilAsync(() => vm.CandidateGroups.Count > 0 && vm.CandidateGroups[0].Models.Count == 2, "both candidate rows");
+
+        // Default state: the Pruned row is unchecked → it is excluded for the next run.
+        Assert.True(vm.CandidateGroups[0].Models.Single(m => m.Model == "fits-model").IsSelected);
+        Assert.False(vm.CandidateGroups[0].Models.Single(m => m.Model == "pruned-model").IsSelected);
+        await vm.RunBenchmarksCommand.ExecuteAsync(CancellationToken.None);
+        Assert.NotNull(captured);
+        Assert.NotNull(captured!.ExcludedModels);
+        Assert.Equal(["pruned-model"], captured.ExcludedModels!["Local"].ToArray());
+
+        // User override: check the Pruned row → CanRun stays true and the re-run sends it
+        // UN-excluded (the map is now empty → the absent-body null request of D5).
+        vm.CandidateGroups[0].Models.Single(m => m.Model == "pruned-model").IsSelected = true;
+        Assert.True(vm.RunBenchmarksCommand.CanExecute(null));
+        await vm.RunBenchmarksCommand.ExecuteAsync(CancellationToken.None);
+        var secondRequest = mock.Invocations
+            .Where(i => i.Method.Name == nameof(IOllamaRouterApiClient.StartBenchmarkAsync))
+            .Last().Arguments[0] as RouterBenchmarkRequest;
+        Assert.Null(secondRequest); // nothing unchecked anymore → null request (D5)
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step3_AllCandidatesPruned_RunDisabled_UntilUserChecksOne()
+    {
+        // Task #169 (AC2, item 10): a node where EVERY candidate is Pruned starts with zero
+        // selected rows — the Run command is disabled and a direct ExecuteAsync no-ops with
+        // the existing "select at least one" hint (zero StartBenchmarkAsync calls); checking
+        // ONE row (force-include) flips CanExecute to true.
+        var mock = MockClient();
+        var startCalls = 0;
+        mock.Setup(c => c.GetBenchmarkCandidatesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(
+            new RouterBenchmarkCandidatesResponse(
+            [
+                new RouterBenchmarkCandidateTarget("Local", null,
+                    [CandidateModel("pruned-a", BenchmarkCandidateFit.Pruned),
+                     CandidateModel("pruned-b", BenchmarkCandidateFit.Pruned)]),
+            ]));
+        mock.Setup(c => c.StartBenchmarkAsync(It.IsAny<RouterBenchmarkRequest?>(), It.IsAny<CancellationToken>()))
+            .Callback<RouterBenchmarkRequest?, CancellationToken>((_, _) => startCalls++)
+            .ReturnsAsync(new RouterBenchmarkRunResponse(true, ["Local"]));
+        WizardBenchmarkStepViewModel vm = null!;
+        vm = BuildBenchmark(mock, ct => vm.RefreshAsync(ct), GatedDelay);
+
+        await vm.OnStepEnteredAsync();
+        await WaitUntilAsync(() => vm.CandidateGroups.Count > 0 && vm.CandidateGroups[0].Models.Count == 2, "both pruned rows");
+
+        Assert.All(vm.CandidateGroups[0].Models, m => Assert.False(m.IsSelected));
+        Assert.False(vm.RunBenchmarksCommand.CanExecute(null));
+        await vm.RunBenchmarksCommand.ExecuteAsync(CancellationToken.None); // ExecuteAsync bypass
+        Assert.Equal(0, startCalls);
+        Assert.Equal("Select at least one candidate model to benchmark.", vm.Message);
+
+        // Checking one row (the user's force-include) re-enables Run.
+        vm.CandidateGroups[0].Models[0].IsSelected = true;
+        Assert.True(vm.RunBenchmarksCommand.CanExecute(null));
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step3_Reentry_WithPrunedRows_ReDefaultsPrunedUnselected_OthersSelected()
+    {
+        // Task #169 (AC2, item 11): entry → leave → entry re-defaults the selection WITH the
+        // Pruned semantics (extends the all-Fits D7 contract pinned by
+        // Step4_Reentry_CandidatePlanReloadedOnce_CheckboxesReDefaulted): the Pruned row is
+        // unchecked again, the Fits row re-selected, and the user's mid-run toggles on BOTH
+        // rows are discarded.
+        var mock = MockClient();
+        mock.Setup(c => c.GetBenchmarkCandidatesAsync(It.IsAny<CancellationToken>())).ReturnsAsync(
+            new RouterBenchmarkCandidatesResponse(
+            [
+                new RouterBenchmarkCandidateTarget("Local", null,
+                    [CandidateModel("fits-model", BenchmarkCandidateFit.Fits),
+                     CandidateModel("pruned-model", BenchmarkCandidateFit.Pruned)]),
+            ]));
+        WizardBenchmarkStepViewModel vm = null!;
+        vm = BuildBenchmark(mock, ct => vm.RefreshAsync(ct), GatedDelay);
+
+        await vm.OnStepEnteredAsync();
+        await WaitUntilAsync(() => vm.CandidateGroups.Count > 0 && vm.CandidateGroups[0].Models.Count == 2, "both candidate rows (first entry)");
+
+        // Mid-run scope: check the Pruned row AND uncheck the Fits row (both must be discarded).
+        vm.CandidateGroups[0].Models.Single(m => m.Model == "pruned-model").IsSelected = true;
+        vm.CandidateGroups[0].Models.Single(m => m.Model == "fits-model").IsSelected = false;
+        await vm.OnStepLeftAsync();
+        await vm.OnStepEnteredAsync(); // fresh entry = fresh run scope (task #152 D7)
+
+        // Guard Count > 0: the fresh entry's rebuild Clear()-ed the groups, so the unguarded
+        // [0] indexer throws while the repopulation is still landing (test-host-only race).
+        await WaitUntilAsync(
+            () => vm.CandidateGroups.Count > 0
+                && vm.CandidateGroups[0].Models.Single(m => m.Model == "pruned-model").IsSelected == false
+                && vm.CandidateGroups[0].Models.Single(m => m.Model == "fits-model").IsSelected,
+            "the re-defaulted selection (Pruned unchecked, Fits selected)");
         await vm.DisposeAsync();
     }
 
@@ -3509,7 +3825,10 @@ public sealed class SetupWizardViewModelsTests
             && vm.ResultRows.Count == 4
             && vm.ResultRows.Select(r => (r.Target, r.Model, r.NumCtx)).Distinct().Count() == 4;
         await WaitUntilAsync(Ac2Holds, "the AC2 dedup invariants to hold across 10+ ticks");
-        Assert.True(Ac2Holds(), "AC2: groups/rows must hold exactly once per key after 10+ ticks");
+        // The flood poller is still ticking, so the FINAL re-check itself may catch a
+        // mid-rebuild collection (test-host-only race) — re-verify over a short retry
+        // window (a genuine duplicate keeps the invariant false and fails below).
+        await AssertHoldsEventuallyAsync(Ac2Holds, "AC2: groups/rows must hold exactly once per key after 10+ ticks");
 
         // The command-side ClearResults interleave (the tick's rebuilds must never interleave
         // with its Clear()s — single-writer gate + UI marshaling).
@@ -3518,9 +3837,9 @@ public sealed class SetupWizardViewModelsTests
         await vm.OnStepLeftAsync(); // awaited → the loop fully exits
 
         // Settle: the cleared rows are REBUILT by the ticks — again exactly once per key
-        // (a final in-flight rebuild may still be landing → retried).
+        // (a final in-flight rebuild may still be landing → retried; see the first check).
         await WaitUntilAsync(Ac2Holds, "the AC2 dedup invariants to hold after the clear interleave");
-        Assert.True(Ac2Holds(), "AC2: groups/rows must hold exactly once per key after the clear interleave");
+        await AssertHoldsEventuallyAsync(Ac2Holds, "AC2: groups/rows must hold exactly once per key after the clear interleave");
         await vm.DisposeAsync();
     }
 
@@ -3575,6 +3894,81 @@ public sealed class SetupWizardViewModelsTests
             vm.RoleRows.Select(r => r.Role));
         Assert.All(vm.RoleRows, r => Assert.False(r.Benchmarked));
         Assert.Empty(vm.ModelRows);
+        await vm.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Task #169 (AC4, item 12): a fully MoE-assigned 5-role matrix (8 GB-only fleet — the
+    /// #168 dynamic role engine resolves EVERY role to a CPU-offload MoE model, node ceilings
+    /// ≥ the 128k eligibility floor) renders cleanly with NO code change: the 5 stable alias
+    /// rows all benchmarked with their MoE model name + non-empty node text, and the dedup
+    /// model index (the matrix's <c>Models</c> dict is keyed by native model name —
+    /// structurally deduplicated) shows the 2 MoE models ordinal-sorted.
+    /// </summary>
+    [Fact]
+    public async Task Step5_FullyMoEFiveRoleMatrix_RendersAllRolesAndDeduplicatedModelIndex()
+    {
+        var qwen = "jetelain/Qwen3.6-35B-A3B:q4";
+        var flint = "jetelain/Flint:q4";
+        // Hoisted locals: the nested object initializers inside the FleetRecommendations ctor
+        // arguments hit a C# parser ambiguity, so build each dictionary first.
+        var roles = new Dictionary<string, RoleRecommendation>
+        {
+            ["basic"] = new RoleRecommendation(
+                "basic", qwen, 131_072, "smallest fast general model",
+                [new NodeRoleProfile("Local", 131_072, null, 38.0, 4096)]),
+            ["agentic_chat"] = new RoleRecommendation(
+                "agentic_chat", qwen, 131_072, "agentic chat",
+                [new NodeRoleProfile("Local", 131_072, null, 30.0, 4096)]),
+            ["junior_developer"] = new RoleRecommendation(
+                "junior_developer", flint, 131_072, "junior developer",
+                [new NodeRoleProfile("Local", 131_072, null, 28.0, 4096)]),
+            ["software_architect"] = new RoleRecommendation(
+                "software_architect", flint, 131_072, "software architect",
+                [new NodeRoleProfile("Local", 131_072, null, 22.0, 4096)]),
+            ["senior_developer"] = new RoleRecommendation(
+                "senior_developer", flint, 131_072, "senior developer",
+                [new NodeRoleProfile("Local", 131_072, null, 21.0, 4096)]),
+        };
+        var models = new Dictionary<string, ModelNodeProfile>
+        {
+            [qwen] = new ModelNodeProfile(
+                qwen, "MoE", 262_144, "UD-Q4_K_XL",
+                [new NodeRoleProfile("Local", 131_072, null, 38.0, 4096)]),
+            [flint] = new ModelNodeProfile(
+                flint, "MoE", 262_144, "UD-Q4_K_XL",
+                [new NodeRoleProfile("Local", 131_072, null, 28.0, 4096)]),
+        };
+        var fake = new FakeRouterApiClient
+        {
+            Recommendations = new FleetRecommendations(DateTimeOffset.UtcNow, roles, models)
+        };
+        var vm = new WizardRecommendationsStepViewModel(() => fake);
+        await vm.RefreshAsync();
+
+        // The 5 role rows in the stable alias order — ALL benchmarked, each with its MoE
+        // model name and non-empty node text (ceilings ≥ the 128k floor).
+        Assert.Equal(5, vm.RoleRows.Count);
+        Assert.Equal(["basic", "agentic_chat", "software_architect", "senior_developer", "junior_developer"],
+            vm.RoleRows.Select(r => r.Role));
+        Assert.All(vm.RoleRows, r => Assert.True(r.Benchmarked));
+        Assert.Equal(qwen, vm.RoleRows.Single(r => r.Role == "basic").Model);
+        Assert.Equal(qwen, vm.RoleRows.Single(r => r.Role == "agentic_chat").Model);
+        Assert.Equal(flint, vm.RoleRows.Single(r => r.Role == "junior_developer").Model);
+        Assert.Equal(flint, vm.RoleRows.Single(r => r.Role == "software_architect").Model);
+        Assert.Equal(flint, vm.RoleRows.Single(r => r.Role == "senior_developer").Model);
+        Assert.All(vm.RoleRows, r =>
+        {
+            Assert.NotNull(r.Nodes);
+            Assert.Single(r.Nodes);
+            Assert.True(r.Nodes[0].ContextCeiling >= 131_072);
+            Assert.False(string.IsNullOrWhiteSpace(r.NodesText));
+        });
+
+        // The deduplicated model index: exactly the 2 MoE models, ordinal-sorted keys.
+        Assert.Equal(2, vm.ModelRows.Count);
+        Assert.Equal([flint, qwen], vm.ModelRows.Select(m => m.Model).ToArray());
+        Assert.All(vm.ModelRows, m => Assert.Equal("MoE", m.Architecture));
         await vm.DisposeAsync();
     }
 

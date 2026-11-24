@@ -1058,7 +1058,19 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
             Assert.Equal(candidate.TotalParams, row.TotalParams);
             Assert.Equal(candidate.ActiveParams, row.ActiveParams);
             Assert.Equal(candidate.NativeContext, row.NativeContext);
+            // Task #169 (item 5): the class metadata passes through from the catalog — the
+            // synthetic fixtures carry NO EstimatedWeightsMB (adding one would change their
+            // sizing verdicts and break the section-(b) run expectations).
+            Assert.Equal(candidate.ModelClass.ToString(), row.ModelClass);
+            Assert.Equal(candidate.AllowCpuOffload, row.AllowCpuOffload);
+            Assert.Null(row.EstimatedWeightsMB);
         }
+        Assert.Equal("Expert", bigGroup.Candidates[0].ModelClass);
+        Assert.False(bigGroup.Candidates[0].AllowCpuOffload);
+        Assert.Equal("Expert", bigGroup.Candidates[1].ModelClass);
+        Assert.False(bigGroup.Candidates[1].AllowCpuOffload);
+        Assert.Equal("MoE", bigGroup.Candidates[2].ModelClass);
+        Assert.True(bigGroup.Candidates[2].AllowCpuOffload);
         Assert.Equal(BenchmarkCandidateFit.Fits, bigGroup.Candidates[0].Fit);
         Assert.Equal(32_768, bigGroup.Candidates[0].MaxFitsContext);
         // The nativeContext cap: big:27b fits at 32k but its native context is 16k.
@@ -1132,6 +1144,36 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
         Assert.Single(empty.Targets);
         Assert.NotNull(empty.Targets[0].Candidates);
         Assert.Empty(empty.Targets[0].Candidates);
+    }
+
+    [Fact]
+    public void GetBenchmarkCandidates_CuratedDefaultCatalog_ReturnsAll7ModelsWithExactClassMetadata()
+    {
+        // Task #169 (AC1, item 6): the DEFAULT catalog (all 7 curated models) on a 96 GB
+        // node — every model reports its exact (ModelClass, AllowCpuOffload, EstimatedWeightsMB)
+        // pin in catalog order, and at 0.92 × 98_304 = 90_439.68 MiB budget the heaviest 256k
+        // residency (Ornith: 71_583 + 6_656 KV = 78_239 MiB) still fits, so all 7 = Fits @ 262_144.
+        var runner = CreateRunner(Profile(98_304), catalog: new CandidateModelCatalogOptions(), modelPresent: true);
+        var response = runner.GetBenchmarkCandidates();
+        Assert.Single(response.Targets);
+        var group = response.Targets[0];
+        var rows = group.Candidates;
+        Assert.Equal(7, rows.Count);
+
+        // Exact (ModelClass string, AllowCpuOffload, EstimatedWeightsMB) pins in catalog order.
+        Assert.Equal(("MoE", true, 23_859.0), (rows[0].ModelClass, rows[0].AllowCpuOffload, rows[0].EstimatedWeightsMB));
+        Assert.Equal(("MoE", true, 40_346.0), (rows[1].ModelClass, rows[1].AllowCpuOffload, rows[1].EstimatedWeightsMB));
+        Assert.Equal(("MoE", true, 22_528.0), (rows[2].ModelClass, rows[2].AllowCpuOffload, rows[2].EstimatedWeightsMB));
+        Assert.Equal(("MoE", true, 40_960.0), (rows[3].ModelClass, rows[3].AllowCpuOffload, rows[3].EstimatedWeightsMB));
+        Assert.Equal(("Expert", false, 12_288.0), (rows[4].ModelClass, rows[4].AllowCpuOffload, rows[4].EstimatedWeightsMB));
+        Assert.Equal(("Expert", false, 18_944.0), (rows[5].ModelClass, rows[5].AllowCpuOffload, rows[5].EstimatedWeightsMB));
+        Assert.Equal(("Expert", false, 71_583.0), (rows[6].ModelClass, rows[6].AllowCpuOffload, rows[6].EstimatedWeightsMB));
+
+        // All 7 fit on the 96 GB node at the full 256k ladder rung (recomputed truth via the
+        // shared CandidateSizingCalculator derivation — the Ornith anchor-verified 78_239 MiB
+        // 256k residency is the heaviest and is still under the 90_439.68 MiB budget).
+        Assert.All(rows, r => Assert.Equal(BenchmarkCandidateFit.Fits, r.Fit));
+        Assert.All(rows, r => Assert.Equal(262_144, r.MaxFitsContext));
     }
 
     // ------------------------------------------------------------------

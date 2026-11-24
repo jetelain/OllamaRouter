@@ -901,11 +901,21 @@ public sealed class OllamaRouterApiClientTests : IDisposable
                 Assert.Equal(65_536, r.Targets[0].Candidates[0].MaxFitsContext);
                 Assert.Equal([UsageRole.BasicModel], r.Targets[0].Candidates[0].Roles);
                 Assert.Null(r.Targets[0].Candidates[0].ActiveParams);
+                // Task #169: the curated-catalog class metadata (OllamaRouterClientJsonContext path).
+                Assert.Equal("Expert", r.Targets[0].Candidates[0].ModelClass);
+                Assert.False(r.Targets[0].Candidates[0].AllowCpuOffload);
+                Assert.Equal(4608.0, r.Targets[0].Candidates[0].EstimatedWeightsMB);
                 Assert.Equal(BenchmarkCandidateFit.Pruned, r.Targets[0].Candidates[1].Fit);
                 Assert.Equal(0, r.Targets[0].Candidates[1].MaxFitsContext);
+                Assert.Equal("Expert", r.Targets[0].Candidates[1].ModelClass);
+                Assert.False(r.Targets[0].Candidates[1].AllowCpuOffload);
+                Assert.Null(r.Targets[0].Candidates[1].EstimatedWeightsMB);
                 Assert.Null(r.Targets[1].Hardware);
                 Assert.Equal(BenchmarkCandidateFit.Assumed, r.Targets[1].Candidates[0].Fit);
                 Assert.Equal(131_072, r.Targets[1].Candidates[0].MaxFitsContext);
+                Assert.Equal("MoE", r.Targets[1].Candidates[0].ModelClass);
+                Assert.True(r.Targets[1].Candidates[0].AllowCpuOffload);
+                Assert.Equal(22_528.0, r.Targets[1].Candidates[0].EstimatedWeightsMB);
             }),
 
         ["GetBenchmarkResultsAsync"] = new(
@@ -1265,15 +1275,18 @@ public sealed class OllamaRouterApiClientTests : IDisposable
            "candidates":[
             {"model":"llama3:8b","roles":["BasicModel"],"quantization":"q4","architecture":"Dense",
              "totalParams":8000000000,"activeParams":null,"nativeContext":131072,
-             "fit":"Fits","maxFitsContext":65536},
+             "fit":"Fits","maxFitsContext":65536,
+             "modelClass":"Expert","allowCpuOffload":false,"estimatedWeightsMB":4608.0},
             {"model":"qwen3.8:27b","roles":["AgenticChat","SeniorDeveloper"],"quantization":"q4",
              "architecture":"Dense","totalParams":27800000000,"activeParams":null,"nativeContext":131072,
-             "fit":"Pruned","maxFitsContext":0}]},
+             "fit":"Pruned","maxFitsContext":0,
+             "modelClass":"Expert","allowCpuOffload":false,"estimatedWeightsMB":null}]},
           {"target":"Remote","hardware":null,
            "candidates":[
             {"model":"llama3:8b","roles":["BasicModel"],"quantization":"q4","architecture":"Dense",
              "totalParams":8000000000,"activeParams":null,"nativeContext":131072,
-             "fit":"Assumed","maxFitsContext":131072}]}]}
+             "fit":"Assumed","maxFitsContext":131072,
+             "modelClass":"MoE","allowCpuOffload":true,"estimatedWeightsMB":22528.0}]}]}
         """;
 
     private const string RecommendationsJson = """
@@ -1544,6 +1557,29 @@ public sealed class OllamaRouterApiClientTests : IDisposable
             public override void SetLength(long value) => throw new NotSupportedException();
             public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
         }
+    }
+
+    // ------------------------------------------------------------------ task #169: class-metadata wire tolerance
+
+    [Fact]
+    public void BenchmarkCandidate_LegacyShapeWithoutTheTask169Fields_DeserializesToConservativeDefaults()
+    {
+        // Task #169 (D2, AC5) — OLD daemon → NEW app: a candidate row WITHOUT the three
+        // class-metadata fields deserializes through OllamaRouterClientJsonContext to the
+        // conservative dense-strict defaults ("Expert" / false / null) instead of failing.
+        const string legacy = """
+            {"model":"qwen3.8:27b","roles":["AgenticChat","SeniorDeveloper"],"quantization":"q4",
+             "architecture":"Dense","totalParams":27800000000,"activeParams":null,"nativeContext":131072,
+             "fit":"Pruned","maxFitsContext":0}
+            """;
+
+        var candidate = JsonSerializer.Deserialize(legacy, OllamaRouterClientJsonContext.Default.RouterBenchmarkCandidateModel)!;
+        Assert.Equal("qwen3.8:27b", candidate.Model);
+        Assert.Equal(BenchmarkCandidateFit.Pruned, candidate.Fit);
+        Assert.Equal(0, candidate.MaxFitsContext);
+        Assert.Equal("Expert", candidate.ModelClass);
+        Assert.False(candidate.AllowCpuOffload);
+        Assert.Null(candidate.EstimatedWeightsMB);
     }
 
     // ------------------------------------------------------------------ fake handler

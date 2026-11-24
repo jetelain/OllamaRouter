@@ -115,6 +115,9 @@ public static class RouterBenchmarkEndpoints
                 + "(GPU, VRAM, bandwidth; null when unknown — no probe is triggered) and the EXACT catalog candidate set the "
                 + "run loop would benchmark for that target, each with its pre-flight fit verdict (Fits / Pruned / Assumed) + "
                 + "the largest surviving ladder context (capped by the model's nativeContext; 0 when Pruned). "
+                + "Each candidate also carries the curated-catalog class metadata (task #169): modelClass (\"MoE\"/\"Expert\"), "
+                + "allowCpuOffload (the sizing CPU-offload gate) and estimatedWeightsMB in MiB (the measured resident sizing "
+                + "anchor, null when the model has no curated anchor). "
                 + "Read-only, no network calls. Read-only — no key required in default mode.");
         app.MapGet("/api/router/benchmark/results", (IMicroBenchmarkRunner benchmarkRunner) =>
         {
