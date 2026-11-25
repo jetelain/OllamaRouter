@@ -137,7 +137,7 @@ public sealed class OllamaRouterDaemonLauncher : IOllamaRouterDaemonLauncher
     /// <c>http://127.0.0.1:11434/</c>), <paramref name="apiKey"/>, <paramref name="keyReader"/>
     /// and <paramref name="httpClient"/> (the standard client auth/timeout semantics apply).
     /// All timeout overrides must be positive (defaults: probe 2 s, start poll 250 ms, start
-    /// timeout 5 s, stop-exit timeout 10 s).
+    /// timeout 15 s, stop-exit timeout 10 s).
     /// </summary>
     public OllamaRouterDaemonLauncher(
         Uri? baseUrl = null,
@@ -175,7 +175,7 @@ public sealed class OllamaRouterDaemonLauncher : IOllamaRouterDaemonLauncher
         _installDirectory = string.IsNullOrWhiteSpace(installDirectory) ? null : installDirectory;
         _probeTimeout = RequirePositive(probeTimeout ?? TimeSpan.FromSeconds(2), "probeTimeout");
         _startPollInterval = RequirePositive(startPollInterval ?? TimeSpan.FromMilliseconds(250), "startPollInterval");
-        _startTimeout = RequirePositive(startTimeout ?? TimeSpan.FromSeconds(5), "startTimeout");
+        _startTimeout = RequirePositive(startTimeout ?? TimeSpan.FromSeconds(15), "startTimeout");
         _stopExitTimeout = RequirePositive(stopExitTimeout ?? TimeSpan.FromSeconds(10), "stopExitTimeout");
     }
 

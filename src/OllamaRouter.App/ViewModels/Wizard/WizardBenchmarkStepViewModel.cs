@@ -33,7 +33,8 @@ public sealed partial class BenchmarkCandidateRow : ObservableObject
         string rolesText,
         string fitText,
         Action selectionChanged,
-        bool isSelected = true)
+        bool isSelected = true,
+        bool isPruned = false)
     {
         Target = target ?? throw new ArgumentNullException(nameof(target));
         Model = model ?? throw new ArgumentNullException(nameof(model));
@@ -42,6 +43,7 @@ public sealed partial class BenchmarkCandidateRow : ObservableObject
         FitText = fitText;
         _selectionChanged = selectionChanged ?? throw new ArgumentNullException(nameof(selectionChanged));
         _isSelected = isSelected;
+        IsPruned = isPruned;
     }
 
     /// <summary>The target (group) this candidate is tested on.</summary>
@@ -49,6 +51,9 @@ public sealed partial class BenchmarkCandidateRow : ObservableObject
 
     /// <summary>The catalog candidate model name.</summary>
     public string Model { get; }
+
+    /// <summary>Whether pre-flight sizing marked this candidate as pruned (does not fit).</summary>
+    public bool IsPruned { get; }
 
     /// <summary>
     /// The class/offload/size annotation (task #169, display only):
@@ -216,6 +221,100 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
     [ObservableProperty]
     private bool _isBusy;
 
+    public bool HasMessage => !string.IsNullOrWhiteSpace(Message);
+
+    public bool HasError => !string.IsNullOrWhiteSpace(Error);
+
+    public bool HasCandidates => CandidateGroups.Count > 0;
+
+    public bool HasBenchmarkRows => BenchmarkRows.Count > 0;
+
+    public bool HasResultRows => ResultRows.Count > 0;
+
+    public bool IsBenchmarkRunning => BenchmarkRows.ToList().Any(r => !IsTerminal(r.Status));
+
+    public double ProgressPercent
+    {
+        get
+        {
+            var snapshot = BenchmarkRows.ToList();
+            if (_queuedTargets.Count > 0)
+            {
+                var done = _queuedTargets.Count(name =>
+                    snapshot.FirstOrDefault(r => string.Equals(r.Target, name, StringComparison.OrdinalIgnoreCase)) is { } row
+                    && IsTerminal(row.Status));
+                return (done * 100.0) / _queuedTargets.Count;
+            }
+
+            if (snapshot.Count > 0)
+            {
+                var done = snapshot.Count(r => IsTerminal(r.Status));
+                return (done * 100.0) / snapshot.Count;
+            }
+
+            return 0.0;
+        }
+    }
+
+    public string ProgressSummaryText
+    {
+        get
+        {
+            var snapshot = BenchmarkRows.ToList();
+            if (_queuedTargets.Count > 0)
+            {
+                var done = _queuedTargets.Count(name =>
+                    snapshot.FirstOrDefault(r => string.Equals(r.Target, name, StringComparison.OrdinalIgnoreCase)) is { } row
+                    && IsTerminal(row.Status));
+                return $"{done} / {_queuedTargets.Count} target(s) finished";
+            }
+
+            if (snapshot.Count > 0)
+            {
+                var done = snapshot.Count(r => IsTerminal(r.Status));
+                return done == snapshot.Count
+                    ? $"{snapshot.Count} target(s) finished"
+                    : $"{done} / {snapshot.Count} target(s) finished";
+            }
+
+            return string.Empty;
+        }
+    }
+
+    partial void OnMessageChanged(string? value) => OnPropertyChanged(nameof(HasMessage));
+
+    partial void OnErrorChanged(string? value) => OnPropertyChanged(nameof(HasError));
+
+    /// <summary>Selects all candidates that fit (unchecks pre-flight pruned models).</summary>
+    [RelayCommand(CanExecute = nameof(CanSelectCandidates))]
+    private void SelectFittingOnly()
+    {
+        foreach (var group in CandidateGroups.ToList())
+        {
+            foreach (var model in group.Models)
+            {
+                model.IsSelected = !model.IsPruned;
+            }
+        }
+        NotifyRunCanExecute();
+    }
+
+    /// <summary>Unchecks all candidate models.</summary>
+    [RelayCommand(CanExecute = nameof(CanSelectCandidates))]
+    private void SelectNone()
+    {
+        foreach (var group in CandidateGroups.ToList())
+        {
+            foreach (var model in group.Models)
+            {
+                model.IsSelected = false;
+            }
+        }
+        NotifyRunCanExecute();
+    }
+
+    private bool CanSelectCandidates() => !IsBusy && CandidateGroups.Count > 0;
+
     /// <summary>
     /// Queues a benchmark run over the SELECTED candidate models (task #152): the unchecked
     /// boxes become the per-target <c>excludedModels</c> map of <c>POST /api/router/benchmark</c>
@@ -291,6 +390,7 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
                 : null;
             var response = await _clientAccessor().StartBenchmarkAsync(request).ConfigureAwait(false);
             _queuedTargets = response.QueuedTargets.ToList();
+            NotifyBenchmarkProgressChanged();
             Error = null;
             Message = _queuedTargets.Count == 0
                 ? "No active non-Cloud targets to benchmark — add a node in Step 2 first."
@@ -305,11 +405,13 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
         }
         catch (OllamaRouterApiException ex)
         {
+            Message = null;
             Error = $"Router error {(int)ex.Status}: {ex.Error ?? "(no error body)"}";
             _logger.Warning("Wizard step 4: benchmark run failed: {Error}", Error);
         }
         catch (System.Net.Http.HttpRequestException ex)
         {
+            Message = null;
             Error = $"Connection failed: {ex.Message}";
             _logger.Warning("Wizard step 4: benchmark run failed: {Error}", Error);
         }
@@ -339,6 +441,7 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
                 {
                     BenchmarkRows.Clear();
                     ResultRows.Clear();
+                    NotifyBenchmarkProgressChanged();
                 });
             }
             finally
@@ -348,16 +451,23 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
 
             Message = "Benchmark results cleared.";
             _logger.Information("Wizard step 4: results cleared");
+            await RefreshAsync(CancellationToken.None).ConfigureAwait(false);
         }
         catch (OllamaRouterApiException ex)
         {
+            Message = null;
             Error = $"Router error {(int)ex.Status}: {ex.Error ?? "(no error body)"}";
+            _logger.Warning("Wizard step 4: clearing results failed: {Error}", Error);
+        }
+        catch (System.Net.Http.HttpRequestException ex)
+        {
+            Message = null;
+            Error = $"Connection failed: {ex.Message}";
             _logger.Warning("Wizard step 4: clearing results failed: {Error}", Error);
         }
         finally
         {
             IsBusy = false;
-            await RefreshAsync(CancellationToken.None).ConfigureAwait(false);
         }
     }
 
@@ -537,7 +647,8 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
                     NotifyRunCanExecute,
                     // Task #169 (D3): pre-flight Pruned candidates start UNCHECKED (no
                     // pre-checked 70+ GB model on an 8 GB node) but stay fully toggleable.
-                    isSelected: candidate.Fit != BenchmarkCandidateFit.Pruned));
+                    isSelected: candidate.Fit != BenchmarkCandidateFit.Pruned,
+                    isPruned: candidate.Fit == BenchmarkCandidateFit.Pruned));
             }
 
             groups.Add(new BenchmarkCandidateGroupRow
@@ -568,6 +679,9 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
             {
                 CandidateGroups.Add(group);
             }
+            OnPropertyChanged(nameof(HasCandidates));
+            SelectFittingOnlyCommand.NotifyCanExecuteChanged();
+            SelectNoneCommand.NotifyCanExecuteChanged();
             NotifyRunCanExecute();
         });
     }
@@ -611,7 +725,8 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
         return string.Join(", ", roles.Select(r => r.ToString()));
     }
 
-    private void NotifyRunCanExecute() => RunBenchmarksCommand.NotifyCanExecuteChanged();
+    private void NotifyRunCanExecute() =>
+        WizardUiThread.InvokeOrPost(() => RunBenchmarksCommand.NotifyCanExecuteChanged());
 
     /// <summary>Builds the benchmark/result rows on the calling thread, then marshles one
     /// UI-thread action that rebuilds BOTH <see cref="BenchmarkRows"/> and
@@ -661,7 +776,18 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
             {
                 ResultRows.Add(row);
             }
+
+            NotifyBenchmarkProgressChanged();
         });
+    }
+
+    private void NotifyBenchmarkProgressChanged()
+    {
+        OnPropertyChanged(nameof(HasBenchmarkRows));
+        OnPropertyChanged(nameof(HasResultRows));
+        OnPropertyChanged(nameof(IsBenchmarkRunning));
+        OnPropertyChanged(nameof(ProgressPercent));
+        OnPropertyChanged(nameof(ProgressSummaryText));
     }
 
     /// <summary>
@@ -681,7 +807,8 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
         // defensive.
         var rows = BenchmarkRows.ToList();
         var allTerminal = _queuedTargets.All(name =>
-            rows.FirstOrDefault(r => r.Target == name) is { } row && IsTerminal(row.Status));
+            rows.FirstOrDefault(r => string.Equals(r.Target, name, StringComparison.OrdinalIgnoreCase)) is { } row
+            && IsTerminal(row.Status));
         if (allTerminal)
         {
             var poller = _poller;
@@ -699,8 +826,13 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
 
     partial void OnIsBusyChanged(bool value)
     {
-        RunBenchmarksCommand.NotifyCanExecuteChanged();
-        ClearResultsCommand.NotifyCanExecuteChanged();
+        WizardUiThread.InvokeOrPost(() =>
+        {
+            RunBenchmarksCommand.NotifyCanExecuteChanged();
+            ClearResultsCommand.NotifyCanExecuteChanged();
+            SelectFittingOnlyCommand.NotifyCanExecuteChanged();
+            SelectNoneCommand.NotifyCanExecuteChanged();
+        });
     }
 
     private static async Task RunOnUiAsync(Action action)

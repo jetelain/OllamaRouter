@@ -113,7 +113,18 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
     private string? _message;
 
     [ObservableProperty]
+    private bool _messageIsError;
+
+    [ObservableProperty]
     private bool _isBusy;
+
+    public bool HasMessage => !string.IsNullOrWhiteSpace(Message);
+
+    public bool HasModels => ModelRows.Count > 0;
+
+    public bool HasAppliedTargets => AppliedTargets.Count > 0;
+
+    partial void OnMessageChanged(string? value) => OnPropertyChanged(nameof(HasMessage));
 
     /// <summary>One-line generated-counts summary (raises <see cref="PropertyChanged"/> below).</summary>
     public string SummaryText => RolesAssigned > 0
@@ -147,14 +158,101 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
             var matrix = await _clientAccessor().GetRecommendationsAsync(ct).ConfigureAwait(false);
             // Task #163: the rebuild runs on the UI thread (the FleetTargetsViewModel pattern).
             await RunOnUiAsync(() => LoadMatrix(matrix));
+            if (MessageIsError)
+            {
+                MessageIsError = false;
+                Message = null;
+            }
         }
         catch (OllamaRouterApiException ex)
         {
+            MessageIsError = true;
             Message = $"Router error {(int)ex.Status}: {ex.Error ?? "(no error body)"}";
         }
         catch (System.Net.Http.HttpRequestException ex)
         {
+            MessageIsError = true;
             Message = $"Connection failed: {ex.Message}";
+        }
+    }
+
+    /// <summary>Generates recommendations from benchmark results and immediately applies
+    /// them as per-node context ceilings in one click.</summary>
+    [RelayCommand(CanExecute = nameof(CanAct))]
+    private async Task GenerateAndApply()
+    {
+        IsBusy = true;
+        var generatedOk = false;
+        try
+        {
+            var generated = await _clientAccessor().GenerateRecommendationsAsync().ConfigureAwait(false);
+            generatedOk = true;
+            _canGoToBenchmark = false;
+            WizardUiThread.InvokeOrPost(() => GoToBenchmarkCommand.NotifyCanExecuteChanged());
+            GeneratedAt = generated.GeneratedAt;
+            RolesAssigned = generated.Recommendations.Roles.Count;
+            NodesConfigured = generated.Targets.Count;
+            TotalContextCeilings = generated.Recommendations.Roles.Values.Sum(r => r.Nodes.Count);
+            await RunOnUiAsync(() => LoadMatrix(generated.Recommendations));
+            _logger.Information(
+                "Wizard step 5: recommendations generated ({Roles} role(s), {Nodes} node(s))",
+                RolesAssigned, NodesConfigured);
+
+            var applied = await _clientAccessor().ApplyRecommendationsAsync().ConfigureAwait(false);
+            GeneratedAt = applied.GeneratedAt;
+            var appliedList = applied.Targets;
+            await RunOnUiAsync(() =>
+            {
+                AppliedTargets.Clear();
+                if (appliedList is not null)
+                {
+                    foreach (var target in appliedList)
+                    {
+                        AppliedTargets.Add(target);
+                    }
+                }
+                OnPropertyChanged(nameof(HasAppliedTargets));
+            });
+
+            MessageIsError = false;
+            var ceilingSummary = appliedList is null || appliedList.Count == 0
+                ? "no per-target ceilings"
+                : string.Join(", ", appliedList.Select(t => $"{t.Target} → {t.MaxContextCeiling}"));
+            Message = $"Generated {RolesAssigned} role assignment(s) and applied ceilings ({ceilingSummary}).";
+            _logger.Information("Wizard step 5: recommendations applied ({Summary})", Message);
+        }
+        catch (OllamaRouterApiException ex) when (ex.Status == HttpStatusCode.Conflict)
+        {
+            if (!generatedOk)
+            {
+                _logger.Information("Wizard step 5: recommendations generate — none available (409 — benchmark first)");
+                MessageIsError = true;
+                Message = "No benchmark results available — run the Step 4 micro-benchmark first";
+                _canGoToBenchmark = true;
+                WizardUiThread.InvokeOrPost(() => GoToBenchmarkCommand.NotifyCanExecuteChanged());
+            }
+            else
+            {
+                _logger.Warning("Wizard step 5: recommendations apply failed (409 — nothing to apply)");
+                MessageIsError = true;
+                Message = "Recommendations were generated, but could not be applied — generate or benchmark again.";
+            }
+        }
+        catch (OllamaRouterApiException ex)
+        {
+            _logger.Warning("Wizard step 5: recommendations generate/apply failed: {Message}", ex.Message);
+            MessageIsError = true;
+            Message = $"Router error {(int)ex.Status}: {ex.Error ?? "(no error body)"}";
+        }
+        catch (System.Net.Http.HttpRequestException ex)
+        {
+            _logger.Warning("Wizard step 5: recommendations generate/apply failed: {Message}", ex.Message);
+            MessageIsError = true;
+            Message = $"Connection failed: {ex.Message}";
+        }
+        finally
+        {
+            IsBusy = false;
         }
     }
 
@@ -166,6 +264,8 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
         try
         {
             var response = await _clientAccessor().GenerateRecommendationsAsync().ConfigureAwait(false);
+            _canGoToBenchmark = false;
+            WizardUiThread.InvokeOrPost(() => GoToBenchmarkCommand.NotifyCanExecuteChanged());
             GeneratedAt = response.GeneratedAt;
             RolesAssigned = response.Recommendations.Roles.Count;
             NodesConfigured = response.Targets.Count;
@@ -175,24 +275,28 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
             _logger.Information(
                 "Wizard step 5: recommendations generated ({Roles} role(s), {Nodes} node(s))",
                 RolesAssigned, NodesConfigured);
+            MessageIsError = false;
             Message = $"Generated {RolesAssigned} role assignment(s) across {NodesConfigured} node(s) " +
                       $"({TotalContextCeilings} context ceiling(s)).";
         }
         catch (OllamaRouterApiException ex) when (ex.Status == HttpStatusCode.Conflict)
         {
             _logger.Information("Wizard step 5: recommendations generate — none available (409 — benchmark first)");
+            MessageIsError = true;
             Message = "No benchmark results available — run the Step 4 micro-benchmark first";
             _canGoToBenchmark = true;
-            GoToBenchmarkCommand.NotifyCanExecuteChanged();
+            WizardUiThread.InvokeOrPost(() => GoToBenchmarkCommand.NotifyCanExecuteChanged());
         }
         catch (OllamaRouterApiException ex)
         {
             _logger.Warning("Wizard step 5: recommendations generate failed: {Message}", ex.Message);
+            MessageIsError = true;
             Message = $"Router error {(int)ex.Status}: {ex.Error ?? "(no error body)"}";
         }
         catch (System.Net.Http.HttpRequestException ex)
         {
             _logger.Warning("Wizard step 5: recommendations generate failed: {Message}", ex.Message);
+            MessageIsError = true;
             Message = $"Connection failed: {ex.Message}";
         }
         finally
@@ -222,8 +326,10 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
                         AppliedTargets.Add(target);
                     }
                 }
+                OnPropertyChanged(nameof(HasAppliedTargets));
             });
 
+            MessageIsError = false;
             Message = response.Targets is null || response.Targets.Count == 0
                 ? "Applied (no per-target ceilings)."
                 : "Applied: " + string.Join(", ", response.Targets.Select(t => $"{t.Target} → {t.MaxContextCeiling}"));
@@ -232,16 +338,19 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
         catch (OllamaRouterApiException ex) when (ex.Status == HttpStatusCode.Conflict)
         {
             _logger.Warning("Wizard step 5: recommendations apply failed (409 — nothing to apply)");
+            MessageIsError = true;
             Message = "No recommendations to apply — generate them first.";
         }
         catch (OllamaRouterApiException ex)
         {
             _logger.Warning("Wizard step 5: recommendations apply failed: {Message}", ex.Message);
+            MessageIsError = true;
             Message = $"Router error {(int)ex.Status}: {ex.Error ?? "(no error body)"}";
         }
         catch (System.Net.Http.HttpRequestException ex)
         {
             _logger.Warning("Wizard step 5: recommendations apply failed: {Message}", ex.Message);
+            MessageIsError = true;
             Message = $"Connection failed: {ex.Message}";
         }
         finally
@@ -259,7 +368,7 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
 
     private bool CanAct() => !IsBusy;
 
-    private bool CanGoToBenchmark() => _canGoToBenchmark;
+    private bool CanGoToBenchmark() => _canGoToBenchmark && !IsBusy;
 
     private void LoadMatrix(FleetRecommendations matrix)
     {
@@ -312,6 +421,7 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
                 NodeCount = profile.Nodes.Count,
             });
         }
+        OnPropertyChanged(nameof(HasModels));
     }
 
     /// <summary>Step lifecycle: refresh the matrix on entry.</summary>
@@ -322,8 +432,13 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
 
     partial void OnIsBusyChanged(bool value)
     {
-        GenerateCommand.NotifyCanExecuteChanged();
-        ApplyCommand.NotifyCanExecuteChanged();
+        WizardUiThread.InvokeOrPost(() =>
+        {
+            GenerateAndApplyCommand.NotifyCanExecuteChanged();
+            GenerateCommand.NotifyCanExecuteChanged();
+            ApplyCommand.NotifyCanExecuteChanged();
+            GoToBenchmarkCommand.NotifyCanExecuteChanged();
+        });
     }
 
     private static async Task RunOnUiAsync(Action action)

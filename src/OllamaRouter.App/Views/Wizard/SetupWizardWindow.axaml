@@ -7,66 +7,142 @@
         x:DataType="wvm:SetupWizardViewModel"
         Title="OllamaRouter Setup"
         Icon="avares://ollamarouter-app/Assets/icon.ico"
-        Width="1020" Height="700"
-        MinWidth="860" MinHeight="560">
-  <DockPanel>
-    <!-- Task #150: branding header (OllamaRouter name + logo) — Setup Wizard window ONLY,
-         docked ABOVE the step strip (the main app window is untouched). -->
-    <Border DockPanel.Dock="Top" Padding="12,8"
+        Width="980"
+        Height="760"
+        MinWidth="820"
+        MinHeight="600"
+        WindowStartupLocation="CenterScreen">
+  <Grid RowDefinitions="Auto,Auto,Auto,*,Auto" Margin="18" RowSpacing="12">
+
+    <!-- Branding Header Card (NightCodeForge Installer shell parity) -->
+    <Border Grid.Row="0"
+            Padding="14"
+            CornerRadius="8"
             Background="{DynamicResource NightCodeBgSurface}"
-            BorderBrush="{DynamicResource SemiColorBorder}" BorderThickness="0,0,0,1">
-      <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
-        <Image Source="avares://ollamarouter-app/Assets/icon.ico" Width="28" Height="28"/>
-        <TextBlock Text="OllamaRouter" FontSize="18" FontWeight="Bold" Foreground="{DynamicResource SemiColorText0}"
-                   VerticalAlignment="Center"/>
-      </StackPanel>
+            BorderBrush="{DynamicResource SemiColorBorder}"
+            BorderThickness="1">
+      <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="12">
+        <Image Grid.Column="0"
+               Source="avares://ollamarouter-app/Assets/icon.ico"
+               Width="30"
+               Height="30"
+               VerticalAlignment="Center" />
+        <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="2">
+          <StackPanel Orientation="Horizontal" Spacing="0">
+            <TextBlock Text="Ollama" FontSize="18" FontWeight="Bold" />
+            <TextBlock Text="Router" FontSize="18" FontWeight="ExtraBold"
+                       Foreground="{DynamicResource NightCodeAccentIndigoLightText}" />
+          </StackPanel>
+          <TextBlock Text="Setup Wizard &amp; Fleet Configuration"
+                     FontSize="11"
+                     Foreground="{DynamicResource SemiColorText2}" />
+        </StackPanel>
+        <Border Grid.Column="2"
+                Padding="10,4"
+                CornerRadius="6"
+                Background="{DynamicResource NightCodeBgInput}"
+                BorderBrush="{DynamicResource SemiColorBorder}"
+                BorderThickness="1"
+                VerticalAlignment="Center">
+          <TextBlock Text="{Binding DaemonBadgeText}"
+                     FontSize="11"
+                     FontWeight="SemiBold"
+                     Foreground="{DynamicResource SemiColorText1}" />
+        </Border>
+      </Grid>
     </Border>
-    <!-- 5-step progress header (task #151): all titles visible, the active step is bold -->
-    <Border DockPanel.Dock="Top" Padding="12,10"
+
+    <!-- Global Daemon Recovery Banner (Steps 2-5 when daemon is down or port is conflicted) -->
+    <Border Grid.Row="1"
+            IsVisible="{Binding ShowDaemonWarningBanner}"
+            Padding="10,8"
+            CornerRadius="6"
+            Background="{DynamicResource SemiColorDangerLight}"
+            BorderBrush="{DynamicResource SemiColorDanger}"
+            BorderThickness="1">
+      <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
+        <TextBlock Grid.Column="0"
+                   Text="{Binding DaemonBannerMessage}"
+                   FontSize="12"
+                   Foreground="{DynamicResource NightCodeAccentCrimsonLightText}"
+                   TextWrapping="Wrap"
+                   VerticalAlignment="Center" />
+        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+          <Button Content="Start Router"
+                  Classes="Primary"
+                  Command="{Binding StartRouterFromBannerCommand}"
+                  IsVisible="{Binding ShowInlineStartRouterButton}" />
+          <Button Content="Go to Step 1"
+                  Command="{Binding GoToStep1Command}" />
+        </StackPanel>
+      </Grid>
+    </Border>
+
+    <!-- 5-Step Progress Indicator -->
+    <Border Grid.Row="2"
+            Padding="14,10"
+            CornerRadius="8"
             Background="{DynamicResource NightCodeBgSurface}"
-            BorderBrush="{DynamicResource SemiColorBorder}" BorderThickness="0,0,0,1">
-      <StackPanel Orientation="Horizontal" Spacing="18">
+            BorderBrush="{DynamicResource SemiColorBorder}"
+            BorderThickness="1">
+      <StackPanel Orientation="Horizontal" Spacing="20" HorizontalAlignment="Center">
         <TextBlock Text="1 · Local Ollama"
-                   FontWeight="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToFontWeightConverter.Instance}, ConverterParameter=0}"/>
+                   FontWeight="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToFontWeightConverter.Instance}, ConverterParameter=0}"
+                   Foreground="{Binding SelectedStep, Converter={x:Static conv:WizardStepForegroundConverter.Instance}, ConverterParameter=0}" />
         <TextBlock Text="2 · Fleet Targets"
-                   FontWeight="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToFontWeightConverter.Instance}, ConverterParameter=1}"/>
+                   FontWeight="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToFontWeightConverter.Instance}, ConverterParameter=1}"
+                   Foreground="{Binding SelectedStep, Converter={x:Static conv:WizardStepForegroundConverter.Instance}, ConverterParameter=1}" />
         <TextBlock Text="3 · Cloud &amp; Providers"
-                   FontWeight="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToFontWeightConverter.Instance}, ConverterParameter=2}"/>
+                   FontWeight="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToFontWeightConverter.Instance}, ConverterParameter=2}"
+                   Foreground="{Binding SelectedStep, Converter={x:Static conv:WizardStepForegroundConverter.Instance}, ConverterParameter=2}" />
         <TextBlock Text="4 · Micro-Benchmark"
-                   FontWeight="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToFontWeightConverter.Instance}, ConverterParameter=3}"/>
+                   FontWeight="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToFontWeightConverter.Instance}, ConverterParameter=3}"
+                   Foreground="{Binding SelectedStep, Converter={x:Static conv:WizardStepForegroundConverter.Instance}, ConverterParameter=3}" />
         <TextBlock Text="5 · Recommendations"
-                   FontWeight="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToFontWeightConverter.Instance}, ConverterParameter=4}"/>
+                   FontWeight="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToFontWeightConverter.Instance}, ConverterParameter=4}"
+                   Foreground="{Binding SelectedStep, Converter={x:Static conv:WizardStepForegroundConverter.Instance}, ConverterParameter=4}" />
       </StackPanel>
     </Border>
 
-    <!-- Bottom navigation bar (Finish is the only hard gate) -->
-    <Border DockPanel.Dock="Bottom" Padding="12,10"
-            Background="{DynamicResource NightCodeBgSurface}"
-            BorderBrush="{DynamicResource SemiColorBorder}" BorderThickness="0,1,0,0">
-      <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
-        <Button Content="Back" Command="{Binding BackCommand}"/>
-        <Button Content="Next" Classes="Primary" Command="{Binding NextCommand}"/>
-        <Button Content="Finish" Classes="Primary" Command="{Binding FinishCommand}"/>
-      </StackPanel>
-    </Border>
-
-    <!-- Step body: all five overlap (task #151); visibility driven by SelectedStep -->
-    <Grid>
+    <!-- Step Content Panels -->
+    <Grid Grid.Row="3">
       <Border IsVisible="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToVisibilityConverter.Instance}, ConverterParameter=0}">
-        <views:WizardEnvironmentStepView DataContext="{Binding EnvironmentStep}"/>
+        <views:WizardEnvironmentStepView DataContext="{Binding EnvironmentStep}" />
       </Border>
       <Border IsVisible="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToVisibilityConverter.Instance}, ConverterParameter=1}">
-        <views:WizardTargetsStepView DataContext="{Binding TargetsStep}"/>
+        <views:WizardTargetsStepView DataContext="{Binding TargetsStep}" />
       </Border>
       <Border IsVisible="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToVisibilityConverter.Instance}, ConverterParameter=2}">
-        <views:WizardCloudStepView DataContext="{Binding CloudStep}"/>
+        <views:WizardCloudStepView DataContext="{Binding CloudStep}" />
       </Border>
       <Border IsVisible="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToVisibilityConverter.Instance}, ConverterParameter=3}">
-        <views:WizardBenchmarkStepView DataContext="{Binding BenchmarkStep}"/>
+        <views:WizardBenchmarkStepView DataContext="{Binding BenchmarkStep}" />
       </Border>
       <Border IsVisible="{Binding SelectedStep, Converter={x:Static conv:IntEqualityToVisibilityConverter.Instance}, ConverterParameter=4}">
-        <views:WizardRecommendationsStepView DataContext="{Binding RecommendationsStep}"/>
+        <views:WizardRecommendationsStepView DataContext="{Binding RecommendationsStep}" />
       </Border>
     </Grid>
-  </DockPanel>
+
+    <!-- Navigation Footer Card -->
+    <Border Grid.Row="4"
+            Padding="12,10"
+            CornerRadius="8"
+            Background="{DynamicResource NightCodeBgSurface}"
+            BorderBrush="{DynamicResource SemiColorBorder}"
+            BorderThickness="1">
+      <Grid ColumnDefinitions="*,Auto">
+        <TextBlock Grid.Column="0"
+                   Text="OllamaRouter Setup Wizard"
+                   FontSize="12"
+                   Foreground="{DynamicResource SemiColorText2}"
+                   VerticalAlignment="Center" />
+        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
+          <Button Content="Back" Command="{Binding BackCommand}" />
+          <Button Content="Next" Classes="Primary" Command="{Binding NextCommand}" />
+          <Button Content="Finish" Classes="Primary" Command="{Binding FinishCommand}" />
+        </StackPanel>
+      </Grid>
+    </Border>
+
+  </Grid>
 </Window>

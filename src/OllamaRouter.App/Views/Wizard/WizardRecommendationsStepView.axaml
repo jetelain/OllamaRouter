@@ -1,76 +1,159 @@
 <UserControl xmlns="https://github.com/avaloniaui"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:conv="using:OllamaRouter.App.Converters"
              xmlns:vm="using:OllamaRouter.App.ViewModels.Wizard"
              xmlns:rec="using:OllamaRouter.Endpoints.RouterApi.Recommendations"
              x:Class="OllamaRouter.App.Views.Wizard.WizardRecommendationsStepView"
              x:DataType="vm:WizardRecommendationsStepViewModel">
-  <ScrollViewer Padding="12">
+  <ScrollViewer>
     <StackPanel Spacing="12">
-      <TextBlock Text="Step 5 — Role Recommendations" FontSize="18" FontWeight="Bold"/>
-      <TextBlock TextWrapping="Wrap"
-                 Text="Generate a role-to-model assignment from the Step 4 benchmark evidence, then apply it as per-node context ceilings."/>
 
-      <StackPanel Orientation="Horizontal" Spacing="8">
-        <Button Content="Generate recommendations" Command="{Binding GenerateCommand}"/>
-        <Button Content="Apply recommendations" Command="{Binding ApplyCommand}"/>
-        <Button Content="Go to benchmark" Command="{Binding GoToBenchmarkCommand}"/>
-      </StackPanel>
-
-      <StackPanel Orientation="Horizontal" Spacing="16">
-        <TextBlock Text="{Binding GeneratedAtText}"/>
-        <TextBlock Text="{Binding SummaryText}" Foreground="{DynamicResource SemiColorText2}"/>
-      </StackPanel>
-
-      <!-- Role matrix (stable 5-alias order; absent roles show the benchmark hint) -->
-      <TextBlock Text="Roles" FontWeight="SemiBold"/>
-      <ItemsControl ItemsSource="{Binding RoleRows}">
-        <ItemsControl.ItemTemplate>
-          <DataTemplate x:DataType="vm:RecommendationRoleRow">
-            <StackPanel Spacing="2" Margin="0,3">
-              <StackPanel Orientation="Horizontal" Spacing="10">
-                <TextBlock Text="{Binding Role}" Width="170" FontWeight="SemiBold"/>
-                <TextBlock Text="{Binding Model}" Width="200"/>
-                <TextBlock Text="{Binding ContextText}" Width="90"/>
-              </StackPanel>
-              <TextBlock Text="{Binding Description}" Foreground="{DynamicResource SemiColorText2}"/>
-              <TextBlock Text="{Binding NodesText}" Foreground="{DynamicResource SemiColorSuccess}"/>
+      <!-- Header & Action Card -->
+      <Border Padding="14"
+              CornerRadius="8"
+              Background="{DynamicResource NightCodeBgSurface}"
+              BorderBrush="{DynamicResource SemiColorBorder}"
+              BorderThickness="1">
+        <StackPanel Spacing="10">
+          <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
+            <StackPanel Grid.Column="0" Spacing="4" VerticalAlignment="Center">
+              <TextBlock Text="Role Recommendations" FontSize="15" FontWeight="SemiBold" />
+              <TextBlock TextWrapping="Wrap"
+                         FontSize="12"
+                         Foreground="{DynamicResource SemiColorText2}"
+                         Text="Generate a role-to-model assignment from the Step 4 benchmark evidence and apply per-node context ceilings." />
             </StackPanel>
-          </DataTemplate>
-        </ItemsControl.ItemTemplate>
-      </ItemsControl>
-
-      <!-- Model index -->
-      <TextBlock Text="Models" FontWeight="SemiBold"/>
-      <ItemsControl ItemsSource="{Binding ModelRows}">
-        <ItemsControl.ItemTemplate>
-          <DataTemplate x:DataType="vm:RecommendationModelRow">
-            <StackPanel Orientation="Horizontal" Spacing="10" Margin="0,2">
-              <TextBlock Text="{Binding Model}" Width="200" FontWeight="SemiBold"/>
-              <TextBlock Text="{Binding Architecture}" Width="120"/>
-              <TextBlock Text="{Binding Quantization}" Width="80"/>
-              <TextBlock Text="{Binding NodesText}"/>
+            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+              <Button Content="Generate &amp; Apply" Classes="Primary" Command="{Binding GenerateAndApplyCommand}" />
+              <Button Content="Generate" Command="{Binding GenerateCommand}" />
+              <Button Content="Apply" Command="{Binding ApplyCommand}" />
+              <Button Content="Go to benchmark" Command="{Binding GoToBenchmarkCommand}" />
             </StackPanel>
-          </DataTemplate>
-        </ItemsControl.ItemTemplate>
-      </ItemsControl>
+          </Grid>
 
-      <!-- Applied ceilings -->
-      <TextBlock Text="Applied ceilings" FontWeight="SemiBold"/>
-      <ItemsControl ItemsSource="{Binding AppliedTargets}">
-        <ItemsControl.ItemTemplate>
-          <DataTemplate x:DataType="rec:RouterRecommendationsAppliedTarget">
-            <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,2">
-              <TextBlock Text="{Binding Target}" Width="130" FontWeight="SemiBold"/>
-              <TextBlock Text="max ceiling"/>
-              <TextBlock Text="{Binding MaxContextCeiling}" Width="80"/>
-              <TextBlock Text="ctx"/>
-            </StackPanel>
-          </DataTemplate>
-        </ItemsControl.ItemTemplate>
-      </ItemsControl>
+          <StackPanel Orientation="Horizontal" Spacing="16">
+            <TextBlock Text="{Binding GeneratedAtText}" FontSize="12" Foreground="{DynamicResource SemiColorText1}" />
+            <TextBlock Text="{Binding SummaryText}" FontSize="12" Foreground="{DynamicResource SemiColorText2}" />
+          </StackPanel>
+        </StackPanel>
+      </Border>
 
-      <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4"/>
-      <TextBlock Text="{Binding Message}" TextWrapping="Wrap" Foreground="{DynamicResource SemiColorSuccess}"/>
+      <!-- Roles Matrix Card (mirrors NightCodeForge Installer Step 4 role cards) -->
+      <Border Padding="14"
+              CornerRadius="8"
+              Background="{DynamicResource NightCodeBgSurface}"
+              BorderBrush="{DynamicResource SemiColorBorder}"
+              BorderThickness="1">
+        <StackPanel Spacing="8">
+          <TextBlock Text="Roles" FontSize="14" FontWeight="SemiBold" />
+          <ItemsControl ItemsSource="{Binding RoleRows}">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate x:DataType="vm:RecommendationRoleRow">
+                <Border Padding="10,8"
+                        Margin="0,0,0,6"
+                        CornerRadius="6"
+                        Background="{DynamicResource NightCodeBgInput}"
+                        BorderBrush="{DynamicResource SemiColorBorder}"
+                        BorderThickness="1">
+                  <StackPanel Spacing="4">
+                    <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="12">
+                      <TextBlock Grid.Column="0" Text="{Binding Role}" FontWeight="SemiBold" />
+                      <TextBlock Grid.Column="1" Text="{Binding Model}"
+                                 Foreground="{DynamicResource NightCodeAccentIndigoLightText}"
+                                 FontWeight="SemiBold" />
+                      <TextBlock Grid.Column="2" Text="{Binding ContextText}"
+                                 FontSize="12"
+                                 Foreground="{DynamicResource SemiColorText2}" />
+                    </Grid>
+                    <TextBlock Text="{Binding Description}" FontSize="12" Foreground="{DynamicResource SemiColorText2}" TextWrapping="Wrap" />
+                    <TextBlock Text="{Binding NodesText}" FontSize="12" Foreground="{DynamicResource SemiColorSuccess}" TextWrapping="Wrap" />
+                  </StackPanel>
+                </Border>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+        </StackPanel>
+      </Border>
+
+      <!-- Two-Column Models & Applied Ceilings -->
+      <Grid ColumnDefinitions="*,*" ColumnSpacing="12">
+        <Border Grid.Column="0"
+                Padding="14"
+                CornerRadius="8"
+                Background="{DynamicResource NightCodeBgSurface}"
+                BorderBrush="{DynamicResource SemiColorBorder}"
+                BorderThickness="1">
+          <StackPanel Spacing="8">
+            <TextBlock Text="Models" FontSize="14" FontWeight="SemiBold" />
+            <ItemsControl ItemsSource="{Binding ModelRows}">
+              <ItemsControl.ItemTemplate>
+                <DataTemplate x:DataType="vm:RecommendationModelRow">
+                  <Border Padding="8,6"
+                          Margin="0,0,0,6"
+                          CornerRadius="6"
+                          Background="{DynamicResource NightCodeBgInput}"
+                          BorderBrush="{DynamicResource SemiColorBorder}"
+                          BorderThickness="1">
+                    <Grid ColumnDefinitions="*,Auto,Auto,Auto" ColumnSpacing="10">
+                      <TextBlock Grid.Column="0" Text="{Binding Model}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+                      <TextBlock Grid.Column="1" Text="{Binding Architecture}" FontSize="12" Foreground="{DynamicResource SemiColorText2}" />
+                      <TextBlock Grid.Column="2" Text="{Binding Quantization}" FontSize="12" Foreground="{DynamicResource SemiColorText2}" />
+                      <TextBlock Grid.Column="3" Text="{Binding NodesText}" FontSize="12" />
+                    </Grid>
+                  </Border>
+                </DataTemplate>
+              </ItemsControl.ItemTemplate>
+            </ItemsControl>
+          </StackPanel>
+        </Border>
+
+        <Border Grid.Column="1"
+                Padding="14"
+                CornerRadius="8"
+                Background="{DynamicResource NightCodeBgSurface}"
+                BorderBrush="{DynamicResource SemiColorBorder}"
+                BorderThickness="1">
+          <StackPanel Spacing="8">
+            <TextBlock Text="Applied ceilings" FontSize="14" FontWeight="SemiBold" />
+            <ItemsControl ItemsSource="{Binding AppliedTargets}">
+              <ItemsControl.ItemTemplate>
+                <DataTemplate x:DataType="rec:RouterRecommendationsAppliedTarget">
+                  <Border Padding="8,6"
+                          Margin="0,0,0,6"
+                          CornerRadius="6"
+                          Background="{DynamicResource NightCodeBgInput}"
+                          BorderBrush="{DynamicResource SemiColorBorder}"
+                          BorderThickness="1">
+                    <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
+                      <TextBlock Grid.Column="0" Text="{Binding Target}" FontWeight="SemiBold" />
+                      <TextBlock Grid.Column="1" Foreground="{DynamicResource SemiColorSuccess}" FontSize="12">
+                        <Run Text="max ceiling " />
+                        <Run Text="{Binding MaxContextCeiling}" />
+                        <Run Text=" ctx" />
+                      </TextBlock>
+                    </Grid>
+                  </Border>
+                </DataTemplate>
+              </ItemsControl.ItemTemplate>
+            </ItemsControl>
+          </StackPanel>
+        </Border>
+      </Grid>
+
+      <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4" />
+
+      <Border IsVisible="{Binding HasMessage}"
+              Padding="10,8"
+              CornerRadius="6"
+              Background="{Binding MessageIsError, Converter={x:Static conv:BoolToBannerBackgroundConverter.Instance}}"
+              BorderBrush="{Binding MessageIsError, Converter={x:Static conv:BoolToBannerBorderConverter.Instance}}"
+              BorderThickness="1">
+        <TextBlock Text="{Binding Message}"
+                   FontSize="12"
+                   TextWrapping="Wrap"
+                   Foreground="{Binding MessageIsError, Converter={x:Static conv:BoolToMessageForegroundConverter.Instance}}" />
+      </Border>
+
     </StackPanel>
   </ScrollViewer>
 </UserControl>

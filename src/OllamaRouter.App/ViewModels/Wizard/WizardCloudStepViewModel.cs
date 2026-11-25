@@ -10,6 +10,18 @@ using Serilog;
 namespace OllamaRouter.App.ViewModels.Wizard;
 
 /// <summary>
+/// One configured external (non-Ollama) provider row displayed in Step 3's "Other providers" card.
+/// </summary>
+public sealed class WizardExternalProviderRow
+{
+    public required string Name { get; init; }
+    public required string Url { get; init; }
+    public string ProviderType { get; init; } = string.Empty;
+    public string? ProviderLabel { get; init; }
+    public string DisplayProvider => !string.IsNullOrWhiteSpace(ProviderLabel) ? ProviderLabel : ProviderType;
+}
+
+/// <summary>
 /// Step 3 — Cloud &amp; External Providers (task #151): the Ollama Cloud (ollama.com)
 /// overflow configuration — the cloud switch (task #161: an OPTIMISTIC click flip that the
 /// wire response confirms and a failed toggle reverts to the previous value), the default
@@ -54,6 +66,9 @@ public sealed partial class WizardCloudStepViewModel : ObservableObject, IWizard
     /// <summary>The cloud-model dropdown items (fleet-catalog order, deduped).</summary>
     public ObservableCollection<string> CloudModels { get; } = [];
 
+    /// <summary>Configured external (non-Ollama) providers shown in the "Other providers" card.</summary>
+    public ObservableCollection<WizardExternalProviderRow> ExternalProviders { get; } = [];
+
     /// <summary>The router's cloud-overflow switch (task #161: flipped OPTIMISTICALLY by the
     /// toggle click, then confirmed by the wire response — a failed toggle reverts to the
     /// previous value under the single-writer gate).</summary>
@@ -96,8 +111,36 @@ public sealed partial class WizardCloudStepViewModel : ObservableObject, IWizard
     [ObservableProperty]
     private bool _isBusy;
 
+    public bool HasMessage => !string.IsNullOrWhiteSpace(Message);
+
+    public bool HasError => !string.IsNullOrWhiteSpace(Error);
+
+    public bool HasExternalProviders => ExternalProviders.Count > 0;
+
+    public bool HasNoExternalProviders => ExternalProviders.Count == 0;
+
+    public bool ShowRelaySignInWarning => CloudEnabled && !CloudOverflowConfigured;
+
+    public bool ShowRelaySignInHint => !CloudEnabled && !CloudOverflowConfigured;
+
     /// <summary>Whether the model dropdown is interactive (models exist and not busy).</summary>
     public bool CanSelectCloudModel => CloudModels.Count > 0 && !IsBusy;
+
+    partial void OnCloudEnabledChanged(bool value)
+    {
+        OnPropertyChanged(nameof(ShowRelaySignInWarning));
+        OnPropertyChanged(nameof(ShowRelaySignInHint));
+    }
+
+    partial void OnCloudOverflowConfiguredChanged(bool value)
+    {
+        OnPropertyChanged(nameof(ShowRelaySignInWarning));
+        OnPropertyChanged(nameof(ShowRelaySignInHint));
+    }
+
+    partial void OnMessageChanged(string? value) => OnPropertyChanged(nameof(HasMessage));
+
+    partial void OnErrorChanged(string? value) => OnPropertyChanged(nameof(HasError));
 
     partial void OnCloudDefaultModelChanged(string? value)
     {
@@ -117,8 +160,11 @@ public sealed partial class WizardCloudStepViewModel : ObservableObject, IWizard
     partial void OnIsBusyChanged(bool value)
     {
         OnPropertyChanged(nameof(CanSelectCloudModel));
-        ToggleCloudCommand.NotifyCanExecuteChanged();
-        AddTargetCommand.NotifyCanExecuteChanged();
+        WizardUiThread.InvokeOrPost(() =>
+        {
+            ToggleCloudCommand.NotifyCanExecuteChanged();
+            AddTargetCommand.NotifyCanExecuteChanged();
+        });
     }
 
     /// <summary>
@@ -176,6 +222,18 @@ public sealed partial class WizardCloudStepViewModel : ObservableObject, IWizard
                 }
             }
 
+            var externalProviders = config.Targets
+                .Where(t => !string.IsNullOrWhiteSpace(t.Type)
+                            && !string.Equals(t.Type, "ollama", StringComparison.OrdinalIgnoreCase))
+                .Select(t => new WizardExternalProviderRow
+                {
+                    Name = t.Name,
+                    Url = t.Url,
+                    ProviderType = t.Type,
+                    ProviderLabel = t.Provider,
+                })
+                .ToList();
+
             // Task #163: marshal the Clear()/Add rebuild to the UI thread INSIDE the gate
             // (the FleetTargetsViewModel pattern). The scalar assignments below STAY exactly
             // where they are (byte-identical ordering with the _applyingRemoteState guard).
@@ -186,6 +244,15 @@ public sealed partial class WizardCloudStepViewModel : ObservableObject, IWizard
                 {
                     CloudModels.Add(name);
                 }
+                OnPropertyChanged(nameof(CanSelectCloudModel));
+
+                ExternalProviders.Clear();
+                foreach (var provider in externalProviders)
+                {
+                    ExternalProviders.Add(provider);
+                }
+                OnPropertyChanged(nameof(HasExternalProviders));
+                OnPropertyChanged(nameof(HasNoExternalProviders));
             });
 
             _applyingRemoteState = true;
@@ -286,12 +353,14 @@ public sealed partial class WizardCloudStepViewModel : ObservableObject, IWizard
         }
         catch (OllamaRouterApiException ex)
         {
+            Message = null;
             Error = $"Router error {(int)ex.Status}: {ex.Error ?? "(no error body)"}";
             _logger.Warning("Wizard step 3: cloud toggle failed: {Error}", Error);
             await RevertCloudFlipAsync(previous, next).ConfigureAwait(false);
         }
         catch (System.Net.Http.HttpRequestException ex)
         {
+            Message = null;
             Error = $"Connection failed: {ex.Message}";
             _logger.Warning("Wizard step 3: cloud toggle failed: {Error}", Error);
             await RevertCloudFlipAsync(previous, next).ConfigureAwait(false);
@@ -368,12 +437,14 @@ public sealed partial class WizardCloudStepViewModel : ObservableObject, IWizard
         }
         catch (OllamaRouterApiException ex)
         {
+            Message = null;
             Error = $"Router error {(int)ex.Status}: {ex.Error ?? "(no error body)"}";
             _logger.Warning("Wizard step 3: persisting cloud default model '{Model}' failed: {Error}", model, Error);
             RevertSelection();
         }
         catch (System.Net.Http.HttpRequestException ex)
         {
+            Message = null;
             Error = $"Connection failed: {ex.Message}";
             _logger.Warning("Wizard step 3: persisting cloud default model '{Model}' failed: {Error}", model, Error);
             RevertSelection();
@@ -420,11 +491,13 @@ public sealed partial class WizardCloudStepViewModel : ObservableObject, IWizard
         }
         catch (OllamaRouterApiException ex)
         {
+            Message = null;
             Error = WizardTargetErrors.MapAddTarget(ex);
             _logger.Warning("Wizard step 3: adding provider '{ProviderName}' failed: {Error}", request.Name, Error);
         }
         catch (System.Net.Http.HttpRequestException ex)
         {
+            Message = null;
             Error = WizardTargetErrors.MapAddTarget(ex);
             _logger.Warning("Wizard step 3: adding provider '{ProviderName}' failed: {Error}", request.Name, Error);
         }

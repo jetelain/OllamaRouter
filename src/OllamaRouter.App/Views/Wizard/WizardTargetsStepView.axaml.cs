@@ -39,7 +39,11 @@ public partial class WizardTargetsStepView : UserControl
                     viewModel.AddTargetCommand.Execute(request);
                 }
             },
-            surfaceError: message => viewModel.Message = message);
+            surfaceError: message =>
+            {
+                viewModel.MessageIsError = true;
+                viewModel.Message = message;
+            });
     }
 
     private void OnAddProviderClick(object? sender, RoutedEventArgs e)
@@ -59,6 +63,10 @@ public partial class WizardTargetsStepView : UserControl
                     viewModel.AddTargetCommand.Execute(request);
                 }
             },
-            surfaceError: message => viewModel.Message = message);
+            surfaceError: message =>
+            {
+                viewModel.MessageIsError = true;
+                viewModel.Message = message;
+            });
     }
 }

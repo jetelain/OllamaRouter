@@ -1,0 +1,11 @@
+{
+  "profiles": {
+    "Wizard": {
+      "commandName": "Project",
+      "commandLineArgs": "--wizard"
+    },
+    "App": {
+      "commandName": "Project"
+    }
+  }
+}

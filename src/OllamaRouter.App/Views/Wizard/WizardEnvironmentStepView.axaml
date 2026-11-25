@@ -4,88 +4,153 @@
              xmlns:vm="using:OllamaRouter.App.ViewModels.Wizard"
              x:Class="OllamaRouter.App.Views.Wizard.WizardEnvironmentStepView"
              x:DataType="vm:WizardEnvironmentStepViewModel">
-  <ScrollViewer Padding="12">
+  <ScrollViewer>
     <StackPanel Spacing="12">
-      <TextBlock Text="Step 1 — Local Ollama for the Router" FontSize="18" FontWeight="Bold"/>
-      <TextBlock TextWrapping="Wrap"
-                 Text="Install, start and update Ollama with one click, keep it on :11435, and run ollamarouter-server on :11434."/>
 
-      <!-- Section 1: Ollama — the detection state drives which actions are visible (task #150). -->
-      <Border Padding="10" CornerRadius="6" Background="{DynamicResource NightCodeBgSurface}"
-              BorderBrush="{DynamicResource SemiColorBorder}" BorderThickness="1">
-        <StackPanel Spacing="6">
-          <TextBlock Text="Ollama" FontSize="15" FontWeight="Bold"/>
-          <TextBlock Text="{Binding DetectionText}" FontWeight="SemiBold" TextWrapping="Wrap"/>
-          <TextBlock Text="✓ Ollama is running" FontWeight="Bold" Foreground="{DynamicResource SemiColorSuccess}"
-                     IsVisible="{Binding ShowRunningCheck}"/>
+      <!-- Step Intro Card -->
+      <Border Padding="14"
+              CornerRadius="8"
+              Background="{DynamicResource NightCodeBgSurface}"
+              BorderBrush="{DynamicResource SemiColorBorder}"
+              BorderThickness="1">
+        <StackPanel Spacing="4">
+          <TextBlock Text="Local Ollama &amp; Router Service" FontSize="15" FontWeight="SemiBold" />
+          <TextBlock TextWrapping="Wrap"
+                     FontSize="12"
+                     Foreground="{DynamicResource SemiColorText2}"
+                     Text="Install, start, or update local Ollama on :11435 and ensure the OllamaRouter daemon is running on :11434. Local Ollama is optional if you only plan to use remote nodes or cloud providers." />
+        </StackPanel>
+      </Border>
+
+      <!-- Section 1: Ollama -->
+      <Border Padding="14"
+              CornerRadius="8"
+              Background="{DynamicResource NightCodeBgSurface}"
+              BorderBrush="{DynamicResource SemiColorBorder}"
+              BorderThickness="1">
+        <StackPanel Spacing="10">
+          <TextBlock Text="Ollama" FontSize="14" FontWeight="SemiBold" />
+          <Border Padding="10,8"
+                  CornerRadius="6"
+                  Background="{DynamicResource NightCodeBgInput}"
+                  BorderBrush="{DynamicResource SemiColorBorder}"
+                  BorderThickness="1">
+            <StackPanel Spacing="4">
+              <TextBlock Text="{Binding DetectionText}" FontWeight="SemiBold" TextWrapping="Wrap" />
+              <TextBlock Text="✓ Ollama is running"
+                         FontSize="12"
+                         FontWeight="Bold"
+                         Foreground="{DynamicResource SemiColorSuccess}"
+                         IsVisible="{Binding ShowRunningCheck}" />
+            </StackPanel>
+          </Border>
           <StackPanel Orientation="Horizontal" Spacing="8">
-            <Button Content="Install Ollama" Classes="Primary" IsVisible="{Binding ShowInstallButton}" Command="{Binding InstallOllamaCommand}"/>
-            <Button Content="Start Ollama" Classes="Primary" IsVisible="{Binding ShowStartButton}" Command="{Binding StartOllamaCommand}"/>
-            <Button Content="Update Ollama" Classes="Primary" IsVisible="{Binding ShowUpdateButton}" Command="{Binding UpdateOllamaCommand}"/>
-            <Button Content="Re-check" Command="{Binding RecheckCommand}"/>
+            <Button Content="Install Ollama" Classes="Primary" IsVisible="{Binding ShowInstallButton}" Command="{Binding InstallOllamaCommand}" />
+            <Button Content="Start Ollama" Classes="Primary" IsVisible="{Binding ShowStartButton}" Command="{Binding StartOllamaCommand}" />
+            <Button Content="Update Ollama" IsVisible="{Binding ShowUpdateButton}" Command="{Binding UpdateOllamaCommand}" />
+            <Button Content="Re-check" Command="{Binding RecheckCommand}" />
           </StackPanel>
         </StackPanel>
       </Border>
 
-      <!-- Section 2: Configuration for router — unified row grid (task #160). -->
-      <Border Padding="10" CornerRadius="6" Background="{DynamicResource NightCodeBgSurface}"
-              BorderBrush="{DynamicResource SemiColorBorder}" BorderThickness="1">
-        <StackPanel Spacing="6">
-          <TextBlock Text="Configuration for router" FontSize="15" FontWeight="Bold"/>
+      <!-- Section 2: Configuration for router — unified row grid -->
+      <Border Padding="14"
+              CornerRadius="8"
+              Background="{DynamicResource NightCodeBgSurface}"
+              BorderBrush="{DynamicResource SemiColorBorder}"
+              BorderThickness="1">
+        <StackPanel Spacing="8">
+          <TextBlock Text="Configuration for router" FontSize="14" FontWeight="SemiBold" />
+
           <!-- Row 1: LAN exposure (hidden on Linux + when Ollama is not installed). -->
-          <Grid ColumnDefinitions="*,Auto" IsVisible="{Binding ShowLanRow}">
-            <TextBlock Grid.Column="0" Text="{Binding LanRowLabel}" TextWrapping="Wrap" VerticalAlignment="Center"/>
-            <Button Grid.Column="1" Content="{Binding LanToggleText}" Command="{Binding ToggleLanCommand}"
-                    IsVisible="{Binding ShowLanToggle}" VerticalAlignment="Center"/>
-          </Grid>
-          <!-- Row 2: effective Ollama port (✓ when Ok / Change port when WrongPort / nothing else). -->
-          <Grid ColumnDefinitions="*,Auto">
-            <StackPanel Grid.Column="0" VerticalAlignment="Center">
-              <TextBlock Text="{Binding OllamaPortLabel}" Foreground="{DynamicResource SemiColorSuccess}" FontWeight="Bold"
-                         TextWrapping="Wrap" IsVisible="{Binding ShowPortOk}"/>
-              <TextBlock Text="{Binding OllamaPortLabel}" Foreground="{DynamicResource NightCodeAccentAmber}"
-                         TextWrapping="Wrap" IsVisible="{Binding ShowPortWrong}"/>
-              <TextBlock Text="{Binding OllamaPortLabel}" Foreground="{DynamicResource SemiColorText2}"
-                         TextWrapping="Wrap" IsVisible="{Binding ShowPortNotRunning}"/>
-              <TextBlock Text="{Binding OllamaPortLabel}" Foreground="{DynamicResource SemiColorText2}"
-                         TextWrapping="Wrap" IsVisible="{Binding ShowPortNotDetected}"/>
-              <TextBlock Text="{Binding OllamaPortLabel}" Foreground="{DynamicResource SemiColorText2}"
-                         TextWrapping="Wrap" IsVisible="{Binding ShowPortUnknown}"/>
-            </StackPanel>
-            <TextBlock Grid.Column="1" Text="✓" FontWeight="Bold" Foreground="{DynamicResource SemiColorSuccess}"
-                       IsVisible="{Binding ShowPortOk}" VerticalAlignment="Center"/>
-            <Button Grid.Column="1" Content="Change port" Command="{Binding ChangePortCommand}"
-                    IsVisible="{Binding ShowChangePortButton}" VerticalAlignment="Center"/>
-          </Grid>
-          <!-- Row 3: router :11434 (✓ when running / Start router when free / nothing else). -->
-          <Grid ColumnDefinitions="*,Auto">
-            <TextBlock Grid.Column="0" Text="{Binding RouterStatusLabel}" FontWeight="Bold"
-                       TextWrapping="Wrap" VerticalAlignment="Center"/>
-            <TextBlock Grid.Column="1" Text="✓" FontWeight="Bold" Foreground="{DynamicResource SemiColorSuccess}"
-                       IsVisible="{Binding ShowRouterRunningCheck}" VerticalAlignment="Center"/>
-            <Button Grid.Column="1" Content="Start router" Command="{Binding StartRouterCommand}"
-                    IsVisible="{Binding ShowStartRouterButton}" VerticalAlignment="Center"/>
-          </Grid>
+          <Border Padding="10,8"
+                  CornerRadius="6"
+                  Background="{DynamicResource NightCodeBgInput}"
+                  BorderBrush="{DynamicResource SemiColorBorder}"
+                  BorderThickness="1"
+                  IsVisible="{Binding ShowLanRow}">
+            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
+              <TextBlock Grid.Column="0" Text="{Binding LanRowLabel}" TextWrapping="Wrap" VerticalAlignment="Center" />
+              <Button Grid.Column="1" Content="{Binding LanToggleText}" Command="{Binding ToggleLanCommand}"
+                      IsVisible="{Binding ShowLanToggle}" VerticalAlignment="Center" />
+            </Grid>
+          </Border>
+
+          <!-- Row 2: effective Ollama port -->
+          <Border Padding="10,8"
+                  CornerRadius="6"
+                  Background="{DynamicResource NightCodeBgInput}"
+                  BorderBrush="{DynamicResource SemiColorBorder}"
+                  BorderThickness="1">
+            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
+              <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                <TextBlock Text="{Binding OllamaPortLabel}" Foreground="{DynamicResource SemiColorSuccess}" FontWeight="Bold"
+                           TextWrapping="Wrap" IsVisible="{Binding ShowPortOk}" />
+                <TextBlock Text="{Binding OllamaPortLabel}" Foreground="{DynamicResource NightCodeAccentAmber}"
+                           TextWrapping="Wrap" IsVisible="{Binding ShowPortWrong}" />
+                <TextBlock Text="{Binding OllamaPortLabel}" Foreground="{DynamicResource SemiColorText2}"
+                           TextWrapping="Wrap" IsVisible="{Binding ShowPortNotRunning}" />
+                <TextBlock Text="{Binding OllamaPortLabel}" Foreground="{DynamicResource SemiColorText2}"
+                           TextWrapping="Wrap" IsVisible="{Binding ShowPortNotDetected}" />
+                <TextBlock Text="{Binding OllamaPortLabel}" Foreground="{DynamicResource SemiColorText2}"
+                           TextWrapping="Wrap" IsVisible="{Binding ShowPortUnknown}" />
+              </StackPanel>
+              <TextBlock Grid.Column="1" Text="✓" FontWeight="Bold" Foreground="{DynamicResource SemiColorSuccess}"
+                         IsVisible="{Binding ShowPortOk}" VerticalAlignment="Center" />
+              <Button Grid.Column="1" Content="Change port" Classes="Primary" Command="{Binding ChangePortCommand}"
+                      IsVisible="{Binding ShowChangePortButton}" VerticalAlignment="Center" />
+            </Grid>
+          </Border>
+
+          <!-- Row 3: router :11434 -->
+          <Border Padding="10,8"
+                  CornerRadius="6"
+                  Background="{DynamicResource NightCodeBgInput}"
+                  BorderBrush="{DynamicResource SemiColorBorder}"
+                  BorderThickness="1">
+            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
+              <TextBlock Grid.Column="0" Text="{Binding RouterStatusLabel}" FontWeight="SemiBold"
+                         TextWrapping="Wrap" VerticalAlignment="Center" />
+              <TextBlock Grid.Column="1" Text="✓" FontWeight="Bold" Foreground="{DynamicResource SemiColorSuccess}"
+                         IsVisible="{Binding ShowRouterRunningCheck}" VerticalAlignment="Center" />
+              <Button Grid.Column="1" Content="Start router" Classes="Primary" Command="{Binding StartRouterCommand}"
+                      IsVisible="{Binding ShowStartRouterButton}" VerticalAlignment="Center" />
+            </Grid>
+          </Border>
         </StackPanel>
       </Border>
 
-      <!-- Linux: Install/Update are one-click above; start + the port stay manual (task #150, M1). -->
-      <Border Padding="10" CornerRadius="6" Background="{DynamicResource SemiColorInformationLight}"
-              BorderBrush="{DynamicResource SemiColorInformation}" BorderThickness="1"
+      <!-- Linux manual instructions block -->
+      <Border Padding="12"
+              CornerRadius="8"
+              Background="{DynamicResource SemiColorInformationLight}"
+              BorderBrush="{DynamicResource SemiColorInformation}"
+              BorderThickness="1"
               IsVisible="{Binding IsLinux}">
         <StackPanel Spacing="4">
           <TextBlock Text="Linux: install and update are one-click above; on Linux, start Ollama and set the port manually:"
-                     FontWeight="Bold" TextWrapping="Wrap"/>
-          <TextBlock Text="export OLLAMA_HOST=127.0.0.1:11435" FontFamily="monospace"/>
-          <TextBlock Text="export OLLAMA_FLASH_ATTENTION=1" FontFamily="monospace"/>
-          <TextBlock Text="export OLLAMA_KV_CACHE_TYPE=q8_0" FontFamily="monospace"/>
-          <TextBlock Text="ollama serve   # then: ollamarouter start" FontFamily="monospace"/>
+                     FontWeight="Bold" TextWrapping="Wrap" />
+          <TextBlock Text="export OLLAMA_HOST=127.0.0.1:11435" FontFamily="Consolas,Menlo,monospace" FontSize="12" />
+          <TextBlock Text="export OLLAMA_FLASH_ATTENTION=1" FontFamily="Consolas,Menlo,monospace" FontSize="12" />
+          <TextBlock Text="export OLLAMA_KV_CACHE_TYPE=q8_0" FontFamily="Consolas,Menlo,monospace" FontSize="12" />
+          <TextBlock Text="ollama serve   # then: ollamarouter start" FontFamily="Consolas,Menlo,monospace" FontSize="12" />
         </StackPanel>
       </Border>
 
-      <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4"/>
-      <TextBlock Text="{Binding Message}" TextWrapping="Wrap"
-                 Foreground="{Binding MessageIsError, Converter={x:Static conv:BoolToMessageForegroundConverter.Instance}}"/>
+      <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4" />
+
+      <Border IsVisible="{Binding HasMessage}"
+              Padding="10,8"
+              CornerRadius="6"
+              Background="{Binding MessageIsError, Converter={x:Static conv:BoolToBannerBackgroundConverter.Instance}}"
+              BorderBrush="{Binding MessageIsError, Converter={x:Static conv:BoolToBannerBorderConverter.Instance}}"
+              BorderThickness="1">
+        <TextBlock Text="{Binding Message}"
+                   FontSize="12"
+                   TextWrapping="Wrap"
+                   Foreground="{Binding MessageIsError, Converter={x:Static conv:BoolToMessageForegroundConverter.Instance}}" />
+      </Border>
+
     </StackPanel>
   </ScrollViewer>
 </UserControl>

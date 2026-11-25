@@ -3,57 +3,157 @@
              xmlns:vm="using:OllamaRouter.App.ViewModels.Wizard"
              x:Class="OllamaRouter.App.Views.Wizard.WizardCloudStepView"
              x:DataType="vm:WizardCloudStepViewModel">
-  <ScrollViewer Padding="12">
+  <ScrollViewer>
     <StackPanel Spacing="12">
-      <TextBlock Text="Step 3 — Cloud &amp; External Providers" FontSize="18" FontWeight="Bold"/>
-      <TextBlock TextWrapping="Wrap"
-                 Text="Configure the built-in Ollama Cloud (ollama.com) overflow — the cloud switch and the default cloud model — and add external (OpenAI-compatible) providers."/>
 
-      <!-- Card 1: Ollama Cloud (task #161): ONE interactive CheckBox — the retired
-           label + display-only CheckBox + "Toggle Cloud" button convention. The click runs
-           ToggleCloudCommand (optimistic flip + wire confirm); while IsBusy the command's
-           CanExecute gating auto-disables the CheckBox. -->
-      <Border Padding="10" CornerRadius="6" Background="{DynamicResource NightCodeBgSurface}"
-              BorderBrush="{DynamicResource SemiColorBorder}" BorderThickness="1">
-        <StackPanel Spacing="8">
-          <TextBlock Text="Ollama Cloud" FontSize="15" FontWeight="Bold"/>
+      <!-- Step Intro Card -->
+      <Border Padding="14"
+              CornerRadius="8"
+              Background="{DynamicResource NightCodeBgSurface}"
+              BorderBrush="{DynamicResource SemiColorBorder}"
+              BorderThickness="1">
+        <StackPanel Spacing="4">
+          <TextBlock Text="Cloud &amp; External Providers" FontSize="15" FontWeight="SemiBold" />
+          <TextBlock TextWrapping="Wrap"
+                     FontSize="12"
+                     Foreground="{DynamicResource SemiColorText2}"
+                     Text="Configure the built-in Ollama Cloud (ollama.com) overflow and add external OpenAI-compatible providers." />
+        </StackPanel>
+      </Border>
+
+      <!-- Card 1: Ollama Cloud -->
+      <Border Padding="14"
+              CornerRadius="8"
+              Background="{DynamicResource NightCodeBgSurface}"
+              BorderBrush="{DynamicResource SemiColorBorder}"
+              BorderThickness="1">
+        <StackPanel Spacing="10">
+          <TextBlock Text="Ollama Cloud" FontSize="14" FontWeight="SemiBold" />
+
           <CheckBox Content="Use Ollama Cloud when all local GPU are busy"
                     IsChecked="{Binding CloudEnabled, Mode=OneWay}"
                     Command="{Binding ToggleCloudCommand}"
-                    VerticalAlignment="Center"/>
-          <StackPanel Orientation="Horizontal" Spacing="12">
-            <TextBlock Text="Default cloud model" VerticalAlignment="Center"/>
-            <!-- The Avalonia 12 ComboBox has no Command property: the view drives the VM's
-                 SelectCloudModelCommand from the SelectionChanged event (see code-behind). -->
-            <ComboBox ItemsSource="{Binding CloudModels}"
+                    VerticalAlignment="Center" />
+
+          <Grid ColumnDefinitions="150,*" ColumnSpacing="12">
+            <TextBlock Grid.Column="0"
+                       Text="Default cloud model:"
+                       Foreground="{DynamicResource SemiColorText2}"
+                       VerticalAlignment="Center" />
+            <ComboBox Grid.Column="1"
+                      ItemsSource="{Binding CloudModels}"
                       SelectedItem="{Binding SelectedCloudModel}"
                       IsEnabled="{Binding CanSelectCloudModel}"
-                      Width="360"
-                      SelectionChanged="OnCloudModelSelectionChanged"/>
-          </StackPanel>
-          <TextBlock TextWrapping="Wrap" Foreground="{DynamicResource SemiColorText2}" IsVisible="{Binding ShowEmptyModelsNote}"
-                     Text="No cloud models in the fleet catalog — enable cloud overflow and/or set per-model CloudModel entries to populate this list."/>
-          <TextBlock TextWrapping="Wrap" Foreground="{DynamicResource NightCodeAccentAmber}" IsVisible="{Binding ShowConfiguredNote}"
-                     Text="{Binding ConfiguredDefaultNote}"/>
-          <TextBlock TextWrapping="Wrap" Foreground="{DynamicResource SemiColorText2}" IsVisible="{Binding !CloudOverflowConfigured}"
-                     Text="Cloud relay needs an ollama.com sign-in on a fleet node."/>
-          <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4"/>
-          <TextBlock Text="{Binding Message}" TextWrapping="Wrap" Foreground="{DynamicResource SemiColorSuccess}"/>
-          <TextBlock Text="{Binding Error}" TextWrapping="Wrap" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}"/>
+                      HorizontalAlignment="Stretch"
+                      MaxWidth="420"
+                      SelectionChanged="OnCloudModelSelectionChanged" />
+          </Grid>
+
+          <TextBlock TextWrapping="Wrap"
+                     FontSize="12"
+                     Foreground="{DynamicResource SemiColorText2}"
+                     IsVisible="{Binding ShowEmptyModelsNote}"
+                     Text="No cloud models in the fleet catalog — enable cloud overflow and/or set per-model CloudModel entries to populate this list." />
+
+          <Border Padding="10,8"
+                  CornerRadius="6"
+                  Background="{DynamicResource SemiColorWarningLight}"
+                  BorderBrush="{DynamicResource SemiColorWarning}"
+                  BorderThickness="1"
+                  IsVisible="{Binding ShowConfiguredNote}">
+            <TextBlock TextWrapping="Wrap"
+                       FontSize="12"
+                       Foreground="{DynamicResource NightCodeAccentAmber}"
+                       Text="{Binding ConfiguredDefaultNote}" />
+          </Border>
+
+          <Border Padding="10,8"
+                  CornerRadius="6"
+                  Background="{DynamicResource SemiColorWarningLight}"
+                  BorderBrush="{DynamicResource SemiColorWarning}"
+                  BorderThickness="1"
+                  IsVisible="{Binding ShowRelaySignInWarning}">
+            <TextBlock TextWrapping="Wrap"
+                       FontSize="12"
+                       Foreground="{DynamicResource NightCodeAccentAmber}"
+                       Text="Cloud overflow is enabled, but no fleet node is signed in to ollama.com yet." />
+          </Border>
+
+          <TextBlock TextWrapping="Wrap"
+                     FontSize="12"
+                     Foreground="{DynamicResource SemiColorText2}"
+                     IsVisible="{Binding ShowRelaySignInHint}"
+                     Text="Cloud relay needs an ollama.com sign-in on a fleet node." />
+
+          <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4" />
+
+          <Border IsVisible="{Binding HasMessage}"
+                  Padding="10,8"
+                  CornerRadius="6"
+                  Background="{DynamicResource SemiColorSuccessLight}"
+                  BorderBrush="{DynamicResource SemiColorSuccess}"
+                  BorderThickness="1">
+            <TextBlock Text="{Binding Message}" FontSize="12" TextWrapping="Wrap" Foreground="{DynamicResource SemiColorSuccess}" />
+          </Border>
+
+          <Border IsVisible="{Binding HasError}"
+                  Padding="10,8"
+                  CornerRadius="6"
+                  Background="{DynamicResource SemiColorDangerLight}"
+                  BorderBrush="{DynamicResource SemiColorDanger}"
+                  BorderThickness="1">
+            <TextBlock Text="{Binding Error}" FontSize="12" TextWrapping="Wrap" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" />
+          </Border>
         </StackPanel>
       </Border>
 
-      <!-- Card 2: Other providers — the main app's dedicated provider dialog (opened
-           view-side; modal ownership needs the Window top level). -->
-      <Border Padding="10" CornerRadius="6" Background="{DynamicResource NightCodeBgSurface}"
-              BorderBrush="{DynamicResource SemiColorBorder}" BorderThickness="1">
-        <StackPanel Spacing="8">
-          <TextBlock Text="Other providers" FontSize="15" FontWeight="Bold"/>
-          <Button Content="Add Provider" Click="OnAddProviderClick"/>
-          <TextBlock TextWrapping="Wrap" Foreground="{DynamicResource SemiColorText2}"
-                     Text="External (OpenAI-compatible) providers use the main app's provider dialog and appear in the Step 2 fleet table."/>
+      <!-- Card 2: Other providers -->
+      <Border Padding="14"
+              CornerRadius="8"
+              Background="{DynamicResource NightCodeBgSurface}"
+              BorderBrush="{DynamicResource SemiColorBorder}"
+              BorderThickness="1">
+        <StackPanel Spacing="10">
+          <TextBlock Text="Other providers" FontSize="14" FontWeight="SemiBold" />
+          <TextBlock TextWrapping="Wrap"
+                     FontSize="12"
+                     Foreground="{DynamicResource SemiColorText2}"
+                     Text="External (OpenAI-compatible) providers appear here and in the Step 2 fleet table." />
+          <Button Content="Add Provider" IsEnabled="{Binding !IsBusy}" Click="OnAddProviderClick" HorizontalAlignment="Left" />
+
+          <ItemsControl ItemsSource="{Binding ExternalProviders}" IsVisible="{Binding HasExternalProviders}">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate x:DataType="vm:WizardExternalProviderRow">
+                <Border Padding="10,8"
+                        Margin="0,0,0,6"
+                        CornerRadius="6"
+                        Background="{DynamicResource NightCodeBgInput}"
+                        BorderBrush="{DynamicResource SemiColorBorder}"
+                        BorderThickness="1">
+                  <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
+                    <StackPanel Grid.Column="0" Spacing="2">
+                      <TextBlock Text="{Binding Name}" FontWeight="SemiBold" />
+                      <TextBlock Text="{Binding Url}" FontSize="12" Foreground="{DynamicResource SemiColorText2}" />
+                    </StackPanel>
+                    <TextBlock Grid.Column="1"
+                               Text="{Binding DisplayProvider}"
+                               FontSize="11"
+                               FontWeight="SemiBold"
+                               Foreground="{DynamicResource NightCodeAccentIndigoLightText}"
+                               VerticalAlignment="Center" />
+                  </Grid>
+                </Border>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+
+          <TextBlock IsVisible="{Binding HasNoExternalProviders}"
+                     FontSize="12"
+                     Foreground="{DynamicResource SemiColorText2}"
+                     Text="No external providers configured yet." />
         </StackPanel>
       </Border>
+
     </StackPanel>
   </ScrollViewer>
 </UserControl>

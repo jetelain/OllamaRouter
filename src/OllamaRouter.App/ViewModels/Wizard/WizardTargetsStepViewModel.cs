@@ -68,6 +68,7 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
     // benign single-word bool written from the poller tick AND UI-thread command refreshes;
     // worst case under a race is one duplicate transition log (Serilog itself is thread-safe).
     private bool? _daemonReachable;
+    private bool _messageIsTransientDaemonError;
     // Task #159: the resolved logger (the seam defaults to the static Serilog.Log.Logger).
     private readonly Serilog.ILogger _logger;
     private bool _disposed;
@@ -106,6 +107,7 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
     /// </summary>
     private void SetFailureMessage(string message)
     {
+        MessageIsError = true;
         if (!string.Equals(Message, message, StringComparison.Ordinal))
         {
             Message = message;
@@ -120,7 +122,16 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
     private string? _message;
 
     [ObservableProperty]
+    private bool _messageIsError;
+
+    [ObservableProperty]
     private bool _isBusy;
+
+    public bool HasMessage => !string.IsNullOrWhiteSpace(Message);
+
+    public bool HasNoRows => Rows.Count == 0;
+
+    partial void OnMessageChanged(string? value) => OnPropertyChanged(nameof(HasMessage));
 
     /// <summary>
     /// Adds a target from the main app's dedicated dialog (task #151 — the
@@ -139,18 +150,22 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
             _logger.Information("Wizard step 2: adding target '{TargetName}'", request.Name);
             await _clientAccessor().AddTargetAsync(request).ConfigureAwait(false);
             _logger.Information("Wizard step 2: target '{TargetName}' added", request.Name);
+            _messageIsTransientDaemonError = false;
+            MessageIsError = false;
             Message = $"Target '{request.Name}' added.";
         }
         catch (OllamaRouterApiException ex)
         {
             var mapped = WizardTargetErrors.MapAddTarget(ex, _daemonBaseUrl());
             _logger.Warning("Wizard step 2: adding target '{TargetName}' failed: {Error}", request.Name, mapped);
+            _messageIsTransientDaemonError = false;
             SetFailureMessage(mapped);
         }
         catch (System.Net.Http.HttpRequestException ex)
         {
             var mapped = WizardTargetErrors.MapAddTarget(ex, _daemonBaseUrl());
             _logger.Warning("Wizard step 2: adding target '{TargetName}' failed: {Error}", request.Name, mapped);
+            _messageIsTransientDaemonError = false;
             SetFailureMessage(mapped);
         }
         finally
@@ -231,13 +246,22 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
                 {
                     Rows.Add(row);
                 }
+                OnPropertyChanged(nameof(HasNoRows));
             });
+
+            if (_messageIsTransientDaemonError)
+            {
+                _messageIsTransientDaemonError = false;
+                MessageIsError = false;
+                Message = null;
+            }
 
             LogReachabilityTransition(true, null);
         }
         catch (OllamaRouterApiException ex)
         {
-            Message = $"Router error {(int)ex.Status}: {ex.Error ?? "(no error body)"}";
+            _messageIsTransientDaemonError = true;
+            SetFailureMessage($"Router error {(int)ex.Status}: {ex.Error ?? "(no error body)"}");
             LogReachabilityTransition(false, ex.Message);
         }
         catch (System.Net.Http.HttpRequestException ex)
@@ -245,6 +269,7 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
             // The router is DOWN (the canonical first-run state before Step 1 has started
             // it): the shared actionable daemon-down message (task #158) — never the raw
             // transport text (which leaked "…actively refused it. (127.0.0.1:11434)").
+            _messageIsTransientDaemonError = true;
             SetFailureMessage(DaemonDownMessage());
             LogReachabilityTransition(false, ex.Message);
         }
@@ -253,12 +278,14 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
             // Task #165: the transport abort class (e.g. 995 OperationAborted, the Windows
             // shape of a cancel/teardown aborting an in-flight socket I/O) — same daemon-down
             // family as HttpRequestException (task #158: the shared message, never raw text).
+            _messageIsTransientDaemonError = true;
             SetFailureMessage(DaemonDownMessage());
             LogReachabilityTransition(false, ex.Message);
         }
         catch (System.IO.IOException ex)
         {
             // Task #165: the transport re-wraps the aborted socket I/O — same daemon-down family.
+            _messageIsTransientDaemonError = true;
             SetFailureMessage(DaemonDownMessage());
             LogReachabilityTransition(false, ex.Message);
         }
@@ -341,24 +368,30 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
                         new AddTargetRequest(LocalTargetName, LocalTargetUrl, TestConnectionFirst: true))
                     .ConfigureAwait(false);
                 _logger.Information("Wizard step 2: local node auto-add → added");
+                _messageIsTransientDaemonError = false;
+                MessageIsError = false;
                 Message = "Local node added.";
             }
             catch (OllamaRouterApiException ex) when (ex.Status == HttpStatusCode.Conflict)
             {
                 _logger.Warning("Wizard step 2: local node auto-add → conflict (left unchanged): {Message}", ex.Message);
+                _messageIsTransientDaemonError = false;
+                MessageIsError = false;
                 Message = "A target named 'Local' already exists — left unchanged.";
             }
             catch (OllamaRouterApiException ex) when (ex.Status == HttpStatusCode.UnprocessableEntity)
             {
                 _logger.Warning("Wizard step 2: local node auto-add → 422 local unreachable: {Message}", ex.Message);
-                Message = "Local Ollama is unreachable — fix Step 1 and retry.";
+                _messageIsTransientDaemonError = false;
+                SetFailureMessage("Local Ollama is unreachable — fix Step 1 and retry.");
             }
             catch (OllamaRouterApiException ex)
             {
                 // The daemon RESPONDED with a router error (not a down-state): the legacy
                 // actionable text (unchanged by task #158).
                 _logger.Warning("Wizard step 2: local node auto-add → router down (retry on next entry): {Message}", ex.Message);
-                Message = "Connection failed — start the router in Step 1 first.";
+                _messageIsTransientDaemonError = true;
+                SetFailureMessage("Connection failed — start the router in Step 1 first.");
             }
             catch (System.Net.Http.HttpRequestException ex)
             {
@@ -366,6 +399,7 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
                 // started it): the shared actionable daemon-down message (task #158),
                 // identical to the fleet poll's — no throw, the next step entry retries.
                 _logger.Warning("Wizard step 2: local node auto-add → router down (retry on next entry): {Message}", ex.Message);
+                _messageIsTransientDaemonError = true;
                 SetFailureMessage(DaemonDownMessage());
             }
             catch (System.Net.Sockets.SocketException ex)
@@ -373,12 +407,14 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
                 // Task #165: the transport abort class (e.g. 995 OperationAborted) — same
                 // daemon-down family as HttpRequestException (no throw, retry on next entry).
                 _logger.Warning("Wizard step 2: local node auto-add → router down (retry on next entry): {Message}", ex.Message);
+                _messageIsTransientDaemonError = true;
                 SetFailureMessage(DaemonDownMessage());
             }
             catch (System.IO.IOException ex)
             {
                 // Task #165: the transport re-wraps the aborted socket I/O — same family.
                 _logger.Warning("Wizard step 2: local node auto-add → router down (retry on next entry): {Message}", ex.Message);
+                _messageIsTransientDaemonError = true;
                 SetFailureMessage(DaemonDownMessage());
             }
         }
@@ -402,7 +438,8 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
     /// <summary>Step lifecycle: stop the poller (no orphan work).</summary>
     public Task OnStepLeftAsync() => _poller.StopAsync();
 
-    partial void OnIsBusyChanged(bool value) => AddTargetCommand.NotifyCanExecuteChanged();
+    partial void OnIsBusyChanged(bool value) =>
+        WizardUiThread.InvokeOrPost(() => AddTargetCommand.NotifyCanExecuteChanged());
 
     /// <inheritdoc />
     public async ValueTask DisposeAsync()

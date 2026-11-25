@@ -40,7 +40,7 @@ public sealed class SetupWizardViewModelsTests
     //  Helpers
     // ------------------------------------------------------------------
 
-    private static Task GatedDelay(TimeSpan span, CancellationToken ct) => new Task(static () => { }, ct);
+    private static Task GatedDelay(TimeSpan span, CancellationToken ct) => Task.Delay(Timeout.InfiniteTimeSpan, ct);
 
     /// <summary>
     /// A soft (NOT max-speed) inter-tick pause: yields a bounded number of times and returns
@@ -4208,5 +4208,745 @@ public sealed class SetupWizardViewModelsTests
 
         // One-way converter: ConvertBack is a no-op for bindings.
         Assert.Throws<System.NotSupportedException>(() => conv.ConvertBack(null, typeof(object), null, culture));
+    }
+
+    // ==================================================================
+    //  Service lifecycle, busy-gating & Phase 3 step enhancements
+    // ==================================================================
+
+    [Fact]
+    public async Task Step1_OnStepEntered_FreePort_AutoStartsRouter()
+    {
+        var launcher = new FakeDaemonLauncher
+        {
+            Status = new RouterDaemonStatus(RouterDaemonState.Stopped, null, null),
+            AfterStart = FakeDaemonLauncher.RunningStatus(),
+        };
+        var (vm, _, _) = BuildEnvStep(launcher: launcher);
+
+        await vm.OnStepEnteredAsync();
+
+        Assert.Contains("EnsureRunningAsync", launcher.Calls);
+        Assert.Equal(Port11434Status.RouterRunning, vm.Port11434Status);
+        Assert.False(vm.MessageIsError);
+        Assert.Contains("Router is running on :11434", vm.Message!);
+    }
+
+    [Fact]
+    public async Task Step1_OnStepEntered_ForeignPort_DoesNotAutoStartRouter()
+    {
+        var launcher = new FakeDaemonLauncher
+        {
+            Status = new RouterDaemonStatus(RouterDaemonState.PortOccupiedByOtherService, null, "occupied"),
+        };
+        var (vm, _, _) = BuildEnvStep(launcher: launcher);
+
+        await vm.OnStepEnteredAsync();
+
+        Assert.DoesNotContain("EnsureRunningAsync", launcher.Calls);
+        Assert.DoesNotContain("StartAsync", launcher.Calls);
+        Assert.Equal(Port11434Status.ForeignService, vm.Port11434Status);
+    }
+
+    [Fact]
+    public async Task Step1_ChangePort_FreesPort_AutoStartsRouter()
+    {
+        var launcher = new FakeDaemonLauncher
+        {
+            Status = new RouterDaemonStatus(RouterDaemonState.PortOccupiedByOtherService, null, "occupied"),
+            AfterStart = FakeDaemonLauncher.RunningStatus(),
+        };
+        var (vm, h, _) = BuildEnvStep(launcher: launcher);
+        h.Detection = new OllamaDetection(true, LocalOllamaConfigurator.WindowsTrayAppPath, true);
+        h.PortMap[11434] = true;
+        await vm.RefreshAsync();
+        Assert.Equal(Port11434Status.ForeignService, vm.Port11434Status);
+
+        h.Configurator.ProcessStarter = info =>
+        {
+            h.Starts.Add(info);
+            h.PortOpen = true;
+            h.PortMap[11434] = false;
+            h.PortMap[11435] = true;
+            launcher.Status = new RouterDaemonStatus(RouterDaemonState.Stopped, null, null);
+            return "handle-1";
+        };
+
+        await vm.ChangePortCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.Contains("EnsureRunningAsync", launcher.Calls);
+        Assert.Equal(Port11434Status.RouterRunning, vm.Port11434Status);
+        Assert.False(vm.MessageIsError);
+        Assert.Contains("127.0.0.1:11435", vm.Message!);
+        Assert.Contains("Router is running on :11434", vm.Message!);
+    }
+
+    [Fact]
+    public async Task Root_GoToStep1_FromStep0_StartFails_StaysOnStep0()
+    {
+        var launcher = new FakeDaemonLauncher
+        {
+            Status = new RouterDaemonStatus(RouterDaemonState.Stopped, null, null),
+            StartException = new RouterDaemonStartTimeoutException(TimeSpan.FromSeconds(15), "/opt/ollamarouter-server"),
+        };
+        var fx = BuildRoot(new FakeRouterApiClient(), launcher: launcher);
+        await fx.Root.InitialStepEntry;
+
+        Assert.Equal(0, fx.Root.SelectedStep);
+        Assert.Equal(Port11434Status.Free, fx.Env.Port11434Status);
+
+        await fx.Root.NextCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.Equal(0, fx.Root.SelectedStep);
+        Assert.True(fx.Env.MessageIsError);
+        Assert.Contains("Could not start the router", fx.Env.Message!);
+        await fx.Root.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Root_GoToStep1_FromStep0_ForeignPort_StaysOnStep0WithError()
+    {
+        var launcher = new FakeDaemonLauncher
+        {
+            Status = new RouterDaemonStatus(RouterDaemonState.PortOccupiedByOtherService, null, "occupied"),
+        };
+        var fx = BuildRoot(new FakeRouterApiClient(), launcher: launcher);
+        await fx.Root.InitialStepEntry;
+
+        await fx.Root.NextCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.Equal(0, fx.Root.SelectedStep);
+        Assert.True(fx.Env.MessageIsError);
+        Assert.Contains("Free port :11434", fx.Env.Message!);
+        await fx.Root.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Root_BusyGating_DisablesNavigationWhileStepIsBusy()
+    {
+        var fx = BuildRoot(new FakeRouterApiClient(), launcher: new FakeDaemonLauncher { Status = FakeDaemonLauncher.RunningStatus() });
+        await fx.Root.InitialStepEntry;
+
+        Assert.True(fx.Root.CanGoNext);
+        Assert.True(fx.Root.NextCommand.CanExecute(null));
+
+        fx.Env.IsBusy = true;
+        Assert.True(fx.Root.IsAnyStepBusy);
+        Assert.False(fx.Root.CanGoNext);
+        Assert.False(fx.Root.NextCommand.CanExecute(null));
+
+        fx.Env.IsBusy = false;
+        Assert.False(fx.Root.IsAnyStepBusy);
+        Assert.True(fx.Root.NextCommand.CanExecute(null));
+
+        await fx.Root.GoToAsync(4);
+        Assert.True(fx.Root.FinishCommand.CanExecute(null));
+        fx.Rec.IsBusy = true;
+        Assert.False(fx.Root.FinishCommand.CanExecute(null));
+        Assert.False(fx.Root.BackCommand.CanExecute(null));
+        fx.Rec.IsBusy = false;
+        Assert.True(fx.Root.FinishCommand.CanExecute(null));
+        await fx.Root.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Root_DaemonBanner_ShowsWhenDownOnStep2_AndStartFromBannerRecovers()
+    {
+        var launcher = new FakeDaemonLauncher
+        {
+            Status = FakeDaemonLauncher.RunningStatus(),
+        };
+        var fake = new FakeRouterApiClient { FleetResponse = new RouterFleetResponse([]) };
+        var fx = BuildRoot(fake, launcher: launcher);
+        await fx.Root.InitialStepEntry;
+        await fx.Root.GoToAsync(1);
+        Assert.False(fx.Root.ShowDaemonWarningBanner);
+
+        // Simulate daemon dropping while on Step 2
+        launcher.Status = new RouterDaemonStatus(RouterDaemonState.Stopped, null, null);
+        launcher.AfterStart = FakeDaemonLauncher.RunningStatus();
+        await fx.Env.RefreshAsync();
+
+        Assert.True(fx.Root.ShowDaemonWarningBanner);
+        Assert.True(fx.Root.ShowInlineStartRouterButton);
+        Assert.Equal("● Router Stopped", fx.Root.DaemonBadgeText);
+
+        await fx.Root.StartRouterFromBannerCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.False(fx.Root.ShowDaemonWarningBanner);
+        Assert.True(fx.Root.IsDaemonRunning);
+        Assert.Equal("● Router Running (:11434)", fx.Root.DaemonBadgeText);
+        await fx.Root.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step2_ErrorMessages_SetMessageIsErrorTrue()
+    {
+        var fake = new FakeRouterApiClient { NextCallException = new HttpRequestException("refused") };
+        var vm = new WizardTargetsStepViewModel(() => fake, ct => Task.CompletedTask, GatedDelay);
+
+        await vm.RefreshAsync();
+
+        Assert.True(vm.MessageIsError);
+        Assert.True(vm.HasMessage);
+
+        vm.AddTargetCommand.Execute(new AddTargetRequest("Node1", "http://node1:11435", TestConnectionFirst: false));
+        await WaitUntilAsync(() => !vm.MessageIsError, "AddTarget success clears MessageIsError");
+        Assert.False(vm.MessageIsError);
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step3_ExternalProviders_PopulatedFromNonOllamaTargets()
+    {
+        var fake = new FakeRouterApiClient();
+        fake.SeedTarget(new RouterTargetConfigDto("Local", "http://127.0.0.1:11435", true, null, 1, "ollama"));
+        fake.SeedTarget(new RouterTargetConfigDto("OpenAI", "https://api.openai.com/v1", true, null, 2, "openai", "openai"));
+        var vm = new WizardCloudStepViewModel(() => fake);
+
+        await vm.RefreshAsync();
+
+        var provider = Assert.Single(vm.ExternalProviders);
+        Assert.Equal("OpenAI", provider.Name);
+        Assert.Equal("openai", provider.ProviderType);
+        Assert.True(vm.HasExternalProviders);
+        Assert.False(vm.HasNoExternalProviders);
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step4_SelectFittingOnly_AndSelectNone_AndProgressPercent()
+    {
+        var fake = new FakeRouterApiClient
+        {
+            CandidatesResponse = new RouterBenchmarkCandidatesResponse([
+                new RouterBenchmarkCandidateTarget(
+                    "Local",
+                    null,
+                    [
+                        new RouterBenchmarkCandidateModel("qwen2.5:7b", [UsageRole.BasicModel], "q4_K_M", "qwen2", 4500, null, 8192, BenchmarkCandidateFit.Fits, 8192),
+                        new RouterBenchmarkCandidateModel("llama3:70b", [UsageRole.SoftwareArchitect], "q4_K_M", "llama", 42000, null, 8192, BenchmarkCandidateFit.Pruned, 0),
+                    ])
+            ]),
+            StartBenchmarkResponse = new RouterBenchmarkRunResponse(true, ["Local"]),
+            BenchmarkResults = new RouterBenchmarkResultsResponse([
+                new BenchmarkTargetResult("Local", BenchmarkRunStatus.Succeeded, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, [])
+            ]),
+        };
+        WizardBenchmarkStepViewModel vm = null!;
+        vm = new WizardBenchmarkStepViewModel(() => fake, ct => vm.RefreshAsync(ct), GatedDelay);
+
+        await vm.RefreshAsync();
+        Assert.True(vm.HasCandidates);
+
+        vm.SelectNoneCommand.Execute(null);
+        Assert.All(vm.CandidateGroups.SelectMany(g => g.Models), m => Assert.False(m.IsSelected));
+        Assert.False(vm.RunBenchmarksCommand.CanExecute(null));
+
+        vm.SelectFittingOnlyCommand.Execute(null);
+        var models = vm.CandidateGroups.SelectMany(g => g.Models).ToList();
+        Assert.True(models[0].IsSelected);
+        Assert.False(models[1].IsSelected);
+        Assert.True(vm.RunBenchmarksCommand.CanExecute(null));
+
+        await vm.RunBenchmarksCommand.ExecuteAsync(CancellationToken.None);
+        Assert.Equal(100.0, vm.ProgressPercent);
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step5_GenerateAndApply_GeneratesAndAppliesInOneClick_AndSetsMessageIsErrorOn409()
+    {
+        var fake = new FakeRouterApiClient();
+        var vm = new WizardRecommendationsStepViewModel(() => fake);
+
+        await vm.GenerateAndApplyCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.False(vm.MessageIsError);
+        Assert.True(vm.HasMessage);
+        Assert.True(vm.HasModels);
+        Assert.True(vm.HasAppliedTargets);
+        Assert.Single(vm.AppliedTargets);
+
+        var conflictFake = new FakeRouterApiClient { GenerateError = (HttpStatusCode.Conflict, "none") };
+        var conflictVm = new WizardRecommendationsStepViewModel(() => conflictFake);
+        await conflictVm.GenerateAndApplyCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.True(conflictVm.MessageIsError);
+        Assert.True(conflictVm.GoToBenchmarkCommand.CanExecute(null));
+        await vm.DisposeAsync();
+        await conflictVm.DisposeAsync();
+    }
+
+    // ==================================================================
+    //  Converters & Review-Finding Regressions
+    // ==================================================================
+
+    [Fact]
+    public void Converters_NewSemanticConverters_MapValuesAndRejectConvertBack()
+    {
+        var culture = CultureInfo.InvariantCulture;
+
+        // BoolToBannerBackgroundConverter
+        var bgConv = BoolToBannerBackgroundConverter.Instance;
+        Assert.Equal(Avalonia.Media.Color.Parse("#26EF4444"),
+            Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(bgConv.Convert(true, typeof(object), null, culture)).Color);
+        Assert.Equal(Avalonia.Media.Color.Parse("#2610B981"),
+            Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(bgConv.Convert(false, typeof(object), null, culture)).Color);
+        Assert.Equal(Avalonia.Media.Color.Parse("#2610B981"),
+            Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(bgConv.Convert("other", typeof(object), null, culture)).Color);
+        Assert.Throws<NotSupportedException>(() => bgConv.ConvertBack(null, typeof(object), null, culture));
+
+        // BoolToBannerBorderConverter
+        var borderConv = BoolToBannerBorderConverter.Instance;
+        Assert.Equal(Avalonia.Media.Color.Parse("#EF4444"),
+            Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(borderConv.Convert(true, typeof(object), null, culture)).Color);
+        Assert.Equal(Avalonia.Media.Color.Parse("#10B981"),
+            Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(borderConv.Convert(false, typeof(object), null, culture)).Color);
+        Assert.Equal(Avalonia.Media.Color.Parse("#10B981"),
+            Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(borderConv.Convert(null, typeof(object), null, culture)).Color);
+        Assert.Throws<NotSupportedException>(() => borderConv.ConvertBack(null, typeof(object), null, culture));
+
+        // FitTextToBrushConverter
+        var fitConv = FitTextToBrushConverter.Instance;
+        Assert.Equal(Avalonia.Media.Color.Parse("#10B981"),
+            Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(fitConv.Convert("ctx ≤ 8192", typeof(object), null, culture)).Color);
+        Assert.Equal(Avalonia.Media.Color.Parse("#10B981"),
+            Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(fitConv.Convert("CTX 4096", typeof(object), null, culture)).Color);
+        Assert.Equal(Avalonia.Media.Color.Parse("#F59E0B"),
+            Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(fitConv.Convert("won't fit this node", typeof(object), null, culture)).Color);
+        Assert.Equal(Avalonia.Media.Color.Parse("#94A3B8"),
+            Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(fitConv.Convert("no profile (assumed)", typeof(object), null, culture)).Color);
+        Assert.Equal(Avalonia.Media.Color.Parse("#94A3B8"),
+            Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(fitConv.Convert(null, typeof(object), null, culture)).Color);
+        Assert.Throws<NotSupportedException>(() => fitConv.ConvertBack(null, typeof(object), null, culture));
+
+        // LivenessToBrushConverter
+        var liveConv = LivenessToBrushConverter.Instance;
+        foreach (var online in new[] { "Online", "healthy", "READY" })
+        {
+            Assert.Equal(Avalonia.Media.Color.Parse("#10B981"),
+                Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(liveConv.Convert(online, typeof(object), null, culture)).Color);
+        }
+        foreach (var offline in new[] { "Offline", "unhealthy", "Down", "ERROR" })
+        {
+            Assert.Equal(Avalonia.Media.Color.Parse("#F87171"),
+                Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(liveConv.Convert(offline, typeof(object), null, culture)).Color);
+        }
+        foreach (var other in new object?[] { "Unknown", "Degraded", null, 42 })
+        {
+            Assert.Equal(Avalonia.Media.Color.Parse("#F59E0B"),
+                Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(liveConv.Convert(other, typeof(object), null, culture)).Color);
+        }
+        Assert.Throws<NotSupportedException>(() => liveConv.ConvertBack(null, typeof(object), null, culture));
+
+        // WizardStepForegroundConverter
+        var stepConv = WizardStepForegroundConverter.Instance;
+        Assert.Equal(Avalonia.Media.Color.Parse("#A5B4FC"),
+            Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(stepConv.Convert(2, typeof(object), "2", culture)).Color);
+        Assert.Equal(Avalonia.Media.Color.Parse("#10B981"),
+            Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(stepConv.Convert(2, typeof(object), 1, culture)).Color);
+        Assert.Equal(Avalonia.Media.Color.Parse("#94A3B8"),
+            Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(stepConv.Convert(2, typeof(object), "3", culture)).Color);
+        Assert.Equal(Avalonia.Media.Color.Parse("#94A3B8"),
+            Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(stepConv.Convert(2, typeof(object), "bad", culture)).Color);
+        Assert.Equal(Avalonia.Media.Color.Parse("#94A3B8"),
+            Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(stepConv.Convert("2", typeof(object), 2, culture)).Color);
+        Assert.Throws<NotSupportedException>(() => stepConv.ConvertBack(null, typeof(object), null, culture));
+    }
+
+    [Fact]
+    public async Task Root_GoToStep1_FromStep0_UnknownPort_ProbesAndBlocksOrAdvances()
+    {
+        var occupiedLauncher = new FakeDaemonLauncher
+        {
+            Status = new RouterDaemonStatus(RouterDaemonState.PortOccupiedByOtherService, null, "occupied"),
+        };
+        var fxBlocked = BuildRoot(new FakeRouterApiClient(), launcher: occupiedLauncher);
+        await fxBlocked.Root.InitialStepEntry;
+        fxBlocked.Env.Port11434Status = Port11434Status.Unknown;
+
+        await fxBlocked.Root.NextCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.Equal(0, fxBlocked.Root.SelectedStep);
+        Assert.Equal(Port11434Status.ForeignService, fxBlocked.Env.Port11434Status);
+        Assert.True(fxBlocked.Env.MessageIsError);
+        Assert.Contains("Free port :11434", fxBlocked.Env.Message!);
+        await fxBlocked.Root.DisposeAsync();
+
+        var runningLauncher = new FakeDaemonLauncher { Status = FakeDaemonLauncher.RunningStatus() };
+        var fxReady = BuildRoot(new FakeRouterApiClient(), launcher: runningLauncher);
+        await fxReady.Root.InitialStepEntry;
+        fxReady.Env.Port11434Status = Port11434Status.Unknown;
+
+        await fxReady.Root.NextCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.Equal(1, fxReady.Root.SelectedStep);
+        Assert.Equal(Port11434Status.RouterRunning, fxReady.Env.Port11434Status);
+        await fxReady.Root.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Root_DaemonDropOnSteps2To5_UpdatesBannerOnStepTransitionAndStepError()
+    {
+        var launcher = new FakeDaemonLauncher { Status = FakeDaemonLauncher.RunningStatus() };
+        var fake = new FakeRouterApiClient { FleetResponse = new RouterFleetResponse([]) };
+        var fx = BuildRoot(fake, launcher: launcher);
+        await fx.Root.InitialStepEntry;
+        await fx.Root.GoToAsync(1);
+        Assert.False(fx.Root.ShowDaemonWarningBanner);
+
+        // Daemon stops, then user navigates to Step 3
+        launcher.Status = new RouterDaemonStatus(RouterDaemonState.Stopped, null, null);
+        await fx.Root.GoToAsync(2);
+
+        Assert.Equal(2, fx.Root.SelectedStep);
+        Assert.True(fx.Root.ShowDaemonWarningBanner);
+        Assert.True(fx.Root.ShowInlineStartRouterButton);
+        Assert.False(fx.Root.IsDaemonPortConflict);
+
+        // Port becomes occupied by raw Ollama and Step 3 reports an error -> background probe updates banner
+        launcher.Status = new RouterDaemonStatus(RouterDaemonState.PortOccupiedByOtherService, null, "occupied");
+        fake.ModelsException = new OllamaRouterApiException(HttpStatusCode.BadGateway, "down");
+        await fx.Cloud.RefreshAsync();
+
+        await WaitUntilAsync(() => fx.Root.IsDaemonPortConflict, "background router probe to detect foreign service");
+        Assert.False(fx.Root.ShowInlineStartRouterButton);
+        Assert.Contains("Change port", fx.Root.DaemonBannerMessage);
+        await fx.Root.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Root_StartRouterFromBanner_FailureBusyGateAndSuccessRefreshWork()
+    {
+        var launcher = new FakeDaemonLauncher { Status = FakeDaemonLauncher.RunningStatus() };
+        var fake = new FakeRouterApiClient { FleetResponse = new RouterFleetResponse([]) };
+        var fx = BuildRoot(fake, launcher: launcher);
+        await fx.Root.InitialStepEntry;
+        await fx.Root.GoToAsync(1);
+        await WaitUntilAsync(() => fake.Calls.Contains("GetFleetAsync"), "initial Step 2 poll tick");
+
+        // Daemon drops while on Step 2
+        launcher.Status = new RouterDaemonStatus(RouterDaemonState.Stopped, null, null);
+        launcher.StartException = new RouterDaemonStartTimeoutException(TimeSpan.FromSeconds(15), "/opt/ollamarouter");
+        await fx.Env.RefreshRouterStatusAsync();
+        Assert.True(fx.Root.ShowDaemonWarningBanner);
+
+        // Failure surfaces error in DaemonBannerMessage
+        await fx.Root.StartRouterFromBannerCommand.ExecuteAsync(CancellationToken.None);
+        Assert.True(fx.Root.ShowDaemonWarningBanner);
+        Assert.Contains("Could not start the router", fx.Root.DaemonBannerMessage);
+
+        // Busy-gating disables StartRouterFromBannerCommand
+        fx.Targets.IsBusy = true;
+        Assert.False(fx.Root.StartRouterFromBannerCommand.CanExecute(null));
+        var callsBeforeBusyAttempt = launcher.Calls.Count;
+        await fx.Root.StartRouterFromBannerCommand.ExecuteAsync(CancellationToken.None);
+        Assert.Equal(callsBeforeBusyAttempt, launcher.Calls.Count);
+        fx.Targets.IsBusy = false;
+
+        // Recovery succeeds and refreshes Step 2 immediately (even with GatedDelay poller)
+        launcher.StartException = null;
+        launcher.AfterStart = FakeDaemonLauncher.RunningStatus();
+        fake.FleetResponse = OneTargetFleet();
+        var fleetCallsBefore = fake.Calls.Count(c => c == "GetFleetAsync");
+
+        await fx.Root.StartRouterFromBannerCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.False(fx.Root.ShowDaemonWarningBanner);
+        Assert.True(fx.Root.IsDaemonRunning);
+        await WaitUntilAsync(
+            () => fake.Calls.Count(c => c == "GetFleetAsync") > fleetCallsBefore && fx.Targets.Rows.Count == 1,
+            "Step 2 poller to restart and refresh rows after banner recovery");
+        await fx.Root.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Root_GoToStep1Command_NavigatesToStep0AndClearsBannerError()
+    {
+        var launcher = new FakeDaemonLauncher { Status = FakeDaemonLauncher.RunningStatus() };
+        var fake = new FakeRouterApiClient { FleetResponse = new RouterFleetResponse([]) };
+        var fx = BuildRoot(fake, launcher: launcher);
+        await fx.Root.InitialStepEntry;
+        await fx.Root.GoToAsync(1);
+
+        launcher.Status = new RouterDaemonStatus(RouterDaemonState.Stopped, null, null);
+        launcher.StartException = new RouterDaemonStartTimeoutException(TimeSpan.FromSeconds(15), "/opt/ollamarouter");
+        await fx.Env.RefreshRouterStatusAsync();
+        await fx.Root.StartRouterFromBannerCommand.ExecuteAsync(CancellationToken.None);
+        Assert.Contains("Could not start the router", fx.Root.DaemonBannerMessage);
+
+        await fx.Root.GoToStep1Command.ExecuteAsync(CancellationToken.None);
+
+        Assert.Equal(0, fx.Root.SelectedStep);
+        Assert.Equal(
+            "The OllamaRouter daemon is not running on :11434. Start it now to continue setup.",
+            fx.Root.DaemonBannerMessage);
+        await fx.Root.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step1_OnStepEntered_FreePort_AutoStartsRouter_WithSingleBinaryProbe()
+    {
+        var launcher = new FakeDaemonLauncher
+        {
+            Status = new RouterDaemonStatus(RouterDaemonState.Stopped, null, null),
+            AfterStart = FakeDaemonLauncher.RunningStatus(),
+        };
+        var envConfig = new FakeEnvConfigurator(new OllamaDetection(true, "/usr/local/bin/ollama", true));
+        var vm = new WizardEnvironmentStepViewModel(envConfig.Configurator, FakeConnection(null, launcher));
+
+        await vm.OnStepEnteredAsync();
+
+        Assert.Equal(1, envConfig.Probes);
+        Assert.Contains("EnsureRunningAsync", launcher.Calls);
+        Assert.Equal(Port11434Status.RouterRunning, vm.Port11434Status);
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step1_StartOllama_FreePort_AutoStartsRouter_AndHandlesStartFailure()
+    {
+        var launcher = new FakeDaemonLauncher
+        {
+            Status = new RouterDaemonStatus(RouterDaemonState.Stopped, null, null),
+            AfterStart = FakeDaemonLauncher.RunningStatus(),
+        };
+        var (vm, h, _) = BuildEnvStep(launcher: launcher);
+        h.Detection = new OllamaDetection(true, LocalOllamaConfigurator.WindowsTrayAppPath, false);
+        h.PortOpen = false;
+        h.PortMap[11434] = false;
+        h.Configurator.ProcessStarter = info =>
+        {
+            h.Starts.Add(info);
+            h.PortMap[11435] = true;
+            return "handle-1";
+        };
+
+        await vm.RefreshAsync();
+        await vm.StartOllamaCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.Contains("EnsureRunningAsync", launcher.Calls);
+        Assert.Equal(Port11434Status.RouterRunning, vm.Port11434Status);
+        Assert.False(vm.MessageIsError);
+        Assert.Contains("Router is running on :11434", vm.Message!);
+
+        // Now verify router auto-start failure combines messages and flags MessageIsError
+        var failLauncher = new FakeDaemonLauncher
+        {
+            Status = new RouterDaemonStatus(RouterDaemonState.Stopped, null, null),
+            StartException = new RouterDaemonStartTimeoutException(TimeSpan.FromSeconds(15), "/opt/ollamarouter"),
+        };
+        var (vmFail, hFail, _) = BuildEnvStep(launcher: failLauncher);
+        hFail.Detection = new OllamaDetection(true, LocalOllamaConfigurator.WindowsTrayAppPath, false);
+        hFail.PortMap[11434] = false;
+        hFail.Configurator.ProcessStarter = info =>
+        {
+            hFail.Starts.Add(info);
+            hFail.PortMap[11435] = true;
+            return "handle-1";
+        };
+
+        await vmFail.RefreshAsync();
+        await vmFail.StartOllamaCommand.ExecuteAsync(CancellationToken.None);
+
+        Assert.True(vmFail.MessageIsError);
+        Assert.Contains("Ollama is serving on", vmFail.Message!);
+        Assert.Contains("Could not start the router", vmFail.Message!);
+        await vm.DisposeAsync();
+        await vmFail.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step2_RecoveryAndHasNoRows_ClearsTransientDaemonError_PreservesAddTargetAndLocalAdded()
+    {
+        var fake = new FakeRouterApiClient { NextCallException = new HttpRequestException("refused") };
+        var vm = new WizardTargetsStepViewModel(() => fake, ct => Task.CompletedTask, GatedDelay);
+        Assert.True(vm.HasNoRows);
+
+        // Transient poll error sets MessageIsError; subsequent healthy poll clears it
+        await vm.RefreshAsync();
+        Assert.True(vm.MessageIsError);
+        Assert.True(vm.HasMessage);
+
+        fake.FleetResponse = OneTargetFleet();
+        await vm.RefreshAsync();
+        Assert.False(vm.MessageIsError);
+        Assert.False(vm.HasMessage);
+        Assert.Null(vm.Message);
+        Assert.False(vm.HasNoRows);
+
+        // Empty fleet flips HasNoRows back to true
+        fake.FleetResponse = new RouterFleetResponse([]);
+        await vm.RefreshAsync();
+        Assert.True(vm.HasNoRows);
+
+        // AddTarget 409 error must survive AddTarget's finally RefreshAsync
+        fake.AddTargetError = (HttpStatusCode.Conflict, "duplicate");
+        await vm.AddTargetCommand.ExecuteAsync(new AddTargetRequest("Node1", "http://node1:11435"));
+        Assert.True(vm.MessageIsError);
+        Assert.Equal("Target already exists.", vm.Message);
+        fake.AddTargetError = null;
+
+        // Local auto-add success message must survive subsequent healthy poll ticks
+        await vm.OnStepEnteredAsync();
+        Assert.False(vm.MessageIsError);
+        Assert.Equal("Local node added.", vm.Message);
+        await vm.RefreshAsync();
+        Assert.Equal("Local node added.", vm.Message);
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step3_Refresh_CanSelectCloudModelPropertyChanged_AndExternalProviderFilterAndFlags()
+    {
+        var fake = new FakeRouterApiClient
+        {
+            ConfigResponse = DefaultConfig() with
+            {
+                Cloud = new RouterCloudConfigDto(true, null, "Local", false),
+            },
+            ModelsResponse = new RouterModelsResponse([Model("glm-5.3-flash:cloud")]),
+        };
+        fake.SeedTarget(new RouterTargetConfigDto("NoType", "http://127.0.0.1:11435", true, null, 1, ""));
+        fake.SeedTarget(new RouterTargetConfigDto("Local", "http://127.0.0.1:11435", true, null, 1, "ollama"));
+        fake.SeedTarget(new RouterTargetConfigDto("OpenAI", "https://api.openai.com/v1", true, null, 2, "openai", "OpenAI API"));
+        fake.SeedTarget(new RouterTargetConfigDto("CustomOai", "https://custom/v1", true, null, 2, "openai", null));
+
+        var vm = new WizardCloudStepViewModel(() => fake);
+        var changed = new List<string?>();
+        vm.PropertyChanged += (_, e) => changed.Add(e.PropertyName);
+
+        await vm.RefreshAsync();
+
+        Assert.Contains(nameof(WizardCloudStepViewModel.CanSelectCloudModel), changed);
+        Assert.True(vm.CanSelectCloudModel);
+        Assert.True(vm.ShowRelaySignInWarning);
+        Assert.False(vm.ShowRelaySignInHint);
+
+        Assert.Equal(2, vm.ExternalProviders.Count);
+        Assert.Equal("OpenAI API", vm.ExternalProviders[0].DisplayProvider);
+        Assert.Equal("openai", vm.ExternalProviders[1].DisplayProvider);
+
+        // Check remaining CloudEnabled x CloudOverflowConfigured states
+        vm.CloudEnabled = false;
+        Assert.False(vm.ShowRelaySignInWarning);
+        Assert.True(vm.ShowRelaySignInHint);
+
+        vm.CloudOverflowConfigured = true;
+        Assert.False(vm.ShowRelaySignInWarning);
+        Assert.False(vm.ShowRelaySignInHint);
+
+        // Failed ToggleCloud clears stale Message
+        await vm.ToggleCloudCommand.ExecuteAsync(CancellationToken.None);
+        Assert.True(vm.HasMessage);
+        fake.UpdateConfigError = (HttpStatusCode.InternalServerError, "boom");
+        await vm.ToggleCloudCommand.ExecuteAsync(CancellationToken.None);
+        Assert.True(vm.HasError);
+        Assert.False(vm.HasMessage);
+        Assert.Null(vm.Message);
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step4_Progress_AndClearResultsHttpFailure_WorkDeterministically()
+    {
+        var fake = new FakeRouterApiClient
+        {
+            CandidatesResponse = new RouterBenchmarkCandidatesResponse([
+                new RouterBenchmarkCandidateTarget(
+                    "local",
+                    null,
+                    [new RouterBenchmarkCandidateModel("qwen2.5:7b", [UsageRole.BasicModel], "q4_K_M", "qwen2", 4500, null, 8192, BenchmarkCandidateFit.Fits, 8192)])
+            ]),
+            StartBenchmarkResponse = new RouterBenchmarkRunResponse(true, ["local", "gpu-2"]),
+            BenchmarkResults = new RouterBenchmarkResultsResponse([
+                new BenchmarkTargetResult("Local", BenchmarkRunStatus.Succeeded, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, []),
+                new BenchmarkTargetResult("gpu-2", BenchmarkRunStatus.Running, DateTimeOffset.UtcNow, null, []),
+            ]),
+        };
+
+        WizardBenchmarkStepViewModel vm = null!;
+        vm = new WizardBenchmarkStepViewModel(() => fake, ct => vm.RefreshAsync(ct), GatedDelay);
+
+        // Without RunBenchmarks (_queuedTargets empty), mid-benchmark entry reports partial progress
+        await vm.RefreshAsync();
+        Assert.True(vm.IsBenchmarkRunning);
+        Assert.Equal(50.0, vm.ProgressPercent);
+        Assert.Equal("1 / 2 target(s) finished", vm.ProgressSummaryText);
+
+        // With _queuedTargets matching case-insensitively ("local" vs "Local")
+        await vm.RunBenchmarksCommand.ExecuteAsync(CancellationToken.None);
+        Assert.True(vm.IsBenchmarkRunning);
+        Assert.Equal(50.0, vm.ProgressPercent);
+        Assert.Equal("1 / 2 target(s) finished", vm.ProgressSummaryText);
+
+        // All terminal without _queuedTargets reports 100%
+        fake.BenchmarkResults = new RouterBenchmarkResultsResponse([
+            new BenchmarkTargetResult("Local", BenchmarkRunStatus.Succeeded, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, []),
+            new BenchmarkTargetResult("gpu-2", BenchmarkRunStatus.Succeeded, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, []),
+        ]);
+        await vm.RefreshAsync();
+        Assert.False(vm.IsBenchmarkRunning);
+        Assert.Equal(100.0, vm.ProgressPercent);
+        Assert.Equal("2 / 2 target(s) finished", vm.ProgressSummaryText);
+        await vm.DisposeAsync();
+
+        // ClearResults HttpRequestException clears Message and sets Error without throwing
+        var mock = new Mock<IOllamaRouterApiClient>();
+        mock.Setup(c => c.ClearBenchmarkResultsAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new HttpRequestException("refused"));
+        mock.Setup(c => c.GetBenchmarkCandidatesAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new RouterBenchmarkCandidatesResponse([]));
+        mock.Setup(c => c.GetBenchmarkResultsAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new RouterBenchmarkResultsResponse([]));
+
+        var vmErr = new WizardBenchmarkStepViewModel(() => mock.Object, _ => Task.CompletedTask, GatedDelay);
+        vmErr.Message = "stale success";
+        await vmErr.ClearResultsCommand.ExecuteAsync(CancellationToken.None);
+        Assert.Null(vmErr.Message);
+        Assert.Contains("Connection failed", vmErr.Error!);
+        await vmErr.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step5_Apply409Distinct_IsBusyGatesGoToBenchmark_AndRecoveryClearsError()
+    {
+        var fake = new FakeRouterApiClient { GenerateError = (HttpStatusCode.Conflict, "none") };
+        var vm = new WizardRecommendationsStepViewModel(() => fake);
+
+        await vm.GenerateAndApplyCommand.ExecuteAsync(CancellationToken.None);
+        Assert.True(vm.MessageIsError);
+        Assert.Contains("run the Step 4 micro-benchmark first", vm.Message!);
+        Assert.True(vm.GoToBenchmarkCommand.CanExecute(null));
+
+        // IsBusy gates GoToBenchmarkCommand
+        vm.IsBusy = true;
+        Assert.False(vm.GoToBenchmarkCommand.CanExecute(null));
+        vm.IsBusy = false;
+        Assert.True(vm.GoToBenchmarkCommand.CanExecute(null));
+
+        // Apply 409 after Generate succeeds uses distinct message and resets GoToBenchmarkCommand
+        fake.GenerateError = null;
+        fake.ApplyError = (HttpStatusCode.Conflict, "missing");
+        await vm.GenerateAndApplyCommand.ExecuteAsync(CancellationToken.None);
+        Assert.True(vm.MessageIsError);
+        Assert.Contains("Recommendations were generated, but could not be applied", vm.Message!);
+        Assert.False(vm.GoToBenchmarkCommand.CanExecute(null));
+
+        // RefreshAsync recovery clears MessageIsError
+        await vm.RefreshAsync();
+        Assert.False(vm.MessageIsError);
+        Assert.Null(vm.Message);
+
+        // GenerateCommand success also resets GoToBenchmarkCommand after prior 409
+        fake.GenerateError = (HttpStatusCode.Conflict, "none");
+        await vm.GenerateCommand.ExecuteAsync(CancellationToken.None);
+        Assert.True(vm.GoToBenchmarkCommand.CanExecute(null));
+        fake.GenerateError = null;
+        await vm.GenerateCommand.ExecuteAsync(CancellationToken.None);
+        Assert.False(vm.GoToBenchmarkCommand.CanExecute(null));
+
+        await vm.DisposeAsync();
     }
 }

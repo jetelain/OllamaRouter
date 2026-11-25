@@ -100,6 +100,9 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
     [ObservableProperty]
     private bool _messageIsError;
 
+    /// <summary>Whether <see cref="Message"/> has content to display in the status banner.</summary>
+    public bool HasMessage => !string.IsNullOrWhiteSpace(Message);
+
     [ObservableProperty]
     private bool _isBusy;
 
@@ -218,12 +221,12 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
         try
         {
             _logger.Information("Wizard step 1: install started");
-            Message = "Installing Ollama via the official script — this can take several minutes…";
             MessageIsError = false;
+            Message = "Installing Ollama via the official script — this can take several minutes…";
             var result = await _configurator.InstallOllamaAsync(CancellationToken.None).ConfigureAwait(false);
             LogStepOutcome("install", result);
-            Message = result.Message;
             MessageIsError = !result.Success;
+            Message = result.Message;
             await RefreshAsync(CancellationToken.None).ConfigureAwait(false);
         }
         finally
@@ -245,12 +248,12 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
         try
         {
             _logger.Information("Wizard step 1: update started");
-            Message = "Updating Ollama: stop → official script → restart…";
             MessageIsError = false;
+            Message = "Updating Ollama: stop → official script → restart…";
             var result = await _configurator.UpdateOllamaAsync(OllamaLanState == OllamaLanState.Lan, CancellationToken.None).ConfigureAwait(false);
             LogStepOutcome("update", result);
-            Message = result.Message;
             MessageIsError = !result.Success;
+            Message = result.Message;
             await RefreshAsync(CancellationToken.None).ConfigureAwait(false);
         }
         finally
@@ -278,9 +281,14 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
             _logger.Information("Wizard step 1: start started");
             var result = await _configurator.StartOllamaOnlyAsync(OllamaLanState == OllamaLanState.Lan, CancellationToken.None).ConfigureAwait(false);
             LogStepOutcome("start", result);
-            Message = result.Message;
             MessageIsError = !result.Success;
+            Message = result.Message;
             await RefreshAsync(CancellationToken.None).ConfigureAwait(false);
+
+            if (result.Success && Port11434Status == Port11434Status.Free && _connection.DaemonLauncher is not null)
+            {
+                await TryAutoStartRouterAfterActionAsync(result.Message, CancellationToken.None).ConfigureAwait(false);
+            }
         }
         finally
         {
@@ -293,7 +301,8 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
     /// reuses the existing start-only path — writes OLLAMA_HOST to the port-corrected host
     /// preserving the DETECTED LAN bind (task #160: <see cref="OllamaLanState"/> = Lan →
     /// <c>0.0.0.0:11435</c>, otherwise → <c>127.0.0.1:11435</c>) and restarts Ollama with
-    /// the explicit env + port wait.
+    /// the explicit env + port wait. When freeing :11434 succeeds, automatically starts the
+    /// router daemon on :11434 if it is stopped.
     /// </summary>
     [RelayCommand(CanExecute = nameof(CanChangePort))]
     private async Task ChangePort()
@@ -302,13 +311,18 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
         try
         {
             _logger.Information("Wizard step 1: change port started");
-            Message = "Changing the Ollama port (set OLLAMA_HOST and restart Ollama)…";
             MessageIsError = false;
+            Message = "Changing the Ollama port (set OLLAMA_HOST and restart Ollama)…";
             var result = await _configurator.StartOllamaOnlyAsync(OllamaLanState == OllamaLanState.Lan, CancellationToken.None).ConfigureAwait(false);
             LogStepOutcome("change port", result);
-            Message = result.Message;
             MessageIsError = !result.Success;
+            Message = result.Message;
             await RefreshAsync(CancellationToken.None).ConfigureAwait(false);
+
+            if (result.Success && Port11434Status == Port11434Status.Free && _connection.DaemonLauncher is not null)
+            {
+                await TryAutoStartRouterAfterActionAsync(result.Message, CancellationToken.None).ConfigureAwait(false);
+            }
         }
         finally
         {
@@ -333,14 +347,14 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
         try
         {
             _logger.Information("Wizard step 1: lan toggle started ({Target})", target ? "LAN" : "loopback");
+            MessageIsError = false;
             Message = target
                 ? $"Exposing Ollama on the LAN (set OLLAMA_HOST to 0.0.0.0:{LocalOllamaConfigurator.OllamaPort} and restart Ollama)…"
                 : $"Restricting Ollama to localhost (set OLLAMA_HOST to 127.0.0.1:{LocalOllamaConfigurator.OllamaPort} and restart Ollama)…";
-            MessageIsError = false;
             var result = await _configurator.StartOllamaOnlyAsync(target, CancellationToken.None).ConfigureAwait(false);
             LogStepOutcome("lan toggle", result);
-            Message = result.Message;
             MessageIsError = !result.Success;
+            Message = result.Message;
             await RefreshAsync(CancellationToken.None).ConfigureAwait(false);
         }
         finally
@@ -361,24 +375,24 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
         try
         {
             _logger.Information("Wizard step 1: router start requested");
-            Message = "Starting the router on :11434…";
             MessageIsError = false;
+            Message = "Starting the router on :11434…";
             try
             {
                 var status = await _connection.DaemonLauncher!.StartAsync(CancellationToken.None).ConfigureAwait(false);
                 _logger.Information("Wizard step 1: router start → {State}", status.State.ToString());
+                MessageIsError = false;
                 Message = status.State == RouterDaemonState.Running
                     ? "Router is running on :11434 ✓"
                     : "Router is starting on :11434";
-                MessageIsError = false;
             }
             catch (Exception ex)
             {
                 // Typed launcher failures (port occupied / executable not found / start
                 // timeout) and anything else: a readable message, never a crash.
                 _logger.Warning(ex, "Wizard step 1: router start failed: {Message}", ex.Message);
-                Message = $"Could not start the router: {ex.Message}";
                 MessageIsError = true;
+                Message = $"Could not start the router: {ex.Message}";
             }
 
             await RefreshAsync(CancellationToken.None).ConfigureAwait(false);
@@ -419,6 +433,26 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
         OllamaDetectedPort = portCheck.DetectedPort;
         OllamaLanState = portCheck.LanState; // task #160: the detected LAN-exposure state
 
+        if (_connection.DaemonLauncher is null)
+        {
+            await RefreshRouterStatusAsync(ct).ConfigureAwait(false);
+            return;
+        }
+
+        await RefreshRouterStatusAsync(ct).ConfigureAwait(false);
+
+        // Task #159: the detection results are Debug-level diagnostics (not per-action spam).
+        _logger.Debug(
+            "Wizard step 1 detection: installed={Installed} running={Running} effectivePort={EffectivePort} portStatus={PortStatus} routerPort={RouterPort}",
+            OllamaInstalled, OllamaRunning, OllamaDetectedPort, OllamaPortStatus.ToString(), Port11434Status.ToString());
+    }
+
+    /// <summary>
+    /// Refreshes ONLY the local router daemon status on <c>:11434</c> without re-running Ollama
+    /// binary, port, or LAN detection.
+    /// </summary>
+    internal async Task RefreshRouterStatusAsync(CancellationToken ct = default)
+    {
         var launcher = _connection.DaemonLauncher;
         if (launcher is null)
         {
@@ -427,19 +461,23 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
             return;
         }
 
-        var status = await launcher.GetStatusAsync(ct).ConfigureAwait(false);
-        Port11434Status = status.State switch
+        try
         {
-            RouterDaemonState.Running => Port11434Status.RouterRunning,
-            RouterDaemonState.PortOccupiedByOtherService => Port11434Status.ForeignService,
-            _ => Port11434Status.Free,
-        };
-        RouterStatusLabel = Describe(Port11434Status);
-
-        // Task #159: the detection results are Debug-level diagnostics (not per-action spam).
-        _logger.Debug(
-            "Wizard step 1 detection: installed={Installed} running={Running} effectivePort={EffectivePort} portStatus={PortStatus} routerPort={RouterPort}",
-            OllamaInstalled, OllamaRunning, OllamaDetectedPort, OllamaPortStatus.ToString(), Port11434Status.ToString());
+            var status = await launcher.GetStatusAsync(ct).ConfigureAwait(false);
+            Port11434Status = status.State switch
+            {
+                RouterDaemonState.Running => Port11434Status.RouterRunning,
+                RouterDaemonState.PortOccupiedByOtherService => Port11434Status.ForeignService,
+                _ => Port11434Status.Free,
+            };
+            RouterStatusLabel = Describe(Port11434Status);
+        }
+        catch (Exception ex)
+        {
+            _logger.Warning(ex, "Wizard step 1: router status check failed: {Message}", ex.Message);
+            Port11434Status = Port11434Status.Unknown;
+            RouterStatusLabel = Describe(Port11434Status);
+        }
     }
 
     /// <summary>
@@ -469,8 +507,100 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
         }
     }
 
-    /// <summary>Step lifecycle: refresh the detection + port state on entry.</summary>
-    public Task OnStepEnteredAsync(CancellationToken ct = default) => RefreshAsync(ct);
+    /// <summary>
+    /// Ensures the local router daemon is running when port :11434 is free.
+    /// Called on Step 1 entry, after freeing :11434, on Step 1 → Step 2 transition, and from
+    /// the global recovery banner. Returns true when the router is running on :11434.
+    /// </summary>
+    internal async Task<bool> EnsureRouterAutoStartedAsync(CancellationToken ct = default)
+    {
+        var launcher = _connection.DaemonLauncher;
+        if (Port11434Status != Port11434Status.Free || launcher is null)
+        {
+            return Port11434Status == Port11434Status.RouterRunning;
+        }
+
+        IsBusy = true;
+        try
+        {
+            _logger.Information("Wizard step 1: router start requested");
+            MessageIsError = false;
+            Message = "Starting the router on :11434…";
+            try
+            {
+                var status = await launcher.EnsureRunningAsync(ct).ConfigureAwait(false);
+                _logger.Information("Wizard step 1: router start → {State}", status.State.ToString());
+                if (status.State == RouterDaemonState.Running)
+                {
+                    MessageIsError = false;
+                    Message = "Router is running on :11434 ✓";
+                }
+                else
+                {
+                    MessageIsError = true;
+                    Message = status.Detail ?? "Could not start the router on :11434.";
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Warning(ex, "Wizard step 1: router start failed: {Message}", ex.Message);
+                MessageIsError = true;
+                Message = $"Could not start the router: {ex.Message}";
+            }
+
+            await RefreshRouterStatusAsync(ct).ConfigureAwait(false);
+            return Port11434Status == Port11434Status.RouterRunning;
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    private async Task TryAutoStartRouterAfterActionAsync(string baseMessage, CancellationToken ct)
+    {
+        var launcher = _connection.DaemonLauncher;
+        if (launcher is null)
+        {
+            return;
+        }
+
+        _logger.Information("Wizard step 1: router start requested");
+        try
+        {
+            var status = await launcher.EnsureRunningAsync(ct).ConfigureAwait(false);
+            _logger.Information("Wizard step 1: router start → {State}", status.State.ToString());
+            if (status.State == RouterDaemonState.Running)
+            {
+                MessageIsError = false;
+                Message = $"{baseMessage} Router is running on :11434 ✓";
+            }
+            else
+            {
+                MessageIsError = true;
+                Message = $"{baseMessage} Could not start the router: {status.Detail ?? status.State.ToString()}";
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.Warning(ex, "Wizard step 1: router start failed: {Message}", ex.Message);
+            MessageIsError = true;
+            Message = $"{baseMessage} Could not start the router: {ex.Message}";
+        }
+
+        await RefreshRouterStatusAsync(ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Step lifecycle: refresh the detection + port state on entry, and auto-start
+    /// the router daemon when port :11434 is free.</summary>
+    public async Task OnStepEnteredAsync(CancellationToken ct = default)
+    {
+        await RefreshAsync(ct).ConfigureAwait(false);
+        if (Port11434Status == Port11434Status.Free && _connection.DaemonLauncher is not null)
+        {
+            await EnsureRouterAutoStartedAsync(ct).ConfigureAwait(false);
+        }
+    }
 
     /// <summary>Step lifecycle: nothing to stop (no poller).</summary>
     public Task OnStepLeftAsync() => Task.CompletedTask;
@@ -489,16 +619,21 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
 
     private bool CanRecheck() => !IsBusy;
 
+    partial void OnMessageChanged(string? value) => OnPropertyChanged(nameof(HasMessage));
+
     partial void OnIsBusyChanged(bool value)
     {
         // Busy disables ALL Step 1 actions concurrently (task #150, AC6).
-        InstallOllamaCommand.NotifyCanExecuteChanged();
-        StartOllamaCommand.NotifyCanExecuteChanged();
-        UpdateOllamaCommand.NotifyCanExecuteChanged();
-        ChangePortCommand.NotifyCanExecuteChanged();
-        ToggleLanCommand.NotifyCanExecuteChanged();
-        StartRouterCommand.NotifyCanExecuteChanged();
-        RecheckCommand.NotifyCanExecuteChanged();
+        WizardUiThread.InvokeOrPost(() =>
+        {
+            InstallOllamaCommand.NotifyCanExecuteChanged();
+            StartOllamaCommand.NotifyCanExecuteChanged();
+            UpdateOllamaCommand.NotifyCanExecuteChanged();
+            ChangePortCommand.NotifyCanExecuteChanged();
+            ToggleLanCommand.NotifyCanExecuteChanged();
+            StartRouterCommand.NotifyCanExecuteChanged();
+            RecheckCommand.NotifyCanExecuteChanged();
+        });
     }
 
     partial void OnOllamaInstalledChanged(bool value)
@@ -509,10 +644,13 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
         OnPropertyChanged(nameof(ShowUpdateButton));
         OnPropertyChanged(nameof(ShowLanRow));
         OnPropertyChanged(nameof(ShowLanToggle));
-        InstallOllamaCommand.NotifyCanExecuteChanged();
-        StartOllamaCommand.NotifyCanExecuteChanged();
-        UpdateOllamaCommand.NotifyCanExecuteChanged();
-        ToggleLanCommand.NotifyCanExecuteChanged();
+        WizardUiThread.InvokeOrPost(() =>
+        {
+            InstallOllamaCommand.NotifyCanExecuteChanged();
+            StartOllamaCommand.NotifyCanExecuteChanged();
+            UpdateOllamaCommand.NotifyCanExecuteChanged();
+            ToggleLanCommand.NotifyCanExecuteChanged();
+        });
     }
 
     partial void OnOllamaRunningChanged(bool value)
@@ -520,7 +658,7 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
         OnPropertyChanged(nameof(DetectionText));
         OnPropertyChanged(nameof(ShowStartButton));
         OnPropertyChanged(nameof(ShowRunningCheck));
-        StartOllamaCommand.NotifyCanExecuteChanged();
+        WizardUiThread.InvokeOrPost(() => StartOllamaCommand.NotifyCanExecuteChanged());
     }
 
     partial void OnOllamaBinaryPathChanged(string? value) => OnPropertyChanged(nameof(DetectionText));
@@ -530,7 +668,7 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
         OnPropertyChanged(nameof(ShowLanToggle));
         OnPropertyChanged(nameof(LanRowLabel));
         OnPropertyChanged(nameof(LanToggleText));
-        ToggleLanCommand.NotifyCanExecuteChanged();
+        WizardUiThread.InvokeOrPost(() => ToggleLanCommand.NotifyCanExecuteChanged());
     }
 
     partial void OnOllamaPortStatusChanged(OllamaPortStatus value)
@@ -542,7 +680,7 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
         OnPropertyChanged(nameof(ShowPortNotDetected));
         OnPropertyChanged(nameof(ShowPortUnknown));
         OnPropertyChanged(nameof(ShowChangePortButton));
-        ChangePortCommand.NotifyCanExecuteChanged();
+        WizardUiThread.InvokeOrPost(() => ChangePortCommand.NotifyCanExecuteChanged());
     }
 
     partial void OnOllamaDetectedPortChanged(int? value) => OnPropertyChanged(nameof(OllamaPortLabel));
@@ -551,7 +689,7 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
     {
         OnPropertyChanged(nameof(ShowStartRouterButton));
         OnPropertyChanged(nameof(ShowRouterRunningCheck));
-        StartRouterCommand.NotifyCanExecuteChanged();
+        WizardUiThread.InvokeOrPost(() => StartRouterCommand.NotifyCanExecuteChanged());
     }
 
     /// <summary>Human summary for a port state (bound to the status label; task #160: the
