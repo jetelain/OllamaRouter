@@ -4,25 +4,26 @@
         x:Class="OllamaRouter.App.Views.Dialogs.EditOllamaNodeDialog"
         x:DataType="vm:OllamaNodeEditFormViewModel"
         Title="Edit Ollama Node"
-        Width="640" Height="640"
+        Width="640" Height="480"
         WindowStartupLocation="CenterOwner">
-  <DockPanel Margin="8">
+  <DockPanel Margin="16">
     <!-- Severity banner (task #171, AC4): the validation error renders in the
          SemiColorDangerLight card, bound to the form's error state. -->
     <Border DockPanel.Dock="Top"
             Padding="10,8"
-            CornerRadius="8"
+            CornerRadius="6"
             Margin="0,0,0,6"
             Background="{DynamicResource SemiColorDangerLight}"
             BorderBrush="{DynamicResource SemiColorDanger}"
             BorderThickness="1"
             IsVisible="{Binding HasValidationError}">
       <TextBlock Text="{Binding ValidationErrorMessage}"
+                 FontSize="12"
                  TextWrapping="Wrap"
                  Foreground="{DynamicResource NightCodeAccentCrimsonLightText}"/>
     </Border>
 
-    <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8" Margin="0,6,0,0">
+    <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8" Margin="0,8,0,0">
       <Button Content="Cancel" Click="OnCancelClick" MinWidth="90"/>
       <Button Content="Save" Classes="Primary" Click="OnSaveClick" MinWidth="90"/>
     </StackPanel>
@@ -30,7 +31,7 @@
     <ScrollViewer>
       <StackPanel Spacing="8">
         <!-- NightCodeForge form card (task #171). -->
-        <Border Padding="12"
+        <Border Padding="14"
                 CornerRadius="8"
                 Background="{DynamicResource NightCodeBgSurface}"
                 BorderBrush="{DynamicResource SemiColorBorder}"

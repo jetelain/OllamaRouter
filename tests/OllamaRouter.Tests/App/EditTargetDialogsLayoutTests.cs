@@ -40,17 +40,19 @@ public sealed class EditTargetDialogsLayoutTests :
     {
         await _fixture.DispatchAsync(() =>
         {
-            var dialogs = new (string, Window)[]
+            var dialogs = new (string title, Window dialog, Size size)[]
             {
-                ("Edit Ollama Node", BuildOllamaDialog().dialog),
-                ("Edit External Provider", BuildProviderDialog().dialog),
+                ("Edit Ollama Node", BuildOllamaDialog().dialog, new Size(640, 480)),
+                ("Edit External Provider", BuildProviderDialog().dialog, new Size(640, 640)),
             };
-            foreach (var (title, dialog) in dialogs)
+            foreach (var (title, dialog, size) in dialogs)
             {
                 Assert.Equal(title, dialog.Title);
-                Assert.Equal(new Size(640, 640), new Size(dialog.Width, dialog.Height));
+                Assert.Equal(size, new Size(dialog.Width, dialog.Height));
 
-                var (_, buttons, _, _) = Traverse(dialog);
+                var (dock, buttons, _, _) = Traverse(dialog);
+                // Task #175: the shell carries the NightCodeForge modal Margin="16".
+                Assert.Equal(new Thickness(16), dock.Margin);
                 var contents = buttons.Children.OfType<Button>().Select(b => b.Content as string).ToArray();
                 Assert.Equal(new[] { "Cancel", "Save" }, contents);
                 // The Save button is the primary call-to-action.
@@ -59,10 +61,13 @@ public sealed class EditTargetDialogsLayoutTests :
 
                 // The severity banner is a Border (not a bare TextBlock): IsVisible is bound
                 // to HasValidationError and it contains the ValidationErrorMessage TextBlock.
-                var banner = Assert.IsType<Border>(Assert.IsType<DockPanel>(dialog.Content).Children[0]);
+                var banner = Assert.IsType<Border>(dock.Children[0]);
                 Assert.Equal("HasValidationError", BindingPath(banner, Control.IsVisibleProperty));
                 var message = Assert.IsType<TextBlock>(banner.Child);
                 Assert.Equal("ValidationErrorMessage", BindingPath(message, TextBlock.TextProperty));
+                // Task #175: the banner token alignment — CornerRadius 6 + FontSize 12.
+                Assert.Equal(new CornerRadius(6), banner.CornerRadius);
+                Assert.Equal(12, message.FontSize);
             }
         });
     }
@@ -82,6 +87,7 @@ public sealed class EditTargetDialogsLayoutTests :
             // The form card: CornerRadius 8 + the NightCodeBgSurface background.
             var card = Assert.IsType<Border>(grid.Parent);
             Assert.Equal(new CornerRadius(8), card.CornerRadius);
+            Assert.Equal(new Thickness(14), card.Padding);
             Assert.NotNull(card.Background);
         });
     }
@@ -170,6 +176,7 @@ public sealed class EditTargetDialogsLayoutTests :
 
             var card = Assert.IsType<Border>(grid.Parent);
             Assert.Equal(new CornerRadius(8), card.CornerRadius);
+            Assert.Equal(new Thickness(14), card.Padding);
             Assert.NotNull(card.Background);
         });
     }
@@ -227,9 +234,13 @@ public sealed class EditTargetDialogsLayoutTests :
             var keyBox = Assert.IsType<TextBox>(keyPanel.Children[0]);
             var statusLine = Assert.IsType<TextBlock>(keyPanel.Children[1]);
 
-            Assert.NotEqual(default, keyBox.PasswordChar); // key material is never displayed
+            Assert.Equal('•', keyBox.PasswordChar); // key material is never displayed (U+2022, task #175)
             Assert.Equal("ApiKey", BindingPath(keyBox, TextBox.TextProperty));
             Assert.Equal("ApiKeyStatusText", BindingPath(statusLine, TextBlock.TextProperty));
+            // Task #175: secondary text uses the SemiColorText2 token, not ad-hoc Opacity dimming.
+            Assert.Equal(1.0, statusLine.Opacity);
+            var statusBrush = Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(statusLine.Foreground);
+            Assert.Equal(Avalonia.Media.Color.Parse("#94A3B8"), statusBrush.Color);
         });
     }
 
@@ -249,9 +260,15 @@ public sealed class EditTargetDialogsLayoutTests :
             {
                 var (_, _, _, content) = Traverse(dialog);
                 var rosterCard = Assert.IsType<Border>(content.Children[1]);
+                Assert.Equal(new Thickness(14), rosterCard.Padding);
                 var rosterStack = Assert.IsType<StackPanel>(rosterCard.Child);
 
                 Assert.Equal("Declared Models", ((TextBlock)rosterStack.Children[0]).Text);
+                // Task #175: the roster helper line carries SemiColorText2, not Opacity dimming.
+                var rosterHelper = Assert.IsType<TextBlock>(rosterStack.Children[1]);
+                Assert.Equal(1.0, rosterHelper.Opacity);
+                var rosterHelperBrush = Assert.IsAssignableFrom<Avalonia.Media.ISolidColorBrush>(rosterHelper.Foreground);
+                Assert.Equal(Avalonia.Media.Color.Parse("#94A3B8"), rosterHelperBrush.Color);
                 var items = rosterStack.Children.OfType<ItemsControl>().Single();
                 Assert.Equal("Models", BindingPath(items, ItemsControl.ItemsSourceProperty));
 

@@ -6,31 +6,32 @@
         Title="Edit External Provider"
         Width="640" Height="640"
         WindowStartupLocation="CenterOwner">
-  <DockPanel Margin="8">
+  <DockPanel Margin="16">
     <!-- Severity banner (task #171, AC4): the validation error renders in the
          SemiColorDangerLight card, bound to the form's error state. -->
     <Border DockPanel.Dock="Top"
             Padding="10,8"
-            CornerRadius="8"
+            CornerRadius="6"
             Margin="0,0,0,6"
             Background="{DynamicResource SemiColorDangerLight}"
             BorderBrush="{DynamicResource SemiColorDanger}"
             BorderThickness="1"
             IsVisible="{Binding HasValidationError}">
       <TextBlock Text="{Binding ValidationErrorMessage}"
+                 FontSize="12"
                  TextWrapping="Wrap"
                  Foreground="{DynamicResource NightCodeAccentCrimsonLightText}"/>
     </Border>
 
-    <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8" Margin="0,6,0,0">
+    <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8" Margin="0,8,0,0">
       <Button Content="Cancel" Click="OnCancelClick" MinWidth="90"/>
       <Button Content="Save" Classes="Primary" Click="OnSaveClick" MinWidth="90"/>
     </StackPanel>
 
     <ScrollViewer>
-      <StackPanel Spacing="8">
+      <StackPanel Spacing="10">
         <!-- NightCodeForge form card (task #171). -->
-        <Border Padding="12"
+        <Border Padding="14"
                 CornerRadius="8"
                 Background="{DynamicResource NightCodeBgSurface}"
                 BorderBrush="{DynamicResource SemiColorBorder}"
@@ -59,18 +60,18 @@
                        ToolTip.Tip="Upstream (masked) key — the key material is never displayed. Untouched = no change, emptied = clear, new value = replace."/>
             <StackPanel Grid.Row="4" Grid.Column="1" Orientation="Vertical" Spacing="4">
               <TextBox Text="{Binding ApiKey, UpdateSourceTrigger=PropertyChanged}"
-                       PasswordChar="●"
+                       PasswordChar="•"
                        PlaceholderText="leave blank = no change, empty = clear"/>
               <TextBlock Text="{Binding ApiKeyStatusText}"
                          FontSize="12"
-                         Opacity="0.7"
+                         Foreground="{DynamicResource SemiColorText2}"
                          TextWrapping="Wrap"/>
             </StackPanel>
           </Grid>
         </Border>
 
         <!-- NightCodeForge roster card (task #171; the shared-dialog roster row pattern). -->
-        <Border Padding="12"
+        <Border Padding="14"
                 CornerRadius="8"
                 Background="{DynamicResource NightCodeBgSurface}"
                 BorderBrush="{DynamicResource SemiColorBorder}"
@@ -79,7 +80,7 @@
             <TextBlock Text="Declared Models" FontWeight="SemiBold"/>
             <TextBlock Text="Optional — leave empty for a model-agnostic endpoint."
                        FontSize="12"
-                       Opacity="0.7"/>
+                       Foreground="{DynamicResource SemiColorText2}"/>
             <ItemsControl ItemsSource="{Binding Models}">
               <ItemsControl.ItemTemplate>
                 <DataTemplate>
