@@ -47,15 +47,21 @@ public sealed class AddTargetDialogsLayoutTests :
             {
                 Assert.Equal(title, dialog.Title);
 
-                var (_, buttons, _, _) = Traverse(dialog);
+                var (dock, buttons, scroll, _) = Traverse(dialog);
                 var contents = buttons.Children.OfType<Button>().Select(b => b.Content as string).ToArray();
                 Assert.Equal(new[] { "Cancel", "Save" }, contents);
 
-                // The top-docked error banner binds the form's validation message + visibility.
-                var banner = Assert.IsType<TextBlock>(
-                    Assert.IsType<DockPanel>(dialog.Content).Children[0]);
-                Assert.Equal("ValidationErrorMessage", BindingPath(banner, TextBlock.TextProperty));
+                // The top-docked error banner is a SemiColorDangerLight BANNER BORDER whose inner
+                // TextBlock binds the form's validation message; visibility binds the flag.
+                var banner = Assert.IsType<Border>(dock.Children[0]);
                 Assert.Equal("HasValidationError", BindingPath(banner, Control.IsVisibleProperty));
+                var bannerText = Assert.IsType<TextBlock>(banner.Child);
+                Assert.Equal("ValidationErrorMessage", BindingPath(bannerText, TextBlock.TextProperty));
+
+                // The fill content is framed in a NightCodeBgSurface card (radius 8).
+                var card = Assert.IsType<Border>(scroll.Content);
+                Assert.Equal(new CornerRadius(8), card.CornerRadius);
+                Assert.IsType<StackPanel>(card.Child);
             }
         });
     }
@@ -273,7 +279,8 @@ public sealed class AddTargetDialogsLayoutTests :
         var dock = Assert.IsType<DockPanel>(dialog.Content);
         var buttons = Assert.IsType<StackPanel>(dock.Children[1]); // the bottom-docked button row
         var scroll = Assert.IsType<ScrollViewer>(dock.Children[2]); // the fill
-        var content = Assert.IsType<StackPanel>(scroll.Content);
+        // The fill content is the NightCodeBgSurface card's inner StackPanel (task #172).
+        var content = Assert.IsType<StackPanel>(Assert.IsType<Border>(scroll.Content).Child);
         return (dock, buttons, scroll, content);
     }
 

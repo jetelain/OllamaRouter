@@ -2,6 +2,7 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Data;
 using Avalonia.Headless;
+using Avalonia.LogicalTree;
 using OllamaRouter.App.ViewModels;
 using OllamaRouter.App.Views.Dialogs;
 
@@ -103,12 +104,48 @@ public sealed class PreloadDialogLayoutTests : IClassFixture<PreloadDialogLayout
         });
     }
 
+    [Fact]
+    public async Task FormGrid_ErrorBanner_IsSemiDangerBannerBorder_BindingTheErrorMessage()
+    {
+        await _fixture.DispatchAsync(() =>
+        {
+            var (_, stack) = GetFormGridAndStack();
+
+            // The raw crimson TextBlock became a banner Border whose inner TextBlock binds the
+            // message; visibility is the IsNotNullOrEmpty converter on the same path.
+            var banner = Assert.IsType<Border>(stack.Children[3]);
+            var message = Assert.IsType<TextBlock>(banner.Child);
+            Assert.Equal("ErrorMessage", BindingPath(message, TextBlock.TextProperty));
+            Assert.Equal("ErrorMessage", BindingPath(banner, Control.IsVisibleProperty));
+        });
+    }
+
+    [Fact]
+    public async Task FormGrid_PreviewAndAppliedSections_AreCardFramed()
+    {
+        await _fixture.DispatchAsync(() =>
+        {
+            var (_, stack) = GetFormGridAndStack();
+            var dock = (DockPanel)stack.Parent!;
+            var scroll = Assert.IsType<ScrollViewer>(dock.Children[1]);
+            var results = Assert.IsType<StackPanel>(scroll.Content);
+
+            var previewCard = Assert.IsType<Border>(results.Children[0]);
+            Assert.Equal("PreviewResult", BindingPath(previewCard, Control.IsVisibleProperty));
+            Assert.Single(previewCard.GetLogicalDescendants().OfType<ItemsControl>());
+
+            var appliedCard = Assert.IsType<Border>(results.Children[1]);
+            Assert.Equal("PreloadResult", BindingPath(appliedCard, Control.IsVisibleProperty));
+        });
+    }
+
     /// <summary>
     /// Builds the dialog (with a throwaway view model, exactly as <c>CartographyView</c> does
     /// in production) and returns its form grid: <c>dialog.Content</c> → top-docked
     /// <see cref="DockPanel"/> → its child 0 (the <c>DockPanel.Dock="Top"</c>
     /// <see cref="StackPanel"/>, children [0] model-name header, [1] form Grid, [2] button
-    /// row, [3] error message) → child 1 (the form <see cref="Grid"/>).
+    /// row, [3] the error banner Border (task #172)) → child 1 (the form
+    /// <see cref="Grid"/>).
     /// </summary>
     private static Grid GetFormGrid() => GetFormGridAndStack().grid;
 
@@ -122,6 +159,12 @@ public sealed class PreloadDialogLayoutTests : IClassFixture<PreloadDialogLayout
         var stack = Assert.IsType<StackPanel>(dock.Children[0]);
         var grid = Assert.IsType<Grid>(stack.Children[1]);
         return (grid, stack);
+    }
+
+    private static string? BindingPath(Control element, AvaloniaProperty property)
+    {
+        var expression = BindingOperations.GetBindingExpressionBase(element, property);
+        return expression?.GetType().GetProperty("Description")?.GetValue(expression) as string;
     }
 
     /// <summary>

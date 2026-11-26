@@ -7,35 +7,56 @@
         WindowStartupLocation="CenterOwner">
   <Border Padding="20">
     <StackPanel Spacing="16">
-      <TextBlock Text="Connect to OllamaRouter" FontSize="18" FontWeight="Bold"/>
+      <TextBlock Text="Connect to OllamaRouter" FontSize="18" FontWeight="Bold" />
 
-      <StackPanel Spacing="10">
-        <RadioButton Name="LocalRadio" Content="Local Daemon (http://localhost:11434)"
-                     IsChecked="True" GroupName="InstanceType"/>
-        <RadioButton Name="RemoteRadio" Content="Remote Router Instance"
-                     GroupName="InstanceType"/>
-      </StackPanel>
-
-      <Border Theme="{DynamicResource CardBorder}" Padding="12"
-              IsEnabled="{Binding #RemoteRadio.IsChecked}">
+      <Border Padding="14"
+              CornerRadius="8"
+              Background="{DynamicResource NightCodeBgSurface}"
+              BorderBrush="{DynamicResource SemiColorBorder}"
+              BorderThickness="1">
         <StackPanel Spacing="10">
-          <TextBlock Text="Remote Instance Details" FontWeight="SemiBold" Foreground="{DynamicResource SemiColorText2}"/>
-          <StackPanel Spacing="4">
-            <TextBlock Text="Router URL:" FontSize="12" Foreground="{DynamicResource SemiColorText2}"/>
-            <TextBox Name="RemoteUrlBox" Watermark="http://host:11434" Text="http://"/>
-          </StackPanel>
-          <StackPanel Spacing="4">
-            <TextBlock Text="API Key (session only):" FontSize="12" Foreground="{DynamicResource SemiColorText2}"/>
-            <TextBox Name="RemoteKeyBox" PasswordChar="•" Watermark="Optional for unprotected routers"/>
-          </StackPanel>
+          <RadioButton Name="LocalRadio" Content="Local Daemon (http://localhost:11434)"
+                       IsChecked="True" GroupName="InstanceType" />
+          <RadioButton Name="RemoteRadio" Content="Remote Router Instance"
+                       GroupName="InstanceType" />
         </StackPanel>
       </Border>
 
-      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="10" Margin="0,8,0,0">
-        <Button Content="Cancel" Click="OnCancelClick"/>
-        <Button Content="Connect" Classes="Primary" Click="OnConnectClick"/>
+      <Border Padding="14"
+              CornerRadius="8"
+              Background="{DynamicResource NightCodeBgSurface}"
+              BorderBrush="{DynamicResource SemiColorBorder}"
+              BorderThickness="1"
+              IsEnabled="{Binding #RemoteRadio.IsChecked}">
+        <StackPanel Spacing="10">
+          <TextBlock Text="Remote Instance Details" FontWeight="SemiBold" Foreground="{DynamicResource SemiColorText2}" />
+          <Border Padding="10,8"
+                  CornerRadius="6"
+                  Background="{DynamicResource NightCodeBgInput}"
+                  BorderBrush="{DynamicResource SemiColorBorder}"
+                  BorderThickness="1">
+            <StackPanel Spacing="4">
+              <TextBlock Text="Router URL:" FontSize="12" Foreground="{DynamicResource SemiColorText2}" />
+              <TextBox Name="RemoteUrlBox" PlaceholderText="http://host:11434" Text="http://" />
+            </StackPanel>
+          </Border>
+          <Border Padding="10,8"
+                  CornerRadius="6"
+                  Background="{DynamicResource NightCodeBgInput}"
+                  BorderBrush="{DynamicResource SemiColorBorder}"
+                  BorderThickness="1">
+            <StackPanel Spacing="4">
+              <TextBlock Text="API Key (session only):" FontSize="12" Foreground="{DynamicResource SemiColorText2}" />
+              <TextBox Name="RemoteKeyBox" PasswordChar="•" PlaceholderText="Optional for unprotected routers" />
+            </StackPanel>
+          </Border>
+        </StackPanel>
+      </Border>
+
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8">
+        <Button Content="Cancel" Click="OnCancelClick" MinWidth="90" />
+        <Button Content="Connect" Classes="Primary" Click="OnConnectClick" MinWidth="90" />
       </StackPanel>
     </StackPanel>
   </Border>
 </Window>
-

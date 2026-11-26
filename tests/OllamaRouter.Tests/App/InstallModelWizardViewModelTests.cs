@@ -349,6 +349,47 @@ public sealed class InstallModelWizardViewModelTests
     }
 
     // ------------------------------------------------------------------
+    //  Result severity flags (the review-step dual-severity banner, task #172)
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public void RunResult_SeverityFlags_TrackTheResultText_WithChangeNotifications()
+    {
+        var vm = new InstallModelWizardViewModel(() => MakeFake());
+        var review = vm.ReviewStep;
+
+        // Before the first run: no result banner.
+        Assert.False(review.HasRunResult);
+        Assert.False(review.RunResultIsError);
+
+        Assert.PropertyChanged(review, nameof(InstallReviewStepViewModel.HasRunResult),
+            () => review.RunResultText = "Succeeded");
+        Assert.True(review.HasRunResult);
+        Assert.False(review.RunResultIsError); // Succeeded = success severity
+
+        Assert.PropertyChanged(review, nameof(InstallReviewStepViewModel.RunResultIsError),
+            () => review.RunResultText = "Partial");
+        Assert.True(review.RunResultIsError); // Partial = danger severity
+
+        review.RunResultText = "Failed";
+        Assert.True(review.HasRunResult);
+        Assert.True(review.RunResultIsError);
+
+        review.RunResultText = "Cancelled";
+        Assert.True(review.HasRunResult);
+        Assert.True(review.RunResultIsError);
+
+        // A cleared result (a fresh run starts null) resets BOTH flags and notifies both.
+        var raised = new List<string>();
+        review.PropertyChanged += (_, e) => raised.Add(e.PropertyName ?? string.Empty);
+        review.RunResultText = null;
+        Assert.False(review.HasRunResult);
+        Assert.False(review.RunResultIsError);
+        Assert.Contains(nameof(InstallReviewStepViewModel.HasRunResult), raised);
+        Assert.Contains(nameof(InstallReviewStepViewModel.RunResultIsError), raised);
+    }
+
+    // ------------------------------------------------------------------
     //  Benchmark-assisted mode
     // ------------------------------------------------------------------
 

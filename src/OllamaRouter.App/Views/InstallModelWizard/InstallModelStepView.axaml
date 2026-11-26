@@ -3,53 +3,137 @@
              xmlns:vm="using:OllamaRouter.App.ViewModels.InstallModelWizard"
              x:Class="OllamaRouter.App.Views.InstallModelWizard.InstallModelStepView"
              x:DataType="vm:InstallModelStepViewModel">
-  <ScrollViewer Padding="12">
-    <StackPanel Spacing="14">
-      <TextBlock Text="Step 1 — Model" FontSize="18" FontWeight="Bold"/>
+  <ScrollViewer>
+    <StackPanel Spacing="12">
+
+      <!-- Step Intro Card -->
+      <Border Padding="14"
+              CornerRadius="8"
+              Background="{DynamicResource NightCodeBgSurface}"
+              BorderBrush="{DynamicResource SemiColorBorder}"
+              BorderThickness="1">
+        <StackPanel Spacing="4">
+          <TextBlock Text="Model" FontSize="15" FontWeight="SemiBold" />
+          <TextBlock TextWrapping="Wrap"
+                     FontSize="12"
+                     Foreground="{DynamicResource SemiColorText2}"
+                     Text="Pick the model to install: name and (optionally) a quantization tag. In benchmark-assisted mode the wizard auto-suggests a tag from fleet data for you to confirm." />
+        </StackPanel>
+      </Border>
 
       <!-- Mode selection -->
-      <StackPanel Orientation="Horizontal" Spacing="18">
-        <RadioButton Content="Manual (pick target(s), quantization, context)"
-                     IsChecked="{Binding Manual}"/>
-        <RadioButton Content="Benchmark-assisted (auto-suggest from fleet data, user confirms)"
-                     IsChecked="{Binding Assisted}"/>
-      </StackPanel>
+      <Border Padding="14"
+              CornerRadius="8"
+              Background="{DynamicResource NightCodeBgSurface}"
+              BorderBrush="{DynamicResource SemiColorBorder}"
+              BorderThickness="1">
+        <StackPanel Spacing="10">
+          <TextBlock Text="Mode" FontSize="14" FontWeight="SemiBold" />
+          <StackPanel Orientation="Horizontal" Spacing="18">
+            <RadioButton Content="Manual (pick target(s), quantization, context)"
+                         IsChecked="{Binding Manual}" />
+            <RadioButton Content="Benchmark-assisted (auto-suggest from fleet data, user confirms)"
+                         IsChecked="{Binding Assisted}" />
+          </StackPanel>
+        </StackPanel>
+      </Border>
 
       <!-- The model reference (name[:tag]) + parsed display -->
-      <Grid ColumnDefinitions="140,*,220" ColumnSpacing="8">
-        <TextBlock Grid.Column="0" Text="Model reference:" VerticalAlignment="Center"/>
-        <TextBox Grid.Column="1" Text="{Binding ModelReference}"
-                 Watermark="name[:tag] — e.g. llama3.2:13b-q4_K_M or org/model:tag"/>
-        <TextBlock Grid.Column="2" VerticalAlignment="Center" TextWrapping="Wrap"
-                   Text="{Binding ParsedTag, StringFormat='quant/tag: {0}'}"
-                   IsVisible="{Binding ParsedTag, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
-      </Grid>
-      <TextBlock Text="{Binding ParseError}" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" TextWrapping="Wrap"/>
-
-      <!-- Quick-pick common quant tags (suggestions only; manual mode) -->
-      <StackPanel Orientation="Horizontal" Spacing="6">
-        <TextBlock Text="Quick tags:" VerticalAlignment="Center" Opacity="0.8"/>
-        <ItemsControl ItemsSource="{Binding QuickPickTags}">
-          <ItemsControl.ItemsPanel>
-            <ItemsPanelTemplate><StackPanel Orientation="Horizontal" Spacing="6"/></ItemsPanelTemplate>
-          </ItemsControl.ItemsPanel>
-          <ItemsControl.ItemTemplate>
-            <DataTemplate x:DataType="x:String">
-              <Button Content="{Binding}" Command="{Binding $parent[UserControl].DataContext.QuickPickTagCommand}"
-                      CommandParameter="{Binding}" Padding="8,2" FontSize="11"/>
-            </DataTemplate>
-          </ItemsControl.ItemTemplate>
-        </ItemsControl>
-      </StackPanel>
+      <Border Padding="14"
+              CornerRadius="8"
+              Background="{DynamicResource NightCodeBgSurface}"
+              BorderBrush="{DynamicResource SemiColorBorder}"
+              BorderThickness="1">
+        <StackPanel Spacing="10">
+          <TextBlock Text="Model reference" FontSize="14" FontWeight="SemiBold" />
+          <Grid ColumnDefinitions="140,*,220" ColumnSpacing="8">
+            <TextBlock Grid.Column="0" Text="Model reference:" VerticalAlignment="Center" />
+            <TextBox Grid.Column="1" Text="{Binding ModelReference}"
+                     PlaceholderText="name[:tag] — e.g. llama3.2:13b-q4_K_M or org/model:tag" />
+            <TextBlock Grid.Column="2" VerticalAlignment="Center" TextWrapping="Wrap"
+                       Text="{Binding ParsedTag, StringFormat='quant/tag: {0}'}"
+                       IsVisible="{Binding ParsedTag, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+          </Grid>
+          <Border Padding="10,8"
+                  CornerRadius="6"
+                  Background="{DynamicResource SemiColorDangerLight}"
+                  BorderBrush="{DynamicResource SemiColorDanger}"
+                  BorderThickness="1"
+                  IsVisible="{Binding ParseError, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+            <TextBlock Text="{Binding ParseError}"
+                       FontSize="12"
+                       TextWrapping="Wrap"
+                       Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" />
+          </Border>
+          <!-- Quick-pick common quant tags (suggestions only; manual mode) -->
+          <Border Padding="10,8"
+                  CornerRadius="6"
+                  Background="{DynamicResource NightCodeBgInput}"
+                  BorderBrush="{DynamicResource SemiColorBorder}"
+                  BorderThickness="1">
+            <StackPanel Orientation="Horizontal" Spacing="6">
+              <TextBlock Text="Quick tags:" VerticalAlignment="Center" Opacity="0.8" />
+              <ItemsControl ItemsSource="{Binding QuickPickTags}">
+                <ItemsControl.ItemsPanel>
+                  <ItemsPanelTemplate><StackPanel Orientation="Horizontal" Spacing="6" /></ItemsPanelTemplate>
+                </ItemsControl.ItemsPanel>
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate x:DataType="x:String">
+                    <Button Content="{Binding}" Command="{Binding $parent[UserControl].DataContext.QuickPickTagCommand}"
+                            CommandParameter="{Binding}" Padding="8,2" FontSize="11" />
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+            </StackPanel>
+          </Border>
+        </StackPanel>
+      </Border>
 
       <!-- Assisted mode: the fleet-known state (setup-wizard-style fetch-on-entry) -->
-      <StackPanel Spacing="4" IsVisible="{Binding Assisted}">
-        <TextBlock Text="{Binding FleetMessage}" TextWrapping="Wrap" Foreground="{DynamicResource SemiColorSuccess}"/>
-        <TextBlock Text="{Binding FleetError}" TextWrapping="Wrap" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}"/>
-        <TextBlock Text="{Binding TagProvenance, StringFormat='tag: {0}'}"
-                   Foreground="{DynamicResource SemiColorText2}" FontSize="11"
-                   IsVisible="{Binding TagProvenance, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
-      </StackPanel>
+      <Border Padding="14"
+              CornerRadius="8"
+              Background="{DynamicResource NightCodeBgSurface}"
+              BorderBrush="{DynamicResource SemiColorBorder}"
+              BorderThickness="1"
+              IsVisible="{Binding Assisted}">
+        <StackPanel Spacing="8">
+          <TextBlock Text="Fleet state" FontSize="14" FontWeight="SemiBold" />
+          <Border Padding="10,8"
+                  CornerRadius="6"
+                  Background="{DynamicResource NightCodeBgInput}"
+                  BorderBrush="{DynamicResource SemiColorBorder}"
+                  BorderThickness="1">
+            <StackPanel Spacing="4">
+              <Border Padding="10,8"
+                      CornerRadius="6"
+                      Background="{DynamicResource SemiColorSuccessLight}"
+                      BorderBrush="{DynamicResource SemiColorSuccess}"
+                      BorderThickness="1"
+                      IsVisible="{Binding FleetMessage, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+                <TextBlock Text="{Binding FleetMessage}"
+                           FontSize="12"
+                           TextWrapping="Wrap"
+                           Foreground="{DynamicResource SemiColorSuccess}" />
+              </Border>
+              <Border Padding="10,8"
+                      CornerRadius="6"
+                      Background="{DynamicResource SemiColorDangerLight}"
+                      BorderBrush="{DynamicResource SemiColorDanger}"
+                      BorderThickness="1"
+                      IsVisible="{Binding FleetError, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+                <TextBlock Text="{Binding FleetError}"
+                           FontSize="12"
+                           TextWrapping="Wrap"
+                           Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" />
+              </Border>
+              <TextBlock Text="{Binding TagProvenance, StringFormat='tag: {0}'}"
+                         Foreground="{DynamicResource SemiColorText2}" FontSize="11"
+                         IsVisible="{Binding TagProvenance, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+            </StackPanel>
+          </Border>
+        </StackPanel>
+      </Border>
+
     </StackPanel>
   </ScrollViewer>
 </UserControl>

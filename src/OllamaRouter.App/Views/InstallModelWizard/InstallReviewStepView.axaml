@@ -1,40 +1,62 @@
 <UserControl xmlns="https://github.com/avaloniaui"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:conv="using:OllamaRouter.App.Converters"
              xmlns:vm="using:OllamaRouter.App.ViewModels.InstallModelWizard"
              x:Class="OllamaRouter.App.Views.InstallModelWizard.InstallReviewStepView"
              x:DataType="vm:InstallReviewStepViewModel">
-  <ScrollViewer Padding="12">
+  <ScrollViewer>
     <StackPanel Spacing="12">
-      <TextBlock Text="Step 3 — Review &amp; Install" FontSize="18" FontWeight="Bold"/>
-      <TextBlock TextWrapping="Wrap"
-                 Text="Review the install plan, then install. Targets run SEQUENTIALLY (one at a time); a failure on one target does not stop the remaining ones. Cancel aborts the in-flight pull."/>
+
+      <!-- Step Intro Card -->
+      <Border Padding="14"
+              CornerRadius="8"
+              Background="{DynamicResource NightCodeBgSurface}"
+              BorderBrush="{DynamicResource SemiColorBorder}"
+              BorderThickness="1">
+        <StackPanel Spacing="4">
+          <TextBlock Text="Review &amp; Install" FontSize="15" FontWeight="SemiBold" />
+          <TextBlock TextWrapping="Wrap"
+                     FontSize="12"
+                     Foreground="{DynamicResource SemiColorText2}"
+                     Text="Review the install plan, then install. Targets run SEQUENTIALLY (one at a time); a failure on one target does not stop the remaining ones. Cancel aborts the in-flight pull." />
+        </StackPanel>
+      </Border>
 
       <!-- Per-target run rows -->
       <ItemsControl ItemsSource="{Binding Rows}">
         <ItemsControl.ItemTemplate>
           <DataTemplate x:DataType="vm:InstallRunRowVm">
-            <Border Padding="8,6" CornerRadius="4" Margin="0,2" Background="{DynamicResource NightCodeBgSurface}"
+            <Border Padding="8,6" CornerRadius="6" Margin="0,2" Background="{DynamicResource NightCodeBgSurface}"
                     BorderBrush="{DynamicResource SemiColorBorder}" BorderThickness="1">
               <StackPanel Spacing="4">
                 <StackPanel Orientation="Horizontal" Spacing="10">
-                  <TextBlock Text="{Binding Target}" Width="140" FontWeight="SemiBold" VerticalAlignment="Center"/>
-                  <TextBlock Text="{Binding Summary}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" Opacity="0.85"/>
+                  <TextBlock Text="{Binding Target}" Width="140" FontWeight="SemiBold" VerticalAlignment="Center" />
+                  <TextBlock Text="{Binding Summary}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" Opacity="0.85" />
                   <TextBlock Text="{Binding StatusText}" Width="230" TextTrimming="CharacterEllipsis"
-                             VerticalAlignment="Center" Foreground="{DynamicResource SemiColorText2}"/>
+                             VerticalAlignment="Center" Foreground="{DynamicResource SemiColorText2}" />
                 </StackPanel>
                 <ProgressBar Value="{Binding ProgressValue}" Minimum="0" Maximum="100" Height="6"
-                             IsIndeterminate="{Binding ProgressIndeterminate}"/>
-                <TextBlock Text="{Binding Error}" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" FontSize="11" TextWrapping="Wrap"/>
+                             IsIndeterminate="{Binding ProgressIndeterminate}" />
+                <TextBlock Text="{Binding Error}" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" FontSize="11" TextWrapping="Wrap" />
               </StackPanel>
             </Border>
           </DataTemplate>
         </ItemsControl.ItemTemplate>
       </ItemsControl>
 
-      <!-- Overall run result -->
-      <TextBlock Text="{Binding RunResultText, StringFormat='Result: {0}'}"
-                 FontWeight="Bold" FontSize="14"
-                 IsVisible="{Binding RunResultText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+      <!-- Overall run result (dual-severity banner: Succeeded = success,
+           Partial / Failed / Cancelled = danger) -->
+      <Border Padding="10,8"
+              CornerRadius="6"
+              Background="{Binding RunResultIsError, Converter={x:Static conv:BoolToBannerBackgroundConverter.Instance}}"
+              BorderBrush="{Binding RunResultIsError, Converter={x:Static conv:BoolToBannerBorderConverter.Instance}}"
+              BorderThickness="1"
+              IsVisible="{Binding HasRunResult}">
+        <TextBlock Text="{Binding RunResultText, StringFormat='Result: {0}'}"
+                   FontWeight="Bold" FontSize="14"
+                   Foreground="{Binding RunResultIsError, Converter={x:Static conv:BoolToMessageForegroundConverter.Instance}}" />
+      </Border>
+
     </StackPanel>
   </ScrollViewer>
 </UserControl>

@@ -7,35 +7,60 @@
         Title="Uninstall Model"
         Width="560" Height="440"
         WindowStartupLocation="CenterOwner">
-  <DockPanel Margin="8">
+  <DockPanel Margin="16">
     <StackPanel DockPanel.Dock="Top" Spacing="6">
-      <TextBlock Text="{Binding ModelName}" FontWeight="Bold" FontSize="16"/>
-      <TextBlock Text="This permanently deletes the model files on the selected nodes. This cannot be undone."
-                 Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" TextWrapping="Wrap"/>
-      <ScrollViewer MaxHeight="200" VerticalScrollBarVisibility="Auto">
-        <ItemsControl ItemsSource="{Binding Targets}">
-          <ItemsControl.ItemTemplate>
-            <DataTemplate>
-              <Grid ColumnDefinitions="auto,140,*" ColumnSpacing="8" Margin="0,1">
-                <CheckBox Grid.Column="0" IsChecked="{Binding IsSelected}" VerticalAlignment="Center"/>
-                <TextBlock Grid.Column="1" Text="{Binding Target}" FontWeight="SemiBold" VerticalAlignment="Center"/>
-                <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
-                  <TextBlock Text="deleted" Foreground="{DynamicResource SemiColorSuccess}" VerticalAlignment="Center"
-                             IsVisible="{Binding Succeeded, Converter={x:Static local:SuccessVisibilityConverter.SuccessInstance}}"/>
-                  <TextBlock Text="{Binding ResultText}" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" TextTrimming="CharacterEllipsis"
-                             VerticalAlignment="Center"
-                             IsVisible="{Binding Succeeded, Converter={x:Static local:SuccessVisibilityConverter.FailureInstance}}"/>
-                </StackPanel>
-              </Grid>
-            </DataTemplate>
-          </ItemsControl.ItemTemplate>
-        </ItemsControl>
-      </ScrollViewer>
-      <TextBlock Text="{Binding ErrorMessage}" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" TextWrapping="Wrap"/>
+      <TextBlock Text="{Binding ModelName}" FontWeight="Bold" FontSize="16" />
+      <!-- Always-visible destructive-action warning -->
+      <Border Padding="10,8"
+              CornerRadius="6"
+              Background="{DynamicResource SemiColorDangerLight}"
+              BorderBrush="{DynamicResource SemiColorDanger}"
+              BorderThickness="1">
+        <TextBlock Text="This permanently deletes the model files on the selected nodes. This cannot be undone."
+                   FontSize="12"
+                   TextWrapping="Wrap"
+                   Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" />
+      </Border>
+      <Border Padding="14"
+              CornerRadius="8"
+              Background="{DynamicResource NightCodeBgSurface}"
+              BorderBrush="{DynamicResource SemiColorBorder}"
+              BorderThickness="1">
+        <ScrollViewer MaxHeight="200" VerticalScrollBarVisibility="Auto">
+          <ItemsControl ItemsSource="{Binding Targets}">
+            <ItemsControl.ItemTemplate>
+              <DataTemplate>
+                <Grid ColumnDefinitions="auto,140,*" ColumnSpacing="8" Margin="0,1">
+                  <CheckBox Grid.Column="0" IsChecked="{Binding IsSelected}" VerticalAlignment="Center" />
+                  <TextBlock Grid.Column="1" Text="{Binding Target}" FontWeight="SemiBold" VerticalAlignment="Center" />
+                  <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                    <TextBlock Text="deleted" Foreground="{DynamicResource SemiColorSuccess}" VerticalAlignment="Center"
+                               IsVisible="{Binding Succeeded, Converter={x:Static local:SuccessVisibilityConverter.SuccessInstance}}" />
+                    <TextBlock Text="{Binding ResultText}" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" TextTrimming="CharacterEllipsis"
+                               VerticalAlignment="Center"
+                               IsVisible="{Binding Succeeded, Converter={x:Static local:SuccessVisibilityConverter.FailureInstance}}" />
+                  </StackPanel>
+                </Grid>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+        </ScrollViewer>
+      </Border>
+      <Border Padding="10,8"
+              CornerRadius="6"
+              Background="{DynamicResource SemiColorDangerLight}"
+              BorderBrush="{DynamicResource SemiColorDanger}"
+              BorderThickness="1"
+              IsVisible="{Binding ErrorMessage, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+        <TextBlock Text="{Binding ErrorMessage}"
+                   FontSize="12"
+                   TextWrapping="Wrap"
+                   Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" />
+      </Border>
       <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
-        <Button Content="Uninstall" Classes="Danger" Click="OnUninstallClick"/>
-        <Button Content="Cancel" Click="OnCancelClick"/>
-        <Button Content="Close" IsVisible="{Binding HasResults}" Click="OnCancelClick"/>
+        <Button Content="Uninstall" Classes="Danger" Click="OnUninstallClick" MinWidth="90" />
+        <Button Content="Cancel" Click="OnCancelClick" MinWidth="90" />
+        <Button Content="Close" IsVisible="{Binding HasResults}" Click="OnCancelClick" MinWidth="90" />
       </StackPanel>
     </StackPanel>
   </DockPanel>

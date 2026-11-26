@@ -7,65 +7,89 @@
         Title="Preload Model"
         Width="720" Height="560"
         WindowStartupLocation="CenterOwner">
-  <DockPanel Margin="8">
+  <DockPanel Margin="16">
     <StackPanel DockPanel.Dock="Top" Spacing="6">
-      <TextBlock Text="{Binding ModelName}" FontWeight="Bold" FontSize="16"/>
+      <TextBlock Text="{Binding ModelName}" FontWeight="Bold" FontSize="16" />
       <Grid RowDefinitions="Auto,Auto,Auto" ColumnDefinitions="150,*" ColumnSpacing="8" RowSpacing="6">
-        <TextBlock Grid.Row="0" Grid.Column="0" Text="Target Pin:" VerticalAlignment="Center"/>
-        <TextBox Grid.Row="0" Grid.Column="1" Text="{Binding TargetPin}" Watermark="Auto (blank = auto-select)"/>
-        <TextBlock Grid.Row="1" Grid.Column="0" Text="Keep Alive (s):" VerticalAlignment="Center"/>
+        <TextBlock Grid.Row="0" Grid.Column="0" Text="Target Pin:" VerticalAlignment="Center" />
+        <TextBox Grid.Row="0" Grid.Column="1" Text="{Binding TargetPin}" PlaceholderText="Auto (blank = auto-select)" />
+        <TextBlock Grid.Row="1" Grid.Column="0" Text="Keep Alive (s):" VerticalAlignment="Center" />
         <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding KeepAliveSeconds}"
-                 Watermark="blank = target default, -1 = indefinitely"/>
-        <TextBlock Grid.Row="2" Grid.Column="0" Text="Context Intent (tok):" VerticalAlignment="Center"/>
+                 PlaceholderText="blank = target default, -1 = indefinitely" />
+        <TextBlock Grid.Row="2" Grid.Column="0" Text="Context Intent (tok):" VerticalAlignment="Center" />
         <TextBox Grid.Row="2" Grid.Column="1" Text="{Binding ContextIntentTokens}"
-                 Watermark="blank = recommended context"/>
+                 PlaceholderText="blank = recommended context" />
       </Grid>
       <StackPanel Orientation="Horizontal" Spacing="8">
-        <Button Content="Preview (no side effects)" Command="{Binding PreviewCommand}"/>
-        <Button Content="Preload Model" Classes="Primary" Command="{Binding PreloadCommand}"/>
+        <Button Content="Preview (no side effects)" Command="{Binding PreviewCommand}" MinWidth="90" />
+        <Button Content="Preload Model" Classes="Primary" Command="{Binding PreloadCommand}" MinWidth="90" />
       </StackPanel>
-      <TextBlock Text="{Binding ErrorMessage}" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" TextWrapping="Wrap"/>
+      <Border Padding="10,8"
+              CornerRadius="6"
+              Background="{DynamicResource SemiColorDangerLight}"
+              BorderBrush="{DynamicResource SemiColorDanger}"
+              BorderThickness="1"
+              IsVisible="{Binding ErrorMessage, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+        <TextBlock Text="{Binding ErrorMessage}"
+                   FontSize="12"
+                   TextWrapping="Wrap"
+                   Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" />
+      </Border>
     </StackPanel>
 
     <ScrollViewer>
       <StackPanel Spacing="10" Margin="0,8,0,0">
         <!-- Preview: candidate evaluation -->
-        <StackPanel Spacing="4" IsVisible="{Binding PreviewResult, Converter={x:Static local:NotNullToBoolConverter.Instance}}">
-          <TextBlock Text="Preview — candidate evaluation" FontWeight="Bold"/>
-          <TextBlock Text="{Binding PreviewSelectedTarget, StringFormat='Projected selection: {0}'}" Opacity="0.9"/>
-          <TextBlock Text="{Binding PreviewReason, StringFormat='Reason: {0}'}" Opacity="0.7" TextWrapping="Wrap"/>
-          <ItemsControl ItemsSource="{Binding PreviewCandidates}">
-            <ItemsControl.ItemTemplate>
-              <DataTemplate>
-                <Grid ColumnDefinitions="150,80,80,120,80,80,*" Margin="0,1">
-                  <TextBlock Grid.Column="0" Text="{Binding Target}"/>
-                  <TextBlock Grid.Column="1" Text="{Binding Eligible}"/>
-                  <TextBlock Grid.Column="2" Text="{Binding Busy}"/>
-                  <TextBlock Grid.Column="3" Text="{Binding ContextCeiling}"/>
-                  <TextBlock Grid.Column="4" Text="{Binding InFlightRequests}"/>
-                  <TextBlock Grid.Column="5" Text="{Binding IsResident}"/>
-                  <TextBlock Grid.Column="6" Text="{Binding SkipReason}" Opacity="0.8" TextTrimming="CharacterEllipsis"/>
-                </Grid>
-              </DataTemplate>
-            </ItemsControl.ItemTemplate>
-          </ItemsControl>
-        </StackPanel>
+        <Border Padding="14"
+                CornerRadius="8"
+                Background="{DynamicResource NightCodeBgSurface}"
+                BorderBrush="{DynamicResource SemiColorBorder}"
+                BorderThickness="1"
+                IsVisible="{Binding PreviewResult, Converter={x:Static local:NotNullToBoolConverter.Instance}}">
+          <StackPanel Spacing="4">
+            <TextBlock Text="Preview — candidate evaluation" FontWeight="Bold" />
+            <TextBlock Text="{Binding PreviewSelectedTarget, StringFormat='Projected selection: {0}'}" Opacity="0.9" />
+            <TextBlock Text="{Binding PreviewReason, StringFormat='Reason: {0}'}" Opacity="0.7" TextWrapping="Wrap" />
+            <ItemsControl ItemsSource="{Binding PreviewCandidates}">
+              <ItemsControl.ItemTemplate>
+                <DataTemplate>
+                  <Grid ColumnDefinitions="150,80,80,120,80,80,*" Margin="0,1">
+                    <TextBlock Grid.Column="0" Text="{Binding Target}" />
+                    <TextBlock Grid.Column="1" Text="{Binding Eligible}" />
+                    <TextBlock Grid.Column="2" Text="{Binding Busy}" />
+                    <TextBlock Grid.Column="3" Text="{Binding ContextCeiling}" />
+                    <TextBlock Grid.Column="4" Text="{Binding InFlightRequests}" />
+                    <TextBlock Grid.Column="5" Text="{Binding IsResident}" />
+                    <TextBlock Grid.Column="6" Text="{Binding SkipReason}" Opacity="0.8" TextTrimming="CharacterEllipsis" />
+                  </Grid>
+                </DataTemplate>
+              </ItemsControl.ItemTemplate>
+            </ItemsControl>
+          </StackPanel>
+        </Border>
 
         <!-- Preload: applied result -->
-        <StackPanel Spacing="4" IsVisible="{Binding PreloadResult, Converter={x:Static local:NotNullToBoolConverter.Instance}}">
-          <TextBlock Text="Preload — applied result" FontWeight="Bold"/>
-          <StackPanel Orientation="Horizontal" Spacing="12">
-            <TextBlock Text="{Binding PreloadSelectedTarget, StringFormat='Target: {0}'}"/>
-            <TextBlock Text="{Binding PreloadAppliedKeepAliveSeconds, StringFormat='KeepAlive: {0}s'}"/>
-            <TextBlock Text="{Binding PreloadAppliedNumCtx, StringFormat='NumCtx: {0}'}"/>
+        <Border Padding="14"
+                CornerRadius="8"
+                Background="{DynamicResource NightCodeBgSurface}"
+                BorderBrush="{DynamicResource SemiColorBorder}"
+                BorderThickness="1"
+                IsVisible="{Binding PreloadResult, Converter={x:Static local:NotNullToBoolConverter.Instance}}">
+          <StackPanel Spacing="4">
+            <TextBlock Text="Preload — applied result" FontWeight="Bold" />
+            <StackPanel Orientation="Horizontal" Spacing="12">
+              <TextBlock Text="{Binding PreloadSelectedTarget, StringFormat='Target: {0}'}" />
+              <TextBlock Text="{Binding PreloadAppliedKeepAliveSeconds, StringFormat='KeepAlive: {0}s'}" />
+              <TextBlock Text="{Binding PreloadAppliedNumCtx, StringFormat='NumCtx: {0}'}" />
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" Spacing="12">
+              <TextBlock Text="{Binding PreloadLoadAccepted, StringFormat='LoadAccepted: {0}'}" />
+              <TextBlock Text="{Binding PreloadResidencyConfirmed, StringFormat='ResidencyConfirmed: {0}'}" />
+              <TextBlock Text="{Binding PreloadDurationMs, StringFormat='Duration: {0} ms'}" />
+            </StackPanel>
+            <TextBlock Text="{Binding PreloadReason, StringFormat='Reason: {0}'}" Opacity="0.7" TextWrapping="Wrap" />
           </StackPanel>
-          <StackPanel Orientation="Horizontal" Spacing="12">
-            <TextBlock Text="{Binding PreloadLoadAccepted, StringFormat='LoadAccepted: {0}'}"/>
-            <TextBlock Text="{Binding PreloadResidencyConfirmed, StringFormat='ResidencyConfirmed: {0}'}"/>
-            <TextBlock Text="{Binding PreloadDurationMs, StringFormat='Duration: {0} ms'}"/>
-          </StackPanel>
-          <TextBlock Text="{Binding PreloadReason, StringFormat='Reason: {0}'}" Opacity="0.7" TextWrapping="Wrap"/>
-        </StackPanel>
+        </Border>
       </StackPanel>
     </ScrollViewer>
   </DockPanel>

@@ -104,8 +104,8 @@
             </ItemsControl.ItemTemplate>
           </ItemsControl>
           <StackPanel Orientation="Horizontal" Spacing="8">
-            <TextBox Text="{Binding CreateKeyName}" Watermark="key name" Width="200"/>
-            <TextBox Text="{Binding CreateKeyHours}" Watermark="valid for (h, blank = none)" Width="180"/>
+            <TextBox Text="{Binding CreateKeyName}" PlaceholderText="key name" Width="200"/>
+            <TextBox Text="{Binding CreateKeyHours}" PlaceholderText="valid for (h, blank = none)" Width="180"/>
             <Button Content="Create Key" Classes="Primary" Command="{Binding CreateKeyCommand}"/>
             <Button Content="Rotate Default Key" Classes="Warning" Click="OnRotateDefaultKeyClick"/>
           </StackPanel>

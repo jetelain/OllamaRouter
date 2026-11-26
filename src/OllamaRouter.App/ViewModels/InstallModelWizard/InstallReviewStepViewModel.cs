@@ -214,6 +214,19 @@ public sealed partial class InstallReviewStepViewModel : ObservableObject, IWiza
     [ObservableProperty]
     private string? _runResultText;
 
+    /// <summary>Whether a run result is displayed (the result banner's visibility gate).</summary>
+    public bool HasRunResult => RunResultText is not null;
+
+    /// <summary>Whether the run result renders at the DANGER severity: "Partial" / "Failed" /
+    /// "Cancelled" are error states (only "Succeeded" renders the success severity).</summary>
+    public bool RunResultIsError => RunResultText is not null && RunResultText != "Succeeded";
+
+    partial void OnRunResultTextChanged(string? value)
+    {
+        OnPropertyChanged(nameof(HasRunResult));
+        OnPropertyChanged(nameof(RunResultIsError));
+    }
+
     /// <summary>Starts the SEQUENTIAL install of every review row (one target at a time, in
     /// plan order; a failure does not stop the remaining targets).</summary>
     [RelayCommand(CanExecute = nameof(CanInstall))]

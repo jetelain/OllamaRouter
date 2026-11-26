@@ -27,7 +27,7 @@
           <ComboBox Grid.Row="2" Grid.Column="1" ItemsSource="{Binding TypeChoices}" SelectedItem="{Binding Type}"/>
 
           <TextBlock Grid.Row="3" Grid.Column="0" Text="Provider:" VerticalAlignment="Center"/>
-          <TextBox Grid.Row="3" Grid.Column="1" Text="{Binding Provider}" Watermark="OpenRouter / Groq / ..."/>
+          <TextBox Grid.Row="3" Grid.Column="1" Text="{Binding Provider}" PlaceholderText="OpenRouter / Groq / ..."/>
 
           <TextBlock Grid.Row="4" Grid.Column="0" Text="Max Parallel:" VerticalAlignment="Center"/>
           <TextBox Grid.Row="4" Grid.Column="1" Text="{Binding MaxParallel}"/>
@@ -38,23 +38,23 @@
           <TextBlock Grid.Row="6" Grid.Column="0" Text="API Key:" VerticalAlignment="Center"
                      ToolTip.Tip="Upstream (masked) key — required for OpenAI-compatible providers. Edit mode: untouched = no change, emptied = clear."/>
           <StackPanel Grid.Row="6" Grid.Column="1" Orientation="Horizontal" Spacing="6">
-            <TextBox Text="{Binding ApiKey}" PasswordChar="•" Width="320" Watermark="{Binding ApiKeyWatermark}"/>
+            <TextBox Text="{Binding ApiKey}" PasswordChar="•" Width="320" PlaceholderText="{Binding ApiKeyWatermark}"/>
             <TextBlock Text="{Binding ExistingApiKeyConfigured, StringFormat='configured: {0}'}"
                        VerticalAlignment="Center" Opacity="0.7"/>
           </StackPanel>
 
           <TextBlock Grid.Row="7" Grid.Column="0" Text="Power (W):" VerticalAlignment="Center"
                      ToolTip.Tip="Node power-draw override; blank = no change (clearing a set override requires editing config/config.json)."/>
-          <TextBox Grid.Row="7" Grid.Column="1" Text="{Binding PowerWatts}" Watermark="blank = no change"/>
+          <TextBox Grid.Row="7" Grid.Column="1" Text="{Binding PowerWatts}" PlaceholderText="blank = no change"/>
 
           <TextBlock Grid.Row="8" Grid.Column="0" Text="SSH User:" VerticalAlignment="Center"
                      ToolTip.Tip="ssh user for the daemon-side hardware probe; the host is the target URL's host (key-based auth, no password). Blank = unset (add) / clear (edit)."/>
           <TextBox Grid.Row="8" Grid.Column="1" Text="{Binding SshUser}"
-                   Watermark="e.g. gpuadmin — key-based auth; blank = unset (add) / clear (edit)"/>
+                   PlaceholderText="e.g. gpuadmin — key-based auth; blank = unset (add) / clear (edit)"/>
 
           <TextBlock Grid.Row="9" Grid.Column="0" Text="SSH Port:" VerticalAlignment="Center"
                      ToolTip.Tip="ssh port of the daemon-side hardware probe; blank = the default port 22. Edit mode: blank = no change (clearing a set port requires editing config/config.json)."/>
-          <TextBox Grid.Row="9" Grid.Column="1" Text="{Binding SshPort}" Watermark="default 22; blank = no change (edit)"/>
+          <TextBox Grid.Row="9" Grid.Column="1" Text="{Binding SshPort}" PlaceholderText="default 22; blank = no change (edit)"/>
         </Grid>
 
         <StackPanel Spacing="4">
@@ -66,9 +66,9 @@
             <ItemsControl.ItemTemplate>
               <DataTemplate>
                 <Grid ColumnDefinitions="*,120,140,auto" Margin="0,2" ColumnSpacing="6">
-                  <TextBox Grid.Column="0" Text="{Binding Name}" Watermark="model name"/>
-                  <TextBox Grid.Column="1" Text="{Binding ContextLength}" Watermark="contextLength"/>
-                  <TextBox Grid.Column="2" Text="{Binding Quantization}" Watermark="quantization"/>
+                  <TextBox Grid.Column="0" Text="{Binding Name}" PlaceholderText="model name"/>
+                  <TextBox Grid.Column="1" Text="{Binding ContextLength}" PlaceholderText="contextLength"/>
+                  <TextBox Grid.Column="2" Text="{Binding Quantization}" PlaceholderText="quantization"/>
                   <Button Grid.Column="3" Content="Remove" Classes="Danger" Click="OnRemoveModelRowClick" Tag="{Binding}"/>
                 </Grid>
               </DataTemplate>
