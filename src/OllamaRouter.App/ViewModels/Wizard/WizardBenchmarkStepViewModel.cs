@@ -114,7 +114,11 @@ public sealed class BenchmarkCandidateGroupRow
 
 /// <summary>
 /// One target's benchmark-run row of Step 4 (task #103): the lifecycle status and the
-/// start/finish stamps.
+/// start/finish stamps. Task #174 adds the live in-flight progress projections — the
+/// current phase, the model/context being worked on, the ready-to-render detail sentence,
+/// the per-target fractional percent and the inline-bar visibility/indeterminate gates
+/// (all derived from the raw <see cref="Progress"/>, which is null on terminal rows and for
+/// older daemons that never publish it).
 /// </summary>
 public sealed class BenchmarkRow
 {
@@ -122,8 +126,44 @@ public sealed class BenchmarkRow
     public BenchmarkRunStatus Status { get; init; }
     public DateTimeOffset? StartedAt { get; init; }
     public DateTimeOffset? FinishedAt { get; init; }
+    /// <summary>Task #174: the raw live progress (null on terminal rows / older daemons).</summary>
+    public BenchmarkTargetProgress? Progress { get; init; }
 
     public string StatusText => Status.ToString();
+
+    // -- Task #174: live progress projections (derived from Status + Progress) -----------
+
+    /// <summary>The current in-flight phase (null when there is no live progress).</summary>
+    public BenchmarkPhase? Phase => Progress?.Phase;
+
+    /// <summary>The model currently being worked on (null when unknown/absent).</summary>
+    public string? CurrentModel => Progress?.Model;
+
+    /// <summary>The rung context currently being benchmarked (null outside that phase).</summary>
+    public int? CurrentNumCtx => Progress?.NumCtx;
+
+    /// <summary>The ready-to-render detail sentence for a Running row (else null).</summary>
+    public string? ProgressDetailText => IsRunning && Progress is not null ? Progress.Message : null;
+
+    /// <summary>The per-target 0..100 fractional percent (pinned BenchmarkLiveProgress formula).</summary>
+    public double RowProgressPercent => BenchmarkLiveProgress.RowPercent(Status, Progress);
+
+    /// <summary>Indeterminate row bar: Running with no sub-progress yet (queued/starting).</summary>
+    public bool IsIndeterminate => IsRunning && (Progress is null || Progress.Phase == BenchmarkPhase.Queued);
+
+    /// <summary>Whether this Running row carries a live progress message to render.</summary>
+    public bool HasLiveProgress => IsRunning && Progress is not null;
+
+    /// <summary>The inline-bar visibility gate: any non-terminal row (Running or NotStarted).</summary>
+    public bool IsRunningRow => !IsTerminalStatus(Status);
+
+    private bool IsRunning => Status == BenchmarkRunStatus.Running;
+
+    private static bool IsTerminalStatus(BenchmarkRunStatus status) =>
+        status is BenchmarkRunStatus.Succeeded
+            or BenchmarkRunStatus.PartiallySucceeded
+            or BenchmarkRunStatus.Failed
+            or BenchmarkRunStatus.Cancelled;
 }
 
 /// <summary>
@@ -240,16 +280,18 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
             var snapshot = BenchmarkRows.ToList();
             if (_queuedTargets.Count > 0)
             {
-                var done = _queuedTargets.Count(name =>
-                    snapshot.FirstOrDefault(r => string.Equals(r.Target, name, StringComparison.OrdinalIgnoreCase)) is { } row
-                    && IsTerminal(row.Status));
-                return (done * 100.0) / _queuedTargets.Count;
+                // Task #174: fractional overall progress — the mean per-target fraction over
+                // the queued targets (a Running row with no live progress contributes 0.0,
+                // so the pre-#174 terminal-count behavior is preserved for older daemons).
+                return _queuedTargets
+                    .Select(name => snapshot.FirstOrDefault(r => string.Equals(r.Target, name, StringComparison.OrdinalIgnoreCase)))
+                    .Select(r => r is null ? 0.0 : BenchmarkLiveProgress.TargetFraction(r.Status, r.Progress))
+                    .Average() * 100.0;
             }
 
             if (snapshot.Count > 0)
             {
-                var done = snapshot.Count(r => IsTerminal(r.Status));
-                return (done * 100.0) / snapshot.Count;
+                return snapshot.Average(r => BenchmarkLiveProgress.TargetFraction(r.Status, r.Progress)) * 100.0;
             }
 
             return 0.0;
@@ -266,15 +308,26 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
                 var done = _queuedTargets.Count(name =>
                     snapshot.FirstOrDefault(r => string.Equals(r.Target, name, StringComparison.OrdinalIgnoreCase)) is { } row
                     && IsTerminal(row.Status));
-                return $"{done} / {_queuedTargets.Count} target(s) finished";
+                var summary = $"{done} / {_queuedTargets.Count} target(s) finished";
+                // Task #174: append the first non-terminal (queue order) target's live message.
+                var active = _queuedTargets
+                    .Select(name => snapshot.FirstOrDefault(r => string.Equals(r.Target, name, StringComparison.OrdinalIgnoreCase)))
+                    .FirstOrDefault(r => r is not null && !IsTerminal(r.Status) && !string.IsNullOrWhiteSpace(r.ProgressDetailText));
+                return active is not null
+                    ? $"{summary} · {active.Target}: {active.ProgressDetailText}"
+                    : summary;
             }
 
             if (snapshot.Count > 0)
             {
                 var done = snapshot.Count(r => IsTerminal(r.Status));
-                return done == snapshot.Count
+                var summary = done == snapshot.Count
                     ? $"{snapshot.Count} target(s) finished"
                     : $"{done} / {snapshot.Count} target(s) finished";
+                var active = snapshot.FirstOrDefault(r => !IsTerminal(r.Status) && !string.IsNullOrWhiteSpace(r.ProgressDetailText));
+                return active is not null
+                    ? $"{summary} · {active.Target}: {active.ProgressDetailText}"
+                    : summary;
             }
 
             return string.Empty;
@@ -744,6 +797,8 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
                 Status = target.Status,
                 StartedAt = target.StartedAt,
                 FinishedAt = target.FinishedAt,
+                // Task #174: the live in-flight progress (null on terminal rows / older daemons).
+                Progress = target.Progress,
             });
 
             foreach (var result in target.Results)

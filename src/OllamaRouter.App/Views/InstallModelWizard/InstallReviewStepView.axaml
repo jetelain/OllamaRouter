@@ -22,6 +22,24 @@
         </StackPanel>
       </Border>
 
+      <!-- Task #174: the opt-in post-install micro-benchmark toggle (mirrors Step 2's
+           alias-switch framing) -->
+      <Border Padding="10,8"
+              CornerRadius="6"
+              Background="{DynamicResource NightCodeBgSurface}"
+              BorderBrush="{DynamicResource SemiColorBorder}"
+              BorderThickness="1">
+        <StackPanel Spacing="4">
+          <CheckBox IsChecked="{Binding RunBenchmarkAfterInstall}" VerticalAlignment="Center">
+            <TextBlock Text="Run micro-benchmark after install" />
+          </CheckBox>
+          <TextBlock TextWrapping="Wrap"
+                     FontSize="11"
+                     Foreground="{DynamicResource SemiColorText2}"
+                     Text="each successfully installed target is micro-benchmarked after install — live progress per target, takes several minutes per model" />
+        </StackPanel>
+      </Border>
+
       <!-- Per-target run rows -->
       <ItemsControl ItemsSource="{Binding Rows}">
         <ItemsControl.ItemTemplate>
@@ -37,6 +55,17 @@
                 </StackPanel>
                 <ProgressBar Value="{Binding ProgressValue}" Minimum="0" Maximum="100" Height="6"
                              IsIndeterminate="{Binding ProgressIndeterminate}" />
+                <!-- Task #174: the opt-in post-install micro-benchmark feedback (live phase
+                     message + slim fractional bar + terminal summary) -->
+                <TextBlock Text="{Binding BenchmarkNote}"
+                           Foreground="{DynamicResource NightCodeAccentIndigoLightText}" FontSize="11" TextWrapping="Wrap"
+                           IsVisible="{Binding HasBenchmarkNote}" />
+                <ProgressBar Value="{Binding BenchmarkProgressValue}" Minimum="0" Maximum="100" Height="4"
+                             IsIndeterminate="{Binding BenchmarkProgressIndeterminate}"
+                             IsVisible="{Binding HasBenchmarkProgress}" />
+                <TextBlock Text="{Binding BenchmarkSummaryText}"
+                           Foreground="{DynamicResource SemiColorText2}" FontSize="11" TextWrapping="Wrap"
+                           IsVisible="{Binding HasBenchmarkSummary}" />
                 <TextBlock Text="{Binding Error}" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" FontSize="11" TextWrapping="Wrap" />
               </StackPanel>
             </Border>

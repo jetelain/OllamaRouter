@@ -98,6 +98,8 @@ namespace OllamaRouter.Serialization;
 [JsonSerializable(typeof(CandidateSizingEstimate))]
 [JsonSerializable(typeof(MemoryFitStatus))]
 [JsonSerializable(typeof(BenchmarkRunStatus))]
+[JsonSerializable(typeof(BenchmarkPhase))]
+[JsonSerializable(typeof(BenchmarkTargetProgress))]
 [JsonSerializable(typeof(Dictionary<string, BenchmarkTargetState>))]
 [JsonSerializable(typeof(Dictionary<string, Dictionary<string, SpeedSnapshotEntry>>))]
 [JsonSerializable(typeof(RouterBenchmarkRequest))]

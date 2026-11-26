@@ -126,6 +126,8 @@ namespace OllamaRouter.Client;
 [JsonSerializable(typeof(BenchmarkCandidateFit))]
 [JsonSerializable(typeof(IReadOnlyDictionary<string, IReadOnlyList<string>>))]
 [JsonSerializable(typeof(BenchmarkRunStatus))]
+[JsonSerializable(typeof(BenchmarkPhase))]
+[JsonSerializable(typeof(BenchmarkTargetProgress))]
 [JsonSerializable(typeof(BenchmarkContextResult))]
 [JsonSerializable(typeof(BenchmarkTargetResult))]
 [JsonSerializable(typeof(BenchmarkTargetState))]

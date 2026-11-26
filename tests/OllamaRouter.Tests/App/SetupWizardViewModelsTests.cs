@@ -4909,6 +4909,204 @@ public sealed class SetupWizardViewModelsTests
         await vmErr.DisposeAsync();
     }
 
+    // ==================================================================
+    //  Task #174 — Step 4 live benchmark progress (row details, the pinned
+    //  fractional progress formula, the detailed summary append, live partial rows)
+    // ==================================================================
+
+    private static BenchmarkTargetProgress DownloadingAt50Bytes() =>
+        new(
+            BenchmarkPhase.DownloadingModel, "qwen3:8b", UsageRole.BasicModel, null,
+            0, 1, 0, 0, "pulling 50%", 2_306_867_200L, 4_613_734_400L,
+            "Downloading qwen3:8b (50% · 2.1 GB / 4.3 GB)", DateTimeOffset.UtcNow);
+
+    [Fact]
+    public async Task Step4_LiveProgress_FractionalPercent_RowDetails_AndDetailedSummary()
+    {
+        // ONE target Running mid-download (50% of the bytes, the SOLE candidate) ⇒ the pinned
+        // formula gives (0 + 0.2 + 0.3·0.5) / 1 = 0.35 ⇒ 35.0% overall.
+        var fake = new FakeRouterApiClient
+        {
+            BenchmarkResults = new RouterBenchmarkResultsResponse(
+            [
+                new BenchmarkTargetResult("Local", BenchmarkRunStatus.Running, DateTimeOffset.UtcNow, null, [],
+                    DownloadingAt50Bytes())
+            ]),
+        };
+        WizardBenchmarkStepViewModel vm = null!;
+        vm = new WizardBenchmarkStepViewModel(() => fake, ct => vm.RefreshAsync(ct), GatedDelay);
+        await vm.RefreshAsync();
+
+        Assert.True(vm.IsBenchmarkRunning);
+        Assert.Equal(35.0, vm.ProgressPercent, 10);
+
+        var row = Assert.Single(vm.BenchmarkRows);
+        Assert.Equal(BenchmarkPhase.DownloadingModel, row.Phase);
+        Assert.Equal("qwen3:8b", row.CurrentModel);
+        Assert.Null(row.CurrentNumCtx); // outside the benchmarking phase
+        Assert.Equal("Downloading qwen3:8b (50% · 2.1 GB / 4.3 GB)", row.ProgressDetailText);
+        Assert.Equal(35.0, row.RowProgressPercent, 10);
+        Assert.False(row.IsIndeterminate); // a phase with sub-progress is determinate
+        Assert.True(row.HasLiveProgress);
+        Assert.True(row.IsRunningRow);
+
+        // The detailed summary: the legacy count + the active target's live message.
+        Assert.Equal("0 / 1 target(s) finished · Local: Downloading qwen3:8b (50% · 2.1 GB / 4.3 GB)",
+            vm.ProgressSummaryText);
+
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step4_LiveProgress_TwoTargets_TerminalPlusDownloading_AveragesTheFractions()
+    {
+        // local: terminal (1.0); gpu-2: Running mid-download at 50% bytes (0.35) ⇒
+        // (1.0 + 0.35) / 2 = 67.5% overall (the pre-#174 formula would have stayed at 50.0).
+        var fake = new FakeRouterApiClient
+        {
+            BenchmarkResults = new RouterBenchmarkResultsResponse(
+            [
+                new BenchmarkTargetResult("local", BenchmarkRunStatus.Succeeded, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, []),
+                new BenchmarkTargetResult("gpu-2", BenchmarkRunStatus.Running, DateTimeOffset.UtcNow, null, [],
+                    DownloadingAt50Bytes()),
+            ]),
+        };
+        WizardBenchmarkStepViewModel vm = null!;
+        vm = new WizardBenchmarkStepViewModel(() => fake, ct => vm.RefreshAsync(ct), GatedDelay);
+        await vm.RefreshAsync();
+
+        Assert.True(vm.IsBenchmarkRunning);
+        Assert.Equal(67.5, vm.ProgressPercent, 10);
+        Assert.Equal("1 / 2 target(s) finished · gpu-2: Downloading qwen3:8b (50% · 2.1 GB / 4.3 GB)",
+            vm.ProgressSummaryText);
+
+        var running = Assert.Single(vm.BenchmarkRows, r => r.Status == BenchmarkRunStatus.Running);
+        Assert.Equal("gpu-2", running.Target);
+        Assert.Equal(35.0, running.RowProgressPercent, 10);
+
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step4_LiveProgress_BenchmarkingPhase_CarriesRungIndicesAndFraction()
+    {
+        // Benchmarking: model 2/5 (ci=1, cc=5), rung 1/3 (ri=0, rc=3) ⇒
+        // (1 + 0.7 + 0.3·0/3) / 5 = 0.34 ⇒ 34.0%.
+        var progress = new BenchmarkTargetProgress(
+            BenchmarkPhase.Benchmarking, "qwen3:8b", UsageRole.BasicModel, 32768,
+            1, 5, 0, 3, null, null, null,
+            "Benchmarking qwen3:8b @ 32768 ctx (model 2/5, rung 1/3)", DateTimeOffset.UtcNow);
+        var fake = new FakeRouterApiClient
+        {
+            BenchmarkResults = new RouterBenchmarkResultsResponse(
+            [
+                new BenchmarkTargetResult("Local", BenchmarkRunStatus.Running, DateTimeOffset.UtcNow, null, [], progress)
+            ]),
+        };
+        WizardBenchmarkStepViewModel vm = null!;
+        vm = new WizardBenchmarkStepViewModel(() => fake, ct => vm.RefreshAsync(ct), GatedDelay);
+        await vm.RefreshAsync();
+
+        var row = Assert.Single(vm.BenchmarkRows);
+        Assert.Equal(BenchmarkPhase.Benchmarking, row.Phase);
+        Assert.Equal("qwen3:8b", row.CurrentModel);
+        Assert.Equal(32768, row.CurrentNumCtx);
+        Assert.Equal(34.0, row.RowProgressPercent, 10);
+        Assert.False(row.IsIndeterminate);
+        Assert.Equal("0 / 1 target(s) finished · Local: Benchmarking qwen3:8b @ 32768 ctx (model 2/5, rung 1/3)",
+            vm.ProgressSummaryText);
+
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step4_LiveProgress_QueuedPhase_IsIndeterminateWithZeroFraction()
+    {
+        // Queued: inner 0.0 ⇒ 0.0% overall + the indeterminate row bar (no sub-progress yet).
+        var progress = new BenchmarkTargetProgress(BenchmarkPhase.Queued, "qwen3:8b", null, null,
+            0, 1, 0, 0, null, null, null, BenchmarkProgressText.QueuedMessage(), DateTimeOffset.UtcNow);
+        var fake = new FakeRouterApiClient
+        {
+            BenchmarkResults = new RouterBenchmarkResultsResponse(
+            [
+                new BenchmarkTargetResult("Local", BenchmarkRunStatus.Running, DateTimeOffset.UtcNow, null, [], progress)
+            ]),
+        };
+        WizardBenchmarkStepViewModel vm = null!;
+        vm = new WizardBenchmarkStepViewModel(() => fake, ct => vm.RefreshAsync(ct), GatedDelay);
+        await vm.RefreshAsync();
+
+        var row = Assert.Single(vm.BenchmarkRows);
+        Assert.True(row.IsIndeterminate);
+        Assert.Equal(0.0, row.RowProgressPercent);
+        Assert.Equal(0.0, vm.ProgressPercent);
+        Assert.True(row.HasLiveProgress);
+        Assert.Equal("Queued", row.ProgressDetailText);
+
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step4_LiveProgress_TerminalRow_ClearsTheProjections()
+    {
+        var fake = new FakeRouterApiClient
+        {
+            BenchmarkResults = new RouterBenchmarkResultsResponse(
+            [
+                new BenchmarkTargetResult("Local", BenchmarkRunStatus.Succeeded, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow, [])
+            ]),
+        };
+        WizardBenchmarkStepViewModel vm = null!;
+        vm = new WizardBenchmarkStepViewModel(() => fake, ct => vm.RefreshAsync(ct), GatedDelay);
+        await vm.RefreshAsync();
+
+        var row = Assert.Single(vm.BenchmarkRows);
+        Assert.Null(row.Phase);
+        Assert.Null(row.CurrentModel);
+        Assert.Null(row.ProgressDetailText);
+        Assert.False(row.IsIndeterminate);
+        Assert.False(row.HasLiveProgress);
+        Assert.False(row.IsRunningRow);
+        Assert.Equal(100.0, row.RowProgressPercent);
+        Assert.Equal(100.0, vm.ProgressPercent);
+        // All terminal (no queued targets) ⇒ the plain completed summary (no active target).
+        Assert.Equal("1 target(s) finished", vm.ProgressSummaryText);
+
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step4_LiveProgress_PartialResultRows_StreamInWhileRunning()
+    {
+        // The server's incremental partial snapshots: the Running target already carries a
+        // measured rung row — it renders in ResultRows BEFORE the target is terminal.
+        var fake = new FakeRouterApiClient
+        {
+            BenchmarkResults = new RouterBenchmarkResultsResponse(
+            [
+                new BenchmarkTargetResult("Local", BenchmarkRunStatus.Running, DateTimeOffset.UtcNow, null,
+                [
+                    new BenchmarkContextResult("qwen3:8b", UsageRole.BasicModel, 4096, 512,
+                        20_000_000_000L, 24.5, 900.0, true, null)
+                ],
+                DownloadingAt50Bytes())
+            ]),
+        };
+        WizardBenchmarkStepViewModel vm = null!;
+        vm = new WizardBenchmarkStepViewModel(() => fake, ct => vm.RefreshAsync(ct), GatedDelay);
+        await vm.RefreshAsync();
+
+        Assert.True(vm.IsBenchmarkRunning);
+        var resultRow = Assert.Single(vm.ResultRows);
+        Assert.Equal("Local", resultRow.Target);
+        Assert.Equal("qwen3:8b", resultRow.Model);
+        Assert.Equal(4096, resultRow.NumCtx);
+        Assert.Equal(24.5, resultRow.DecodeTokensPerSecond);
+        Assert.True(resultRow.Viable);
+
+        await vm.DisposeAsync();
+    }
+
     [Fact]
     public async Task Step5_Apply409Distinct_IsBusyGatesGoToBenchmark_AndRecoveryClearsError()
     {

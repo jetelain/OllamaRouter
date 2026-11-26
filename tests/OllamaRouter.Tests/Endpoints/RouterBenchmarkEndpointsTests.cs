@@ -10,6 +10,7 @@ using Microsoft.Extensions.Options;
 using Moq;
 using OllamaRouter.Endpoints;
 using OllamaRouter.Endpoints.RouterApi.Benchmark;
+using OllamaRouter.Client;
 using OllamaRouter.Extensions;
 using OllamaRouter.Options;
 using OllamaRouter.Serialization;
@@ -317,6 +318,110 @@ public sealed class RouterBenchmarkEndpointsTests : IDisposable
         Assert.Equal(2, targets.Count);
         Assert.Contains(targets.Select(t => t?["status"]?.GetValue<string>()), s => s == "Running");
         Assert.Contains(targets.Select(t => t?["status"]?.GetValue<string>()), s => s == "Succeeded");
+    }
+
+    [Fact]
+    public async Task GetResults_RunningRowCarriesLiveProgress_CamelCaseFields_StringEnumPhase()
+    {
+        // Task #174: the in-flight row carries the optional live progress object with the
+        // camelCase wire fields, the string-enum phase, the byte counts and the ready-to-
+        // render human message.
+        var progress = new BenchmarkTargetProgress(
+            BenchmarkPhase.DownloadingModel, "qwen3:8b", UsageRole.AgenticChat, null,
+            CandidateIndex: 1, CandidateCount: 5,
+            Detail: "pulling 42%",
+            CompletedBytes: 1_925_560_320,
+            TotalBytes: 4_613_734_400,
+            Message: "Downloading qwen3:8b (42% · 1.8 GB / 4.3 GB)",
+            UpdatedAt: DateTimeOffset.UtcNow);
+        var running = new BenchmarkTargetResult(
+            "Peer", BenchmarkRunStatus.Running,
+            DateTimeOffset.UtcNow, null, [], Progress: progress);
+        var runner = new StubRunner(["Peer"], true, [running]);
+        await using var harness = await CreateAppAsync(runner);
+
+        using var response = await harness.Client.GetAsync("/api/router/benchmark/results");
+        Assert.Equal(System.Net.HttpStatusCode.OK, response.StatusCode);
+
+        var body = JsonNode.Parse(await response.Content.ReadAsStringAsync());
+        var row = body?["targets"]?.AsArray()![0]!;
+        var p = row["progress"]!;
+        Assert.Equal("downloading-model", p["phase"]?.GetValue<string>()); // string-enum wire form
+        Assert.Equal("qwen3:8b", p["model"]?.GetValue<string>());
+        Assert.Equal("AgenticChat", p["role"]?.GetValue<string>());
+        Assert.Null(p["numCtx"]);
+        Assert.Equal(1, p["candidateIndex"]!.GetValue<int>());
+        Assert.Equal(5, p["candidateCount"]!.GetValue<int>());
+        Assert.Equal(0, p["rungIndex"]!.GetValue<int>());
+        Assert.Equal(0, p["rungCount"]!.GetValue<int>());
+        Assert.Equal("pulling 42%", p["detail"]?.GetValue<string>());
+        Assert.Equal(1_925_560_320, p["completedBytes"]!.GetValue<long>());
+        Assert.Equal(4_613_734_400, p["totalBytes"]!.GetValue<long>());
+        Assert.Equal("Downloading qwen3:8b (42% · 1.8 GB / 4.3 GB)", p["message"]?.GetValue<string>());
+        Assert.NotNull(p["updatedAt"]);
+    }
+
+    [Fact]
+    public async Task GetResults_TerminalRowOmitsTheProgressProperty()
+    {
+        // Task #174: a terminal row (and a Running row from an older daemon with null
+        // progress) must OMIT the property entirely — old daemons/clients are unaffected.
+        var terminal = new BenchmarkTargetResult(
+            "Local", BenchmarkRunStatus.Succeeded,
+            DateTimeOffset.UtcNow.AddSeconds(-1), DateTimeOffset.UtcNow, []);
+        var runningNoProgress = new BenchmarkTargetResult(
+            "Peer", BenchmarkRunStatus.Running,
+            DateTimeOffset.UtcNow, null, [], Progress: null);
+        var runner = new StubRunner(["Local", "Peer"], true, [terminal, runningNoProgress]);
+        await using var harness = await CreateAppAsync(runner);
+
+        using var response = await harness.Client.GetAsync("/api/router/benchmark/results");
+        Assert.Equal(System.Net.HttpStatusCode.OK, response.StatusCode);
+
+        var raw = await response.Content.ReadAsStringAsync();
+        Assert.DoesNotContain("progress", raw); // the property is absent in both rows
+        var body = JsonNode.Parse(raw);
+        Assert.Equal(2, body?["targets"]?.AsArray()!.Count);
+    }
+
+    [Fact]
+    public void BenchmarkProgress_AotRoundTrips_BothSerializerContexts()
+    {
+        // Task #174: full NativeAOT coverage — the progress shape round-trips through BOTH
+        // the server context (OllamaRouterJsonSerializerContext) and the client context
+        // (OllamaRouterClientJsonContext), in each direction.
+        var progress = new BenchmarkTargetProgress(
+            BenchmarkPhase.Benchmarking, "qwen3:8b", UsageRole.SoftwareArchitect, 32_768,
+            CandidateIndex: 1, CandidateCount: 5,
+            RungIndex: 0, RungCount: 3,
+            Message: "Benchmarking qwen3:8b @ 32768 ctx (model 2/5, rung 1/3)",
+            UpdatedAt: DateTimeOffset.UtcNow);
+        var result = new BenchmarkTargetResult(
+            "Peer", BenchmarkRunStatus.Running, DateTimeOffset.UtcNow, null, [], Progress: progress);
+
+        // Server → client.
+        var serverJson = JsonSerializer.Serialize(result, OllamaRouterJsonSerializerContext.Default.BenchmarkTargetResult);
+        var viaClient = JsonSerializer.Deserialize(serverJson, OllamaRouterClientJsonContext.Default.BenchmarkTargetResult);
+        Assert.NotNull(viaClient);
+        Assert.Equal(result.Target, viaClient.Target);
+        Assert.Equal(result.Status, viaClient.Status);
+        Assert.Equal(progress, viaClient.Progress); // deep record equality (all value/string members)
+
+        // Client → server.
+        var clientJson = JsonSerializer.Serialize(result, OllamaRouterClientJsonContext.Default.BenchmarkTargetResult);
+        var viaServer = JsonSerializer.Deserialize(clientJson, OllamaRouterJsonSerializerContext.Default.BenchmarkTargetResult);
+        Assert.NotNull(viaServer);
+        Assert.Equal(result.Status, viaServer.Status);
+        Assert.Equal(progress, viaServer.Progress);
+
+        // The phase wire string is the pinned kebab-case form in BOTH contexts.
+        Assert.Equal("\"benchmarking\"", JsonSerializer.Serialize(viaServer.Progress!.Phase, OllamaRouterJsonSerializerContext.Default.BenchmarkPhase));
+        Assert.Equal("\"benchmarking\"", JsonSerializer.Serialize(viaClient.Progress!.Phase, OllamaRouterClientJsonContext.Default.BenchmarkPhase));
+
+        // Terminal (null progress) → the property is omitted on the wire.
+        var terminal = result with { Status = BenchmarkRunStatus.Succeeded, Progress = null };
+        var terminalJson = JsonSerializer.Serialize(terminal, OllamaRouterJsonSerializerContext.Default.BenchmarkTargetResult);
+        Assert.DoesNotContain("progress", terminalJson);
     }
 
     // ------------------------------------------------------------------

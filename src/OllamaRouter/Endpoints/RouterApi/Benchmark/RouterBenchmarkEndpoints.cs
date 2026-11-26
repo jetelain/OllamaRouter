@@ -129,7 +129,13 @@ public static class RouterBenchmarkEndpoints
         .WithTags("Benchmarking")
         .WithSummary("List benchmark results (including in-flight Running rows).")
         .WithDescription("Every known target result (persisted or in-flight; in-flight rows carry status \"Running\"), "
-            + "empty when nothing ever ran. Read-only — no key required in default mode.");
+            + "empty when nothing ever ran. Each in-flight row additionally carries an optional in-flight "
+            + "progress object (task #174): a string-enum phase (queued / sizing / checking-model / "
+            + "downloading-model / inspecting-model / unloading-model / benchmarking / persisting), "
+            + "model + role, numCtx, candidateIndex/candidateCount, rungIndex/rungCount, the raw daemon "
+            + "status detail, completedBytes/totalBytes during downloads and a ready-to-render human "
+            + "message; the property is omitted on terminal rows and by older daemons. "
+            + "Read-only — no key required in default mode.");
         app.MapDelete("/api/router/benchmark/results", (IMicroBenchmarkRunner benchmarkRunner) =>
         {
             // In-flight runs keep their Running states: the delete applies to completed

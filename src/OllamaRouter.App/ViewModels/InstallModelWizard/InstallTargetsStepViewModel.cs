@@ -38,6 +38,7 @@ public sealed partial class InstallTargetRowVm : ObservableObject
         string context = "",
         string? suggestionBadge = null,
         string? suggestionProvenance = null,
+        string? benchmarkNote = null,
         bool probeable = false)
     {
         Name = name;
@@ -50,6 +51,7 @@ public sealed partial class InstallTargetRowVm : ObservableObject
         _context = context;
         _suggestionBadge = suggestionBadge;
         _suggestionProvenance = suggestionProvenance;
+        _benchmarkNote = benchmarkNote;
         _showReprobe = probeable;
 
         // The FULL step-0 reference, parsed ONCE (the step-0 gate guarantees validity — the
@@ -131,6 +133,13 @@ public sealed partial class InstallTargetRowVm : ObservableObject
     /// <summary>The suggestion provenance line (benchmark / fleet catalog / hint / veto).</summary>
     [ObservableProperty]
     private string? _suggestionProvenance;
+
+    /// <summary>Task #174 (assisted mode only): the live in-flight benchmark note for this
+    /// target (e.g. "Benchmarking qwen3:8b @ 32768 ctx (model 2/5, rung 1/3)") — shown instead
+    /// of silently degrading to the "no benchmark/catalog data" provenance while a benchmark
+    /// is running. Manual mode never sets it (null).</summary>
+    [ObservableProperty]
+    private string? _benchmarkNote;
 
     /// <summary>Whether the row's context parses to >= 1 (the per-row gate while the alias is
     /// ON).</summary>
@@ -435,6 +444,7 @@ public sealed partial class InstallTargetsStepViewModel : ObservableObject, IWiz
 
                 string? badge = null;
                 string? provenance = null;
+                string? benchmarkNote = null;
                 var context = string.Empty;
                 if (assisted)
                 {
@@ -447,6 +457,16 @@ public sealed partial class InstallTargetsStepViewModel : ObservableObject, IWiz
                     badge = suggestion.Context is { } suggested ? $"Suggested: {suggested}" : null;
                     provenance = suggestion.Provenance;
                     context = suggestion.Context is { } prefilled ? prefilled.ToString() : string.Empty;
+
+                    // Task #174: a target mid-benchmark (Running + a non-blank live progress
+                    // message) shows it on the row instead of the "no data" provenance.
+                    var targetBenchmark = benchmarks?.Targets
+                        .FirstOrDefault(t => string.Equals(t.Target, item.Name, StringComparison.OrdinalIgnoreCase));
+                    if (targetBenchmark is { Status: BenchmarkRunStatus.Running } &&
+                        !string.IsNullOrWhiteSpace(targetBenchmark.Progress?.Message))
+                    {
+                        benchmarkNote = targetBenchmark.Progress!.Message;
+                    }
                 }
 
                 rows.Add(new InstallTargetRowVm(
@@ -462,6 +482,7 @@ public sealed partial class InstallTargetsStepViewModel : ObservableObject, IWiz
                     context: context,
                     suggestionBadge: badge,
                     suggestionProvenance: provenance,
+                    benchmarkNote: benchmarkNote,
                     probeable: hardwareByName is not null &&
                         (hardwareByName.TryGetValue(item.Name, out var hardwareNode) is false ||
                          string.Equals(hardwareNode.Source, "none", StringComparison.OrdinalIgnoreCase) ||

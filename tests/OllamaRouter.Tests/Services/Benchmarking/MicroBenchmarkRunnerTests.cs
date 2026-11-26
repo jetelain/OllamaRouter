@@ -35,9 +35,13 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
     /// Records every request (method, absolute path, body) and answers /api/generate from a
     /// first-in-first-out queue of response bodies — STRICT 1:1 with the measurement
     /// generates (task #167: no warmup generates exist and cold-start evictions never reach
-    /// this handler; they ride the Moq'd catalog client). /api/pull always answers 200
-    /// {"status":"success"}. An optional gate can stall the FIRST generate call so tests
-    /// can assert the single-flight contract.
+    /// this handler; they ride the Moq'd catalog client). /api/pull answers from a FIFO queue
+    /// of scriptable NDJSON bodies (task #174; the default — nothing enqueued — is the
+    /// single-line {"status":"success"} response, which IS valid one-line NDJSON), and an
+    /// optional mid-stream gate can stall a pull after a configurable number of lines so
+    /// tests can assert the live DownloadingModel progress. One-shot generate gates can
+    /// stall successive measurement rungs in sequence (single-flight contract + the live
+    /// Benchmarking phase + incremental partial rows).
     /// </summary>
     private sealed class RecordingHandler : HttpMessageHandler
     {
@@ -48,29 +52,92 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
         public List<Request> Requests { get; } = new();
         private readonly Queue<string> _generateResponses = new();
 
-        /// <summary>When set, the first generate call blocks until the gate is released.</summary>
-        private TaskCompletionSource? _generateGate;
+        /// <summary>Task #174: scriptable NDJSON /api/pull bodies (FIFO; default single-line
+        /// success). <paramref name="LinesBeforeGate"/> (0-based count; null = no stall): when
+        /// a pull gate is set, the response streams exactly that many lines, flushes and
+        /// BLOCKS until released — the mid-stream observation point.</summary>
+        private readonly Queue<(string Body, int? LinesBeforeGate)> _pullResponses = new();
 
+        /// <summary>One-shot generate gates (task #174): each enqueued gate stalls exactly ONE
+        /// generate call (picked up in FIFO order), so rung 1 and rung 2 can be gated in
+        /// sequence. <see cref="_activeGenerateGate"/> is the gate currently blocking a call.</summary>
+        private readonly Queue<TaskCompletionSource> _pendingGenerateGates = new();
+        private TaskCompletionSource? _activeGenerateGate;
+
+        /// <summary>Task #174: when set, the next scriptable pull (with a
+        /// <paramref name="linesBeforeGate"/>) stalls mid-stream until released.</summary>
+        private TaskCompletionSource? _pullGate;
+
+        /// <summary>Stalls the NEXT generate call (replaces any previously enqueued gates —
+        /// the pre-#174 single-gate semantics; the run loop is strictly sequential, so the
+        /// next call is always the one that matters).</summary>
         public void SetGenerateGate(TaskCompletionSource gate)
         {
             lock (_gateLock)
             {
-                _generateGate = gate;
+                _pendingGenerateGates.Clear();
+                _pendingGenerateGates.Enqueue(gate);
             }
         }
 
+        /// <summary>Enqueues a gate that stalls the NEXT still-pending generate call (task
+        /// #174: queue TWO gates to gate rung 1 and rung 2 of the same candidate).</summary>
+        public void EnqueueGenerateGate(TaskCompletionSource gate)
+        {
+            lock (_gateLock)
+            {
+                _pendingGenerateGates.Enqueue(gate);
+            }
+        }
+
+        /// <summary>Releases the in-flight (picked-up) gate; falls back to the oldest pending
+        /// one when the release runs before the runner picks it up (deterministic either way).</summary>
         public void ReleaseGenerateGate()
         {
             TaskCompletionSource? gate;
             lock (_gateLock)
             {
-                gate = _generateGate;
-                _generateGate = null;
+                gate = _activeGenerateGate
+                    ?? (_pendingGenerateGates.Count > 0 ? _pendingGenerateGates.Dequeue() : null);
+                _activeGenerateGate = null;
+            }
+            gate?.TrySetResult();
+        }
+
+        /// <summary>Task #174: sets the mid-stream pull gate (stalls the next scriptable pull
+        /// after its <paramref name="linesBeforeGate"/> lines).</summary>
+        public void SetPullGate(TaskCompletionSource gate)
+        {
+            lock (_gateLock)
+            {
+                _pullGate = gate;
+            }
+        }
+
+        /// <summary>Task #174: releases the mid-stream pull gate.</summary>
+        public void ReleasePullGate()
+        {
+            TaskCompletionSource? gate;
+            lock (_gateLock)
+            {
+                gate = _pullGate;
+                _pullGate = null;
             }
             gate?.TrySetResult();
         }
 
         public void EnqueueGenerateResponse(string body) => _generateResponses.Enqueue(body);
+
+        /// <summary>Task #174: enqueues a scriptable NDJSON /api/pull response (newline-
+        /// separated lines; the default single-line success body is the pre-#174 daemon
+        /// behavior).</summary>
+        public void EnqueuePullResponse(string ndjsonBody, int? linesBeforeGate = null)
+        {
+            lock (_requestsLock)
+            {
+                _pullResponses.Enqueue((ndjsonBody, linesBeforeGate));
+            }
+        }
 
         public int PullCallCount => CountByPath("/api/pull");
         public int GenerateCallCount => CountByPath("/api/generate");
@@ -112,10 +179,16 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
 
             if (absolutePath == "/api/generate")
             {
+                // Task #174: one-shot generate gates — the call picks up (dequeues) the oldest
+                // pending gate and blocks on it until released.
                 TaskCompletionSource? gate;
                 lock (_gateLock)
                 {
-                    gate = _generateGate;
+                    gate = _pendingGenerateGates.Count > 0 ? _pendingGenerateGates.Dequeue() : null;
+                    if (gate is not null)
+                    {
+                        _activeGenerateGate = gate;
+                    }
                 }
                 if (gate is not null)
                 {
@@ -137,9 +210,43 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
 
             if (absolutePath == "/api/pull")
             {
+                (string Body, int? LinesBeforeGate) scripted;
+                lock (_requestsLock)
+                {
+                    scripted = _pullResponses.Count > 0
+                        ? _pullResponses.Dequeue()
+                        : ("{\"status\":\"success\"}", (int?)null);
+                }
+
+                // Task #174: mid-stream stall — serve the first N lines, then HOLD the read
+                // (the pull is "in flight") until the gate opens, then serve the rest. The
+                // blocking lives in the STREAM's Read (run off the response path), wrapped in
+                // StreamContent so HttpClient streams it LIVE with ResponseHeadersRead — the
+                // same proven shape as FakeOllamaDaemonHandler in RouterModelPullEndpointTests.
+                TaskCompletionSource? pullGate = null;
+                int? linesBeforeGate = null;
+                if (scripted.LinesBeforeGate is { } lines && lines >= 0)
+                {
+                    linesBeforeGate = lines;
+                    lock (_gateLock)
+                    {
+                        pullGate = _pullGate;
+                    }
+                }
+                if (pullGate is not null && linesBeforeGate is { } cut)
+                {
+                    var allLines = scripted.Body.Split('\n').Where(l => !string.IsNullOrWhiteSpace(l)).ToList();
+                    var head = string.Join('\n', allLines.Take(cut)) + "\n";
+                    var tail = string.Join('\n', allLines.Skip(cut)) + (allLines.Count > cut ? "\n" : string.Empty);
+                    var gated = new StreamContent(new GatedNdjsonStream(
+                        Encoding.UTF8.GetBytes(head), Encoding.UTF8.GetBytes(tail), pullGate.Task, cancellationToken));
+                    gated.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/x-ndjson");
+                    return new HttpResponseMessage(HttpStatusCode.OK) { Content = gated };
+                }
+
                 return new HttpResponseMessage(HttpStatusCode.OK)
                 {
-                    Content = new StringContent("{\"status\":\"success\"}", Encoding.UTF8, "application/json")
+                    Content = new StringContent(scripted.Body, Encoding.UTF8, "application/x-ndjson")
                 };
             }
 
@@ -147,6 +254,105 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
             {
                 Content = new StringContent("{\"error\":\"no route\"}", Encoding.UTF8, "application/json")
             };
+        }
+
+        /// <summary>
+        /// The gated /api/pull response stream (task #174 test seam, mirroring
+        /// <c>FakeOllamaDaemonHandler.GatedNdjsonStream</c>): serves <paramref name="head"/>
+        /// (the first N NDJSON lines) immediately, then the synchronous
+        /// <see cref="Read(byte[], int, int)"/> HOLDs (the StreamReader's async read runs it
+        /// off the response path) until the gate opens or the token cancels, then serves
+        /// <paramref name="tail"/> and EOFs. This is what lets the runner observe the first
+        /// progress lines LIVE (as DownloadingModel progress) while the pull is "in flight".
+        /// </summary>
+        private sealed class GatedNdjsonStream(byte[] head, byte[] tail, Task gate, CancellationToken ct) : Stream
+        {
+            private readonly byte[] _head = head;
+            private readonly byte[] _tail = tail;
+            private readonly Task _gate = gate;
+            private readonly CancellationToken _ct = ct;
+            private int _phase; // 0 = head, 1 = gated (in flight), 2 = tail, 3 = EOF
+            private int _offset;
+
+            public override bool CanRead => true;
+            public override bool CanSeek => false;
+            public override bool CanWrite => false;
+            public override long Length => throw new NotSupportedException();
+            public override long Position
+            {
+                get => throw new NotSupportedException();
+                set => throw new NotSupportedException();
+            }
+
+            public override void Flush() { }
+
+            public override int Read(byte[] buffer, int offset, int count)
+            {
+                if (count == 0)
+                {
+                    return 0;
+                }
+
+                while (true)
+                {
+                    switch (_phase)
+                    {
+                        case 0:
+                        {
+                            if (_head.Length == 0)
+                            {
+                                _phase = 1;
+                                continue;
+                            }
+
+                            var nHead = Math.Min(count, _head.Length - _offset);
+                            Buffer.BlockCopy(_head, _offset, buffer, offset, nHead);
+                            _offset += nHead;
+                            if (_offset >= _head.Length)
+                            {
+                                // Head fully out — the NEXT read call holds the pull "in flight".
+                                _phase = 1;
+                                _offset = 0;
+                            }
+
+                            return nHead;
+                        }
+
+                        case 1:
+                            // Hold the pull open until the gate opens; a token cancellation
+                            // ends the stream with an OCE (the silent-cancellation path).
+                            _gate.Wait(_ct);
+                            _phase = 2;
+                            continue;
+
+                        case 2:
+                        {
+                            if (_tail.Length == 0)
+                            {
+                                _phase = 3;
+                                continue;
+                            }
+
+                            var nTail = Math.Min(count, _tail.Length - _offset);
+                            Buffer.BlockCopy(_tail, _offset, buffer, offset, nTail);
+                            _offset += nTail;
+                            if (_offset >= _tail.Length)
+                            {
+                                _phase = 3;
+                            }
+
+                            return nTail;
+                        }
+
+                        default:
+                            return 0; // EOF
+                    }
+                }
+            }
+
+            public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+            public override void SetLength(long value) => throw new NotSupportedException();
+            public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
         }
     }
 
@@ -352,7 +558,7 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
     }
 
     [Fact]
-    public async Task ModelAbsent_ExactlyOnePull_WithNonStreamBody()
+    public async Task ModelAbsent_ExactlyOnePull_WithStreamBody()
     {
         var runner = CreateRunner(Profile(32_768), modelPresent: false);
         _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
@@ -364,7 +570,8 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
         Assert.Equal(1, _handler.PullCallCount);
         var pullBody = JsonNode.Parse(_handler.FirstByPath("/api/pull")!.Body) as JsonObject;
         Assert.Equal(TestModel.Name, pullBody?["model"]?.GetValue<string>());
-        Assert.Equal(false, pullBody?["stream"]?.GetValue<bool>());
+        // Task #174: the pull is now STREAMING NDJSON (live DownloadingModel progress).
+        Assert.Equal(true, pullBody?["stream"]?.GetValue<bool>());
     }
 
     [Fact]
@@ -1408,5 +1615,332 @@ public sealed class MicroBenchmarkRunnerTests : IDisposable
         _catalogClient.Verify(
             c => c.UnloadModelAsync(TargetUrl, TestModel.Name, It.IsAny<CancellationToken>()),
             Times.Exactly(2));
+    }
+
+    // ------------------------------------------------------------------
+    //  Task #174: live progress, streaming pull, incremental partial rows
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// Polls (10 ms ticks, deterministic bounds — no sleeps above 10 ms) until the sync
+    /// <paramref name="condition"/> holds; asserts the named observation happened in time.
+    /// </summary>
+    private static async Task WaitUntilAsync(Func<bool> condition, string what, int timeoutMs = 8_000)
+    {
+        var sw = Stopwatch.StartNew();
+        while (!condition() && sw.ElapsedMilliseconds < timeoutMs)
+        {
+            await Task.Delay(10);
+        }
+        Assert.True(condition(), $"timed out waiting for: {what}");
+    }
+
+    [Fact]
+    public async Task StreamingPull_PublishesLiveDownloadingModelProgress_WithPerDigestAggregation()
+    {
+        // The daemon stream: manifest + two layer digests (aaa: 10 MB with 1 MB done,
+        // bbb: 1 MB fully done), then success. The handler stalls AFTER the four progress
+        // lines, so the test can assert the LIVE DownloadingModel progress mid-stream.
+        var runner = CreateRunner(Profile(32_768), modelPresent: false);
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _handler.SetPullGate(gate);
+        _handler.EnqueuePullResponse(
+            "{\"status\":\"pulling manifest\"}\n" +
+            "{\"status\":\"verifying sha256 digest\",\"digest\":\"sha256:aaa\",\"total\":10485760,\"completed\":0}\n" +
+            "{\"status\":\"pulling 34%\",\"digest\":\"sha256:aaa\",\"total\":10485760,\"completed\":1048576}\n" +
+            "{\"status\":\"pulling 90%\",\"digest\":\"sha256:bbb\",\"total\":1048576,\"completed\":1048576}\n" +
+            "{\"status\":\"success\"}",
+            linesBeforeGate: 4);
+        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
+        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
+
+        Assert.True(runner.TryStartRun(target: null, roles: null, model: null));
+        try
+        {
+            // The gate holds the stream after the four head lines — wait until ALL of them
+            // have been consumed (the per-digest aggregation reached its final pre-gate value).
+            await WaitUntilAsync(
+                () => runner.GetAllResults().FirstOrDefault() is { Progress.TotalBytes: 11_534_336, Progress.CompletedBytes: 2_097_152 },
+                "the aggregated DownloadingModel progress (all four pre-gate lines consumed)");
+
+            // Per-digest aggregation (ollama-CLI style): Σ of the LATEST per-digest values →
+            // completed 2,097,152 / total 11,534,336 → 18% (floor of 18.18…).
+            var progress = runner.GetAllResults().Single().Progress!;
+            Assert.Equal(BenchmarkPhase.DownloadingModel, progress.Phase);
+            Assert.Equal(TestModel.Name, progress.Model);
+            Assert.Equal("pulling 90%", progress.Detail);
+            Assert.Equal(2_097_152, progress.CompletedBytes);
+            Assert.Equal(11_534_336, progress.TotalBytes);
+            Assert.Equal("Downloading bench:27b (18% · 2 MB / 11 MB)", progress.Message);
+        }
+        finally
+        {
+            _handler.ReleasePullGate();
+        }
+
+        await WaitUntilRunCompleteAsync(runner);
+        var results = runner.GetAllResults().Single();
+        Assert.Equal(BenchmarkRunStatus.Succeeded, results.Status);
+        Assert.Null(results.Progress); // a terminal row carries no live progress
+        Assert.Equal(2, results.Results.Count);
+    }
+
+    [Fact]
+    public async Task PullErrorLine_IsPullFailureRow_AndClearsProgress()
+    {
+        // A daemon {"error": "…"} line anywhere in the NDJSON stream fails the pull → the
+        // target ends Failed with the error:pull row and NO live progress.
+        var runner = CreateRunner(Profile(32_768), modelPresent: false);
+        _handler.EnqueuePullResponse(
+            "{\"status\":\"pulling manifest\"}\n" +
+            "{\"error\":\"model not found on registry\"}");
+
+        Assert.True(runner.TryStartRun(target: null, roles: null, model: null));
+        await WaitUntilRunCompleteAsync(runner);
+
+        var results = runner.GetAllResults().Single();
+        Assert.Equal(BenchmarkRunStatus.Failed, results.Status);
+        var row = results.Results.Single();
+        Assert.False(row.Viable);
+        Assert.Equal("error:pull", row.Reason);
+        Assert.Null(results.Progress);
+    }
+
+    [Fact]
+    public async Task SingleLinePullResponse_IsValidOneLineNdJson_AndSucceeds()
+    {
+        // The pre-#174 daemon shape — a single-line {"status":"success"} body — IS valid
+        // one-line NDJSON and terminates the streaming loop exactly as before.
+        var runner = CreateRunner(Profile(32_768), modelPresent: false);
+        _handler.EnqueuePullResponse("{\"status\":\"success\"}");
+        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
+        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
+
+        Assert.True(runner.TryStartRun(target: null, roles: null, model: null));
+        await WaitUntilRunCompleteAsync(runner);
+
+        var results = runner.GetAllResults().Single();
+        Assert.Equal(BenchmarkRunStatus.Succeeded, results.Status);
+        Assert.Equal(2, results.Results.Count);
+        Assert.All(results.Results, r => Assert.True(r.Viable));
+    }
+
+    [Fact]
+    public async Task PhaseTransitions_TwoTargets_QueuedCheckingDownloadingBenchmarking_TerminalNull()
+    {
+        // The full phase ladder, observed deterministically: the run drains targets
+        // sequentially, so while node-a is frozen at a gated point, node-b stays in the
+        // Queued phase written by TryStartRun.
+        const string urlA = "http://node-a:11434";
+        const string urlB = "http://node-b:11434";
+        var options2 = new OllamaRouterOptions
+        {
+            Targets =
+            [
+                new OllamaTargetOptions { Name = "node-a", Url = urlA },
+                new OllamaTargetOptions { Name = "node-b", Url = urlB }
+            ]
+        };
+
+        _fleetHardware.Setup(f => f.GetProfile(It.IsAny<string>())).Returns(Profile(32_768));
+
+        // node-a: /api/tags BLOCKS on gateA → the run freezes in the CheckingModel phase.
+        var gateA = new TaskCompletionSource<JsonArray>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _catalogClient
+            .Setup(c => c.GetTagsAsync(urlA, It.IsAny<CancellationToken>()))
+            .Returns(() => gateA.Task);
+
+        // node-a's pull: the manifest line, then a mid-stream STALL (DownloadingModel gate).
+        var pullGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _handler.SetPullGate(pullGate);
+        _handler.EnqueuePullResponse(
+            "{\"status\":\"pulling manifest\"}\n" +
+            "{\"status\":\"success\"}",
+            linesBeforeGate: 1);
+
+        // node-a's rung-1 measurement generate is gated → freezes in Benchmarking rung 1.
+        _handler.EnqueueGenerateGate(new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+
+        // 4 measurement responses: node-a 16k/32k, then node-b 16k/32k (node-b pulls the
+        // default single-line success body — its NDJSON compatibility is covered there).
+        for (var i = 0; i < 4; i++)
+        {
+            _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000));
+        }
+
+        var runner = new MicroBenchmarkRunner(
+            MsOptions.Create(new CandidateModelCatalogOptions
+            {
+                Models = [TestModel],
+                BenchmarkContextLadder = [16_384, 32_768]
+            }),
+            _fleetHardware.Object,
+            new FixedTokenEstimator(),
+            new TestOptionsMonitor<OllamaRouterOptions>(options2),
+            _catalogClient.Object,
+            new HttpClient(_handler),
+            _lifetime.Object,
+            NullLogger<MicroBenchmarkRunner>.Instance,
+            Path.Combine(_stateDirectory, "benchmarks.json"),
+            Path.Combine(_stateDirectory, "targets-speed.json"));
+
+        BenchmarkTargetResult? A() => runner.GetAllResults().FirstOrDefault(r => r.Target == "node-a");
+        BenchmarkTargetResult? B() => runner.GetAllResults().FirstOrDefault(r => r.Target == "node-b");
+
+        Assert.True(runner.TryStartRun(target: null, roles: null, model: null));
+        try
+        {
+            // node-a freezes in CheckingModel (the /api/tags presence check is gated);
+            // node-b is still Queued (no work started for it yet).
+            await WaitUntilAsync(() => A()?.Progress?.Phase == BenchmarkPhase.CheckingModel, "node-a to reach CheckingModel");
+            Assert.Equal($"Checking {TestModel.Name}…", A()!.Progress!.Message);
+            Assert.Equal(TestModel.Name, A()!.Progress!.Model);
+            Assert.Equal(BenchmarkPhase.Queued, B()!.Progress!.Phase);
+            Assert.Equal("Queued", B()!.Progress!.Message);
+            Assert.Null(B()!.Progress!.Model);
+
+            // Release the tags check → the streaming pull begins and STALLS after the
+            // manifest line (no bytes aggregated yet → the detail-only download message).
+            gateA.TrySetResult(new JsonArray());
+            await WaitUntilAsync(() => A()?.Progress?.Phase == BenchmarkPhase.DownloadingModel, "node-a to reach DownloadingModel");
+            Assert.Equal("pulling manifest", A()!.Progress!.Detail);
+            Assert.Equal(0, A()!.Progress!.CompletedBytes);
+            Assert.Equal(0, A()!.Progress!.TotalBytes);
+            Assert.Equal($"Downloading {TestModel.Name} (pulling manifest)", A()!.Progress!.Message);
+
+            // Release the pull → node-a inspects, self-evicts and reaches Benchmarking
+            // rung 1, where the first measurement generate is gated.
+            _handler.ReleasePullGate();
+            await WaitUntilAsync(() => A()?.Progress?.Phase == BenchmarkPhase.Benchmarking, "node-a to reach Benchmarking");
+            var pA = A()!.Progress!;
+            Assert.Equal(16_384, pA.NumCtx);
+            Assert.Equal(0, pA.CandidateIndex);
+            Assert.Equal(1, pA.CandidateCount);
+            Assert.Equal(0, pA.RungIndex);
+            Assert.Equal(2, pA.RungCount);
+            Assert.Equal($"Benchmarking {TestModel.Name} @ 16384 ctx (model 1/1, rung 1/2)", pA.Message);
+        }
+        finally
+        {
+            gateA.TrySetResult(new JsonArray());
+            _handler.ReleasePullGate();
+            _handler.ReleaseGenerateGate();
+        }
+
+        await WaitUntilRunCompleteAsync(runner);
+
+        var all = runner.GetAllResults();
+        Assert.Equal(2, all.Count);
+        Assert.All(all, r => Assert.Equal(BenchmarkRunStatus.Succeeded, r.Status));
+        Assert.All(all, r => Assert.Null(r.Progress)); // terminal rows carry no live progress
+        Assert.All(all, r => Assert.Equal(2, r.Results.Count));
+    }
+
+    [Fact]
+    public async Task IncrementalPartialResults_AreVisibleWhileTargetStillRunning()
+    {
+        // The measured rows stream to the polling clients LIVE: rung 1's row is visible
+        // while rung 2 is still in flight (the target is Running with a partial snapshot).
+        var runner = CreateRunner(Profile(32_768), modelPresent: true);
+
+        // Two one-shot gates: rung 1 and rung 2 of the same candidate are gated in sequence.
+        _handler.EnqueueGenerateGate(new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+        _handler.EnqueueGenerateGate(new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // 16k
+        _handler.EnqueueGenerateResponse(GenerateJson(64, 2_000_000_000)); // 32k
+
+        Assert.True(runner.TryStartRun(target: null, roles: null, model: null));
+        try
+        {
+            // Rung 1 in flight (gated): nothing measured yet → the partial is still empty.
+            await WaitUntilAsync(() => _handler.GenerateCallCount == 1, "rung 1 to start");
+            var whileRung1 = runner.GetAllResults().Single();
+            Assert.Equal(BenchmarkRunStatus.Running, whileRung1.Status);
+            Assert.Empty(whileRung1.Results);
+            Assert.Equal(BenchmarkPhase.Benchmarking, whileRung1.Progress!.Phase);
+            Assert.Equal(16_384, whileRung1.Progress!.NumCtx);
+            Assert.Equal(0, whileRung1.Progress!.RungIndex);
+
+            // Release rung 1 → its row is published IMMEDIATELY (partial snapshot #1) and
+            // rung 2 starts (gated).
+            _handler.ReleaseGenerateGate();
+            await WaitUntilAsync(() => _handler.GenerateCallCount == 2, "rung 2 to start");
+
+            var whileRung2 = runner.GetAllResults().Single();
+            Assert.Equal(BenchmarkRunStatus.Running, whileRung2.Status);
+            var partialRow = Assert.Single(whileRung2.Results); // the 16k row is visible LIVE
+            Assert.Equal(16_384, partialRow.NumCtx);
+            Assert.True(partialRow.Viable);
+            Assert.Null(partialRow.Reason);
+            Assert.Equal(1, whileRung2.Progress!.RungIndex); // rung 2 in flight
+            Assert.Equal(32_768, whileRung2.Progress!.NumCtx);
+        }
+        finally
+        {
+            _handler.ReleaseGenerateGate();
+        }
+
+        await WaitUntilRunCompleteAsync(runner);
+        var final = runner.GetAllResults().Single();
+        Assert.Equal(BenchmarkRunStatus.Succeeded, final.Status);
+        Assert.Equal(2, final.Results.Count);
+        Assert.Null(final.Progress);
+    }
+
+    [Fact]
+    public async Task Cancellation_MidPull_MarksTargetCancelled_AndClearsProgress()
+    {
+        // Cancelling the host while the pull stream is in flight: the target must reach
+        // Cancelled (not stuck in Running) and its live progress entry must be dropped.
+        var statePath = Path.Combine(_stateDirectory, "benchmarks.json");
+        var capturingLifetime = new CapturingLifetime();
+        _fleetHardware.Setup(f => f.GetProfile(It.IsAny<string>())).Returns(Profile(32_768));
+
+        var pullGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _handler.SetPullGate(pullGate);
+        _handler.EnqueuePullResponse(
+            "{\"status\":\"pulling manifest\"}\n" +
+            "{\"status\":\"success\"}",
+            linesBeforeGate: 1);
+
+        var runner = new MicroBenchmarkRunner(
+            MsOptions.Create(new CandidateModelCatalogOptions
+            {
+                Models = [TestModel],
+                BenchmarkContextLadder = [16_384, 32_768]
+            }),
+            _fleetHardware.Object,
+            new FixedTokenEstimator(),
+            new TestOptionsMonitor<OllamaRouterOptions>(_options),
+            _catalogClient.Object,
+            new HttpClient(_handler),
+            capturingLifetime,
+            NullLogger<MicroBenchmarkRunner>.Instance,
+            statePath,
+            Path.Combine(_stateDirectory, "targets-speed.json"));
+
+        Assert.True(runner.TryStartRun(target: null, roles: null, model: null));
+        try
+        {
+            await WaitUntilAsync(
+                () => runner.GetAllResults().FirstOrDefault()?.Progress?.Phase == BenchmarkPhase.DownloadingModel,
+                "the DownloadingModel phase");
+
+            // Simulate the host stopping while the pull stream is mid-flight.
+            capturingLifetime.StopApplication();
+        }
+        finally
+        {
+            _handler.ReleasePullGate();
+        }
+
+        await WaitUntilAsync(
+            () => runner.GetAllResults().FirstOrDefault() is { } r && r.Status != BenchmarkRunStatus.Running,
+            "the terminal state");
+
+        var result = runner.GetAllResults().Single();
+        Assert.Equal(BenchmarkRunStatus.Cancelled, result.Status);
+        Assert.Null(result.Progress); // the cancelled target's live progress is cleared
+        Assert.Contains("\"Cancelled\"", File.ReadAllText(statePath));
     }
 }

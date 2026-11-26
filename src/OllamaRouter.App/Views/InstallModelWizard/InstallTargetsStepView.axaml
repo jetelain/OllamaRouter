@@ -96,6 +96,9 @@
                   </StackPanel>
                   <TextBlock Text="{Binding ModelRefError}" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" FontSize="11" TextWrapping="Wrap"
                              IsVisible="{Binding ModelRefError, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+                  <!-- Task #174: the live in-flight benchmark note (assisted mode) -->
+                  <TextBlock Text="{Binding BenchmarkNote}" Foreground="{DynamicResource SemiColorText2}" FontSize="11" TextWrapping="Wrap"
+                             IsVisible="{Binding BenchmarkNote, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
                 </StackPanel>
               </Border>
             </DataTemplate>

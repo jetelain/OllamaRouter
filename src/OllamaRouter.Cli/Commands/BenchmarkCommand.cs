@@ -142,6 +142,18 @@ public sealed class BenchmarkCommand : IRouterCommand
         !Console.IsInputRedirected && !Console.IsOutputRedirected;
 
     /// <summary>
+    /// Task #174 — the human wait-loop segment for ONE target: <c>"{target}={status}"</c>
+    /// plus, for a Running target with a non-blank live progress message,
+    /// <c>" [{message}]"</c> (e.g. <c>Local=Running [Downloading qwen3:8b (42% · 1.8 / 4.3 GB)]</c>).
+    /// <see cref="BenchmarkTargetResult.Progress"/> == null (older daemon) ⇒ exactly the
+    /// pre-#174 output.
+    /// </summary>
+    private static string FormatTargetSegment(BenchmarkTargetResult target) =>
+        target.Status == BenchmarkRunStatus.Running && !string.IsNullOrWhiteSpace(target.Progress?.Message)
+            ? $"{target.Target}={target.Status} [{target.Progress!.Message}]"
+            : $"{target.Target}={target.Status}";
+
+    /// <summary>
     /// The wait loop: polls the results every <see cref="PollInterval"/> (default 2 s); human
     /// mode prints ONE summary line per poll (every known target's current status) and, after
     /// the poll containing no <c>Running</c> row, a <c>benchmark: finished</c> line + the final
@@ -195,7 +207,7 @@ public sealed class BenchmarkCommand : IRouterCommand
             if (!json)
             {
                 context.Output.WriteLine("benchmark: " +
-                    string.Join(" ", results.Targets.Select(t => t.Target + "=" + t.Status.ToString())));
+                    string.Join(" ", results.Targets.Select(FormatTargetSegment)));
                 if (finished)
                 {
                     context.Output.WriteLine("benchmark: finished");
@@ -338,7 +350,12 @@ public sealed class BenchmarkCommand : IRouterCommand
     {
         foreach (var target in results.Targets)
         {
-            writer.WriteLine($"{target.Target} ({target.Status}, started {FormatStamp(target.StartedAt)}, finished {FormatStamp(target.FinishedAt)})");
+            // Task #174: a Running target with a live progress message appends it to the
+            // header line (identical to the pre-#174 header otherwise).
+            var progressSuffix = target.Status == BenchmarkRunStatus.Running && !string.IsNullOrWhiteSpace(target.Progress?.Message)
+                ? $" — {target.Progress!.Message}"
+                : string.Empty;
+            writer.WriteLine($"{target.Target} ({target.Status}, started {FormatStamp(target.StartedAt)}, finished {FormatStamp(target.FinishedAt)}){progressSuffix}");
             foreach (var row in target.Results)
             {
                 writer.WriteLine(string.Format(CultureInfo.InvariantCulture,

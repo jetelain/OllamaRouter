@@ -13,6 +13,7 @@ using OllamaRouter.Services.ContextSizing;
 using OllamaRouter.Services.Routing;
 using OllamaRouter.Services.Hardware;
 using OllamaRouter.Services.Catalog;
+using OllamaRouter.Services.Models;
 
 namespace OllamaRouter.Services.Benchmarking;
 
@@ -60,6 +61,11 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
     private readonly SemaphoreSlim _runGate = new(1, 1);
     private readonly object _stateGate = new();
     private readonly ConcurrentDictionary<string, BenchmarkTargetState> _states =
+        new(StringComparer.OrdinalIgnoreCase);
+    // Task #174: the live per-target in-flight progress (in-memory ONLY — never persisted to
+    // benchmarks.json). Mutated ONLY under _stateGate — the same single-gate invariant as
+    // _states; entries are removed when the target's state goes terminal (SetTargetState).
+    private readonly Dictionary<string, BenchmarkTargetProgress> _progress =
         new(StringComparer.OrdinalIgnoreCase);
     private List<string>? _queueOrder; // ordered target names for the current run
     private CancellationTokenSource? _runCts;
@@ -141,7 +147,8 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
         _runCts = cts;
         _runStoppingRegistration = stoppingRegistration;
 
-        // Mark all targets as Running immediately so GetStatusAsync can report them.
+        // Mark all targets as Running immediately so GetStatusAsync can report them;
+        // task #174: each target also starts in the Queued live-progress phase.
         lock (_stateGate)
         {
             _queueOrder = selected.Select(t => t.Name!).ToList();
@@ -151,6 +158,10 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
                 _states[t.Name!] = new BenchmarkTargetState(
                     t.Name!, BenchmarkRunStatus.Running, now, null, now,
                     SizingSourceAssumed, []);
+                _progress[t.Name!] = new BenchmarkTargetProgress(
+                    BenchmarkPhase.Queued,
+                    Message: BenchmarkProgressText.QueuedMessage(),
+                    UpdatedAt: now);
             }
         }
 
@@ -167,7 +178,11 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
             if (_states.TryGetValue(target.Value, out var state))
             {
                 return Task.FromResult<BenchmarkTargetResult?>(new BenchmarkTargetResult(
-                    state.Target, state.Status, state.StartedAt, state.FinishedAt, state.Results));
+                    state.Target, state.Status, state.StartedAt, state.FinishedAt, state.Results,
+                    state.Status == BenchmarkRunStatus.Running
+                        && _progress.TryGetValue(state.Target, out var progress)
+                        ? progress
+                        : null));
             }
         }
 
@@ -189,7 +204,11 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
 
             return ordered
                 .Select(s => new BenchmarkTargetResult(
-                    s.Target, s.Status, s.StartedAt, s.FinishedAt, s.Results))
+                    s.Target, s.Status, s.StartedAt, s.FinishedAt, s.Results,
+                    s.Status == BenchmarkRunStatus.Running
+                        && _progress.TryGetValue(s.Target, out var progress)
+                        ? progress
+                        : null))
                 .ToList();
         }
     }
@@ -275,17 +294,20 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
             {
                 // The delete applies to completed targets only: in-flight (Running) states are
                 // retained and the in-flight work continues for its remaining targets.
+                // (Task #174: the Running targets' live progress is retained too.)
                 foreach (var (name, state) in _states.ToList())
                 {
                     if (state.Status != BenchmarkRunStatus.Running)
                     {
                         _states.TryRemove(name, out _);
+                        _progress.Remove(name);
                     }
                 }
             }
             else
             {
                 _states.Clear();
+                _progress.Clear();
             }
 
             _queueOrder = null;
@@ -338,17 +360,7 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "Benchmark run for target {Target} failed unexpectedly.", target.Name);
-                    lock (_stateGate)
-                    {
-                        var name = target.Name!;
-                        if (_states.TryGetValue(name, out var existing) && existing.Status == BenchmarkRunStatus.Running)
-                        {
-                            var now = DateTimeOffset.UtcNow;
-                            _states[name] = new BenchmarkTargetState(
-                                name, BenchmarkRunStatus.Failed, existing.StartedAt, now, now,
-                                existing.SizingSource, existing.Results);
-                        }
-                    }
+                    SetTargetStateIfRunning(target.Name!, BenchmarkRunStatus.Failed);
                     PersistStateSafe();
                 }
             }
@@ -370,16 +382,7 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
 
     private void MarkTargetCancelled(string name)
     {
-        lock (_stateGate)
-        {
-            if (_states.TryGetValue(name, out var existing) && existing.Status == BenchmarkRunStatus.Running)
-            {
-                var now = DateTimeOffset.UtcNow;
-                _states[name] = new BenchmarkTargetState(
-                    name, BenchmarkRunStatus.Cancelled, existing.StartedAt, now, now,
-                    existing.SizingSource, existing.Results);
-            }
-        }
+        SetTargetStateIfRunning(name, BenchmarkRunStatus.Cancelled);
     }
 
     private void MarkRemainingCancelled(List<OllamaTargetOptions> allTargets, OllamaTargetOptions? afterTarget)
@@ -393,14 +396,111 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
                 var name = allTargets[i].Name!;
                 if (_states.TryGetValue(name, out var existing) && existing.Status == BenchmarkRunStatus.Running)
                 {
-                    _states[name] = new BenchmarkTargetState(
+                    SetTargetStateLocked(name, new BenchmarkTargetState(
                         name, BenchmarkRunStatus.Cancelled, existing.StartedAt, now, now,
-                        existing.SizingSource, existing.Results);
+                        existing.SizingSource, existing.Results));
                 }
             }
         }
 
         PersistStateSafe();
+    }
+
+    /// <summary>
+    /// The centralized terminal-state write (task #174): when the target is still Running,
+    /// replaces its state with the terminal status and drops the target's live progress entry
+    /// (a terminal row never carries stale in-flight metadata). Non-terminal writes go through
+    /// <see cref="SetTargetState"/> / <see cref="PublishPartial"/>.
+    /// </summary>
+    private void SetTargetStateIfRunning(string name, BenchmarkRunStatus terminalStatus)
+    {
+        lock (_stateGate)
+        {
+            if (_states.TryGetValue(name, out var existing) && existing.Status == BenchmarkRunStatus.Running)
+            {
+                var now = DateTimeOffset.UtcNow;
+                SetTargetStateLocked(name, new BenchmarkTargetState(
+                    name, terminalStatus, existing.StartedAt, now, now,
+                    existing.SizingSource, existing.Results));
+            }
+        }
+    }
+
+    /// <summary>
+    /// The ONE centralized state write (task #174) for non-gated callers: writes the state
+    /// under _stateGate and removes the live progress entry when the status is terminal.
+    /// <see cref="PublishPartial"/> / <see cref="SetTargetStateIfRunning"/> reuse the locked
+    /// core for callers that already hold the gate.
+    /// </summary>
+    private void SetTargetState(string name, BenchmarkTargetState state)
+    {
+        lock (_stateGate)
+        {
+            SetTargetStateLocked(name, state);
+        }
+    }
+
+    // Caller must hold _stateGate: writes the state and drops the live progress entry when
+    // the new status is terminal (a terminal row never carries stale in-flight metadata).
+    private void SetTargetStateLocked(string name, BenchmarkTargetState state)
+    {
+        _states[name] = state;
+        if (state.Status != BenchmarkRunStatus.Running)
+        {
+            _progress.Remove(name);
+        }
+    }
+
+    /// <summary>
+    /// Publishes an incremental partial snapshot of the measured rows so far (task #174):
+    /// replaces the target's state with a fresh Running state carrying the accumulated rows
+    /// (the same target, startedAt and sizingSource are preserved) so polling clients render
+    /// measured rows LIVE while the target is still Running.
+    /// </summary>
+    private void PublishPartial(
+        string name,
+        DateTimeOffset startedAt,
+        string sizingSource,
+        IReadOnlyList<BenchmarkContextResult> allResults)
+    {
+        lock (_stateGate)
+        {
+            if (_states.TryGetValue(name, out var existing) && existing.Status == BenchmarkRunStatus.Running)
+            {
+                _states[name] = new BenchmarkTargetState(
+                    name, BenchmarkRunStatus.Running, startedAt, null, DateTimeOffset.UtcNow,
+                    sizingSource, allResults.ToList());
+            }
+        }
+    }
+
+    /// <summary>
+    /// Records the target's live in-flight progress (task #174) — under _stateGate, skipping
+    /// the write when NOTHING VISIBLE changed (same phase/model/bytes/indices: only the
+    /// UpdatedAt stamp would differ) to avoid redundant work on chatty daemon streams.
+    /// </summary>
+    private void SetProgress(string name, BenchmarkTargetProgress progress)
+    {
+        lock (_stateGate)
+        {
+            if (_progress.TryGetValue(name, out var existing) &&
+                existing.Phase == progress.Phase &&
+                existing.Model == progress.Model &&
+                existing.Role == progress.Role &&
+                existing.NumCtx == progress.NumCtx &&
+                existing.CandidateIndex == progress.CandidateIndex &&
+                existing.CandidateCount == progress.CandidateCount &&
+                existing.RungIndex == progress.RungIndex &&
+                existing.RungCount == progress.RungCount &&
+                existing.Detail == progress.Detail &&
+                existing.CompletedBytes == progress.CompletedBytes &&
+                existing.TotalBytes == progress.TotalBytes)
+            {
+                return;
+            }
+
+            _progress[name] = progress;
+        }
     }
 
     private async Task RunTargetBenchmarkAsync(
@@ -450,12 +550,25 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
         string? previousMeasuredModel = null;
 
         // 3. For each candidate: sizing, pull, cap, benchmark loop (evict → measure).
-        foreach (var (candidate, role) in candidates)
+        // Task #174: indexed loop (the 1-based candidateIndex feeds the live progress).
+        var candidateCount = candidates.Length;
+        for (var candidateIndex = 0; candidateIndex < candidateCount; candidateIndex++)
         {
             if (ct.IsCancellationRequested)
             {
                 break;
             }
+
+            var (candidate, role) = candidates[candidateIndex];
+
+            // Task #174: the live progress phase advances with the work (Sizing →
+            // CheckingModel → DownloadingModel → InspectingModel → UnloadingModel →
+            // Benchmarking → Persisting); the message is the ready-to-render human sentence.
+            SetProgress(name, new BenchmarkTargetProgress(
+                BenchmarkPhase.Sizing, candidate.Name, role, null,
+                CandidateIndex: candidateIndex, CandidateCount: candidateCount,
+                Message: BenchmarkProgressText.SizingMessage(candidate.Name),
+                UpdatedAt: DateTimeOffset.UtcNow));
 
             // Evaluate sizing for each ladder context (ONE shared derivation with
             // GetBenchmarkCandidates — the same map / AnySurvived values as before the
@@ -473,11 +586,13 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
                         Viable: false,
                         Reason: "sizing-pruned"));
                 }
+                PublishPartial(name, startedAt, sizingSource, allResults);
                 continue;
             }
 
-            // 4. Pull the model if not already present.
-            var pullResult = await EnsureModelAsync(url, candidate.Name, ct).ConfigureAwait(false);
+            // 4. Pull the model if not already present (task #174: the streaming pull
+            // reports CheckingModel / DownloadingModel progress per daemon line).
+            var pullResult = await EnsureModelAsync(name, url, candidate.Name, ct).ConfigureAwait(false);
             if (pullResult == PullResult.Failed)
             {
                 allResults.Add(new BenchmarkContextResult(
@@ -485,6 +600,7 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
                     0, 0, 0, 0,
                     Viable: false,
                     Reason: "error:pull"));
+                PublishPartial(name, startedAt, sizingSource, allResults);
                 continue;
             }
 
@@ -494,6 +610,11 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
             // generate time overrides it up to the model's native context (the conservative
             // Modelfile defaults would silently drop rungs like 128k/160k/256k). Fail-soft:
             // show failure / missing model_info → NativeContext alone.
+            SetProgress(name, new BenchmarkTargetProgress(
+                BenchmarkPhase.InspectingModel, candidate.Name, role, null,
+                CandidateIndex: candidateIndex, CandidateCount: candidateCount,
+                Message: BenchmarkProgressText.InspectingMessage(candidate.Name),
+                UpdatedAt: DateTimeOffset.UtcNow));
             long? ggufNativeCtx = null;
             try
             {
@@ -512,6 +633,11 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
             // distort the offloading decision and trigger spurious OOMs).
             if (previousMeasuredModel is not null)
             {
+                SetProgress(name, new BenchmarkTargetProgress(
+                    BenchmarkPhase.UnloadingModel, previousMeasuredModel, role, null,
+                    CandidateIndex: candidateIndex, CandidateCount: candidateCount,
+                    Message: BenchmarkProgressText.UnloadingMessage(previousMeasuredModel),
+                    UpdatedAt: DateTimeOffset.UtcNow));
                 await UnloadModelAsync(url, previousMeasuredModel, ct).ConfigureAwait(false);
             }
 
@@ -522,7 +648,10 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
             // decodes, and llama.cpp builds its compute graph at load time, so
             // eval_count/eval_duration (the viability gate input) are representative
             // steady-state decode.
-            foreach (var ctx in ladder.Where(c => c <= effectiveMaxCtx))
+            var survivingRungs = ladder.Where(c => c <= effectiveMaxCtx).ToList();
+            var rungCount = survivingRungs.Count;
+            var rungIndex = 0;
+            foreach (var ctx in survivingRungs)
             {
                 if (ct.IsCancellationRequested)
                 {
@@ -539,21 +668,39 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
                         0, 0, 0, 0,
                         Viable: false,
                         Reason: "sizing-pruned"));
+                    rungIndex++;
                     continue;
                 }
 
                 // Surviving context: evict this model so the KV allocation is a clean
                 // cold start at exactly this rung's num_ctx (no inherited smaller buffer or
                 // partial context from the previous rung), then benchmark it.
+                SetProgress(name, new BenchmarkTargetProgress(
+                    BenchmarkPhase.UnloadingModel, candidate.Name, role, null,
+                    CandidateIndex: candidateIndex, CandidateCount: candidateCount,
+                    Message: BenchmarkProgressText.UnloadingMessage(candidate.Name),
+                    UpdatedAt: DateTimeOffset.UtcNow));
                 await UnloadModelAsync(url, candidate.Name, ct).ConfigureAwait(false);
 
+                SetProgress(name, new BenchmarkTargetProgress(
+                    BenchmarkPhase.Benchmarking, candidate.Name, role, ctx,
+                    CandidateIndex: candidateIndex, CandidateCount: candidateCount,
+                    RungIndex: rungIndex, RungCount: rungCount,
+                    Message: BenchmarkProgressText.BenchmarkingMessage(
+                        candidate.Name, ctx, candidateIndex, candidateCount, rungIndex, rungCount),
+                    UpdatedAt: DateTimeOffset.UtcNow));
                 var (viable, result) = await RunSingleBenchmarkAsync(
                     url, candidate, role, ctx, ct).ConfigureAwait(false);
 
                 if (result is not null)
                 {
                     allResults.Add(result);
+                    // Task #174: stream this measured rung row to the polling clients NOW
+                    // (the target is still Running — the final state is written at the end).
+                    PublishPartial(name, startedAt, sizingSource, allResults);
                 }
+
+                rungIndex++;
 
                 if (!viable && result?.Reason is not null &&
                     result.Reason != "sizing-pruned")
@@ -594,13 +741,19 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
             status = BenchmarkRunStatus.Succeeded;
         }
 
-        var state = new BenchmarkTargetState(
-            name, status, startedAt, finishedAt, finishedAt, sizingSource, allResults);
-
-        lock (_stateGate)
+        // Task #174: the Persisting phase (normal path only — a cancelled run writes its
+        // Cancelled terminal state straight away, no Persisting phase). SetTargetState
+        // drops the live progress entry for the terminal status.
+        if (status != BenchmarkRunStatus.Cancelled)
         {
-            _states[name] = state;
+            SetProgress(name, new BenchmarkTargetProgress(
+                BenchmarkPhase.Persisting,
+                Message: BenchmarkProgressText.PersistingMessage(),
+                UpdatedAt: finishedAt));
         }
+
+        SetTargetState(name, new BenchmarkTargetState(
+            name, status, startedAt, finishedAt, finishedAt, sizingSource, allResults));
 
         PersistStateSafe();
         SeedSpeedSnapshot(name, allResults);
@@ -761,7 +914,20 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
 
     private enum PullResult { Present, Pulled, Failed }
 
-    private async Task<PullResult> EnsureModelAsync(string? baseUrl, string modelName, CancellationToken ct)
+    /// <summary>
+    /// Ensures <paramref name="modelName"/> is present on the daemon at <paramref name="baseUrl"/>
+    /// (present via /api/tags, or PULLED — task #174: the pull is now STREAMING NDJSON
+    /// (<c>stream: true</c>, <c>ResponseHeadersRead</c>, mirroring
+    /// <c>ModelPullService.DaemonPullStreamAsync</c>) and each daemon progress line updates the
+    /// target's live <c>DownloadingModel</c> progress with per-digest byte aggregation
+    /// (ollama-CLI style: Σ of the latest per-digest totals/completeds → the overall
+    /// percentage). Cancellation contract unchanged: a caller-requested cancellation
+    /// rethrows (run → Cancelled); any other failure → <see cref="PullResult.Failed"/>.
+    /// A single-line <c>{"status":"success"}</c> response (the pre-#174 daemon behavior and
+    /// the test fakes) IS valid one-line NDJSON and terminates the loop as before; a clean
+    /// end-of-stream with no error line keeps the fail-open <see cref="PullResult.Pulled"/>.
+    /// </summary>
+    private async Task<PullResult> EnsureModelAsync(string targetName, string? baseUrl, string modelName, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(baseUrl))
         {
@@ -770,6 +936,12 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
 
         try
         {
+            // Task #174: the CheckingModel phase covers the /api/tags presence check.
+            SetProgress(targetName, new BenchmarkTargetProgress(
+                BenchmarkPhase.CheckingModel, modelName, null, null,
+                Message: BenchmarkProgressText.CheckingMessage(modelName),
+                UpdatedAt: DateTimeOffset.UtcNow));
+
             // Check if the model is already present via /api/tags.
             var tags = await _catalogClient.GetTagsAsync(baseUrl, ct).ConfigureAwait(false);
             foreach (var tag in tags)
@@ -781,16 +953,22 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
                 }
             }
 
-            // Model absent: pull it.
+            // Model absent: pull it — STREAMING (task #174). Serialize the wire body via the
+            // registered OllamaDaemonPullRequest (stream: true); ResponseHeadersRead keeps
+            // the body unbuffered so the NDJSON progress lines are observable LIVE.
             _logger.LogInformation("Pulling model {Model} from {Url}...", modelName, baseUrl);
-            var pullBody = new JsonObject { ["model"] = modelName, ["stream"] = false };
-            using var content = new StringContent(pullBody.ToJsonString(), Encoding.UTF8, "application/json");
+            var pullBody = JsonSerializer.SerializeToUtf8Bytes(
+                new OllamaDaemonPullRequest(modelName, true),
+                OllamaRouterJsonSerializerContext.Default.OllamaDaemonPullRequest);
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             cts.CancelAfter(PullTimeout);
 
-            using var pullRequest = new HttpRequestMessage(HttpMethod.Post, new Uri(new Uri(baseUrl), PullPath)) { Content = content };
+            using var pullRequest = new HttpRequestMessage(HttpMethod.Post, new Uri(new Uri(baseUrl), PullPath))
+            {
+                Content = new ByteArrayContent(pullBody)
+            };
             using var response = await _httpClient
-                .SendAsync(pullRequest, cts.Token)
+                .SendAsync(pullRequest, HttpCompletionOption.ResponseHeadersRead, cts.Token)
                 .ConfigureAwait(false);
 
             if (!response.IsSuccessStatusCode)
@@ -800,15 +978,81 @@ public sealed class MicroBenchmarkRunner : IMicroBenchmarkRunner
                 return PullResult.Failed;
             }
 
-            // Parse the pull response for errors.
-            var raw = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-            var json = JsonNode.Parse(raw) as JsonObject;
-            if (json?["error"]?.GetValue<string>() is { Length: > 0 } error)
+            // Per-digest byte aggregation (ollama-CLI style): the daemon reports each layer
+            // digest's total/completed separately; the overall progress is the sum of the
+            // LATEST per-digest values. A line whose total/completed are absent only refreshes
+            // the Detail status text (no byte update for that line).
+            var digests = new Dictionary<string, (long Total, long Completed)>(StringComparer.Ordinal);
+            using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+            using var reader = new StreamReader(stream);
+            string? line;
+            while ((line = await reader.ReadLineAsync(ct).ConfigureAwait(false)) is not null)
             {
-                _logger.LogWarning("Pull of {Model} reported error: {Error}", modelName, error);
-                return PullResult.Failed;
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    continue;
+                }
+
+                OllamaDaemonLineEvent? evt = null;
+                try
+                {
+                    evt = JsonSerializer.Deserialize(line, OllamaRouterJsonSerializerContext.Default.OllamaDaemonLineEvent);
+                }
+                catch (JsonException)
+                {
+                    // Skip a malformed line (mirrors ModelPullService.DaemonPullStreamAsync;
+                    // a daemon error line is always well-formed JSON).
+                }
+
+                if (evt is null)
+                {
+                    continue;
+                }
+
+                if (evt.Error is { } error)
+                {
+                    _logger.LogWarning("Pull of {Model} reported error: {Error}", modelName, error);
+                    return PullResult.Failed;
+                }
+
+                if (evt.Status is not "success")
+                {
+                    if (evt.Digest is { } digest)
+                    {
+                        var (total, completed) = digests.TryGetValue(digest, out var existing)
+                            ? existing
+                            : (0L, 0L);
+                        if (evt.Total is { } t)
+                        {
+                            total = t;
+                        }
+
+                        if (evt.Completed is { } c)
+                        {
+                            completed = c;
+                        }
+
+                        digests[digest] = (total, completed);
+                    }
+
+                    var totalBytes = digests.Values.Sum(d => d.Total);
+                    var completedBytes = digests.Values.Sum(d => d.Completed);
+                    SetProgress(targetName, new BenchmarkTargetProgress(
+                        BenchmarkPhase.DownloadingModel, modelName, null, null,
+                        Detail: evt.Status,
+                        CompletedBytes: completedBytes,
+                        TotalBytes: totalBytes,
+                        Message: BenchmarkProgressText.DownloadMessage(modelName, evt.Status, completedBytes, totalBytes),
+                        UpdatedAt: DateTimeOffset.UtcNow));
+                    continue;
+                }
+
+                // The terminal {"status":"success"} line ends the pull.
+                _logger.LogInformation("Model {Model} pulled successfully.", modelName);
+                return PullResult.Pulled;
             }
 
+            // Clean end-of-stream with no error line: fail-open (unchanged pre-#174 semantics).
             _logger.LogInformation("Model {Model} pulled successfully.", modelName);
             return PullResult.Pulled;
         }

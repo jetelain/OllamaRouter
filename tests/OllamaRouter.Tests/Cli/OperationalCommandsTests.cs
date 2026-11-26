@@ -191,6 +191,24 @@ public class OperationalCommandsTests
             new BenchmarkTargetResult("Remote", BenchmarkRunStatus.Succeeded, StartedAt, FinishedAt, []),
         });
 
+    // Task #174 — live progress fixtures (the byte pair floors to EXACTLY 42%: the spec's
+    // pinned example). Local carries live progress; Remote stays Progress == null (the
+    // old-daemon fallback ⇒ the pre-#174 rendering).
+
+    private static BenchmarkTargetProgress DownloadingProgress() =>
+        new(
+            BenchmarkPhase.DownloadingModel, "qwen3:8b", UsageRole.AgenticChat, null,
+            0, 1, 0, 0, "pulling 42%", 1_937_768_448L, 4_613_734_400L,
+            "Downloading qwen3:8b (42% · 1.8 GB / 4.3 GB)", DateTimeOffset.UtcNow);
+
+    private static RouterBenchmarkResultsResponse RunningResultsWithProgress() =>
+        new(new[]
+        {
+            new BenchmarkTargetResult("Local", BenchmarkRunStatus.Running, StartedAt, null, [],
+                DownloadingProgress()),
+            new BenchmarkTargetResult("Remote", BenchmarkRunStatus.Running, StartedAt, null, []),
+        });
+
     // ------------------------------------------------------------------
     //  fleet / cartography
     // ------------------------------------------------------------------
@@ -1359,6 +1377,94 @@ public class OperationalCommandsTests
         Assert.Single(lines);
         using var doc = JsonDocument.Parse(lines[0]);
         Assert.Equal(2, doc.RootElement.GetProperty("targets").GetArrayLength());
+    }
+
+    // ------------------------------------------------------------------
+    //  Task #174 — live benchmark progress in the CLI output
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task BenchmarkRun_Wait_Human_RunningProgressMessage_PrintedInline()
+    {
+        var client = NewClient();
+        client.Setup(c => c.StartBenchmarkAsync(It.IsAny<RouterBenchmarkRequest?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RunResponse());
+        client.SetupSequence(c => c.GetBenchmarkResultsAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RunningResultsWithProgress())
+            .ReturnsAsync(FinishedResults());
+
+        var context = BuildContext(client, RunningLauncher(), out var output, out _);
+        var command = new BenchmarkCommand
+        {
+            IsInteractive = () => true,
+            PollInterval = TimeSpan.FromMilliseconds(10),
+        };
+
+        var exitCode = await command.ExecuteAsync(context, ["run", "--wait"], CancellationToken.None);
+
+        Assert.Equal(0, exitCode);
+        var lines = output.ToString().ReplaceLineEndings("\n").Split('\n');
+        // Local (Progress non-null) carries the live message in brackets; Remote (Progress
+        // null — old daemon) keeps the EXACT pre-#174 segment.
+        Assert.Contains(
+            "benchmark: Local=Running [Downloading qwen3:8b (42% · 1.8 GB / 4.3 GB)] Remote=Running",
+            lines);
+        Assert.Contains("benchmark: Local=Succeeded Remote=Succeeded", lines);
+        Assert.Contains("benchmark: finished", lines);
+    }
+
+    [Fact]
+    public async Task BenchmarkStatus_Human_RunningProgress_AppendedToTheHeader()
+    {
+        var client = NewClient();
+        client.Setup(c => c.GetBenchmarkResultsAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(RunningResultsWithProgress());
+
+        var context = BuildContext(client, RunningLauncher(), out var output, out _);
+
+        var exitCode = await new BenchmarkCommand().ExecuteAsync(context, ["status"], CancellationToken.None);
+
+        Assert.Equal(0, exitCode);
+        var text = output.ToString();
+        Assert.Contains(
+            "Local (Running, started 2026-11-10 10:00:00Z, finished -) — Downloading qwen3:8b (42% · 1.8 GB / 4.3 GB)",
+            text);
+        // Remote (Progress null) ⇒ the pre-#174 header, byte-identical (no suffix).
+        Assert.Contains("Remote (Running, started 2026-11-10 10:00:00Z, finished -)", text);
+    }
+
+    [Fact]
+    public async Task BenchmarkStatus_Json_RunningTarget_CarriesProgressObject_TerminalOmitsIt()
+    {
+        var client = NewClient();
+        client.Setup(c => c.GetBenchmarkResultsAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new RouterBenchmarkResultsResponse(new[]
+            {
+                new BenchmarkTargetResult("Local", BenchmarkRunStatus.Running, StartedAt, null, [],
+                    DownloadingProgress()),
+                new BenchmarkTargetResult("Remote", BenchmarkRunStatus.Succeeded, StartedAt, FinishedAt, []),
+            }));
+
+        var context = BuildContext(client, RunningLauncher(), out var output, out _);
+
+        var exitCode = await new BenchmarkCommand().ExecuteAsync(context, ["status", "--json"], CancellationToken.None);
+
+        Assert.Equal(0, exitCode);
+        var lines = output.ToString().Trim().Split('\n');
+        Assert.Single(lines); // exactly ONE document
+        using var doc = JsonDocument.Parse(lines[0]);
+        var targets = doc.RootElement.GetProperty("targets");
+        var local = targets[0];
+        // The in-flight target carries the progress object (kebab-case phase string-enum,
+        // byte fields, the ready-to-render message).
+        Assert.True(local.TryGetProperty("progress", out var progress));
+        Assert.Equal("downloading-model", progress.GetProperty("phase").GetString());
+        Assert.Equal("qwen3:8b", progress.GetProperty("model").GetString());
+        Assert.Equal(1_937_768_448L, progress.GetProperty("completedBytes").GetInt64());
+        Assert.Equal(4_613_734_400L, progress.GetProperty("totalBytes").GetInt64());
+        Assert.Equal("Downloading qwen3:8b (42% · 1.8 GB / 4.3 GB)", progress.GetProperty("message").GetString());
+        // The terminal target OMITS the property entirely (backward-compatible wire).
+        Assert.False(targets[1].TryGetProperty("progress", out _));
     }
 
     [Fact]

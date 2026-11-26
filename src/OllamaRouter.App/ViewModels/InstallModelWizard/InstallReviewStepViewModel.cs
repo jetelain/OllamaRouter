@@ -1,9 +1,12 @@
 using System.Collections.ObjectModel;
+using System.Net;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using OllamaRouter.App.ViewModels.Wizard;
 using OllamaRouter.Client;
+using OllamaRouter.Endpoints.RouterApi.Benchmark;
 using OllamaRouter.Endpoints.RouterApi.Models;
+using OllamaRouter.Services.Benchmarking;
 
 namespace OllamaRouter.App.ViewModels.InstallModelWizard;
 
@@ -80,10 +83,46 @@ public sealed partial class InstallRunRowVm : ObservableObject
 
     partial void OnProgressValueChanged(double value) => OnPropertyChanged(nameof(ProgressIndeterminate));
 
+    /// <summary>
+    /// Task #174 — the live post-install micro-benchmark feedback for this row: the in-flight
+    /// phase message (e.g. "Downloading qwen3:8b (42% · 1.8 / 4.3 GB)" or the 409 / cancelled
+    /// notes), the slim-bar percent (−1 = hidden / indeterminate) and the terminal summary
+    /// ("max viable ctx 16384 @ 24.5 t/s" / "no viable context" / "benchmark failed").
+    /// </summary>
+    [ObservableProperty]
+    private string? _benchmarkNote;
+
+    [ObservableProperty]
+    private double _benchmarkProgressValue = -1;
+
+    [ObservableProperty]
+    private string? _benchmarkSummaryText;
+
+    public bool HasBenchmarkNote => BenchmarkNote is not null;
+
+    public bool HasBenchmarkProgress => BenchmarkProgressValue >= 0;
+
+    public bool HasBenchmarkSummary => BenchmarkSummaryText is not null;
+
+    /// <summary>The benchmark slim-bar indeterminate gate (< 0 = indeterminate — the row is
+    /// benchmarking but the phase has no byte/rung fraction yet, e.g. queued/sizing).</summary>
+    public bool BenchmarkProgressIndeterminate => BenchmarkProgressValue < 0;
+
+    partial void OnBenchmarkNoteChanged(string? value) => OnPropertyChanged(nameof(HasBenchmarkNote));
+
+    partial void OnBenchmarkProgressValueChanged(double value)
+    {
+        OnPropertyChanged(nameof(HasBenchmarkProgress));
+        OnPropertyChanged(nameof(BenchmarkProgressIndeterminate));
+    }
+
+    partial void OnBenchmarkSummaryTextChanged(string? value) => OnPropertyChanged(nameof(HasBenchmarkSummary));
+
     public void SetRunning()
     {
         Status = InstallRunStatus.Running;
-        StatusText = "pulling…";
+        // Task #174: the model-named start text (the daemon's first progress line follows).
+        StatusText = $"Checking {Model}…";
         ProgressValue = -1;
         Error = null;
     }
@@ -145,10 +184,21 @@ public sealed partial class InstallRunRowVm : ObservableObject
             return;
         }
 
-        StatusText = progress.Status;
-        ProgressValue = progress.TotalBytes is { } total and > 0 && progress.CompletedBytes is { } completed
-            ? Math.Min(100.0, completed * 100.0 / total)
-            : -1;
+        // Task #174: model-named download status with human-readable byte progress
+        // (1024-based, canonical BenchmarkProgressText formatting). The bar percent keeps
+        // its pre-#174 semantics (−1 = indeterminate when the daemon reports no totals).
+        var totalBytes = progress.TotalBytes;
+        var completedBytes = progress.CompletedBytes;
+        if (totalBytes is { } total and > 0 && completedBytes is { } completed)
+        {
+            StatusText = $"Downloading {Model}: {progress.Status} — {BenchmarkProgressText.FormatBytes(completed)} / {BenchmarkProgressText.FormatBytes(total)} ({Math.Min(100, (long)Math.Floor(completed * 100.0 / total))}%)";
+            ProgressValue = Math.Min(100.0, completed * 100.0 / total);
+        }
+        else
+        {
+            StatusText = $"Downloading {Model}: {progress.Status}";
+            ProgressValue = -1;
+        }
     }
 
     private static string BuildSummary(string model, string? alias, int? context, bool present, string liveness)
@@ -197,6 +247,12 @@ public sealed partial class InstallReviewStepViewModel : ObservableObject, IWiza
         _targets = targets ?? throw new ArgumentNullException(nameof(targets));
     }
 
+    /// <summary>
+    /// Task #174 test seam: replaces the post-install benchmark poll interval (default:
+    /// 2 s — a plain <c>Task.Delay</c> loop, no <c>DashboardPoller</c>).
+    /// </summary>
+    internal TimeSpan? BenchmarkPollInterval { get; set; }
+
     /// <summary>The per-target run rows (review summary + live install state).</summary>
     public ObservableCollection<InstallRunRowVm> Rows { get; } = [];
 
@@ -208,6 +264,16 @@ public sealed partial class InstallReviewStepViewModel : ObservableObject, IWiza
     /// button gate (before the first run the wizard is closed via Cancel).</summary>
     [ObservableProperty]
     private bool _runCompleted;
+
+    /// <summary>Task #174 — opt-in (default OFF): after the install loop, every successfully
+    /// installed target is micro-benchmarked (sequentially, live progress per row).</summary>
+    [ObservableProperty]
+    private bool _runBenchmarkAfterInstall;
+
+    /// <summary>Task #174 — whether the opt-in post-install benchmark phase is in flight
+    /// (IsRunning stays true throughout, so the window/nav gate keeps working).</summary>
+    [ObservableProperty]
+    private bool _isBenchmarking;
 
     /// <summary>The overall result text (null before the first run: "Succeeded" / "Partial" /
     /// "Failed" / "Cancelled").</summary>
@@ -310,18 +376,187 @@ public sealed partial class InstallReviewStepViewModel : ObservableObject, IWiza
             }
         }
 
+        // Task #174 — opt-in post-install micro-benchmark: AFTER the sequential install loop,
+        // BEFORE RunCompleted. IsRunning stays true throughout the phase (the window/nav gate
+        // and CancelInstallCommand keep working — _runCts.Cancel() aborts the phase too).
+        string? benchmarkSuffix = null;
+        var succeededRows = Rows.Where(r => r.Status == InstallRunStatus.Succeeded).ToList();
+        if (RunBenchmarkAfterInstall && !cts.Token.IsCancellationRequested && succeededRows.Count > 0)
+        {
+            var benchmarkCancelled = await RunPostInstallBenchmarksAsync(client, succeededRows, cts.Token).ConfigureAwait(false);
+            if (benchmarkCancelled)
+            {
+                benchmarkSuffix = " · benchmark cancelled";
+            }
+        }
+
         IsRunning = false;
         RunCompleted = true;
         _runCts = null;
-        RunResultText = cancelled
+        RunResultText = (cancelled
             ? "Cancelled"
             : failed == 0
                 ? "Succeeded"
                 : succeeded > 0
                     ? "Partial"
-                    : "Failed";
+                    : "Failed") + (benchmarkSuffix ?? string.Empty);
         InstallCommand.NotifyCanExecuteChanged();
         CancelInstallCommand.NotifyCanExecuteChanged();
+    }
+
+    /// <summary>
+    /// Task #174 — the opt-in post-install micro-benchmark phase. For EACH succeeded row (in
+    /// plan order): (1) <c>POST /api/router/benchmark</c> scoped to that target + model (the
+    /// server run is SINGLE-FLIGHT, so the runs are strictly sequential — one target goes
+    /// terminal before the next starts); (2) poll <c>GET /api/router/benchmark/results</c>
+    /// every <see cref="BenchmarkPollInterval"/> until the row's target is terminal, mirroring
+    /// the live progress (message + slim bar) into the row. A 409 (a run is already in
+    /// progress elsewhere) notes every benchmarked row and skips the phase; transient poll
+    /// errors are ignored (the next tick retries); cancellation stops the loop and leaves the
+    /// install result intact plus the "· benchmark cancelled" suffix. Row writes are marshaled
+    /// via <see cref="AppUiThread.InvokeOrPost"/> (headless tests run inline).
+    /// </summary>
+    /// <returns>Whether the phase was cancelled mid-flight (the caller appends the suffix).</returns>
+    private async Task<bool> RunPostInstallBenchmarksAsync(
+        IOllamaRouterApiClient client, IReadOnlyList<InstallRunRowVm> succeededRows, CancellationToken ct)
+    {
+        AppUiThread.InvokeOrPost(() => IsBenchmarking = true);
+        try
+        {
+            var pollInterval = BenchmarkPollInterval ?? TimeSpan.FromSeconds(2);
+
+            foreach (var row in succeededRows)
+            {
+                if (ct.IsCancellationRequested)
+                {
+                    break;
+                }
+
+                try
+                {
+                    await client.StartBenchmarkAsync(
+                        new RouterBenchmarkRequest(Target: row.Target, Model: row.Model), ct)
+                        .ConfigureAwait(false);
+                }
+                catch (OllamaRouterApiException ex) when (ex.Status == HttpStatusCode.Conflict)
+                {
+                    // A benchmark run is already in progress (e.g. from the Setup Wizard or
+                    // the CLI): note EVERY benchmarked row and skip the whole phase.
+                    AppUiThread.InvokeOrPost(() =>
+                    {
+                        foreach (var r in succeededRows)
+                        {
+                            r.BenchmarkNote = "a benchmark run is already in progress — track it in the Setup Wizard or 'ollamarouter benchmark status'";
+                        }
+                    });
+                    return false;
+                }
+                catch (OllamaRouterApiException)
+                {
+                    // Any other router error (e.g. the router went down between the install
+                    // and the phase): skip the phase cleanly — the install result stays
+                    // intact and the rows keep their current state (the phase is purely
+                    // observational; it never fails the wizard).
+                    return false;
+                }
+
+                // Poll until this row's target result is terminal.
+                while (true)
+                {
+                    RouterBenchmarkResultsResponse? results;
+                    try
+                    {
+                        results = await client.GetBenchmarkResultsAsync(ct).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (OllamaRouterApiException)
+                    {
+                        // Transient router error: ignore — the next tick retries (the wizard
+                        // never fails over a poll blip).
+                        results = null;
+                    }
+
+                    var target = results?.Targets
+                        .FirstOrDefault(t => string.Equals(t.Target, row.Target, StringComparison.OrdinalIgnoreCase));
+
+                    if (target is null || target.Status == BenchmarkRunStatus.Running)
+                    {
+                        if (target is not null && target.Progress is not null)
+                        {
+                            var progress = target.Progress;
+                            var percent = BenchmarkLiveProgress.RowPercent(target.Status, progress);
+                            AppUiThread.InvokeOrPost(() =>
+                            {
+                                row.BenchmarkNote = progress.Message;
+                                row.BenchmarkProgressValue = percent;
+                            });
+                        }
+
+                        await Task.Delay(pollInterval, ct).ConfigureAwait(false);
+                        continue;
+                    }
+
+                    // Terminal: clear the live note + bar, render the summary.
+                    AppUiThread.InvokeOrPost(() =>
+                    {
+                        row.BenchmarkNote = null;
+                        row.BenchmarkProgressValue = -1;
+                        row.BenchmarkSummaryText = BuildBenchmarkSummary(target);
+                    });
+                    break;
+                }
+            }
+
+            return false;
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancellation mid-phase: the rows still awaiting a summary keep a note (the
+            // server run may continue — track it in the Setup Wizard or CLI). The install
+            // result itself stays intact (the caller appends the suffix).
+            AppUiThread.InvokeOrPost(() =>
+            {
+                foreach (var row in succeededRows)
+                {
+                    if (row.BenchmarkSummaryText is null)
+                    {
+                        row.BenchmarkNote = "benchmark cancelled (the server run may continue — track it in the Setup Wizard or CLI)";
+                    }
+                }
+            });
+            return true;
+        }
+        finally
+        {
+            AppUiThread.InvokeOrPost(() => IsBenchmarking = false);
+        }
+    }
+
+    /// <summary>
+    /// Task #174 — the terminal benchmark summary of one row's target: any viable measured
+    /// row ⇒ "max viable ctx {n} @ {tps:0.0} t/s" (the LARGEST viable context); measured rows
+    /// but none viable ⇒ "no viable context"; no measured rows at all ⇒ "benchmark
+    /// {status}" (e.g. a failed / cancelled run).
+    /// </summary>
+    private static string BuildBenchmarkSummary(BenchmarkTargetResult target)
+    {
+        var measured = target.Results;
+        var viable = measured.Where(r => r.Viable && r.Reason is null).ToList();
+        if (viable.Count > 0)
+        {
+            var best = viable.OrderByDescending(r => r.NumCtx).First();
+            return $"max viable ctx {best.NumCtx} @ {best.DecodeTokensPerSecond:0.0} t/s";
+        }
+
+        if (measured.Any(r => r.Reason is null))
+        {
+            return "no viable context";
+        }
+
+        return $"benchmark {target.Status.ToString().ToLowerInvariant()}";
     }
 
     /// <summary>Cancels the in-flight run (the current row → Cancelled, the remaining rows →

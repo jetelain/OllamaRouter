@@ -4,10 +4,14 @@ using Avalonia.Data;
 using Avalonia.Headless;
 using Avalonia.Input;
 using Avalonia.LogicalTree;
+using Avalonia.Markup.Xaml.Templates;
 using OllamaRouter.App;
 using OllamaRouter.App.ViewModels.Wizard;
 using OllamaRouter.App.Views.Wizard;
+using OllamaRouter.Endpoints.RouterApi.Benchmark;
 using OllamaRouter.Endpoints.RouterApi.Fleet;
+using OllamaRouter.Options;
+using OllamaRouter.Services.Benchmarking;
 
 namespace OllamaRouter.Tests.App;
 
@@ -258,6 +262,110 @@ public sealed class SetupWizardWindowLayoutTests : IClassFixture<SetupWizardWind
         });
     }
 
+    // Task #174 — the live progress row (detail text + slim fractional bar) contract:
+    // the static run-status chrome renders the live summary + fractional overall bar from
+    // the VM data, and the per-row DataTemplate carries the pinned live bindings.
+    [Fact]
+    public async Task Step4_BenchmarkView_LiveProgress_SummaryOverallBarAndRowTemplateBindings()
+    {
+        await _fixture.DispatchAsync(async () =>
+        {
+            var fake = new FakeRouterApiClient
+            {
+                FleetResponse = new RouterFleetResponse([]),
+                BenchmarkResults = new RouterBenchmarkResultsResponse(
+                [
+                    new BenchmarkTargetResult("Local", BenchmarkRunStatus.Running, DateTimeOffset.UtcNow, null, [],
+                        new BenchmarkTargetProgress(
+                            BenchmarkPhase.DownloadingModel, "qwen3:8b", UsageRole.BasicModel, null,
+                            0, 1, 0, 0, "pulling 50%", 2_306_867_200L, 4_613_734_400L,
+                            "Downloading qwen3:8b (50% · 2.1 GB / 4.3 GB)", DateTimeOffset.UtcNow))
+                ]),
+            };
+            var connection = SetupWizardViewModelsTests.FakeConnection(fake, null);
+            var configurator = new LocalOllamaConfigurator
+            {
+                IsWindows = _ => true,
+                IsMacOS = _ => false,
+                BinaryProbe = _ => new OllamaDetection(true, "/usr/local/bin/ollama", false),
+                ProcessNames = _ => [],
+                PortProbe = _ => false,
+                Delay = _ => Task.CompletedTask,
+                OllamaHostReader = () => null,
+                NonLoopbackLocalAddresses = () => [],
+                LanBindProbe = (_, _) => null,
+                LaunchctlGetenv = _ => null,
+            };
+            var environment = new WizardEnvironmentStepViewModel(configurator, connection);
+
+            Task GatedDelay(TimeSpan _, CancellationToken ct) => Task.Delay(Timeout.InfiniteTimeSpan, ct);
+
+            WizardTargetsStepViewModel targets = null!;
+            targets = new WizardTargetsStepViewModel(() => fake, ct => targets.RefreshAsync(ct), GatedDelay);
+            var cloud = new WizardCloudStepViewModel(() => fake);
+            WizardBenchmarkStepViewModel bench = null!;
+            bench = new WizardBenchmarkStepViewModel(() => fake, ct => bench.RefreshAsync(ct), GatedDelay);
+            SetupWizardViewModel root = null!;
+            var rec = new WizardRecommendationsStepViewModel(() => fake, () => _ = root.GoToAsync(3));
+            root = new SetupWizardViewModel(connection, environment, targets, cloud, bench, rec);
+
+            await bench.RefreshAsync();
+            Assert.True(bench.IsBenchmarkRunning);
+
+            var window = new SetupWizardWindow { DataContext = root };
+            HeadlessThemeHelper.Apply(window);
+            await root.GoToAsync(3);
+
+            var grid = Assert.IsType<Grid>(window.Content);
+            var bodyGrid = Assert.IsType<Grid>(grid.Children[3]);
+            var stepView = Assert.IsType<WizardBenchmarkStepView>(Assert.IsType<Border>(bodyGrid.Children[3]).Child);
+
+            // The live summary line renders the pinned "{done} / {N} target(s) finished ·
+            // {target}: {message}" text from the VM data (bound, resolved headlessly).
+            Assert.Contains(
+                stepView.GetLogicalDescendants().OfType<TextBlock>().Select(t => t.Text),
+                t => t == "0 / 1 target(s) finished · Local: Downloading qwen3:8b (50% · 2.1 GB / 4.3 GB)");
+
+            // The overall bar (Height 8) advances fractionally (pinned 35.0 = (0 + 0.2 +
+            // 0.3·0.5) / 1 for the sole downloading target) and is determinate + visible.
+            var overall = stepView.GetLogicalDescendants().OfType<ProgressBar>().Single(p => p.Height == 8);
+            Assert.Equal(35.0, overall.Value);
+            Assert.False(overall.IsIndeterminate);
+            Assert.True(overall.IsVisible);
+
+            // The per-row DataTemplate carries the live progress contract: the detail line
+            // (ProgressDetailText, visible only with live progress) + the slim fractional
+            // bar (RowProgressPercent / IsIndeterminate, visible on any running row).
+            var itemsControl = stepView.GetLogicalDescendants().OfType<ItemsControl>()
+                .Single(ic => BindingPath(ic, ItemsControl.ItemsSourceProperty) == "BenchmarkRows");
+            var built = Assert.IsType<DataTemplate>(itemsControl.ItemTemplate).Build(null);
+            var cardStack = Assert.IsType<StackPanel>(Assert.IsType<Border>(built).Child);
+
+            var detail = cardStack.Children.OfType<TextBlock>().Single(tb =>
+                BindingPath(tb, TextBlock.TextProperty) == "ProgressDetailText");
+            Assert.Equal("HasLiveProgress", BindingPath(detail, Control.IsVisibleProperty));
+
+            var bar = cardStack.Children.OfType<ProgressBar>().Single(p =>
+                BindingPath(p, ProgressBar.ValueProperty) == "RowProgressPercent");
+            Assert.Equal(4.0, bar.Height);
+            Assert.Equal("IsIndeterminate", BindingPath(bar, ProgressBar.IsIndeterminateProperty));
+            Assert.Equal("IsRunningRow", BindingPath(bar, Control.IsVisibleProperty));
+
+            await root.DisposeAsync();
+        });
+    }
+
+    /// <summary>
+    /// The XAML path of the binding on <paramref name="property"/> (null when the property
+    /// carries no binding) — the <see cref="InstallTargetsStepViewLayoutTests"/> precedent for
+    /// asserting compiled-template binding contracts headlessly.
+    /// </summary>
+    private static string? BindingPath(Control element, AvaloniaProperty property)
+    {
+        var expression = BindingOperations.GetBindingExpressionBase(element, property);
+        return expression?.GetType().GetProperty("Description")?.GetValue(expression) as string;
+    }
+
     [Fact]
     public async Task Step5_RecommendationsView_HasOneClickGenerateAndApplyAndRoleCards()
     {
@@ -378,12 +486,6 @@ public sealed class SetupWizardWindowLayoutTests : IClassFixture<SetupWizardWind
         }
 
         return null;
-    }
-
-    private static string? BindingPath(Control element, AvaloniaProperty property)
-    {
-        var expression = BindingOperations.GetBindingExpressionBase(element, property);
-        return expression?.GetType().GetProperty("Description")?.GetValue(expression) as string;
     }
 
     public sealed class HeadlessSessionFixture : IAsyncLifetime

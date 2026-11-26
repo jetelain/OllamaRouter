@@ -144,6 +144,21 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
     /// task #125: the install wizard's assisted mode reads it best-effort).</summary>
     public RouterBenchmarkResultsResponse BenchmarkResults { get; set; } = new([]);
 
+    /// <summary>A one-shot await gate for <c>GetBenchmarkResultsAsync</c> (task #174 — the
+    /// deterministic mid-poll observation / cancellation scripting): while set, the NEXT call
+    /// AWAITs it before responding (then it is cleared).</summary>
+    public Task? BenchmarkResultsBlock { get; set; }
+
+    /// <summary>FIFO override of the <c>GET /api/router/benchmark/results</c> payloads
+    /// (task #174 — the post-install benchmark polling tests): while non-empty, each call
+    /// DEQUEUES and serves the next item; otherwise the scripted
+    /// <see cref="BenchmarkResults"/> (the existing behavior).</summary>
+    public Queue<RouterBenchmarkResultsResponse>? BenchmarkResultsQueue { get; set; }
+
+    /// <summary>A one-shot exception thrown by the NEXT <c>StartBenchmarkAsync</c> call
+    /// (task #174 — the 409 conflict scripting; cleared after the first throw).</summary>
+    public Exception? StartBenchmarkException { get; set; }
+
     /// <summary>The <c>GET /api/router/benchmark/candidates</c> response (task #152 — the
     /// Step-4 candidate plan; empty by default, scriptable per test).</summary>
     public RouterBenchmarkCandidatesResponse CandidatesResponse { get; set; } = new([]);
@@ -811,6 +826,12 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
         lock (_gate)
         {
             StartBenchmarkCalls.Add(request);
+            var exception = StartBenchmarkException;
+            if (exception is not null)
+            {
+                StartBenchmarkException = null;
+                throw exception;
+            }
         }
 
         return Task.FromResult(StartBenchmarkResponse);
@@ -831,10 +852,18 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
     }
 
     /// <inheritdoc />
-    public Task<RouterBenchmarkResultsResponse> GetBenchmarkResultsAsync(CancellationToken ct = default)
+    public async Task<RouterBenchmarkResultsResponse> GetBenchmarkResultsAsync(CancellationToken ct = default)
     {
         Log(nameof(GetBenchmarkResultsAsync));
-        return Task.FromResult(BenchmarkResults);
+        var block = BenchmarkResultsBlock;
+        if (block is not null)
+        {
+            BenchmarkResultsBlock = null;
+            await block;
+        }
+
+        var response = BenchmarkResultsQueue is { Count: > 0 } ? BenchmarkResultsQueue.Dequeue() : BenchmarkResults;
+        return response;
     }
 
     /// <inheritdoc />

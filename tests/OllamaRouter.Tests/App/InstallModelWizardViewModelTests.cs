@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Net;
 using OllamaRouter.App.ViewModels.InstallModelWizard;
 using OllamaRouter.Client;
 using OllamaRouter.Endpoints.RouterApi.Benchmark;
@@ -27,10 +28,34 @@ public sealed class InstallModelWizardViewModelTests
     private const string Model = "llama3.2:13b-q4_K_M";
     private const string ModelBase = "llama3.2";
 
+    /// <summary>
+    /// Spins on the caller's async context until <paramref name="condition"/> holds, or the
+    /// budget is exhausted (→ fails the test). The budget is BOTH a beat cap (fast exit when
+    /// the condition is already nearly true) AND a wall-clock floor (task #174 regression:
+    /// a condition can legitimately need real wall-clock time — the post-install benchmark
+    /// phase's poll ticks are timer-coarsened, and 20 000 cheap <c>Task.Yield()</c> beats can
+    /// burn out BEFORE the last phase write lands; under pathological container load even a
+    /// single tick was observed to exceed 2 s). The floor bounds the added wait of a
+    /// GENUINELY broken condition at ~5 s.
+    /// </summary>
     private static async Task WaitUntilAsync(Func<bool> condition, int maxBeats = 20000)
     {
-        for (var i = 0; i < maxBeats && !condition(); i++)
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        var wallFloor = TimeSpan.FromSeconds(5);
+        var beats = 0;
+        while (true)
         {
+            if (condition())
+            {
+                return;
+            }
+
+            if (beats >= maxBeats && stopwatch.Elapsed >= wallFloor)
+            {
+                break;
+            }
+
+            beats++;
             await Task.Yield();
         }
 
@@ -522,13 +547,17 @@ public sealed class InstallModelWizardViewModelTests
     {
         var row = new InstallRunRowVm("Alpha", Model, "llama3.2:latest-8k", 8192, false, "Online");
         row.SetRunning();
+        // Task #174: the model-named start text (the daemon's first line follows).
+        Assert.Equal($"Checking {Model}…", row.StatusText);
 
         row.ApplyProgress(new OllamaRouterModelPullProgress("pull", "pulling 34%", 100, 34, null, null));
-        Assert.Equal("pulling 34%", row.StatusText);
+        // Task #174: model-named status + 1024-based byte progress (tiny test totals ⇒ 0 MB).
+        Assert.Equal($"Downloading {Model}: pulling 34% — 0 MB / 0 MB (34%)", row.StatusText);
         Assert.Equal(34, row.ProgressValue);
         Assert.False(row.ProgressIndeterminate);
 
         row.ApplyProgress(new OllamaRouterModelPullProgress("pull", "verifying sha256 digest", null, null, null, null));
+        Assert.Equal($"Downloading {Model}: verifying sha256 digest", row.StatusText);
         Assert.True(row.ProgressIndeterminate); // no daemon totals → indeterminate bar
 
         row.ApplyProgress(new OllamaRouterModelPullProgress("alias", "started", null, null, "llama3.2:latest-8k", 8192));
@@ -908,6 +937,273 @@ public sealed class InstallModelWizardViewModelTests
 
         Assert.True(signaled);
         Assert.Null(result);
+
+        await vm.DisposeAsync();
+    }
+
+    // ------------------------------------------------------------------
+    //  Task #174 — Step 2 in-flight benchmark note (assisted mode)
+    // ------------------------------------------------------------------
+
+    [Fact]
+    public async Task AssistedMode_Step1_InFlightBenchmark_SeedstheBenchmarkNote_ManualNeverDoes()
+    {
+        var fake = MakeFake();
+        // Alpha is MID-benchmark (Running + a non-blank live progress message); Beta is
+        // terminal (no progress) — neither gets a context suggestion here (no catalog data).
+        fake.BenchmarkResults = new RouterBenchmarkResultsResponse(
+        [
+            new BenchmarkTargetResult(
+                "Alpha", BenchmarkRunStatus.Running, null, null, [],
+                new BenchmarkTargetProgress(
+                    BenchmarkPhase.Benchmarking, Model, UsageRole.AgenticChat, 32768,
+                    1, 5, 0, 3, null, null, null,
+                    "Benchmarking llama3.2:13b-q4_K_M @ 32768 ctx (model 2/5, rung 1/3)",
+                    DateTimeOffset.UtcNow)),
+            new BenchmarkTargetResult("Beta", BenchmarkRunStatus.Succeeded, null, null, [])
+        ]);
+
+        var vm = new InstallModelWizardViewModel(() => fake);
+        vm.ModelStep.Assisted = true;
+        vm.ModelStep.ModelReference = Model;
+        vm.NextCommand.Execute(null);
+        await OpenAtStepAsync(vm, vm.TargetsStep, 1);
+
+        // The mid-benchmark target shows its live status instead of the "no data" provenance.
+        Assert.Equal(
+            "Benchmarking llama3.2:13b-q4_K_M @ 32768 ctx (model 2/5, rung 1/3)",
+            vm.TargetsStep.Rows[0]!.BenchmarkNote);
+        Assert.Null(vm.TargetsStep.Rows[1]!.BenchmarkNote); // Beta: terminal (no live progress)
+
+        // Manual mode: the note is NEVER seeded (same wire data, assisted OFF).
+        var manualFake = MakeFake();
+        manualFake.BenchmarkResults = fake.BenchmarkResults;
+        var manualVm = new InstallModelWizardViewModel(() => manualFake);
+        manualVm.ModelStep.ModelReference = Model;
+        manualVm.NextCommand.Execute(null);
+        await OpenAtStepAsync(manualVm, manualVm.TargetsStep, 1);
+        Assert.Null(manualVm.TargetsStep.Rows[0]!.BenchmarkNote);
+
+        await vm.DisposeAsync();
+        await manualVm.DisposeAsync();
+    }
+
+    // ------------------------------------------------------------------
+    //  Task #174 — Step 3 opt-in post-install micro-benchmark
+    // ------------------------------------------------------------------
+
+    private static BenchmarkTargetProgress DownloadProgress() =>
+        new(
+            BenchmarkPhase.DownloadingModel, Model, UsageRole.AgenticChat, null,
+            0, 1, 0, 0, "pulling 41%", 1_925_560_320L, 4_613_734_400L,
+            "Downloading llama3.2:13b-q4_K_M (41% · 1.8 GB / 4.3 GB)", DateTimeOffset.UtcNow);
+
+    private static BenchmarkTargetProgress BenchmarkingProgress() =>
+        new(
+            BenchmarkPhase.Benchmarking, Model, UsageRole.AgenticChat, 32768,
+            1, 5, 0, 3, null, null, null,
+            "Benchmarking llama3.2:13b-q4_K_M @ 32768 ctx (model 2/5, rung 1/3)",
+            DateTimeOffset.UtcNow);
+
+    /// <summary>
+    /// Walks a MANUAL-mode wizard to the review step (both rows selected, alias OFF so the
+    /// context inputs are optional — the benchmark tests are about the phase, not the plan).
+    /// </summary>
+    private static async Task<InstallModelWizardViewModel> WalkToReviewAsync(FakeRouterApiClient fake)
+    {
+        var vm = new InstallModelWizardViewModel(() => fake);
+        vm.ModelStep.ModelReference = Model;
+        vm.NextCommand.Execute(null);
+        await OpenAtStepAsync(vm, vm.TargetsStep, 1);
+        vm.TargetsStep.Rows[0]!.Selected = true; // Alpha
+        vm.TargetsStep.Rows[1]!.Selected = true; // Beta
+        vm.TargetsStep.CreateAlias = false;
+        vm.TargetsStep.RefreshGate();
+        Assert.True(vm.TargetsStep.IsValid);
+        vm.NextCommand.Execute(null);
+        await WaitUntilAsync(() => vm.ReviewStep.Rows.Count == 2);
+        return vm;
+    }
+
+    [Fact]
+    public void PostInstallBenchmark_Toggle_DefaultsOff()
+    {
+        var vm = new InstallModelWizardViewModel(() => MakeFake());
+        Assert.False(vm.ReviewStep.RunBenchmarkAfterInstall);
+        Assert.False(vm.ReviewStep.IsBenchmarking);
+    }
+
+    [Fact]
+    public async Task PostInstallBenchmark_OptIn_PollsLiveProgress_ThenSummarizesPerRow()
+    {
+        var fake = MakeFake();
+        var vm = await WalkToReviewAsync(fake);
+        vm.ReviewStep.RunBenchmarkAfterInstall = true;
+        // 50 ms poll interval: Task.Delay never fires EARLY, so every intermediate live state
+        // (download note / benchmarking note) dwells >= 50 ms — comfortably observable by the
+        // sub-millisecond wait beats — while the whole scripted phase still settles in ~0.15 s.
+        // (1 ms worked on healthy machines but the coarsened tick's dwell can shrink to the
+        // timer resolution under suite load, and a starved tick once exceeded 2 s — see the
+        // WaitUntilAsync wall-clock floor below.)
+        vm.ReviewStep.BenchmarkPollInterval = TimeSpan.FromMilliseconds(50);
+
+        // Scripted poll sequence (FIFO): Alpha Running (mid-download) → Alpha terminal
+        // (viable 32768 @ 24.3 t/s) → Beta Running (mid-benchmark) → Beta terminal
+        // (measured but NOT viable → "no viable context").
+        var viableRow = new BenchmarkContextResult(
+            Model, UsageRole.AgenticChat, 32768, 512, 21_000_000_000L, 24.3, 900.0, true, null);
+        var oomRow = new BenchmarkContextResult(
+            Model, UsageRole.AgenticChat, 65536, 512, 20_000_000_000L, 12.0, 500.0, false, "out of memory");
+        var nonViableMeasured = new BenchmarkContextResult(
+            Model, UsageRole.AgenticChat, 8192, 512, 12_000_000_000L, 3.5, 250.0, false, null);
+
+        var firstPollGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        fake.BenchmarkResultsBlock = firstPollGate.Task; // parks the very first poll
+        fake.BenchmarkResultsQueue = new Queue<RouterBenchmarkResultsResponse>(
+        [
+            new([new BenchmarkTargetResult("Alpha", BenchmarkRunStatus.Running, null, null, [], DownloadProgress())]),
+            new([new BenchmarkTargetResult("Alpha", BenchmarkRunStatus.Succeeded, null, null, [viableRow, oomRow])]),
+            new([new BenchmarkTargetResult("Beta", BenchmarkRunStatus.Running, null, null, [], BenchmarkingProgress())]),
+            new([new BenchmarkTargetResult("Beta", BenchmarkRunStatus.Succeeded, null, null, [nonViableMeasured])])
+        ]);
+
+        var alpha = vm.ReviewStep.Rows[0]!;
+        var beta = vm.ReviewStep.Rows[1]!;
+
+        var installTask = vm.ReviewStep.InstallCommand.ExecuteAsync(null);
+        // Release the parked poll (a pre-completed TCS would pass through equally well).
+        firstPollGate.TrySetResult(true);
+
+        // Alpha's live feedback: the download message + the pinned fractional bar
+        // (0.2 + 0.3 · 1.925560320/4.613734400, single candidate ⇒ 100× the raw inner value).
+        await WaitUntilAsync(() => alpha.BenchmarkNote == "Downloading llama3.2:13b-q4_K_M (41% · 1.8 GB / 4.3 GB)");
+        Assert.True(alpha.HasBenchmarkNote);
+        Assert.Equal(100.0 * (0.2 + 0.3 * (1_925_560_320.0 / 4_613_734_400.0)), alpha.BenchmarkProgressValue, 10);
+        Assert.True(alpha.HasBenchmarkProgress);
+        Assert.False(alpha.HasBenchmarkSummary);
+
+        // Alpha goes terminal: the note + bar clear, the summary renders (largest VIABLE ctx).
+        await WaitUntilAsync(() => alpha.BenchmarkSummaryText == "max viable ctx 32768 @ 24.3 t/s");
+        Assert.Null(alpha.BenchmarkNote);
+        Assert.Equal(-1, alpha.BenchmarkProgressValue);
+        Assert.True(alpha.HasBenchmarkSummary);
+
+        // THEN (strictly sequential — single-flight server run) Beta's phase runs: its live
+        // benchmarking note + the (ci+inner)/cc fraction (1 + 0.7) / 5 = 34.0.
+        await WaitUntilAsync(() => beta.BenchmarkNote == "Benchmarking llama3.2:13b-q4_K_M @ 32768 ctx (model 2/5, rung 1/3)");
+        Assert.Equal(34.0, beta.BenchmarkProgressValue, 10);
+        await WaitUntilAsync(() => beta.BenchmarkSummaryText == "no viable context");
+
+        await installTask;
+
+        // ONE start per succeeded row, in plan order, scoped to the row's target + model.
+        Assert.Equal(
+            [
+                new RouterBenchmarkRequest(Target: "Alpha", Model: Model),
+                new RouterBenchmarkRequest(Target: "Beta", Model: Model)
+            ],
+            fake.StartBenchmarkCalls);
+
+        // No cancellation ⇒ the plain install result (no suffix); the run gate is restored.
+        Assert.Equal("Succeeded", vm.ReviewStep.RunResultText);
+        Assert.True(vm.ReviewStep.RunCompleted);
+        Assert.False(vm.ReviewStep.IsRunning);
+        Assert.False(vm.ReviewStep.IsBenchmarking);
+        Assert.True(vm.DoneCommand.CanExecute(null));
+
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task PostInstallBenchmark_Conflict409_NotesEveryRowAndSkipsThePhase()
+    {
+        var fake = MakeFake();
+        fake.StartBenchmarkException = new OllamaRouterApiException(
+            HttpStatusCode.Conflict, "a benchmark run is already in progress");
+
+        var vm = await WalkToReviewAsync(fake);
+        vm.ReviewStep.RunBenchmarkAfterInstall = true;
+
+        var pollsBeforeInstall = fake.Calls.Count(c => c == nameof(IOllamaRouterApiClient.GetBenchmarkResultsAsync));
+        await vm.ReviewStep.InstallCommand.ExecuteAsync(null);
+
+        // Every benchmarked row carries the 409 note; NO poll happened, no summaries.
+        var note = "a benchmark run is already in progress — track it in the Setup Wizard or 'ollamarouter benchmark status'";
+        Assert.All(vm.ReviewStep.Rows, row =>
+        {
+            Assert.Equal(note, row.BenchmarkNote);
+            Assert.True(row.HasBenchmarkNote);
+            Assert.Null(row.BenchmarkSummaryText);
+        });
+        Assert.Single(fake.StartBenchmarkCalls); // the SECOND start never happened
+        Assert.Equal(pollsBeforeInstall, fake.Calls.Count(c => c == nameof(IOllamaRouterApiClient.GetBenchmarkResultsAsync)));
+
+        // The install result itself is intact (no cancelled suffix) and the run completed.
+        Assert.Equal("Succeeded", vm.ReviewStep.RunResultText);
+        Assert.True(vm.ReviewStep.RunCompleted);
+        Assert.False(vm.ReviewStep.IsBenchmarking);
+
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task PostInstallBenchmark_CancelledMidPhase_KeepsInstallResult_PlusCancelledSuffix()
+    {
+        var fake = MakeFake();
+        var vm = await WalkToReviewAsync(fake);
+        vm.ReviewStep.RunBenchmarkAfterInstall = true;
+        // A LONG poll interval: the phase parks in Task.Delay after the first poll, so the
+        // deterministic cancellation lands mid-phase (NO real wait — the cancel is instant).
+        vm.ReviewStep.BenchmarkPollInterval = TimeSpan.FromSeconds(5);
+        fake.BenchmarkResultsQueue = new Queue<RouterBenchmarkResultsResponse>(
+        [
+            new([new BenchmarkTargetResult("Alpha", BenchmarkRunStatus.Running, null, null, [], DownloadProgress())])
+            // Beta's polls never happen — the cancel preempts them.
+        ]);
+
+        var alpha = vm.ReviewStep.Rows[0]!;
+        var beta = vm.ReviewStep.Rows[1]!;
+
+        var installTask = vm.ReviewStep.InstallCommand.ExecuteAsync(null);
+        await WaitUntilAsync(() => alpha.BenchmarkNote == "Downloading llama3.2:13b-q4_K_M (41% · 1.8 GB / 4.3 GB)");
+        Assert.True(vm.ReviewStep.IsRunning); // the gate stays closed during the phase
+        Assert.True(vm.ReviewStep.IsBenchmarking);
+
+        vm.ReviewStep.CancelInstallCommand.Execute(null);
+        await installTask;
+
+        // The rows still awaiting a summary get the cancellation note (the server run may
+        // continue — track it elsewhere); the install result keeps its text + the suffix.
+        var cancelledNote = "benchmark cancelled (the server run may continue — track it in the Setup Wizard or CLI)";
+        Assert.Equal(cancelledNote, alpha.BenchmarkNote);
+        Assert.Equal(cancelledNote, beta.BenchmarkNote);
+        Assert.Null(alpha.BenchmarkSummaryText);
+        Assert.Equal("Succeeded · benchmark cancelled", vm.ReviewStep.RunResultText);
+        Assert.True(vm.ReviewStep.RunCompleted);
+        Assert.False(vm.ReviewStep.IsRunning);
+        Assert.False(vm.ReviewStep.IsBenchmarking);
+
+        await vm.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task PostInstallBenchmark_OptOut_StartsNoRunsAndPollsNothing()
+    {
+        var fake = MakeFake();
+        var vm = await WalkToReviewAsync(fake);
+        var pollsBeforeInstall = fake.Calls.Count(c => c == nameof(IOllamaRouterApiClient.GetBenchmarkResultsAsync));
+
+        await vm.ReviewStep.InstallCommand.ExecuteAsync(null);
+
+        Assert.Empty(fake.StartBenchmarkCalls);
+        Assert.Equal(pollsBeforeInstall, fake.Calls.Count(c => c == nameof(IOllamaRouterApiClient.GetBenchmarkResultsAsync)));
+        Assert.All(vm.ReviewStep.Rows, row =>
+        {
+            Assert.Null(row.BenchmarkNote);
+            Assert.Null(row.BenchmarkSummaryText);
+            Assert.Equal(-1, row.BenchmarkProgressValue);
+        });
+        Assert.Equal("Succeeded", vm.ReviewStep.RunResultText);
 
         await vm.DisposeAsync();
     }
