@@ -188,7 +188,7 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
             var generated = await _clientAccessor().GenerateRecommendationsAsync().ConfigureAwait(false);
             generatedOk = true;
             _canGoToBenchmark = false;
-            WizardUiThread.InvokeOrPost(() => GoToBenchmarkCommand.NotifyCanExecuteChanged());
+            AppUiThread.InvokeOrPost(() => GoToBenchmarkCommand.NotifyCanExecuteChanged());
             GeneratedAt = generated.GeneratedAt;
             RolesAssigned = generated.Recommendations.Roles.Count;
             NodesConfigured = generated.Targets.Count;
@@ -229,7 +229,7 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
                 MessageIsError = true;
                 Message = "No benchmark results available — run the Step 4 micro-benchmark first";
                 _canGoToBenchmark = true;
-                WizardUiThread.InvokeOrPost(() => GoToBenchmarkCommand.NotifyCanExecuteChanged());
+                AppUiThread.InvokeOrPost(() => GoToBenchmarkCommand.NotifyCanExecuteChanged());
             }
             else
             {
@@ -265,7 +265,7 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
         {
             var response = await _clientAccessor().GenerateRecommendationsAsync().ConfigureAwait(false);
             _canGoToBenchmark = false;
-            WizardUiThread.InvokeOrPost(() => GoToBenchmarkCommand.NotifyCanExecuteChanged());
+            AppUiThread.InvokeOrPost(() => GoToBenchmarkCommand.NotifyCanExecuteChanged());
             GeneratedAt = response.GeneratedAt;
             RolesAssigned = response.Recommendations.Roles.Count;
             NodesConfigured = response.Targets.Count;
@@ -285,7 +285,7 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
             MessageIsError = true;
             Message = "No benchmark results available — run the Step 4 micro-benchmark first";
             _canGoToBenchmark = true;
-            WizardUiThread.InvokeOrPost(() => GoToBenchmarkCommand.NotifyCanExecuteChanged());
+            AppUiThread.InvokeOrPost(() => GoToBenchmarkCommand.NotifyCanExecuteChanged());
         }
         catch (OllamaRouterApiException ex)
         {
@@ -432,7 +432,7 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
 
     partial void OnIsBusyChanged(bool value)
     {
-        WizardUiThread.InvokeOrPost(() =>
+        AppUiThread.InvokeOrPost(() =>
         {
             GenerateAndApplyCommand.NotifyCanExecuteChanged();
             GenerateCommand.NotifyCanExecuteChanged();

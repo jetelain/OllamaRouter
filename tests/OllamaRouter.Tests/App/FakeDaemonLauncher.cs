@@ -32,6 +32,10 @@ internal sealed class FakeDaemonLauncher : IOllamaRouterDaemonLauncher
     /// <summary>Scripted <see cref="IOllamaRouterDaemonLauncher.StopAsync"/> failure.</summary>
     public Exception? StopException { get; set; }
 
+    /// <summary>Scripted <see cref="IOllamaRouterDaemonLauncher.GetStatusAsync"/> failure
+    /// (task #173: the generic-probe → Disconnected state seam).</summary>
+    public Exception? GetStatusException { get; set; }
+
     /// <summary>The base URL the launcher was built with (set by the harness factory).</summary>
     public Uri? CapturedBaseUrl { get; set; }
 
@@ -50,6 +54,11 @@ internal sealed class FakeDaemonLauncher : IOllamaRouterDaemonLauncher
     public Task<RouterDaemonStatus> GetStatusAsync(CancellationToken ct = default)
     {
         Log(nameof(GetStatusAsync));
+        if (GetStatusException is { } exception)
+        {
+            throw exception;
+        }
+
         return Task.FromResult(Status);
     }
 

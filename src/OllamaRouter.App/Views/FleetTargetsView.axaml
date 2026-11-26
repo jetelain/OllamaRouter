@@ -7,7 +7,17 @@
              x:DataType="vm:FleetTargetsViewModel">
   <ScrollViewer VerticalScrollBarVisibility="Auto">
     <StackPanel Spacing="12" Margin="12,12,12,48">
-      <TextBlock Text="{Binding LastError}" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" TextWrapping="Wrap" IsVisible="{Binding IsErrorVisible}"/>
+      <!-- Severity banner (task #173): the tab error renders in the NightCodeForge
+           SemiColorDangerLight card — same pattern as the target dialogs (task #171). -->
+      <Border Padding="10,8" CornerRadius="8"
+              Background="{DynamicResource SemiColorDangerLight}"
+              BorderBrush="{DynamicResource SemiColorDanger}"
+              BorderThickness="1"
+              IsVisible="{Binding IsErrorVisible}">
+        <TextBlock Text="{Binding LastError}"
+                   TextWrapping="Wrap"
+                   Foreground="{DynamicResource NightCodeAccentCrimsonLightText}"/>
+      </Border>
       <StackPanel Orientation="Horizontal" Spacing="8">
         <Button Content="Refresh" Command="{Binding RefreshCommand}"/>
         <Button Content="Add Ollama Node" Classes="Primary" Click="OnAddOllamaNodeClick"/>
@@ -28,7 +38,8 @@
                                Foreground="{Binding Location, Converter={x:Static views:TargetBrushConverter.Instance}}"
                                FontWeight="Bold" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
                   </StackPanel>
-                  <TextBlock Grid.Column="1" Text="{Binding Liveness}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="1" Text="{Binding Liveness}" VerticalAlignment="Center"
+                             Foreground="{Binding Liveness, Converter={x:Static converters:LivenessToBrushConverter.Instance}}"/>
                   <!-- Enabled toggle (task #161): ONE interactive CheckBox (clicking the box or
                        its label toggles) — the retired label + display-only CheckBox +
                        "Toggle" button convention. -->

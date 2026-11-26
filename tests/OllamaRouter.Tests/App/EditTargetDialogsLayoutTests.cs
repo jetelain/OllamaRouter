@@ -261,12 +261,18 @@ public sealed class EditTargetDialogsLayoutTests :
                 Assert.Equal("AddModelRowCommand", BindingPath(addButton, Button.CommandProperty));
 
                 // The row template: three TextBoxes (name / contextLength / quantization)
-                // + the Danger "Remove" button (read from the un-instantiated DataTemplate
-                // content — no measure/arrange needed; the concrete DataTemplate type is
-                // internal in Avalonia 12, so the Content property is read via reflection).
+                // + the Danger "Remove" button. Built OFF-TREE via ItemTemplate.Build —
+                // the DataTemplate's Content is a deferred (PointerDeferredContent) wrapper
+                // until built, so reading it raw does not yield the Grid (task #173 fix —
+                // the old reflection cast was vacuous: it ran in an async-void dispatch
+                // whose failures were swallowed).
                 var template = Assert.IsAssignableFrom<Avalonia.Controls.Templates.IDataTemplate>(items.ItemTemplate);
-                var rowGrid = Assert.IsType<Grid>(
-                    (Control)template.GetType().GetProperty("Content")!.GetValue(template)!);
+                var rowGrid = Assert.IsType<Grid>(template.Build(new ModelRosterEntry
+                {
+                    Name = "probe",
+                    ContextLength = string.Empty,
+                    Quantization = string.Empty,
+                }));
                 var rowBoxes = rowGrid.Children.OfType<TextBox>().ToArray();
                 Assert.Equal(3, rowBoxes.Length);
                 Assert.All(rowBoxes, tb => Assert.False(string.IsNullOrWhiteSpace(tb.PlaceholderText)));

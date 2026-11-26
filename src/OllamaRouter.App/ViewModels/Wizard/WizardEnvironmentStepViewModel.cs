@@ -624,7 +624,7 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
     partial void OnIsBusyChanged(bool value)
     {
         // Busy disables ALL Step 1 actions concurrently (task #150, AC6).
-        WizardUiThread.InvokeOrPost(() =>
+        AppUiThread.InvokeOrPost(() =>
         {
             InstallOllamaCommand.NotifyCanExecuteChanged();
             StartOllamaCommand.NotifyCanExecuteChanged();
@@ -644,7 +644,7 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
         OnPropertyChanged(nameof(ShowUpdateButton));
         OnPropertyChanged(nameof(ShowLanRow));
         OnPropertyChanged(nameof(ShowLanToggle));
-        WizardUiThread.InvokeOrPost(() =>
+        AppUiThread.InvokeOrPost(() =>
         {
             InstallOllamaCommand.NotifyCanExecuteChanged();
             StartOllamaCommand.NotifyCanExecuteChanged();
@@ -658,7 +658,7 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
         OnPropertyChanged(nameof(DetectionText));
         OnPropertyChanged(nameof(ShowStartButton));
         OnPropertyChanged(nameof(ShowRunningCheck));
-        WizardUiThread.InvokeOrPost(() => StartOllamaCommand.NotifyCanExecuteChanged());
+        AppUiThread.InvokeOrPost(() => StartOllamaCommand.NotifyCanExecuteChanged());
     }
 
     partial void OnOllamaBinaryPathChanged(string? value) => OnPropertyChanged(nameof(DetectionText));
@@ -668,7 +668,7 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
         OnPropertyChanged(nameof(ShowLanToggle));
         OnPropertyChanged(nameof(LanRowLabel));
         OnPropertyChanged(nameof(LanToggleText));
-        WizardUiThread.InvokeOrPost(() => ToggleLanCommand.NotifyCanExecuteChanged());
+        AppUiThread.InvokeOrPost(() => ToggleLanCommand.NotifyCanExecuteChanged());
     }
 
     partial void OnOllamaPortStatusChanged(OllamaPortStatus value)
@@ -680,7 +680,7 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
         OnPropertyChanged(nameof(ShowPortNotDetected));
         OnPropertyChanged(nameof(ShowPortUnknown));
         OnPropertyChanged(nameof(ShowChangePortButton));
-        WizardUiThread.InvokeOrPost(() => ChangePortCommand.NotifyCanExecuteChanged());
+        AppUiThread.InvokeOrPost(() => ChangePortCommand.NotifyCanExecuteChanged());
     }
 
     partial void OnOllamaDetectedPortChanged(int? value) => OnPropertyChanged(nameof(OllamaPortLabel));
@@ -689,7 +689,7 @@ public sealed partial class WizardEnvironmentStepViewModel : ObservableObject, I
     {
         OnPropertyChanged(nameof(ShowStartRouterButton));
         OnPropertyChanged(nameof(ShowRouterRunningCheck));
-        WizardUiThread.InvokeOrPost(() => StartRouterCommand.NotifyCanExecuteChanged());
+        AppUiThread.InvokeOrPost(() => StartRouterCommand.NotifyCanExecuteChanged());
     }
 
     /// <summary>Human summary for a port state (bound to the status label; task #160: the

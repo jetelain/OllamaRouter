@@ -160,7 +160,7 @@ public sealed partial class WizardCloudStepViewModel : ObservableObject, IWizard
     partial void OnIsBusyChanged(bool value)
     {
         OnPropertyChanged(nameof(CanSelectCloudModel));
-        WizardUiThread.InvokeOrPost(() =>
+        AppUiThread.InvokeOrPost(() =>
         {
             ToggleCloudCommand.NotifyCanExecuteChanged();
             AddTargetCommand.NotifyCanExecuteChanged();

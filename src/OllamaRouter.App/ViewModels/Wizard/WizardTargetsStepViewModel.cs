@@ -439,7 +439,7 @@ public sealed partial class WizardTargetsStepViewModel : ObservableObject, IWiza
     public Task OnStepLeftAsync() => _poller.StopAsync();
 
     partial void OnIsBusyChanged(bool value) =>
-        WizardUiThread.InvokeOrPost(() => AddTargetCommand.NotifyCanExecuteChanged());
+        AppUiThread.InvokeOrPost(() => AddTargetCommand.NotifyCanExecuteChanged());
 
     /// <inheritdoc />
     public async ValueTask DisposeAsync()

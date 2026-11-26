@@ -8,7 +8,17 @@
              x:DataType="vm:AgentSessionsViewModel">
   <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
     <StackPanel Spacing="16" Margin="12,12,12,48">
-      <TextBlock Text="{Binding LastError}" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" TextWrapping="Wrap" IsVisible="{Binding IsErrorVisible}"/>
+      <!-- Severity banner (task #173): the tab error renders in the NightCodeForge
+           SemiColorDangerLight card — same pattern as the target dialogs (task #171). -->
+      <Border Padding="10,8" CornerRadius="8"
+              Background="{DynamicResource SemiColorDangerLight}"
+              BorderBrush="{DynamicResource SemiColorDanger}"
+              BorderThickness="1"
+              IsVisible="{Binding IsErrorVisible}">
+        <TextBlock Text="{Binding LastError}"
+                   TextWrapping="Wrap"
+                   Foreground="{DynamicResource NightCodeAccentCrimsonLightText}"/>
+      </Border>
 
       <!-- 1. SUMMARY: fleet-wide aggregates over the listed sessions -->
       <Border Theme="{DynamicResource CardBorder}" Padding="14">

@@ -193,6 +193,20 @@ public sealed class PreloadDialogLayoutTests : IClassFixture<PreloadDialogLayout
         public Task DispatchAsync(Action action) =>
             Session.Dispatch(action, CancellationToken.None);
 
+        /// <summary>
+        /// Dispatches an ASYNC job and keeps the dispatcher pumping until it completes.
+        /// REQUIRED for async work — the <see cref="DispatchAsync(Action)"/> overload swallows
+        /// async-void lambdas, and the generic <see cref="DispatchAsync{TResult}"/> wraps a
+        /// <c>Task</c> result in <c>Task.FromResult</c> (completed immediately, inner task
+        /// never awaited). (task #173)
+        /// </summary>
+        public Task DispatchAsync(Func<Task> work) =>
+            Session.Dispatch(async () =>
+            {
+                await work();
+                return 0;
+            }, CancellationToken.None);
+
         public Task<TResult> DispatchAsync<TResult>(Func<TResult> func) =>
             Session.Dispatch(func, CancellationToken.None);
 

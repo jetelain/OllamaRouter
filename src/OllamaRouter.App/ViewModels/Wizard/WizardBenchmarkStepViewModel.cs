@@ -726,7 +726,7 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
     }
 
     private void NotifyRunCanExecute() =>
-        WizardUiThread.InvokeOrPost(() => RunBenchmarksCommand.NotifyCanExecuteChanged());
+        AppUiThread.InvokeOrPost(() => RunBenchmarksCommand.NotifyCanExecuteChanged());
 
     /// <summary>Builds the benchmark/result rows on the calling thread, then marshles one
     /// UI-thread action that rebuilds BOTH <see cref="BenchmarkRows"/> and
@@ -826,7 +826,7 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
 
     partial void OnIsBusyChanged(bool value)
     {
-        WizardUiThread.InvokeOrPost(() =>
+        AppUiThread.InvokeOrPost(() =>
         {
             RunBenchmarksCommand.NotifyCanExecuteChanged();
             ClearResultsCommand.NotifyCanExecuteChanged();

@@ -13,7 +13,17 @@
   </UserControl.Styles>
   <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
     <StackPanel Spacing="16" Margin="12,12,12,48">
-      <TextBlock Text="{Binding LastError}" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" TextWrapping="Wrap" IsVisible="{Binding IsErrorVisible}"/>
+      <!-- Severity banner (task #173): the tab error renders in the NightCodeForge
+           SemiColorDangerLight card — same pattern as the target dialogs (task #171). -->
+      <Border Padding="10,8" CornerRadius="8"
+              Background="{DynamicResource SemiColorDangerLight}"
+              BorderBrush="{DynamicResource SemiColorDanger}"
+              BorderThickness="1"
+              IsVisible="{Binding IsErrorVisible}">
+        <TextBlock Text="{Binding LastError}"
+                   TextWrapping="Wrap"
+                   Foreground="{DynamicResource NightCodeAccentCrimsonLightText}"/>
+      </Border>
 
       <!-- 1. FLEET STATUS & RUNTIME AVAILABILITY (Top section, exactly matching web monitor) -->
       <Border Theme="{DynamicResource CardBorder}" Padding="14">
@@ -51,7 +61,8 @@
                   </StackPanel>
 
                   <TextBlock Grid.Column="1" Text="{Binding HardwareProfile, TargetNullValue='-'}" VerticalAlignment="Center"/>
-                  <TextBlock Grid.Column="2" Text="{Binding Liveness}" VerticalAlignment="Center"/>
+                  <TextBlock Grid.Column="2" Text="{Binding Liveness}" VerticalAlignment="Center"
+                             Foreground="{Binding Liveness, Converter={x:Static converters:LivenessToBrushConverter.Instance}}"/>
                   <TextBlock Grid.Column="3" Text="{Binding ActiveModel, TargetNullValue='-'}"
                              TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
                   <TextBlock Grid.Column="4" Text="{Binding KeepAliveDisplay}" VerticalAlignment="Center" TextAlignment="Right"/>

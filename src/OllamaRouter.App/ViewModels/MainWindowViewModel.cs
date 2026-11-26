@@ -73,6 +73,11 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
     /// <summary>The Settings &amp; API Keys tab.</summary>
     public SettingsViewModel SettingsTab { get; }
 
+    /// <summary>The connection bar daemon state (task #173) — the single source of truth
+    /// for the status text and the status-dot brush (green/amber/crimson).</summary>
+    [ObservableProperty]
+    private DaemonStatus _daemonStatus = DaemonStatus.Connecting;
+
     /// <summary>The connection bar status text
     /// ("Running" / "Stopped" / "Port Conflict" / "Remote" / "Disconnected").</summary>
     [ObservableProperty]
@@ -300,8 +305,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
     public async Task StartAsync(CancellationToken ct = default)
     {
         IsBusy = true;
-        StatusText = "Connecting\u2026";
-        StatusDetail = "Checking local router daemon\u2026";
+        SetStatus(DaemonStatus.Connecting, "Checking local router daemon\u2026");
         RaiseCommandAvailability();
         try
         {
@@ -370,8 +374,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
             }
             catch (Exception ex)
             {
-                StatusText = "Disconnected";
-                StatusDetail = ex.Message;
+                SetStatus(DaemonStatus.Disconnected, ex.Message);
                 IsDaemonRunning = false;
                 RaiseCommandAvailability();
             }
@@ -399,8 +402,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
         }
         catch (Exception ex)
         {
-            StatusText = "Disconnected";
-            StatusDetail = ex.Message;
+            SetStatus(DaemonStatus.Disconnected, ex.Message);
             IsDaemonRunning = false;
             RaiseCommandAvailability();
         }
@@ -415,8 +417,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
             var info = await _connection.Client.GetInfoAsync(ct).ConfigureAwait(false);
             IsPortConflict = false;
             IsDaemonRunning = false;
-            StatusText = "Remote";
-            StatusDetail = BuildRemoteDetail(info);
+            SetStatus(DaemonStatus.Remote, BuildRemoteDetail(info));
             RaiseCommandAvailability();
         }
         catch (OllamaRouterApiException ex) when (
@@ -424,18 +425,17 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
         {
             IsPortConflict = false;
             IsDaemonRunning = false;
-            StatusText = "Remote";
-            StatusDetail =
+            SetStatus(
+                DaemonStatus.Remote,
                 "The router is key-locked and rejected the configured key — enter a valid API " +
-                $"key (connect → remote) at {BaseUrl}.";
+                $"key (connect → remote) at {BaseUrl}.");
             RaiseCommandAvailability();
         }
         catch (Exception ex)
         {
             IsPortConflict = false;
             IsDaemonRunning = false;
-            StatusText = "Disconnected";
-            StatusDetail = ex.Message;
+            SetStatus(DaemonStatus.Disconnected, ex.Message);
             RaiseCommandAvailability();
         }
     }
@@ -449,16 +449,16 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
             case RouterDaemonState.Running:
                 IsPortConflict = false;
                 IsDaemonRunning = true;
-                StatusText = "Running";
-                StatusDetail = BuildLocalDetail(status.Info);
+                SetStatus(DaemonStatus.Running, BuildLocalDetail(status.Info));
                 break;
             case RouterDaemonState.Stopped:
                 IsPortConflict = false;
                 IsDaemonRunning = false;
-                StatusText = "Stopped";
-                StatusDetail = string.IsNullOrWhiteSpace(status.Detail)
-                    ? $"The daemon is not running at {BaseUrl}."
-                    : $"The daemon is not running at {BaseUrl} ({status.Detail}).";
+                SetStatus(
+                    DaemonStatus.Stopped,
+                    string.IsNullOrWhiteSpace(status.Detail)
+                        ? $"The daemon is not running at {BaseUrl}."
+                        : $"The daemon is not running at {BaseUrl} ({status.Detail}).");
                 break;
             default: // PortOccupiedByOtherService
                 ApplyForeignPortStatus(status);
@@ -499,12 +499,12 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
         LogDaemonStateTransition(status.State, status.Detail);
         IsPortConflict = true;
         IsDaemonRunning = false;
-        StatusText = "Port Conflict";
         var detail = string.IsNullOrWhiteSpace(status.Detail) ? "port occupied" : status.Detail;
-        StatusDetail =
+        SetStatus(
+            DaemonStatus.PortConflict,
             $"{BaseUrl}: {detail} — a NON-router service owns this port. The launcher never " +
             "launches against or kills a foreign port owner; move the raw 'ollama' off " +
-            ":11434 (or connect to the router via its actual URL → remote).";
+            ":11434 (or connect to the router via its actual URL → remote).");
         RaiseCommandAvailability();
     }
 
@@ -512,8 +512,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
     {
         IsPortConflict = false;
         IsDaemonRunning = false;
-        StatusText = "Stopped";
-        StatusDetail = message;
+        SetStatus(DaemonStatus.Stopped, message);
         RaiseCommandAvailability();
     }
 
@@ -604,14 +603,27 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
             ConnectRemoteCommand.NotifyCanExecuteChanged();
         }
 
-        if (Avalonia.Application.Current is null || Avalonia.Threading.Dispatcher.UIThread.CheckAccess())
+        // Task #173: marshal through the shared UI-thread helper (Avalonia's Button
+        // CanExecuteChanged handler runs on the CALLING thread — an unguarded
+        // NotifyCanExecuteChanged from a pool thread throws cross-thread).
+        AppUiThread.InvokeOrPost(Notify);
+    }
+
+    /// <summary>Sets the connection-bar state atomically (task #173): status kind → derived
+    /// status text + detail in a single mutation point.</summary>
+    private void SetStatus(DaemonStatus status, string detail)
+    {
+        DaemonStatus = status;
+        StatusText = status switch
         {
-            Notify();
-        }
-        else
-        {
-            Avalonia.Threading.Dispatcher.UIThread.Post(Notify);
-        }
+            DaemonStatus.Running => "Running",
+            DaemonStatus.Remote => "Remote",
+            DaemonStatus.PortConflict => "Port Conflict",
+            DaemonStatus.Stopped => "Stopped",
+            DaemonStatus.Disconnected => "Disconnected",
+            _ => "Connecting\u2026", // Connecting
+        };
+        StatusDetail = detail;
     }
 
     /// <summary>
@@ -661,8 +673,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IAsyncDispos
         }
 
         IsLocalModeChanged();
-        StatusText = "Connecting\u2026";
-        StatusDetail = string.Empty;
+        SetStatus(DaemonStatus.Connecting, string.Empty);
         IsDaemonRunning = false;
         RaiseCommandAvailability();
         _ = RefreshStatusAsync(CancellationToken.None);

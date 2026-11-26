@@ -376,7 +376,7 @@ public sealed partial class SetupWizardViewModel : ObservableObject, IAsyncDispo
 
     private void NotifyDaemonBannerProperties()
     {
-        WizardUiThread.InvokeOrPost(() =>
+        AppUiThread.InvokeOrPost(() =>
         {
             OnPropertyChanged(nameof(DaemonBadgeText));
             OnPropertyChanged(nameof(IsDaemonRunning));
@@ -389,7 +389,7 @@ public sealed partial class SetupWizardViewModel : ObservableObject, IAsyncDispo
 
     private void NotifyNavigationStateChanged()
     {
-        WizardUiThread.InvokeOrPost(() =>
+        AppUiThread.InvokeOrPost(() =>
         {
             OnPropertyChanged(nameof(IsAnyStepBusy));
             OnPropertyChanged(nameof(CanGoBack));

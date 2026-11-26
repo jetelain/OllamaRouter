@@ -46,6 +46,7 @@ public sealed class MainWindowViewModelTests : IAsyncLifetime
 
         Assert.Single(_launcher.Calls, c => c == "EnsureRunningAsync");
         Assert.Equal("Running", viewModel.StatusText);
+        Assert.Equal(DaemonStatus.Running, viewModel.DaemonStatus); // task #173: status kind tracks the text
         Assert.Contains("PID 4242", viewModel.StatusDetail);
         Assert.Contains("v9.9.9", viewModel.StatusDetail);
         Assert.Contains("1m 35s", viewModel.StatusDetail);
@@ -59,11 +60,13 @@ public sealed class MainWindowViewModelTests : IAsyncLifetime
         await viewModel.StartAsync(); // auto-starts (EnsureRunningAsync launches it)
         await viewModel.StopDaemonCommand.ExecuteAsync(null);
         Assert.Equal("Stopped", viewModel.StatusText);
+        Assert.Equal(DaemonStatus.Stopped, viewModel.DaemonStatus); // task #173
 
         // The manual re-probe (GetStatusAsync) NEVER launches — only (re)connect/start do.
         await viewModel.RefreshStatusCommand.ExecuteAsync(null);
 
         Assert.Equal("Stopped", viewModel.StatusText);
+        Assert.Equal(DaemonStatus.Stopped, viewModel.DaemonStatus); // task #173
         Assert.Contains(OllamaRouterDaemonLauncher.DefaultBaseUrl.ToString(), viewModel.StatusDetail);
         Assert.Single(_launcher.Calls, c => c == "StartAsync");
     }
@@ -78,6 +81,7 @@ public sealed class MainWindowViewModelTests : IAsyncLifetime
         await viewModel.StartAsync();
 
         Assert.Equal("Port Conflict", viewModel.StatusText);
+        Assert.Equal(DaemonStatus.PortConflict, viewModel.DaemonStatus); // task #173
         Assert.Contains("non-router payload", viewModel.StatusDetail);
         Assert.Contains("never launches against or kills", viewModel.StatusDetail);
         Assert.Contains("11434", viewModel.StatusDetail);
@@ -146,6 +150,7 @@ public sealed class MainWindowViewModelTests : IAsyncLifetime
         Assert.False(viewModel.StopDaemonCommand.CanExecute(null));
         Assert.False(viewModel.RestartDaemonCommand.CanExecute(null));
         Assert.Equal("Remote", viewModel.StatusText);
+        Assert.Equal(DaemonStatus.Remote, viewModel.DaemonStatus); // task #173
         Assert.Contains("PID 77", viewModel.StatusDetail);
         Assert.Contains("http://192.168.1.50:11434/", viewModel.StatusDetail);
     }
@@ -164,6 +169,7 @@ public sealed class MainWindowViewModelTests : IAsyncLifetime
         await viewModel.RefreshStatusCommand.ExecuteAsync(null);
 
         Assert.Equal("Remote", viewModel.StatusText);
+        Assert.Equal(DaemonStatus.Remote, viewModel.DaemonStatus); // task #173: a 401 router is still "Remote"
         Assert.Contains("key-locked", viewModel.StatusDetail);
     }
 
@@ -217,6 +223,8 @@ public sealed class MainWindowViewModelTests : IAsyncLifetime
 
         // Initial ("Connecting…") local state: Start visible, Stop hidden.
         Assert.False(viewModel.IsDaemonRunning);
+        Assert.Equal(DaemonStatus.Connecting, viewModel.DaemonStatus); // task #173: initial state
+        Assert.Equal("Connecting\u2026", viewModel.StatusText);
         Assert.True(viewModel.ShowStartButton);
         Assert.False(viewModel.ShowStopButton);
 
@@ -353,6 +361,69 @@ public sealed class MainWindowViewModelTests : IAsyncLifetime
         // stop, start) flips BOTH of them.
         Assert.Equal(3, notifications.Count(n => n == nameof(MainWindowViewModel.ShowStartButton)));
         Assert.Equal(3, notifications.Count(n => n == nameof(MainWindowViewModel.ShowStopButton)));
+    }
+
+    [Fact]
+    public async Task RefreshStatus_LauncherGenericException_SurfacesDisconnected()
+    {
+        var viewModel = CreateViewModel();
+        _launcher.Status = FakeDaemonLauncher.RunningStatus();
+        await viewModel.StartAsync();
+        Assert.Equal(DaemonStatus.Running, viewModel.DaemonStatus);
+
+        // Task #173 seam: a generic GetStatusAsync failure (NOT a RouterDaemonException)
+        // surfaces the Disconnected state, not Stopped.
+        _launcher.GetStatusException = new InvalidOperationException("probe exploded");
+        await viewModel.RefreshStatusCommand.ExecuteAsync(null);
+
+        Assert.Equal("Disconnected", viewModel.StatusText);
+        Assert.Equal(DaemonStatus.Disconnected, viewModel.DaemonStatus);
+        Assert.False(viewModel.IsDaemonRunning);
+        Assert.Contains("probe exploded", viewModel.StatusDetail);
+    }
+
+    [Fact]
+    public async Task SetStatus_TextAndKindStayConsistent_AcrossEveryState()
+    {
+        var viewModel = CreateViewModel();
+        _launcher.Status = FakeDaemonLauncher.RunningStatus();
+
+        // Connecting (initial state — before any probe).
+        Assert.Equal(DaemonStatus.Connecting, viewModel.DaemonStatus);
+        Assert.Equal("Connecting\u2026", viewModel.StatusText);
+
+        // Running.
+        await viewModel.StartAsync();
+        Assert.Equal(DaemonStatus.Running, viewModel.DaemonStatus);
+        Assert.Equal("Running", viewModel.StatusText);
+
+        // Stopped.
+        await viewModel.StopDaemonCommand.ExecuteAsync(null);
+        Assert.Equal(DaemonStatus.Stopped, viewModel.DaemonStatus);
+        Assert.Equal("Stopped", viewModel.StatusText);
+
+        // Port Conflict.
+        _launcher.Status = new RouterDaemonStatus(
+            RouterDaemonState.PortOccupiedByOtherService, null, "foreign owner");
+        await viewModel.RefreshStatusCommand.ExecuteAsync(null);
+        Assert.Equal(DaemonStatus.PortConflict, viewModel.DaemonStatus);
+        Assert.Equal("Port Conflict", viewModel.StatusText);
+
+        // Remote (200) — the connection switch's own background probe and the explicit
+        // refresh both settle on the same sticky InfoResponse.
+        await _harness.Service.SwitchConnectionAsync(new RouterConnectionProfile(
+            RouterConnectionMode.Remote, new Uri("http://192.168.1.50:11434/"), "key"));
+        _client.InfoResponse = FakeDaemonLauncher.RunningStatus().Info!;
+        await viewModel.RefreshStatusCommand.ExecuteAsync(null);
+        Assert.Equal(DaemonStatus.Remote, viewModel.DaemonStatus);
+        Assert.Equal("Remote", viewModel.StatusText);
+
+        // Disconnected (the remote probe fails generically).
+        _client.InfoException = new OllamaRouterApiException(
+            HttpStatusCode.NotFound, "router gone");
+        await viewModel.RefreshStatusCommand.ExecuteAsync(null);
+        Assert.Equal(DaemonStatus.Disconnected, viewModel.DaemonStatus);
+        Assert.Equal("Disconnected", viewModel.StatusText);
     }
 
     private MainWindowViewModel CreateViewModel()
