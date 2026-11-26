@@ -1,0 +1,106 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:OllamaRouter.App.ViewModels"
+        x:Class="OllamaRouter.App.Views.Dialogs.EditExternalProviderDialog"
+        x:DataType="vm:ExternalProviderEditFormViewModel"
+        Title="Edit External Provider"
+        Width="640" Height="640"
+        WindowStartupLocation="CenterOwner">
+  <DockPanel Margin="8">
+    <!-- Severity banner (task #171, AC4): the validation error renders in the
+         SemiColorDangerLight card, bound to the form's error state. -->
+    <Border DockPanel.Dock="Top"
+            Padding="10,8"
+            CornerRadius="8"
+            Margin="0,0,0,6"
+            Background="{DynamicResource SemiColorDangerLight}"
+            BorderBrush="{DynamicResource SemiColorDanger}"
+            BorderThickness="1"
+            IsVisible="{Binding HasValidationError}">
+      <TextBlock Text="{Binding ValidationErrorMessage}"
+                 TextWrapping="Wrap"
+                 Foreground="{DynamicResource NightCodeAccentCrimsonLightText}"/>
+    </Border>
+
+    <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8" Margin="0,6,0,0">
+      <Button Content="Cancel" Click="OnCancelClick" MinWidth="90"/>
+      <Button Content="Save" Classes="Primary" Click="OnSaveClick" MinWidth="90"/>
+    </StackPanel>
+
+    <ScrollViewer>
+      <StackPanel Spacing="8">
+        <!-- NightCodeForge form card (task #171). -->
+        <Border Padding="12"
+                CornerRadius="8"
+                Background="{DynamicResource NightCodeBgSurface}"
+                BorderBrush="{DynamicResource SemiColorBorder}"
+                BorderThickness="1">
+          <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto" RowSpacing="6" ColumnSpacing="8">
+            <TextBlock Grid.Row="0" Grid.Column="0" Text="Name:" VerticalAlignment="Center"/>
+            <!-- D5 (task #171): the name is READ-ONLY identity — the PUT path parameter. -->
+            <TextBox Grid.Row="0" Grid.Column="1" IsEnabled="False"
+                     Text="{Binding Name, Mode=OneWay}"
+                     PlaceholderText="read-only identity"/>
+
+            <TextBlock Grid.Row="1" Grid.Column="0" Text="Base URL:" VerticalAlignment="Center"/>
+            <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding BaseUrl}"
+                     PlaceholderText="https://api.example.com/v1 or host:port"/>
+
+            <TextBlock Grid.Row="2" Grid.Column="0" Text="Provider:" VerticalAlignment="Center"
+                       ToolTip.Tip="Informational label. Blank = clear the stored label."/>
+            <TextBox Grid.Row="2" Grid.Column="1" Text="{Binding Provider}"
+                     PlaceholderText="e.g. OpenRouter — blank = clear"/>
+
+            <TextBlock Grid.Row="3" Grid.Column="0" Text="Max Parallel:" VerticalAlignment="Center"/>
+            <TextBox Grid.Row="3" Grid.Column="1" Text="{Binding MaxParallel}"
+                     PlaceholderText="1"/>
+
+            <TextBlock Grid.Row="4" Grid.Column="0" Text="API Key:" VerticalAlignment="Center"
+                       ToolTip.Tip="Upstream (masked) key — the key material is never displayed. Untouched = no change, emptied = clear, new value = replace."/>
+            <StackPanel Grid.Row="4" Grid.Column="1" Orientation="Vertical" Spacing="4">
+              <TextBox Text="{Binding ApiKey, UpdateSourceTrigger=PropertyChanged}"
+                       PasswordChar="●"
+                       PlaceholderText="leave blank = no change, empty = clear"/>
+              <TextBlock Text="{Binding ApiKeyStatusText}"
+                         FontSize="12"
+                         Opacity="0.7"
+                         TextWrapping="Wrap"/>
+            </StackPanel>
+          </Grid>
+        </Border>
+
+        <!-- NightCodeForge roster card (task #171; the shared-dialog roster row pattern). -->
+        <Border Padding="12"
+                CornerRadius="8"
+                Background="{DynamicResource NightCodeBgSurface}"
+                BorderBrush="{DynamicResource SemiColorBorder}"
+                BorderThickness="1">
+          <StackPanel Spacing="4">
+            <TextBlock Text="Declared Models" FontWeight="SemiBold"/>
+            <TextBlock Text="Optional — leave empty for a model-agnostic endpoint."
+                       FontSize="12"
+                       Opacity="0.7"/>
+            <ItemsControl ItemsSource="{Binding Models}">
+              <ItemsControl.ItemTemplate>
+                <DataTemplate>
+                  <Grid ColumnDefinitions="*,120,140,auto" Margin="0,2" ColumnSpacing="6">
+                    <TextBox Grid.Column="0" Text="{Binding Name}"
+                             PlaceholderText="model name"/>
+                    <TextBox Grid.Column="1" Text="{Binding ContextLength}"
+                             PlaceholderText="contextLength"/>
+                    <TextBox Grid.Column="2" Text="{Binding Quantization}"
+                             PlaceholderText="quantization"/>
+                    <Button Grid.Column="3" Content="Remove" Classes="Danger"
+                            Click="OnRemoveModelRowClick" Tag="{Binding}"/>
+                  </Grid>
+                </DataTemplate>
+              </ItemsControl.ItemTemplate>
+            </ItemsControl>
+            <Button Content="+ Add Model" HorizontalAlignment="Left"
+                    Command="{Binding AddModelRowCommand}"/>
+          </StackPanel>
+        </Border>
+      </StackPanel>
+    </ScrollViewer>
+  </DockPanel>
+</Window>

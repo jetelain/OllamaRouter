@@ -172,7 +172,7 @@ public sealed class FleetTargetsViewLayoutTests
     {
         var (_, identity, endpoint) = LoadRowTemplate();
 
-        // Overlap guard (TargetEditDialogLayoutTests.FormGrid_NoTwoChildren_ShareACell precedent):
+        // Overlap guard (EditTargetDialogsLayoutTests form-grid no-shared-cell precedent):
         // in BOTH header grids no two children may share a Grid.Column — the original defect was
         // six info elements packed into one star-column StackPanel whose desired width overflowed.
         foreach (var (name, grid) in new[] { ("identity row", identity), ("endpoint row", endpoint) })

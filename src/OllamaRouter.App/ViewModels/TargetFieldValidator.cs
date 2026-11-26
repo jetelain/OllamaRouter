@@ -77,6 +77,27 @@ internal static class TargetFieldValidator
     }
 
     /// <summary>
+    /// Validates the node power-draw override in watts (optional): blank is valid (no
+    /// change / unset); a present value must be a non-negative number (invariant culture).
+    /// (Task #171: the rule moved here from the retiring shared
+    /// <c>TargetEditFormViewModel</c> — the Ollama-node edit form is now the only form with
+    /// the field, and this stays the single home of the rule.)
+    /// </summary>
+    public static bool ValidatePowerWatts(string value, out string? error)
+    {
+        if (!string.IsNullOrWhiteSpace(value) &&
+            (!double.TryParse(value, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var watts) || watts < 0))
+        {
+            error = "powerWatts must be a non-negative number (or blank).";
+            return false;
+        }
+
+        error = null;
+        return true;
+    }
+
+    /// <summary>
     /// Validates the daemon-side hardware-probe ssh user (optional): blank is valid; a
     /// non-blank value must match the POSIX-ish charset the server enforces
     /// (^[A-Za-z0-9._-]{1,64}$ — safe to interpolate into {user}@{host}).

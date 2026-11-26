@@ -3,19 +3,34 @@ using Avalonia.Interactivity;
 using OllamaRouter.App.Logging;
 using OllamaRouter.App.ViewModels;
 using OllamaRouter.App.Views.Dialogs;
+using OllamaRouter.Endpoints.RouterApi.Targets;
 
 namespace OllamaRouter.App.Views;
 
 /// <summary>
-/// The Fleet &amp; Cloud Targets tab view (task #102; task #149 entry points): the two
-/// DEDICATED per-type add dialogs (<see cref="AddOllamaNodeDialog"/> / <see cref="AddExternalProviderDialog"/>)
-/// behind the "Add Ollama Node" / "Add External Provider" toolbar buttons; the shared
-/// <see cref="TargetEditDialog"/> handles EDIT only; delete confirms first.
+/// The Fleet &amp; Cloud Targets tab view (task #102; task #149 add entry points;
+/// task #171 edit entry points): the two DEDICATED per-type add dialogs
+/// (<see cref="AddOllamaNodeDialog"/> / <see cref="AddExternalProviderDialog"/>)
+/// behind the "Add Ollama Node" / "Add External Provider" toolbar buttons; the two
+/// DEDICATED per-type edit dialogs (<see cref="EditOllamaNodeDialog"/> for every
+/// non-<c>openai</c> row / <see cref="EditExternalProviderDialog"/> for
+/// <c>openai</c> rows, see <see cref="UseExternalProviderEditDialog"/>) handle EDIT;
+/// delete confirms first.
 /// Task #159: every handler runs through <see cref="SafeRun"/> with the tab's
 /// <c>LastError</c>/<c>IsErrorVisible</c> message surface.
 /// </summary>
 public partial class FleetTargetsView : UserControl
 {
+    /// <summary>
+    /// The task #171 edit-dispatch rule (testable without a window): an <c>openai</c>
+    /// row (case-insensitive) edits through the external-provider dialog; EVERYTHING
+    /// else (<c>ollama</c>, <c>osnative</c>, unknown / blank types) edits through the
+    /// Ollama-node dialog — safe for osnative because the edit forms never send
+    /// <c>type</c> (decision D3), so the protocol family is preserved.
+    /// </summary>
+    internal static bool UseExternalProviderEditDialog(string? type) =>
+        string.Equals(type, "openai", StringComparison.OrdinalIgnoreCase);
+
     /// <summary>Creates the view (the DataContext is the <see cref="FleetTargetsViewModel"/>).</summary>
     public FleetTargetsView()
     {
@@ -101,23 +116,42 @@ public partial class FleetTargetsView : UserControl
             return;
         }
 
-        var form = viewModel.CreateEditForm(row);
-        form.ExistingApiKeyConfigured = row.ApiKeyConfigured;
-        var dialog = new TargetEditDialog(form);
+        // Task #171: dispatch to the DEDICATED per-type edit dialog (the single-pass flow
+        // mirrors the task #149 add handlers): Save → BuildUpdateRequest → the EditTarget
+        // command; validation error → the banner stays up and the dialog re-opens (the
+        // follow-up Save simply closes without submitting).
+        Window dialog;
+        Func<(UpdateTargetRequest Request, string? Error)> buildUpdateRequest;
+        Action<string?> reportError;
+        if (UseExternalProviderEditDialog(row.Type))
+        {
+            var providerForm = viewModel.CreateExternalProviderEditForm(row);
+            dialog = new EditExternalProviderDialog(providerForm);
+            buildUpdateRequest = providerForm.BuildUpdateRequest;
+            reportError = providerForm.ReportError;
+        }
+        else
+        {
+            var ollamaForm = viewModel.CreateOllamaNodeEditForm(row);
+            dialog = new EditOllamaNodeDialog(ollamaForm);
+            buildUpdateRequest = ollamaForm.BuildUpdateRequest;
+            reportError = ollamaForm.ReportError;
+        }
+
         SafeRun.Run(
             async () =>
             {
                 if (await dialog.ShowDialog<bool>(owner) is true)
                 {
-                    var (request, error) = form.BuildUpdateRequest();
+                    var (request, error) = buildUpdateRequest();
                     if (error is null)
                     {
                         viewModel.EditTargetCommand.Execute((row.Name, request));
                     }
                     else
                     {
-                        form.ReportError(error);
-                        dialog.Show();
+                        reportError(error);
+                        dialog.Show(); // keep the dialog open on the validation error
                     }
                 }
             },

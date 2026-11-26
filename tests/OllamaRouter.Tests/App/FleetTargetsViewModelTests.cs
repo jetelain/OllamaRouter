@@ -130,58 +130,17 @@ public sealed class FleetTargetsViewModelTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task AddTarget_BuildsTheFullRequest_AndRefreshesOnSuccess()
-    {
-        SeedFleet(_client);
-        await _viewModel.RefreshAsync();
-
-        var form = _viewModel.CreateAddForm();
-        form.Name = "GroqBox";
-        form.Url = "https://api.groq.com/openai/v1/";
-        form.Type = "openai";
-        form.Provider = "Groq";
-        form.MaxParallel = "4";
-        form.HardwareHint = "cloud-groq";
-        form.ApiKey = "gsk_key";
-        form.PowerWatts = "0";
-        form.Models.Add(new ModelRosterEntry
-        {
-            Name = "llama-3.3-70b",
-            ContextLength = "128000",
-            Quantization = "Q8_0",
-        });
-
-        var (request, error) = form.BuildAddRequest();
-        Assert.Null(error);
-        await _viewModel.AddTargetCommand.ExecuteAsync(request);
-
-        var sent = Assert.Single(_client.AddTargetCalls);
-        Assert.Equal("GroqBox", sent.Name);
-        Assert.Equal("https://api.groq.com/openai/v1", sent.Url); // trailing / stripped
-        Assert.Equal("openai", sent.Type);
-        Assert.Equal("Groq", sent.Provider);
-        Assert.Equal(4, sent.MaxParallel);
-        Assert.True(sent.TestConnectionFirst);
-        Assert.Equal("cloud-groq", sent.HardwareHint);
-        Assert.Equal("gsk_key", sent.ApiKey);
-        Assert.Equal(0.0, sent.PowerWatts);
-        var model = Assert.Single(sent.Models!);
-        Assert.Equal("llama-3.3-70b", model.Name);
-        Assert.Equal(128000, model.ContextLength);
-        Assert.Equal("Q8_0", model.Quantization);
-        Assert.Contains(_viewModel.Rows, r => r.Name == "GroqBox");
-    }
-
-    [Fact]
     public async Task AddTarget_ProbeFailure_SurfacesTheError_AndDoesNotAddTheRow()
     {
         SeedFleet(_client);
         await _viewModel.RefreshAsync();
 
-        var form = _viewModel.CreateAddForm();
-        form.Name = "Flaky";
-        form.Url = "http://10.0.0.9:11434";
-        var (request, _) = form.BuildAddRequest();
+        // The dead shared-form add mode retired with the shared form (task #171): the
+        // command-error-surface coverage stays form-free with a direct request.
+        var request = new AddTargetRequest(
+            Name: "Flaky",
+            Url: "http://10.0.0.9:11434",
+            Type: "ollama");
 
         _client.AddTargetError = (System.Net.HttpStatusCode.UnprocessableEntity,
             "connection probe failed: connection refused (retry when the target is up)");
@@ -198,21 +157,23 @@ public sealed class FleetTargetsViewModelTests : IAsyncLifetime
         SeedFleet(_client);
         await _viewModel.RefreshAsync();
 
-        var row = _viewModel.Rows[0];
-        var form = _viewModel.CreateEditForm(row);
-        Assert.True(form.IsEdit);
+        // Task #171: the API key edit moved to the provider form (the old test used the
+        // Local ollama row precisely because the shared dialog showed the key box for every
+        // type) — OpenRouter is the seeded openai row with ApiKeyConfigured = true.
+        var row = _viewModel.Rows.Single(r => r.Name == "OpenRouter");
+        var form = _viewModel.CreateExternalProviderEditForm(row);
         Assert.True(form.ExistingApiKeyConfigured);
         form.MaxParallel = "3";
 
         var (request, error) = form.BuildUpdateRequest();
         Assert.Null(error);
-        await _viewModel.EditTargetCommand.ExecuteAsync(("Local", request));
+        await _viewModel.EditTargetCommand.ExecuteAsync(("OpenRouter", request));
 
         var sent = Assert.Single(_client.UpdateTargetCalls);
-        Assert.Equal("Local", sent.Name);
+        Assert.Equal("OpenRouter", sent.Name);
         Assert.Null(sent.Request.ApiKey); // untouched = NO CHANGE (absent on the wire)
         Assert.Equal(3, sent.Request.MaxParallel);
-        Assert.Equal(3, _client.Targets["Local"].MaxParallel); // persisted by the store
+        Assert.Equal(3, _client.Targets["OpenRouter"].MaxParallel); // persisted by the store
     }
 
     [Fact]
@@ -221,17 +182,17 @@ public sealed class FleetTargetsViewModelTests : IAsyncLifetime
         SeedFleet(_client);
         await _viewModel.RefreshAsync();
 
-        var row = _viewModel.Rows[0];
+        var row = _viewModel.Rows.Single(r => r.Name == "OpenRouter");
         Assert.True(row.ApiKeyConfigured);
-        var form = _viewModel.CreateEditForm(row);
+        var form = _viewModel.CreateExternalProviderEditForm(row);
         form.ApiKey = "temp"; // touch the box…
         form.ApiKey = "";     // …then explicitly empty it → CLEAR
         var (request, _) = form.BuildUpdateRequest();
 
-        await _viewModel.EditTargetCommand.ExecuteAsync(("Local", request));
+        await _viewModel.EditTargetCommand.ExecuteAsync(("OpenRouter", request));
 
         Assert.Equal(string.Empty, _client.UpdateTargetCalls.Single().Request.ApiKey);
-        Assert.False(_client.Targets["Local"].ApiKeyConfigured); // cleared on the store
+        Assert.False(_client.Targets["OpenRouter"].ApiKeyConfigured); // cleared on the store
     }
 
     [Fact]
@@ -264,34 +225,6 @@ public sealed class FleetTargetsViewModelTests : IAsyncLifetime
         Assert.Null(sent.Request.Url);
         Assert.Null(sent.Request.ApiKey);
         Assert.False(_client.Targets["Local"].Enabled);
-    }
-
-    [Fact]
-    public void BuildAddRequest_ValidatesNameUrlParallel_AndRoster()
-    {
-        var form = new TargetEditFormViewModel(isEdit: false);
-        form.Url = "http://127.0.0.1:11434";
-
-        form.Name = "Bad/Name";
-        Assert.NotNull(form.BuildAddRequest().Error);
-
-        form.Name = "Cloud";
-        Assert.NotNull(form.BuildAddRequest().Error);
-
-        form.Name = "ok";
-        form.MaxParallel = "0";
-        Assert.NotNull(form.BuildAddRequest().Error);
-
-        form.MaxParallel = "1";
-        form.PowerWatts = "-5";
-        Assert.NotNull(form.BuildAddRequest().Error);
-
-        form.PowerWatts = "";
-        form.Models.Add(new ModelRosterEntry { Name = "  " });
-        Assert.NotNull(form.BuildAddRequest().Error);
-
-        form.Models.Clear();
-        Assert.Null(form.BuildAddRequest().Error);
     }
 
     // -- Task #144: ssh credential form fields + the daemon-side hardware probe ---
@@ -381,11 +314,11 @@ public sealed class FleetTargetsViewModelTests : IAsyncLifetime
     }
 
     [Fact]
-    public void CreateEditForm_PrefillsSshUserAndSshPort_FromTheRow()
+    public void CreateOllamaNodeEditForm_PrefillsSshUserAndSshPort_FromTheRow()
     {
         var row = new FleetTargetRow { Name = "GpuBox", SshUser = "gpuadmin", SshPort = 2222 };
 
-        var form = _viewModel.CreateEditForm(row);
+        var form = _viewModel.CreateOllamaNodeEditForm(row);
 
         Assert.Equal("gpuadmin", form.SshUser);
         Assert.Equal("2222", form.SshPort);
@@ -393,7 +326,7 @@ public sealed class FleetTargetsViewModelTests : IAsyncLifetime
     }
 
     [Fact]
-    public void CreateEditForm_BlankSshFields_StayBlank_AndBlankIsValid()
+    public void CreateOllamaNodeEditForm_BlankSshFields_StayBlank_AndBlankIsValid()
     {
         var row = new FleetTargetRow
         {
@@ -402,11 +335,11 @@ public sealed class FleetTargetsViewModelTests : IAsyncLifetime
             ConfigMaxParallel = 1,
         };
 
-        var form = _viewModel.CreateEditForm(row);
+        var form = _viewModel.CreateOllamaNodeEditForm(row);
 
         Assert.Equal(string.Empty, form.SshUser);
         Assert.Equal(string.Empty, form.SshPort);
-        Assert.Null(form.BuildUpdateRequest().Error); // blank ssh fields are valid (both modes)
+        Assert.Null(form.BuildUpdateRequest().Error); // blank ssh fields are valid
         Assert.Null(row.SshLabel); // no label when unset
     }
 
@@ -588,65 +521,13 @@ public sealed class FleetTargetsViewModelTests : IAsyncLifetime
     }
 
     [Fact]
-    public void BuildAddRequest_SshFields_ValidateUsernameCharsetAndPortRange()
-    {
-        var form = new TargetEditFormViewModel(isEdit: false);
-        form.Name = "ok";
-        form.Url = "http://10.0.0.7:11434";
-        Assert.Null(form.BuildAddRequest().Error); // blank = valid
-
-        const string userError =
-            "sshUser must be 1–64 characters of letters, digits, '.', '_' or '-' (or blank).";
-        const string portError = "sshPort must be a port between 1 and 65535 (or blank).";
-
-        form.SshUser = "bad user"; // space
-        Assert.Equal(userError, form.BuildAddRequest().Error);
-
-        form.SshUser = "üser"; // non-ASCII
-        Assert.Equal(userError, form.BuildAddRequest().Error);
-
-        form.SshUser = new string('a', 65); // > 64 chars
-        Assert.Equal(userError, form.BuildAddRequest().Error);
-
-        form.SshUser = "gpu.admin-1"; // valid charset
-        form.SshPort = "0";
-        Assert.Equal(portError, form.BuildAddRequest().Error);
-
-        form.SshPort = "70000";
-        Assert.Equal(portError, form.BuildAddRequest().Error);
-
-        form.SshPort = "abc"; // non-numeric
-        Assert.Equal(portError, form.BuildAddRequest().Error);
-
-        form.SshPort = "2222";
-        Assert.Null(form.BuildAddRequest().Error);
-    }
-
-    [Fact]
-    public void BuildAddRequest_SshFields_BlankSendsNull_ValueSendsTheValue()
-    {
-        var form = new TargetEditFormViewModel(isEdit: false);
-        form.Name = "ok";
-        form.Url = "http://10.0.0.7:11434";
-        var (blank, blankError) = form.BuildAddRequest();
-        Assert.Null(blankError);
-        Assert.Null(blank.SshUser); // ADD: blank = unset (null)
-        Assert.Null(blank.SshPort);
-
-        form.SshUser = "gpuadmin";
-        form.SshPort = "2222";
-        var (filled, filledError) = form.BuildAddRequest();
-        Assert.Null(filledError);
-        Assert.Equal("gpuadmin", filled.SshUser);
-        Assert.Equal(2222, filled.SshPort);
-    }
-
-    [Fact]
     public async Task AddTarget_SshFields_CarryTheWireAndRoundTripToTheRow()
     {
         await _viewModel.RefreshAsync(); // empty fleet: no auto-probes
 
-        var form = _viewModel.CreateAddForm();
+        // Task #171: the live UI add path is the dedicated Ollama-node form (the dead
+        // shared-form add mode retired with the shared form).
+        var form = _viewModel.CreateOllamaNodeAddForm();
         form.Name = "GpuBox";
         form.Url = "http://10.0.0.7:11434";
         form.SshUser = "gpuadmin";
@@ -674,7 +555,7 @@ public sealed class FleetTargetsViewModelTests : IAsyncLifetime
         await WaitUntilAsync(() => _client.ProbeCalls.Count == 1); // GpuBox auto-probe settled
 
         var row = _viewModel.Rows.Single(r => r.Name == "GpuBox");
-        var form = _viewModel.CreateEditForm(row);
+        var form = _viewModel.CreateOllamaNodeEditForm(row);
         Assert.Equal("gpuadmin", form.SshUser);
         Assert.Equal("2222", form.SshPort);
         form.SshUser = string.Empty; // explicitly emptied → CLEAR (task #143 wire)
@@ -700,7 +581,7 @@ public sealed class FleetTargetsViewModelTests : IAsyncLifetime
         await WaitUntilAsync(() => _client.ProbeCalls.Count == 1); // GpuBox auto-probe settled
 
         var row = _viewModel.Rows.Single(r => r.Name == "Plain");
-        var form = _viewModel.CreateEditForm(row);
+        var form = _viewModel.CreateOllamaNodeEditForm(row);
         form.SshUser = "root";
         form.SshPort = "22";
         var (request, error) = form.BuildUpdateRequest();
@@ -933,7 +814,7 @@ public sealed class FleetTargetsViewModelTests : IAsyncLifetime
         // A successful config save of that target LIFTS the suppression → the next refresh
         // auto-probes again (the ssh credential may have been fixed).
         var row = _viewModel.Rows.Single(r => r.Name == "GpuBox");
-        var form = _viewModel.CreateEditForm(row);
+        var form = _viewModel.CreateOllamaNodeEditForm(row);
         var (request, _) = form.BuildUpdateRequest();
         _client.ProbeFailTargets.Clear();
         await _viewModel.EditTargetCommand.ExecuteAsync(("GpuBox", request));
@@ -999,6 +880,483 @@ public sealed class FleetTargetsViewModelTests : IAsyncLifetime
 
         Assert.Equal(humanMessage, _viewModel.LastError);
         Assert.DoesNotContain("{\"", _viewModel.LastError);
+    }
+
+    // -- Task #171: the dedicated per-type EDIT forms ----------------------------------
+
+    private static FleetTargetRow FullOllamaRow() => new()
+    {
+        Name = "Local",
+        Url = "http://127.0.0.1:11434/",
+        Type = "ollama",
+        ConfigMaxParallel = 2,
+        HardwareHint = "RTX 4090",
+        PowerWatts = 350,
+        SshUser = "gpuadmin",
+        SshPort = 2222,
+        Models = [new TargetModelDto("llama3:8b", 8192, "Q4_K_M")],
+        ApiKeyConfigured = true,
+    };
+
+    [Fact]
+    public void CreateOllamaNodeEditForm_PrefillsAllFields_FromTheRow()
+    {
+        var form = _viewModel.CreateOllamaNodeEditForm(FullOllamaRow());
+
+        Assert.Equal("Local", form.Name); // get-only identity = the row name
+        Assert.Equal("http://127.0.0.1:11434/", form.Url);
+        Assert.Equal("2", form.MaxParallel); // the PERSISTED budget, not the effective one
+        Assert.Equal("RTX 4090", form.HardwareHint);
+        Assert.Equal("350", form.PowerWatts);
+        Assert.Equal("gpuadmin", form.SshUser);
+        Assert.Equal("2222", form.SshPort);
+    }
+
+    [Fact]
+    public void CreateOllamaNodeEditForm_NullRow_Throws()
+    {
+        Assert.Throws<ArgumentNullException>(() => _viewModel.CreateOllamaNodeEditForm(null!));
+    }
+
+    [Fact]
+    public void OllamaEdit_ValidationMatrix_ByteIdenticalMessages()
+    {
+        var form = _viewModel.CreateOllamaNodeEditForm(FullOllamaRow());
+
+        // The error surfaces on BuildUpdateRequest().Error (the view's single-pass flow
+        // then calls ReportError, which lights HasValidationError — same contract as the
+        // dedicated add forms).
+        form.Url = "not-a-uri";
+        var (urlError, urlMessage) = form.BuildUpdateRequest();
+        Assert.Equal("The target URL must be an absolute http(s) URI.", urlMessage);
+        form.ReportError(urlMessage);
+        Assert.True(form.HasValidationError);
+
+        form.Url = "http://127.0.0.1:11434";
+        form.MaxParallel = "0";
+        Assert.Equal("maxParallel must be an integer of 1 or greater.", form.BuildUpdateRequest().Error);
+        form.MaxParallel = "abc";
+        Assert.Equal("maxParallel must be an integer of 1 or greater.", form.BuildUpdateRequest().Error);
+
+        form.MaxParallel = "2";
+        form.PowerWatts = "-5";
+        Assert.Equal("powerWatts must be a non-negative number (or blank).", form.BuildUpdateRequest().Error);
+        form.PowerWatts = "watts";
+        Assert.Equal("powerWatts must be a non-negative number (or blank).", form.BuildUpdateRequest().Error);
+
+        form.PowerWatts = "";
+        form.SshUser = "bad user"; // space
+        Assert.Equal(
+            "sshUser must be 1–64 characters of letters, digits, '.', '_' or '-' (or blank).",
+            form.BuildUpdateRequest().Error);
+
+        form.SshUser = "gpuadmin";
+        form.SshPort = "0";
+        Assert.Equal("sshPort must be a port between 1 and 65535 (or blank).", form.BuildUpdateRequest().Error);
+
+        form.SshPort = "70000";
+        Assert.Equal("sshPort must be a port between 1 and 65535 (or blank).", form.BuildUpdateRequest().Error);
+
+        form.SshPort = "2222";
+        var (request, error) = form.BuildUpdateRequest();
+        Assert.Null(error);
+        Assert.False(form.HasValidationError);
+        Assert.NotNull(request);
+    }
+
+    [Fact]
+    public void OllamaEdit_BuildUpdateRequest_NeverSendsTypeApiKeyProviderModelsEnabled()
+    {
+        var (request, error) = _viewModel.CreateOllamaNodeEditForm(FullOllamaRow()).BuildUpdateRequest();
+
+        Assert.Null(error);
+        Assert.Null(request.Enabled); // enablement is the row toggle
+        Assert.Null(request.Type); // D3: the protocol family never changes from edit
+        Assert.Null(request.ApiKey); // no key surface (a key on non-openai is a 400 anyway)
+        Assert.Null(request.Provider); // no label surface
+        Assert.Null(request.Models); // no roster surface — the row's roster is PRESERVED
+    }
+
+    [Fact]
+    public void OllamaEdit_HardwareHintBlank_Clears_ValueSendsTrimmed()
+    {
+        var form = _viewModel.CreateOllamaNodeEditForm(FullOllamaRow());
+        form.HardwareHint = string.Empty; // D1: blanking a pre-filled value CLEARS it
+        var (blanked, blankedError) = form.BuildUpdateRequest();
+        Assert.Null(blankedError);
+        Assert.Equal(string.Empty, blanked.HardwareHint); // "" = CLEAR on the wire
+
+        form.HardwareHint = "  new hint  ";
+        var (value, valueError) = form.BuildUpdateRequest();
+        Assert.Null(valueError);
+        Assert.Equal("new hint", value.HardwareHint); // trimmed
+    }
+
+    [Fact]
+    public void OllamaEdit_SshUserBlank_Clears_ValueSends()
+    {
+        var form = _viewModel.CreateOllamaNodeEditForm(FullOllamaRow());
+        form.SshUser = string.Empty; // the task #144 convention: blank = "" (CLEAR)
+        var (blanked, blankedError) = form.BuildUpdateRequest();
+        Assert.Null(blankedError);
+        Assert.Equal(string.Empty, blanked.SshUser);
+
+        form.SshUser = "  root  ";
+        var (value, valueError) = form.BuildUpdateRequest();
+        Assert.Null(valueError);
+        Assert.Equal("root", value.SshUser); // trimmed
+    }
+
+    [Fact]
+    public void OllamaEdit_SshPortBlank_NoChange_ValueSends()
+    {
+        var form = _viewModel.CreateOllamaNodeEditForm(FullOllamaRow());
+        form.SshPort = string.Empty; // the port wire cannot clear → null (NO CHANGE)
+        var (blanked, blankedError) = form.BuildUpdateRequest();
+        Assert.Null(blankedError);
+        Assert.Null(blanked.SshPort);
+
+        form.SshPort = "22";
+        var (value, valueError) = form.BuildUpdateRequest();
+        Assert.Null(valueError);
+        Assert.Equal(22, value.SshPort);
+    }
+
+    [Fact]
+    public void OllamaEdit_PowerWattsBlank_NoChange_ValueSends()
+    {
+        var form = _viewModel.CreateOllamaNodeEditForm(FullOllamaRow());
+        form.PowerWatts = string.Empty; // no wire clear path → null (NO CHANGE)
+        var (blanked, blankedError) = form.BuildUpdateRequest();
+        Assert.Null(blankedError);
+        Assert.Null(blanked.PowerWatts);
+
+        form.PowerWatts = "125.5";
+        var (value, valueError) = form.BuildUpdateRequest();
+        Assert.Null(valueError);
+        Assert.Equal(125.5, value.PowerWatts);
+    }
+
+    [Fact]
+    public async Task OllamaEdit_Valid_SendsNormalizedUrlAndParsedMaxParallel_RoundTrips()
+    {
+        // Seed the store (the fake 404s an update for an unknown target) — a LOCAL ollama
+        // target, so it is never ssh-probeable and no auto-probes fire.
+        _client.SeedTarget(new RouterTargetConfigDto(
+            "Local", "http://127.0.0.1:11434/", true, "RTX 4090", 2, "ollama", null,
+            [new TargetModelDto("llama3:8b", 8192, "Q4_K_M")], true, 350));
+        _client.FleetResponse = new RouterFleetResponse(
+        [
+            new RouterTargetItem("Local", "http://127.0.0.1:11434/", true, "Online", 12, "local",
+                new RouterTargetHardware("CPU", [], null, 1, 1.0),
+                new RouterTargetExecution(0, null, "-"), null),
+        ]);
+        await _viewModel.RefreshAsync();
+
+        var row = _viewModel.Rows.Single(r => r.Name == "Local");
+        var form = _viewModel.CreateOllamaNodeEditForm(row);
+        form.Url = "http://127.0.0.1:11435/";
+        form.MaxParallel = "3";
+        var (request, error) = form.BuildUpdateRequest();
+        Assert.Null(error);
+        Assert.Equal("http://127.0.0.1:11435", request.Url); // trailing / stripped
+        Assert.Equal(3, request.MaxParallel);
+
+        await _viewModel.EditTargetCommand.ExecuteAsync(("Local", request));
+
+        var sent = Assert.Single(_client.UpdateTargetCalls);
+        Assert.Equal("Local", sent.Name);
+        Assert.Equal(3, sent.Request.MaxParallel);
+        Assert.Equal("http://127.0.0.1:11435", _client.Targets["Local"].Url);
+    }
+
+    [Fact]
+    public void CreateExternalProviderEditForm_PrefillsAllFields_FromTheRow()
+    {
+        // The OpenRouter shape (openai + provider label + key + roster) built directly —
+        // the same values SeedFleet uses for the fleet rows.
+        var row = new FleetTargetRow
+        {
+            Name = "OpenRouter",
+            Url = "https://openrouter.ai/api",
+            Type = "openai",
+            Provider = "OpenRouter",
+            ConfigMaxParallel = 1,
+            ApiKeyConfigured = true,
+            Models = [new TargetModelDto("openrouter/gpt-4o-mini")],
+        };
+
+        var form = _viewModel.CreateExternalProviderEditForm(row);
+
+        Assert.Equal("OpenRouter", form.Name); // get-only identity
+        Assert.Equal("https://openrouter.ai/api", form.BaseUrl);
+        Assert.Equal("1", form.MaxParallel);
+        Assert.Equal("OpenRouter", form.Provider);
+        Assert.True(form.ExistingApiKeyConfigured);
+        Assert.Equal(
+            "A key is stored — leave blank to keep it, or enter a new key to replace it.",
+            form.ApiKeyStatusText);
+        var entry = Assert.Single(form.Models);
+        Assert.Equal("openrouter/gpt-4o-mini", entry.Name);
+        Assert.Equal(string.Empty, entry.ContextLength); // null → blank
+        Assert.Equal(string.Empty, entry.Quantization);
+    }
+
+    [Fact]
+    public void CreateExternalProviderEditForm_NullRow_Throws()
+    {
+        Assert.Throws<ArgumentNullException>(() => _viewModel.CreateExternalProviderEditForm(null!));
+    }
+
+    private static ExternalProviderEditFormViewModel ProviderForm(FleetTargetsViewModel vm) =>
+        vm.CreateExternalProviderEditForm(new FleetTargetRow
+        {
+            Name = "OpenRouter",
+            Url = "https://openrouter.ai/api",
+            Type = "openai",
+            Provider = "OpenRouter",
+            ConfigMaxParallel = 1,
+            ApiKeyConfigured = true,
+            Models = [new TargetModelDto("openrouter/gpt-4o-mini", 128000, null)],
+        });
+
+    [Fact]
+    public void ProviderEdit_BadBaseUrl_Rejects()
+    {
+        var form = ProviderForm(_viewModel);
+        form.BaseUrl = string.Empty; // blank → "http://" → not an absolute http(s) URI
+        Assert.Equal("The target URL must be an absolute http(s) URI.", form.BuildUpdateRequest().Error);
+    }
+
+    [Fact]
+    public void ProviderEdit_BareHostPort_NormalizesToHttp()
+    {
+        var form = ProviderForm(_viewModel);
+        form.BaseUrl = "api.groq.com:443";
+        var (request, error) = form.BuildUpdateRequest();
+        Assert.Null(error);
+        Assert.Equal("http://api.groq.com:443", request.Url);
+    }
+
+    [Fact]
+    public void ProviderEdit_BadMaxParallel_Rejects()
+    {
+        var form = ProviderForm(_viewModel);
+        form.MaxParallel = "0";
+        Assert.Equal("maxParallel must be an integer of 1 or greater.", form.BuildUpdateRequest().Error);
+    }
+
+    [Fact]
+    public void ProviderEdit_RosterBlankName_Rejects()
+    {
+        var form = ProviderForm(_viewModel);
+        form.Models[0].Name = "  ";
+        Assert.Equal("Every roster model needs a name.", form.BuildUpdateRequest().Error);
+    }
+
+    [Fact]
+    public void ProviderEdit_RosterBadContextLength_Rejects()
+    {
+        var form = ProviderForm(_viewModel);
+        form.Models[0].ContextLength = "-1";
+        Assert.Equal(
+            "Model \"openrouter/gpt-4o-mini\": contextLength must be a positive integer (or blank).",
+            form.BuildUpdateRequest().Error);
+        form.Models[0].ContextLength = "abc";
+        Assert.Equal(
+            "Model \"openrouter/gpt-4o-mini\": contextLength must be a positive integer (or blank).",
+            form.BuildUpdateRequest().Error);
+    }
+
+    [Fact]
+    public void ProviderEdit_ApiKeyUntouched_SendsNull()
+    {
+        var (request, error) = ProviderForm(_viewModel).BuildUpdateRequest();
+
+        Assert.Null(error);
+        Assert.Null(request.ApiKey); // untouched = the stored key is KEPT
+    }
+
+    [Fact]
+    public void ProviderEdit_ApiKeyEmptied_SendsEmptyString()
+    {
+        var form = ProviderForm(_viewModel);
+        form.ApiKey = "temp"; // touch the box…
+        form.ApiKey = "";     // …then explicitly empty it → CLEAR
+        var (request, error) = form.BuildUpdateRequest();
+
+        Assert.Null(error);
+        Assert.Equal(string.Empty, request.ApiKey); // "" = CLEAR
+        Assert.True(form.IsApiKeyTouched);
+    }
+
+    [Fact]
+    public void ProviderEdit_ApiKeyReplaced_SendsTheValue()
+    {
+        var form = ProviderForm(_viewModel);
+        form.ApiKey = "  new-key  ";
+        var (request, error) = form.BuildUpdateRequest();
+
+        Assert.Null(error);
+        Assert.Equal("new-key", request.ApiKey); // trimmed = REPLACE
+    }
+
+    [Fact]
+    public void ProviderEdit_ProviderBlank_Clears_ValueSendsTrimmed()
+    {
+        var form = ProviderForm(_viewModel);
+        form.Provider = string.Empty; // D1: blanking the pre-filled label CLEARS it
+        var (blanked, blankedError) = form.BuildUpdateRequest();
+        Assert.Null(blankedError);
+        Assert.Equal(string.Empty, blanked.Provider);
+
+        form.Provider = "  Groq  ";
+        var (value, valueError) = form.BuildUpdateRequest();
+        Assert.Null(valueError);
+        Assert.Equal("Groq", value.Provider);
+    }
+
+    [Fact]
+    public void ProviderEdit_RosterUnchanged_RoundTripsEntries()
+    {
+        var (request, error) = ProviderForm(_viewModel).BuildUpdateRequest();
+
+        Assert.Null(error);
+        var model = Assert.Single(request.Models!);
+        Assert.Equal("openrouter/gpt-4o-mini", model.Name);
+        Assert.Equal(128000, model.ContextLength);
+        Assert.Null(model.Quantization); // blank → null per entry
+    }
+
+    [Fact]
+    public void ProviderEdit_AllRowsRemoved_SendsEmptyList_Clears()
+    {
+        var form = ProviderForm(_viewModel); // the row HAD a roster at open (D2)
+        form.RemoveModelRowCommand.Execute(form.Models[0]);
+        Assert.Empty(form.Models);
+
+        var (request, error) = form.BuildUpdateRequest();
+
+        Assert.Null(error);
+        Assert.NotNull(request.Models); // NOT null — a provided empty list CLEARS the roster
+        Assert.Empty(request.Models);
+    }
+
+    [Fact]
+    public void ProviderEdit_NeverHadRoster_NoRowsAdded_SendsNull()
+    {
+        var form = _viewModel.CreateExternalProviderEditForm(new FleetTargetRow
+        {
+            Name = "Plain",
+            Url = "https://api.example.com/v1",
+            Type = "openai",
+            ConfigMaxParallel = 1,
+        }); // no roster at open, none added → NO CHANGE (no config.json diff on an untouched save)
+
+        var (request, error) = form.BuildUpdateRequest();
+
+        Assert.Null(error);
+        Assert.Null(request.Models);
+    }
+
+    [Fact]
+    public void ProviderEdit_NeverHadRoster_RowsAdded_SendsTheList()
+    {
+        var form = _viewModel.CreateExternalProviderEditForm(new FleetTargetRow
+        {
+            Name = "Plain",
+            Url = "https://api.example.com/v1",
+            Type = "openai",
+            ConfigMaxParallel = 1,
+        });
+        form.AddModelRowCommand.Execute(null);
+        form.Models[0].Name = "some-model";
+
+        var (request, error) = form.BuildUpdateRequest();
+
+        Assert.Null(error);
+        var model = Assert.Single(request.Models!);
+        Assert.Equal("some-model", model.Name);
+    }
+
+    [Fact]
+    public void ProviderEdit_NeverSendsTypePowerWattsHardwareHintSsh()
+    {
+        var (request, error) = ProviderForm(_viewModel).BuildUpdateRequest();
+
+        Assert.Null(error);
+        Assert.Null(request.Enabled);
+        Assert.Null(request.Type); // D3
+        Assert.Null(request.PowerWatts); // fields not offered → NO CHANGE
+        Assert.Null(request.HardwareHint);
+        Assert.Null(request.SshUser);
+        Assert.Null(request.SshPort);
+    }
+
+    [Fact]
+    public void ProviderEdit_RosterRowCommands_AddAndRemove()
+    {
+        var form = ProviderForm(_viewModel);
+
+        form.AddModelRowCommand.Execute(null);
+        Assert.Equal(2, form.Models.Count);
+        Assert.Equal(string.Empty, form.Models[1].Name);
+        Assert.Equal(string.Empty, form.Models[1].ContextLength);
+        Assert.Equal(string.Empty, form.Models[1].Quantization);
+
+        var target = form.Models[0];
+        form.RemoveModelRowCommand.Execute(target);
+        Assert.DoesNotContain(target, form.Models);
+        form.RemoveModelRowCommand.Execute(null); // null-safe no-op
+        Assert.Single(form.Models);
+    }
+
+    [Fact]
+    public async Task ProviderEdit_RoundTripsThroughTheStore()
+    {
+        // Seed the store (the fake 404s an update for an unknown target) — no fleet entries,
+        // so no auto-probes.
+        _client.SeedTarget(new RouterTargetConfigDto(
+            "OpenRouter", "https://openrouter.ai/api", true, null, 1, "openai", "OpenRouter",
+            [new TargetModelDto("openrouter/gpt-4o-mini", 128000, null)], true, null));
+        await _viewModel.RefreshAsync();
+
+        var form = ProviderForm(_viewModel);
+        form.BaseUrl = "https://openrouter.ai/api";
+        form.ApiKey = "new-key";
+        form.Models[0].Name = "openrouter/gpt-5-mini";
+        form.Models[0].Quantization = "FP8";
+        var (request, error) = form.BuildUpdateRequest();
+        Assert.Null(error);
+
+        await _viewModel.EditTargetCommand.ExecuteAsync(("OpenRouter", request));
+
+        var sent = Assert.Single(_client.UpdateTargetCalls);
+        Assert.Equal("OpenRouter", sent.Name);
+        Assert.Equal("new-key", sent.Request.ApiKey);
+        Assert.Null(sent.Request.Type); // the protocol family was never sent
+        var model = Assert.Single(sent.Request.Models!);
+        Assert.Equal("openrouter/gpt-5-mini", model.Name);
+        Assert.Equal("FP8", model.Quantization);
+        // The store keeps only the configured flag (key material never persisted in the fake).
+        Assert.True(_client.Targets["OpenRouter"].ApiKeyConfigured);
+    }
+
+    // -- Task #171: the edit-dispatch routing (FleetTargetsView predicate) -----------
+
+    [Theory]
+    [InlineData("openai", true)]
+    [InlineData("OpenAI", true)]
+    [InlineData("OLLAMA", false)] // case-insensitive match ONLY for openai
+    [InlineData("ollama", false)]
+    [InlineData("OSNATIVE", false)]
+    [InlineData("custom", false)]
+    [InlineData("", false)]
+    [InlineData(null, false)]
+    public static void UseExternalProviderEditDialog_RoutesOnlyOpenai_CaseInsensitive(
+        string? type, bool expected)
+    {
+        Assert.Equal(expected, OllamaRouter.App.Views.FleetTargetsView.UseExternalProviderEditDialog(type));
     }
 
     /// <inheritdoc />

@@ -1,0 +1,77 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:OllamaRouter.App.ViewModels"
+        x:Class="OllamaRouter.App.Views.Dialogs.EditOllamaNodeDialog"
+        x:DataType="vm:OllamaNodeEditFormViewModel"
+        Title="Edit Ollama Node"
+        Width="640" Height="640"
+        WindowStartupLocation="CenterOwner">
+  <DockPanel Margin="8">
+    <!-- Severity banner (task #171, AC4): the validation error renders in the
+         SemiColorDangerLight card, bound to the form's error state. -->
+    <Border DockPanel.Dock="Top"
+            Padding="10,8"
+            CornerRadius="8"
+            Margin="0,0,0,6"
+            Background="{DynamicResource SemiColorDangerLight}"
+            BorderBrush="{DynamicResource SemiColorDanger}"
+            BorderThickness="1"
+            IsVisible="{Binding HasValidationError}">
+      <TextBlock Text="{Binding ValidationErrorMessage}"
+                 TextWrapping="Wrap"
+                 Foreground="{DynamicResource NightCodeAccentCrimsonLightText}"/>
+    </Border>
+
+    <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="8" Margin="0,6,0,0">
+      <Button Content="Cancel" Click="OnCancelClick" MinWidth="90"/>
+      <Button Content="Save" Classes="Primary" Click="OnSaveClick" MinWidth="90"/>
+    </StackPanel>
+
+    <ScrollViewer>
+      <StackPanel Spacing="8">
+        <!-- NightCodeForge form card (task #171). -->
+        <Border Padding="12"
+                CornerRadius="8"
+                Background="{DynamicResource NightCodeBgSurface}"
+                BorderBrush="{DynamicResource SemiColorBorder}"
+                BorderThickness="1">
+          <Grid ColumnDefinitions="140,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto,Auto" RowSpacing="6" ColumnSpacing="8">
+            <TextBlock Grid.Row="0" Grid.Column="0" Text="Name:" VerticalAlignment="Center"/>
+            <!-- D5 (task #171): the name is READ-ONLY identity — the PUT path parameter. -->
+            <TextBox Grid.Row="0" Grid.Column="1" IsEnabled="False"
+                     Text="{Binding Name, Mode=OneWay}"
+                     PlaceholderText="read-only identity"/>
+
+            <TextBlock Grid.Row="1" Grid.Column="0" Text="URL:" VerticalAlignment="Center"/>
+            <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding Url}"
+                     PlaceholderText="http://127.0.0.1:11434"/>
+
+            <TextBlock Grid.Row="2" Grid.Column="0" Text="Max Parallel:" VerticalAlignment="Center"/>
+            <TextBox Grid.Row="2" Grid.Column="1" Text="{Binding MaxParallel}"
+                     PlaceholderText="1"/>
+
+            <TextBlock Grid.Row="3" Grid.Column="0" Text="Hardware Hint:" VerticalAlignment="Center"
+                       ToolTip.Tip="Free-form routing hint. Blank = clear the stored hint."/>
+            <TextBox Grid.Row="3" Grid.Column="1" Text="{Binding HardwareHint}"
+                     PlaceholderText="e.g. RTX 4090 24GB"/>
+
+            <TextBlock Grid.Row="4" Grid.Column="0" Text="Power (W):" VerticalAlignment="Center"
+                       ToolTip.Tip="Node power-draw override; blank = no change (clearing a set override requires editing config/config.json)."/>
+            <TextBox Grid.Row="4" Grid.Column="1" Text="{Binding PowerWatts}"
+                     PlaceholderText="e.g. 350"/>
+
+            <TextBlock Grid.Row="5" Grid.Column="0" Text="SSH User:" VerticalAlignment="Center"
+                       ToolTip.Tip="ssh user for the daemon-side hardware probe; the host is the target URL's host (key-based auth, no password). Blank = clear."/>
+            <TextBox Grid.Row="5" Grid.Column="1" Text="{Binding SshUser}"
+                     PlaceholderText="e.g. gpuadmin"/>
+
+            <TextBlock Grid.Row="6" Grid.Column="0" Text="SSH Port:" VerticalAlignment="Center"
+                       ToolTip.Tip="ssh port of the daemon-side hardware probe; blank = the default port 22 / no change (clearing a set port requires editing config/config.json)."/>
+            <TextBox Grid.Row="6" Grid.Column="1" Text="{Binding SshPort}"
+                     PlaceholderText="e.g. 2222"/>
+          </Grid>
+        </Border>
+      </StackPanel>
+    </ScrollViewer>
+  </DockPanel>
+</Window>
