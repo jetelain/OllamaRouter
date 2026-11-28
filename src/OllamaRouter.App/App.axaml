@@ -23,5 +23,29 @@
   </Application.Resources>
   <Application.Styles>
     <semi:SemiTheme Locale="en-US" />
+    <Style Selector="Button.Primary">
+      <Setter Property="Background" Value="{DynamicResource ButtonSolidPrimaryBackground}" />
+      <Setter Property="Foreground" Value="{DynamicResource ButtonSolidForeground}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource ButtonSolidPrimaryBorderBrush}" />
+    </Style>
+    <Style Selector="Button.Primary /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource ButtonSolidPrimaryBackground}" />
+      <Setter Property="Foreground" Value="{DynamicResource ButtonSolidForeground}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource ButtonSolidPrimaryBorderBrush}" />
+    </Style>
+    <Style Selector="Button.Primary:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource ButtonSolidPrimaryPointeroverBackground}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource ButtonSolidPrimaryPointeroverBorderBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource ButtonSolidForeground}" />
+    </Style>
+    <Style Selector="Button.Primary:pressed /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource ButtonSolidPrimaryPressedBackground}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource ButtonSolidPrimaryPressedBorderBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource ButtonSolidPrimaryPressedForeground}" />
+    </Style>
+    <Style Selector="Button.Primary:disabled /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource ButtonSolidDisabledBackground}" />
+      <Setter Property="Foreground" Value="{DynamicResource ButtonSolidDisabledForeground}" />
+    </Style>
   </Application.Styles>
 </Application>

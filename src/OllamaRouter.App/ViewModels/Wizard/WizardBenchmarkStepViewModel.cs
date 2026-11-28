@@ -273,6 +273,23 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
 
     public bool IsBenchmarkRunning => BenchmarkRows.ToList().Any(r => !IsTerminal(r.Status));
 
+    /// <summary>Whether Run benchmarks should be the Primary CTA (when idle without results).</summary>
+    public bool IsRunPrimary => !IsBenchmarkRunning && !HasResultRows;
+
+    /// <summary>Whether the overall progress bar should be shown (running or has benchmark rows).</summary>
+    public bool ShowProgressBar => IsBenchmarkRunning || HasBenchmarkRows;
+
+    /// <summary>Whether the idle guidance hint should be shown instead of an empty progress bar.</summary>
+    public bool ShowIdleHint => !IsBenchmarkRunning && !HasBenchmarkRows;
+
+    /// <summary>Actionable idle hint shown before benchmarks are started.</summary>
+    public string IdleHintText => HasSelectedCandidate
+        ? "Ready: click 'Run benchmarks' and wait for completion before continuing."
+        : "Select at least one candidate model below, then click 'Run benchmarks'.";
+
+    /// <summary>Whether the benchmark completion banner should be shown.</summary>
+    public bool ShowCompletionBanner => !IsBenchmarkRunning && HasResultRows && !HasError;
+
     public double ProgressPercent
     {
         get
@@ -779,7 +796,11 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
     }
 
     private void NotifyRunCanExecute() =>
-        AppUiThread.InvokeOrPost(() => RunBenchmarksCommand.NotifyCanExecuteChanged());
+        AppUiThread.InvokeOrPost(() =>
+        {
+            RunBenchmarksCommand.NotifyCanExecuteChanged();
+            OnPropertyChanged(nameof(IdleHintText));
+        });
 
     /// <summary>Builds the benchmark/result rows on the calling thread, then marshles one
     /// UI-thread action that rebuilds BOTH <see cref="BenchmarkRows"/> and
@@ -841,6 +862,11 @@ public sealed partial class WizardBenchmarkStepViewModel : ObservableObject, IWi
         OnPropertyChanged(nameof(HasBenchmarkRows));
         OnPropertyChanged(nameof(HasResultRows));
         OnPropertyChanged(nameof(IsBenchmarkRunning));
+        OnPropertyChanged(nameof(IsRunPrimary));
+        OnPropertyChanged(nameof(ShowProgressBar));
+        OnPropertyChanged(nameof(ShowIdleHint));
+        OnPropertyChanged(nameof(IdleHintText));
+        OnPropertyChanged(nameof(ShowCompletionBanner));
         OnPropertyChanged(nameof(ProgressPercent));
         OnPropertyChanged(nameof(ProgressSummaryText));
     }

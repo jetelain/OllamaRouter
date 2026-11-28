@@ -7,6 +7,20 @@
   <ScrollViewer>
     <StackPanel Spacing="12">
 
+      <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4" />
+
+      <Border IsVisible="{Binding HasMessage}"
+              Padding="10,8"
+              CornerRadius="6"
+              Background="{Binding MessageIsError, Converter={x:Static conv:BoolToBannerBackgroundConverter.Instance}}"
+              BorderBrush="{Binding MessageIsError, Converter={x:Static conv:BoolToBannerBorderConverter.Instance}}"
+              BorderThickness="1">
+        <TextBlock Text="{Binding Message}"
+                   FontSize="12"
+                   TextWrapping="Wrap"
+                   Foreground="{Binding MessageIsError, Converter={x:Static conv:BoolToMessageForegroundConverter.Instance}}" />
+      </Border>
+      
       <!-- Step Intro Card -->
       <Border Padding="14"
               CornerRadius="8"
@@ -135,20 +149,6 @@
           <TextBlock Text="export OLLAMA_KV_CACHE_TYPE=q8_0" FontFamily="Consolas,Menlo,monospace" FontSize="12" />
           <TextBlock Text="ollama serve   # then: ollamarouter start" FontFamily="Consolas,Menlo,monospace" FontSize="12" />
         </StackPanel>
-      </Border>
-
-      <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4" />
-
-      <Border IsVisible="{Binding HasMessage}"
-              Padding="10,8"
-              CornerRadius="6"
-              Background="{Binding MessageIsError, Converter={x:Static conv:BoolToBannerBackgroundConverter.Instance}}"
-              BorderBrush="{Binding MessageIsError, Converter={x:Static conv:BoolToBannerBorderConverter.Instance}}"
-              BorderThickness="1">
-        <TextBlock Text="{Binding Message}"
-                   FontSize="12"
-                   TextWrapping="Wrap"
-                   Foreground="{Binding MessageIsError, Converter={x:Static conv:BoolToMessageForegroundConverter.Instance}}" />
       </Border>
 
     </StackPanel>

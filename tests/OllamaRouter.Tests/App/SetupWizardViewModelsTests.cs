@@ -5147,4 +5147,84 @@ public sealed class SetupWizardViewModelsTests
 
         await vm.DisposeAsync();
     }
+
+    [Fact]
+    public async Task Step4_FooterAndPrimaryEmphasis_GatesWhileRunning_AndPromotesNextOnCompletion()
+    {
+        var fake = new FakeRouterApiClient();
+        var fx = BuildRoot(fake);
+        await fx.Root.GoToAsync(3);
+
+        // Idle without results: Next is "Skip" (non-Primary) and Run benchmarks is Primary
+        Assert.True(fx.Root.ShowNextButton);
+        Assert.False(fx.Root.ShowFinishButton);
+        Assert.Equal("Skip", fx.Root.NextButtonText);
+        Assert.False(fx.Root.IsNextPrimary);
+        Assert.True(fx.Root.CanGoNext);
+        Assert.True(fx.Bench.IsRunPrimary);
+        Assert.True(fx.Bench.ShowIdleHint);
+        Assert.False(fx.Bench.ShowProgressBar);
+        Assert.False(fx.Bench.ShowCompletionBanner);
+
+        // While running: Next is disabled, progress bar is shown
+        fake.BenchmarkResults = new RouterBenchmarkResultsResponse(
+        [
+            new BenchmarkTargetResult("Local", BenchmarkRunStatus.Running, DateTimeOffset.UtcNow, null, [])
+        ]);
+        await fx.Bench.RefreshAsync();
+        Assert.True(fx.Bench.IsBenchmarkRunning);
+        Assert.False(fx.Root.CanGoNext);
+        Assert.False(fx.Root.NextCommand.CanExecute(null));
+        Assert.False(fx.Root.IsNextPrimary);
+        Assert.False(fx.Bench.IsRunPrimary);
+        Assert.False(fx.Bench.ShowIdleHint);
+        Assert.True(fx.Bench.ShowProgressBar);
+
+        // Once completed with results: Next becomes "Next" and Primary, completion banner appears
+        fake.BenchmarkResults = new RouterBenchmarkResultsResponse(
+        [
+            new BenchmarkTargetResult("Local", BenchmarkRunStatus.Succeeded, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow,
+            [
+                new BenchmarkContextResult("qwen3:8b", UsageRole.BasicModel, 8192, 512,
+                    20_000_000_000L, 42.5, 900.0, true, null)
+            ])
+        ]);
+        await fx.Bench.RefreshAsync();
+        Assert.False(fx.Bench.IsBenchmarkRunning);
+        Assert.True(fx.Root.CanGoNext);
+        Assert.Equal("Next", fx.Root.NextButtonText);
+        Assert.True(fx.Root.IsNextPrimary);
+        Assert.False(fx.Bench.IsRunPrimary);
+        Assert.True(fx.Bench.ShowCompletionBanner);
+
+        await fx.Root.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Step5_AutoGeneratesAndAppliesOnEntry_AndHandles409Conflict()
+    {
+        var fake = new FakeRouterApiClient();
+        var fx = BuildRoot(fake);
+        await fx.Root.GoToAsync(4);
+
+        Assert.False(fx.Root.ShowNextButton);
+        Assert.True(fx.Root.ShowFinishButton);
+        Assert.NotEmpty(fx.Rec.AppliedTargets);
+        Assert.True(fx.Root.IsFinishPrimary);
+        Assert.False(fx.Rec.IsGenerateAndApplyPrimary);
+        Assert.False(fx.Rec.ShowGoToBenchmark);
+
+        // 409 on entry surfaces Go to benchmark and keeps Finish non-Primary
+        var conflictFake = new FakeRouterApiClient { GenerateError = (HttpStatusCode.Conflict, "none") };
+        var conflictFx = BuildRoot(conflictFake);
+        await conflictFx.Root.GoToAsync(4);
+
+        Assert.True(conflictFx.Rec.MessageIsError);
+        Assert.True(conflictFx.Rec.ShowGoToBenchmark);
+        Assert.True(conflictFx.Rec.IsGenerateAndApplyPrimary);
+        Assert.False(conflictFx.Root.IsFinishPrimary);
+
+        await fx.Root.DisposeAsync();
+        await conflictFx.Root.DisposeAsync();
+    }
 }

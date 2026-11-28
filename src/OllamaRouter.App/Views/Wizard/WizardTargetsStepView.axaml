@@ -7,6 +7,20 @@
   <ScrollViewer>
     <StackPanel Spacing="12">
 
+      <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4" />
+
+      <Border IsVisible="{Binding HasMessage}"
+              Padding="10,8"
+              CornerRadius="6"
+              Background="{Binding MessageIsError, Converter={x:Static conv:BoolToBannerBackgroundConverter.Instance}}"
+              BorderBrush="{Binding MessageIsError, Converter={x:Static conv:BoolToBannerBorderConverter.Instance}}"
+              BorderThickness="1">
+        <TextBlock Text="{Binding Message}"
+                   FontSize="12"
+                   TextWrapping="Wrap"
+                   Foreground="{Binding MessageIsError, Converter={x:Static conv:BoolToMessageForegroundConverter.Instance}}" />
+      </Border>
+      
       <!-- Header Card -->
       <Border Padding="14"
               CornerRadius="8"
@@ -80,20 +94,6 @@
                      Foreground="{DynamicResource SemiColorText2}"
                      TextWrapping="Wrap" />
         </StackPanel>
-      </Border>
-
-      <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4" />
-
-      <Border IsVisible="{Binding HasMessage}"
-              Padding="10,8"
-              CornerRadius="6"
-              Background="{Binding MessageIsError, Converter={x:Static conv:BoolToBannerBackgroundConverter.Instance}}"
-              BorderBrush="{Binding MessageIsError, Converter={x:Static conv:BoolToBannerBorderConverter.Instance}}"
-              BorderThickness="1">
-        <TextBlock Text="{Binding Message}"
-                   FontSize="12"
-                   TextWrapping="Wrap"
-                   Foreground="{Binding MessageIsError, Converter={x:Static conv:BoolToMessageForegroundConverter.Instance}}" />
       </Border>
 
     </StackPanel>

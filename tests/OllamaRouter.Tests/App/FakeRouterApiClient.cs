@@ -149,6 +149,10 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
     /// AWAITs it before responding (then it is cleared).</summary>
     public Task? BenchmarkResultsBlock { get; set; }
 
+    /// <summary>Optional per-call gates dequeued one per <c>GetBenchmarkResultsAsync</c> call
+    /// for deterministic step-by-step poll progression.</summary>
+    public Queue<Task>? BenchmarkResultsGates { get; set; }
+
     /// <summary>FIFO override of the <c>GET /api/router/benchmark/results</c> payloads
     /// (task #174 — the post-install benchmark polling tests): while non-empty, each call
     /// DEQUEUES and serves the next item; otherwise the scripted
@@ -860,6 +864,11 @@ internal sealed class FakeRouterApiClient : IOllamaRouterApiClient, IDisposable
         {
             BenchmarkResultsBlock = null;
             await block;
+        }
+
+        if (BenchmarkResultsGates is { Count: > 0 })
+        {
+            await BenchmarkResultsGates.Dequeue();
         }
 
         var response = BenchmarkResultsQueue is { Count: > 0 } ? BenchmarkResultsQueue.Dequeue() : BenchmarkResults;

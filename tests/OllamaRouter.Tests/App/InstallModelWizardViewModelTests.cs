@@ -1039,13 +1039,7 @@ public sealed class InstallModelWizardViewModelTests
         var fake = MakeFake();
         var vm = await WalkToReviewAsync(fake);
         vm.ReviewStep.RunBenchmarkAfterInstall = true;
-        // 50 ms poll interval: Task.Delay never fires EARLY, so every intermediate live state
-        // (download note / benchmarking note) dwells >= 50 ms — comfortably observable by the
-        // sub-millisecond wait beats — while the whole scripted phase still settles in ~0.15 s.
-        // (1 ms worked on healthy machines but the coarsened tick's dwell can shrink to the
-        // timer resolution under suite load, and a starved tick once exceeded 2 s — see the
-        // WaitUntilAsync wall-clock floor below.)
-        vm.ReviewStep.BenchmarkPollInterval = TimeSpan.FromMilliseconds(50);
+        vm.ReviewStep.BenchmarkPollInterval = TimeSpan.FromMilliseconds(1);
 
         // Scripted poll sequence (FIFO): Alpha Running (mid-download) → Alpha terminal
         // (viable 32768 @ 24.3 t/s) → Beta Running (mid-benchmark) → Beta terminal
@@ -1057,8 +1051,11 @@ public sealed class InstallModelWizardViewModelTests
         var nonViableMeasured = new BenchmarkContextResult(
             Model, UsageRole.AgenticChat, 8192, 512, 12_000_000_000L, 3.5, 250.0, false, null);
 
-        var firstPollGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        fake.BenchmarkResultsBlock = firstPollGate.Task; // parks the very first poll
+        var poll1Gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var poll2Gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var poll3Gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var poll4Gate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        fake.BenchmarkResultsGates = new Queue<Task>([poll1Gate.Task, poll2Gate.Task, poll3Gate.Task, poll4Gate.Task]);
         fake.BenchmarkResultsQueue = new Queue<RouterBenchmarkResultsResponse>(
         [
             new([new BenchmarkTargetResult("Alpha", BenchmarkRunStatus.Running, null, null, [], DownloadProgress())]),
@@ -1071,8 +1068,7 @@ public sealed class InstallModelWizardViewModelTests
         var beta = vm.ReviewStep.Rows[1]!;
 
         var installTask = vm.ReviewStep.InstallCommand.ExecuteAsync(null);
-        // Release the parked poll (a pre-completed TCS would pass through equally well).
-        firstPollGate.TrySetResult(true);
+        poll1Gate.TrySetResult(true);
 
         // Alpha's live feedback: the download message + the pinned fractional bar
         // (0.2 + 0.3 · 1.925560320/4.613734400, single candidate ⇒ 100× the raw inner value).
@@ -1083,6 +1079,7 @@ public sealed class InstallModelWizardViewModelTests
         Assert.False(alpha.HasBenchmarkSummary);
 
         // Alpha goes terminal: the note + bar clear, the summary renders (largest VIABLE ctx).
+        poll2Gate.TrySetResult(true);
         await WaitUntilAsync(() => alpha.BenchmarkSummaryText == "max viable ctx 32768 @ 24.3 t/s");
         Assert.Null(alpha.BenchmarkNote);
         Assert.Equal(-1, alpha.BenchmarkProgressValue);
@@ -1090,8 +1087,10 @@ public sealed class InstallModelWizardViewModelTests
 
         // THEN (strictly sequential — single-flight server run) Beta's phase runs: its live
         // benchmarking note + the (ci+inner)/cc fraction (1 + 0.7) / 5 = 34.0.
+        poll3Gate.TrySetResult(true);
         await WaitUntilAsync(() => beta.BenchmarkNote == "Benchmarking llama3.2:13b-q4_K_M @ 32768 ctx (model 2/5, rung 1/3)");
         Assert.Equal(34.0, beta.BenchmarkProgressValue, 10);
+        poll4Gate.TrySetResult(true);
         await WaitUntilAsync(() => beta.BenchmarkSummaryText == "no viable context");
 
         await installTask;

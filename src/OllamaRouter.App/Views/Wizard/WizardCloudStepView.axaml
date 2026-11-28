@@ -6,6 +6,26 @@
   <ScrollViewer>
     <StackPanel Spacing="12">
 
+      <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4" />
+
+      <Border IsVisible="{Binding HasMessage}"
+              Padding="10,8"
+              CornerRadius="6"
+              Background="{DynamicResource SemiColorSuccessLight}"
+              BorderBrush="{DynamicResource SemiColorSuccess}"
+              BorderThickness="1">
+        <TextBlock Text="{Binding Message}" FontSize="12" TextWrapping="Wrap" Foreground="{DynamicResource SemiColorSuccess}" />
+      </Border>
+
+      <Border IsVisible="{Binding HasError}"
+              Padding="10,8"
+              CornerRadius="6"
+              Background="{DynamicResource SemiColorDangerLight}"
+              BorderBrush="{DynamicResource SemiColorDanger}"
+              BorderThickness="1">
+        <TextBlock Text="{Binding Error}" FontSize="12" TextWrapping="Wrap" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" />
+      </Border>
+
       <!-- Step Intro Card -->
       <Border Padding="14"
               CornerRadius="8"
@@ -85,25 +105,6 @@
                      IsVisible="{Binding ShowRelaySignInHint}"
                      Text="Cloud relay needs an ollama.com sign-in on a fleet node." />
 
-          <ProgressBar IsIndeterminate="True" IsVisible="{Binding IsBusy}" Height="4" />
-
-          <Border IsVisible="{Binding HasMessage}"
-                  Padding="10,8"
-                  CornerRadius="6"
-                  Background="{DynamicResource SemiColorSuccessLight}"
-                  BorderBrush="{DynamicResource SemiColorSuccess}"
-                  BorderThickness="1">
-            <TextBlock Text="{Binding Message}" FontSize="12" TextWrapping="Wrap" Foreground="{DynamicResource SemiColorSuccess}" />
-          </Border>
-
-          <Border IsVisible="{Binding HasError}"
-                  Padding="10,8"
-                  CornerRadius="6"
-                  Background="{DynamicResource SemiColorDangerLight}"
-                  BorderBrush="{DynamicResource SemiColorDanger}"
-                  BorderThickness="1">
-            <TextBlock Text="{Binding Error}" FontSize="12" TextWrapping="Wrap" Foreground="{DynamicResource NightCodeAccentCrimsonLightText}" />
-          </Border>
         </StackPanel>
       </Border>
 

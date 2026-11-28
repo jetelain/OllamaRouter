@@ -375,7 +375,7 @@ public sealed class SetupWizardWindowLayoutTests : IClassFixture<SetupWizardWind
             var buttons = stepView.GetLogicalDescendants().OfType<Button>()
                 .Select(b => b.Content as string ?? string.Empty)
                 .ToArray();
-            Assert.Equal(["Generate & Apply", "Generate", "Apply", "Go to benchmark"], buttons);
+            Assert.Equal(["Generate & Apply", "Go to benchmark"], buttons);
             var texts = stepView.GetLogicalDescendants().OfType<TextBlock>().Select(t => t.Text).ToArray();
             Assert.Contains("Roles", texts);
             Assert.Contains("Models", texts);

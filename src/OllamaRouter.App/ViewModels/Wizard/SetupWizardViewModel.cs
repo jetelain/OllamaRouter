@@ -135,11 +135,31 @@ public sealed partial class SetupWizardViewModel : ObservableObject, IAsyncDispo
     /// <summary>Whether Back is available (not on step 0 and not busy).</summary>
     public bool CanGoBack => SelectedStep > 0 && !IsAnyStepBusy;
 
-    /// <summary>Whether Next is available (not on the last step, 4, and not busy).</summary>
-    public bool CanGoNext => SelectedStep < 4 && !IsAnyStepBusy;
+    /// <summary>Whether Next is available (not on the last step, 4, not busy, and not mid-benchmark on Step 4).</summary>
+    public bool CanGoNext => SelectedStep < 4 && !IsAnyStepBusy && !(SelectedStep == 3 && BenchmarkStep.IsBenchmarkRunning);
 
     /// <summary>Whether Finish is available (only on the last step, 4, and not busy).</summary>
     public bool CanFinish => SelectedStep == 4 && !IsAnyStepBusy;
+
+    /// <summary>Whether the Next button is visible in the footer (hidden on Step 5).</summary>
+    public bool ShowNextButton => SelectedStep < 4;
+
+    /// <summary>Whether the Finish button is visible in the footer (only on Step 5).</summary>
+    public bool ShowFinishButton => SelectedStep == 4;
+
+    /// <summary>Label for the footer forward button ("Skip" on Step 4 when no benchmark results exist yet).</summary>
+    public string NextButtonText =>
+        SelectedStep == 3 && !BenchmarkStep.HasResultRows && !BenchmarkStep.IsBenchmarkRunning
+            ? "Skip"
+            : "Next";
+
+    /// <summary>Whether the Next button should use Primary emphasis (demoted on Step 4 until benchmark results are ready).</summary>
+    public bool IsNextPrimary =>
+        SelectedStep != 3 || (BenchmarkStep.HasResultRows && !BenchmarkStep.IsBenchmarkRunning);
+
+    /// <summary>Whether the Finish button should use Primary emphasis (once recommendations are applied).</summary>
+    public bool IsFinishPrimary =>
+        SelectedStep == 4 && (RecommendationsStep.HasAppliedTargets || RecommendationsStep.GeneratedAt is not null);
 
     /// <summary>Status pill text displayed in the wizard header.</summary>
     public string DaemonBadgeText => _connection.DaemonLauncher is null
@@ -317,7 +337,9 @@ public sealed partial class SetupWizardViewModel : ObservableObject, IAsyncDispo
 
     private void OnStepPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
-        if (e.PropertyName == nameof(WizardEnvironmentStepViewModel.IsBusy))
+        if (e.PropertyName is nameof(WizardEnvironmentStepViewModel.IsBusy)
+            || (ReferenceEquals(sender, BenchmarkStep) && e.PropertyName is nameof(WizardBenchmarkStepViewModel.IsBenchmarkRunning) or nameof(WizardBenchmarkStepViewModel.HasResultRows))
+            || (ReferenceEquals(sender, RecommendationsStep) && e.PropertyName is nameof(WizardRecommendationsStepViewModel.HasAppliedTargets) or nameof(WizardRecommendationsStepViewModel.GeneratedAt)))
         {
             NotifyNavigationStateChanged();
         }
@@ -395,6 +417,11 @@ public sealed partial class SetupWizardViewModel : ObservableObject, IAsyncDispo
             OnPropertyChanged(nameof(CanGoBack));
             OnPropertyChanged(nameof(CanGoNext));
             OnPropertyChanged(nameof(CanFinish));
+            OnPropertyChanged(nameof(ShowNextButton));
+            OnPropertyChanged(nameof(ShowFinishButton));
+            OnPropertyChanged(nameof(NextButtonText));
+            OnPropertyChanged(nameof(IsNextPrimary));
+            OnPropertyChanged(nameof(IsFinishPrimary));
             BackCommand.NotifyCanExecuteChanged();
             NextCommand.NotifyCanExecuteChanged();
             FinishCommand.NotifyCanExecuteChanged();

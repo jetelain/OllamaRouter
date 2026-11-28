@@ -124,6 +124,12 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
 
     public bool HasAppliedTargets => AppliedTargets.Count > 0;
 
+    /// <summary>Whether Generate &amp; Apply should be Primary (when not yet applied and not busy).</summary>
+    public bool IsGenerateAndApplyPrimary => !HasAppliedTargets && !IsBusy;
+
+    /// <summary>Whether the Go to benchmark recovery button is visible (when 409 indicates missing benchmarks).</summary>
+    public bool ShowGoToBenchmark => _canGoToBenchmark;
+
     partial void OnMessageChanged(string? value) => OnPropertyChanged(nameof(HasMessage));
 
     /// <summary>One-line generated-counts summary (raises <see cref="PropertyChanged"/> below).</summary>
@@ -188,7 +194,11 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
             var generated = await _clientAccessor().GenerateRecommendationsAsync().ConfigureAwait(false);
             generatedOk = true;
             _canGoToBenchmark = false;
-            AppUiThread.InvokeOrPost(() => GoToBenchmarkCommand.NotifyCanExecuteChanged());
+            AppUiThread.InvokeOrPost(() =>
+            {
+                GoToBenchmarkCommand.NotifyCanExecuteChanged();
+                OnPropertyChanged(nameof(ShowGoToBenchmark));
+            });
             GeneratedAt = generated.GeneratedAt;
             RolesAssigned = generated.Recommendations.Roles.Count;
             NodesConfigured = generated.Targets.Count;
@@ -212,6 +222,7 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
                     }
                 }
                 OnPropertyChanged(nameof(HasAppliedTargets));
+                OnPropertyChanged(nameof(IsGenerateAndApplyPrimary));
             });
 
             MessageIsError = false;
@@ -229,7 +240,11 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
                 MessageIsError = true;
                 Message = "No benchmark results available — run the Step 4 micro-benchmark first";
                 _canGoToBenchmark = true;
-                AppUiThread.InvokeOrPost(() => GoToBenchmarkCommand.NotifyCanExecuteChanged());
+                AppUiThread.InvokeOrPost(() =>
+                {
+                    GoToBenchmarkCommand.NotifyCanExecuteChanged();
+                    OnPropertyChanged(nameof(ShowGoToBenchmark));
+                });
             }
             else
             {
@@ -265,7 +280,11 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
         {
             var response = await _clientAccessor().GenerateRecommendationsAsync().ConfigureAwait(false);
             _canGoToBenchmark = false;
-            AppUiThread.InvokeOrPost(() => GoToBenchmarkCommand.NotifyCanExecuteChanged());
+            AppUiThread.InvokeOrPost(() =>
+            {
+                GoToBenchmarkCommand.NotifyCanExecuteChanged();
+                OnPropertyChanged(nameof(ShowGoToBenchmark));
+            });
             GeneratedAt = response.GeneratedAt;
             RolesAssigned = response.Recommendations.Roles.Count;
             NodesConfigured = response.Targets.Count;
@@ -424,8 +443,15 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
         OnPropertyChanged(nameof(HasModels));
     }
 
-    /// <summary>Step lifecycle: refresh the matrix on entry.</summary>
-    public Task OnStepEnteredAsync(CancellationToken ct = default) => RefreshAsync(ct);
+    /// <summary>Step lifecycle: refresh the matrix on entry, then auto-generate &amp; apply when reachable.</summary>
+    public async Task OnStepEnteredAsync(CancellationToken ct = default)
+    {
+        await RefreshAsync(ct).ConfigureAwait(false);
+        if (!MessageIsError)
+        {
+            await GenerateAndApply().ConfigureAwait(false);
+        }
+    }
 
     /// <summary>Step lifecycle: nothing to stop (no poller).</summary>
     public Task OnStepLeftAsync() => Task.CompletedTask;
@@ -434,6 +460,7 @@ public sealed partial class WizardRecommendationsStepViewModel : ObservableObjec
     {
         AppUiThread.InvokeOrPost(() =>
         {
+            OnPropertyChanged(nameof(IsGenerateAndApplyPrimary));
             GenerateAndApplyCommand.NotifyCanExecuteChanged();
             GenerateCommand.NotifyCanExecuteChanged();
             ApplyCommand.NotifyCanExecuteChanged();
