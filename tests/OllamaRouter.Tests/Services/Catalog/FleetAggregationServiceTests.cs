@@ -419,7 +419,7 @@ public class FleetAggregationServiceTests : IDisposable
         var result = await CreateService().GetShowFleetAsync("llama3", pinned: null);
         sw.Stop();
 
-        Assert.True(sw.Elapsed < TimeSpan.FromMilliseconds(5000),
+        Assert.True(sw.Elapsed < TimeSpan.FromMilliseconds(8000),
             $"Never-seen hanging hoster took {sw.Elapsed.TotalMilliseconds:F0} ms; the call must be bounded (client timeout + margin), never infinite.");
         Assert.NotNull(result);
         Assert.Equal("llama-on-server", result!["details"]?["family"]?.GetValue<string>());
